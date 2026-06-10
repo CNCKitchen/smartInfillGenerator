@@ -48,6 +48,8 @@ pub struct Level {
     pub constrained: Vec<bool>,
     /// Per-node inverted 3x3 diagonal block (row-major 9), zeroed at constrained rows/cols.
     dinv: Vec<f32>,
+    /// Penalty springs (node, unit direction, stiffness N/mm) — frictionless supports.
+    springs: Vec<(u32, [f64; 3], f64)>,
 }
 
 impl Level {
@@ -74,6 +76,7 @@ impl Level {
         eps: Vec<f32>,
         ke64: [[f64; 24]; 24],
         fixed: &[bool],
+        springs: Vec<(u32, [f64; 3], f64)>,
     ) -> Self {
         assert_eq!(eps.len(), nx * ny * nz);
         let (mx, my, mz) = (nx + 1, ny + 1, nz + 1);
@@ -101,6 +104,7 @@ impl Level {
             colors: Default::default(),
             constrained: vec![false; ndof],
             dinv: Vec::new(),
+            springs,
         };
         level.build_colors();
         level.build_constrained(fixed);
@@ -151,7 +155,20 @@ impl Level {
                 }
             }
         }
-        Self::new(nx, ny, nz, self.h * 2.0, eps, ke64, &fixed)
+        // Springs move to the nearest coarse node (keeps the penalty visible
+        // to the preconditioner; exactness is not required there).
+        let springs = self
+            .springs
+            .iter()
+            .map(|&(n, dir, k)| {
+                let n = n as usize;
+                let x = ((n % self.mx + 1) / 2).min(mx - 1);
+                let y = ((n / self.mx % self.my + 1) / 2).min(my - 1);
+                let z = ((n / (self.mx * self.my) + 1) / 2).min(mz - 1);
+                (((z * my + y) * mx + x) as u32, dir, k)
+            })
+            .collect();
+        Self::new(nx, ny, nz, self.h * 2.0, eps, ke64, &fixed, springs)
     }
 
     fn build_colors(&mut self) {
@@ -203,6 +220,15 @@ impl Level {
 
     fn build_dinv(&mut self) {
         let blocks = ke_diag_blocks(&self.ke64);
+        let mut spring_blocks: std::collections::HashMap<u32, [[f64; 3]; 3]> = Default::default();
+        for &(n, dir, k) in &self.springs {
+            let e = spring_blocks.entry(n).or_insert([[0.0; 3]; 3]);
+            for r in 0..3 {
+                for c in 0..3 {
+                    e[r][c] += k * dir[r] * dir[c];
+                }
+            }
+        }
         let mut dinv = vec![0f32; 9 * self.node_count()];
         let (nx, ny, nz) = (self.nx, self.ny, self.nz);
         let (mx, my) = (self.mx, self.my);
@@ -243,6 +269,13 @@ impl Level {
                 }
                 if !any {
                     continue; // stays zero
+                }
+                if let Some(sb) = spring_blocks.get(&(n as u32)) {
+                    for r in 0..3 {
+                        for c in 0..3 {
+                            acc[r][c] += sb[r][c];
+                        }
+                    }
                 }
                 // Reduce out constrained DOFs of this node before inverting.
                 let mut anyfree = false;
@@ -323,6 +356,16 @@ impl Level {
                 });
             }
         }
+        for &(n, dir, k) in &self.springs {
+            let n = n as usize;
+            let s = k
+                * (dir[0] * x[3 * n] as f64
+                    + dir[1] * x[3 * n + 1] as f64
+                    + dir[2] * x[3 * n + 2] as f64);
+            for d in 0..3 {
+                y[3 * n + d] += (s * dir[d]) as f32;
+            }
+        }
         par::mask_zero(y, &self.constrained);
     }
 
@@ -378,6 +421,13 @@ impl Level {
                         }
                     }
                 });
+            }
+        }
+        for &(n, dir, k) in &self.springs {
+            let n = n as usize;
+            let s = k * (dir[0] * x[3 * n] + dir[1] * x[3 * n + 1] + dir[2] * x[3 * n + 2]);
+            for d in 0..3 {
+                y[3 * n + d] += s * dir[d];
             }
         }
         // Mask constrained DOFs.

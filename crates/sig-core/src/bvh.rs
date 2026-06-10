@@ -26,6 +26,8 @@ pub struct WindingBvh {
     nodes: Vec<Node>,
     /// Triangles reordered for leaf locality, 9 f64 each (f64 for stable solid angles).
     tris: Vec<[f64; 9]>,
+    /// Original mesh index of each reordered triangle.
+    orig: Vec<u32>,
 }
 
 impl WindingBvh {
@@ -58,9 +60,42 @@ impl WindingBvh {
                 o
             })
             .collect();
-        let mut bvh = Self { nodes, tris };
+        let mut bvh = Self { nodes, tris, orig: order };
         bvh.compute_aggregates(0);
         bvh
+    }
+
+    /// Closest triangle to q: returns (original triangle index, squared distance).
+    /// Best-first descent pruned by node bounding spheres.
+    pub fn closest_triangle(&self, q: [f64; 3]) -> (u32, f64) {
+        let mut best = (0u32, f64::INFINITY);
+        self.closest_recurse(0, &q, &mut best);
+        best
+    }
+
+    fn closest_recurse(&self, idx: u32, q: &[f64; 3], best: &mut (u32, f64)) {
+        let node = &self.nodes[idx as usize];
+        let lb = (dist(&node.centroid, q) - node.radius).max(0.0);
+        if lb * lb >= best.1 {
+            return;
+        }
+        if node.count > 0 {
+            for ti in node.start..node.start + node.count {
+                let d2 = point_tri_dist2(&self.tris[ti as usize], q);
+                if d2 < best.1 {
+                    *best = (self.orig[ti as usize], d2);
+                }
+            }
+            return;
+        }
+        // Visit nearer child first for tighter pruning.
+        let l = &self.nodes[node.left as usize];
+        let r = &self.nodes[node.right as usize];
+        let dl = dist(&l.centroid, q) - l.radius;
+        let dr = dist(&r.centroid, q) - r.radius;
+        let (first, second) = if dl <= dr { (node.left, node.right) } else { (node.right, node.left) };
+        self.closest_recurse(first, q, best);
+        self.closest_recurse(second, q, best);
     }
 
     /// Aggregate dipole data bottom-up.
@@ -235,6 +270,72 @@ fn dist(a: &[f64; 3], b: &[f64; 3]) -> f64 {
     let dy = a[1] - b[1];
     let dz = a[2] - b[2];
     (dx * dx + dy * dy + dz * dz).sqrt()
+}
+
+fn sub3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn len2(a: [f64; 3]) -> f64 {
+    dot3(a, a)
+}
+
+/// Squared distance from p to triangle t (Ericson, Real-Time Collision Detection §5.1.5).
+fn point_tri_dist2(t: &[f64; 9], p: &[f64; 3]) -> f64 {
+    let a = [t[0], t[1], t[2]];
+    let b = [t[3], t[4], t[5]];
+    let c = [t[6], t[7], t[8]];
+    let ab = sub3(b, a);
+    let ac = sub3(c, a);
+    let ap = sub3(*p, a);
+    let d1 = dot3(ab, ap);
+    let d2 = dot3(ac, ap);
+    if d1 <= 0.0 && d2 <= 0.0 {
+        return len2(ap);
+    }
+    let bp = sub3(*p, b);
+    let d3 = dot3(ab, bp);
+    let d4 = dot3(ac, bp);
+    if d3 >= 0.0 && d4 <= d3 {
+        return len2(bp);
+    }
+    let vc = d1 * d4 - d3 * d2;
+    if vc <= 0.0 && d1 >= 0.0 && d3 <= 0.0 {
+        let v = d1 / (d1 - d3);
+        return len2(sub3(*p, [a[0] + v * ab[0], a[1] + v * ab[1], a[2] + v * ab[2]]));
+    }
+    let cp = sub3(*p, c);
+    let d5 = dot3(ab, cp);
+    let d6 = dot3(ac, cp);
+    if d6 >= 0.0 && d5 <= d6 {
+        return len2(cp);
+    }
+    let vb = d5 * d2 - d1 * d6;
+    if vb <= 0.0 && d2 >= 0.0 && d6 <= 0.0 {
+        let w = d2 / (d2 - d6);
+        return len2(sub3(*p, [a[0] + w * ac[0], a[1] + w * ac[1], a[2] + w * ac[2]]));
+    }
+    let va = d3 * d6 - d5 * d4;
+    if va <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0 {
+        let w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+        let bc = sub3(c, b);
+        return len2(sub3(*p, [b[0] + w * bc[0], b[1] + w * bc[1], b[2] + w * bc[2]]));
+    }
+    let denom = 1.0 / (va + vb + vc);
+    let v = vb * denom;
+    let w = vc * denom;
+    len2(sub3(
+        *p,
+        [
+            a[0] + ab[0] * v + ac[0] * w,
+            a[1] + ab[1] * v + ac[1] * w,
+            a[2] + ab[2] * v + ac[2] * w,
+        ],
+    ))
 }
 
 /// Signed solid angle of triangle t seen from q, normalized by 4π

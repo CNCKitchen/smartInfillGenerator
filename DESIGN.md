@@ -144,7 +144,7 @@ panel. Fallback pattern law: conservative generic n = 2.
 | Phase | Scope | Exit criterion |
 |-------|-------|----------------|
 | 1. Core spike (risk-first) ✅ **done, see PHASE1_RESULTS.md** | Rust→WASM: STL parse → voxelize → multigrid elasticity solve → displacement field | Cantilever matches analytic within tolerance; ~1 M cells solved in seconds on desktop |
-| 2. Setup UI | three.js viewer, drag-drop import, segmentation + brush picking, loads/BCs, RBM check + animation | A novice can set up a bracket case unaided |
+| 2. Setup UI ✅ **done** | three.js viewer, drag-drop import, segmentation + brush picking, loads/BCs, RBM check + animation | A novice can set up a bracket case unaided |
 | 3. Optimization | SIMP loop, bins + clustering, verification solve, comparison card, density/displacement views | Mass slider → stable binned result with reported stiffness retention |
 | 4. Export | Marching cubes regions, Orca/Bambu writer, Prusa writer, per-bin STLs; golden FEA comparisons (5 parts) | Sample-equivalent 3MF opens clean in Orca & Bambu with densities applied |
 | 5. Beta hardening | Dirty-mesh corpus, perf tuning, materials panel, docs/limitations page, project save | Public free beta |

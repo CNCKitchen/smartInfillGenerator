@@ -1,5 +1,6 @@
 /target
-/crates/sig-wasm/pkg
-node_modules
+/web/node_modules
+/web/dist
+/web/src/wasm/
 _sample_extracted/
 *.stl.tmp

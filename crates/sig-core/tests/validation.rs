@@ -182,7 +182,7 @@ fn apply_and_mgcg_match_dense_reference() {
             }
         }
     }
-    let level = Level::new(nx, ny, nz, 1.0, eps.clone(), ke64, &fixed);
+    let level = Level::new(nx, ny, nz, 1.0, eps.clone(), ke64, &fixed, Vec::new());
     let constrained = level.constrained.clone();
 
     // Matrix-free apply vs dense multiply (rows/cols zeroed at constraints).
@@ -275,7 +275,7 @@ fn uniaxial_patch_test_is_exact() {
             }
         }
     }
-    let level = Level::new(nx, ny, nz, h, eps, ke64, &fixed);
+    let level = Level::new(nx, ny, nz, h, eps, ke64, &fixed, Vec::new());
 
     // Uniform traction sigma on the x = L face: sigma*h^2/4 per face-cell corner.
     let sigma = 10.0f64;
