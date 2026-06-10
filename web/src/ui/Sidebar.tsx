@@ -39,12 +39,12 @@ export function Sidebar() {
         <input
           ref={fileRef}
           type="file"
-          accept=".stl"
+          accept=".stl,.3mf"
           hidden
           onChange={(e) => void onFile(e.target.files?.[0])}
         />
         <button className="primary" onClick={pickFile}>
-          {s.fileName ? "Replace model…" : "Open STL…"}
+          {s.fileName ? "Replace model…" : "Open STL / 3MF…"}
         </button>
         {s.fileName ? (
           <div className="fileinfo">
@@ -171,16 +171,16 @@ export function Sidebar() {
         </section>
       )}
 
-      {/* ---- run ---- */}
+      {/* ---- check / solve ---- */}
       {s.model && (
         <section>
-          <header>4 · Run</header>
+          <header>4 · Verify setup</header>
           <div className="toolrow">
             <button onClick={() => void s.runCheck()} disabled={!!s.busy}>
               Check setup
             </button>
-            <button className="primary" onClick={() => void s.runSolve()} disabled={!!s.busy}>
-              Solve
+            <button onClick={() => void s.runSolve()} disabled={!!s.busy}>
+              Solve once
             </button>
           </div>
           {s.check && (
@@ -192,33 +192,118 @@ export function Sidebar() {
                   : "Under-constrained — the part can still move (animated). Add supports."}
             </div>
           )}
-          {s.stats && s.hasResult && (
+          {s.stats && s.hasResult && !s.optSummary && (
+            <div className="status ok">
+              Max deflection <b>{fmtDisp(s.stats.maxDisplacement)}</b> · {s.stats.iterations} iters
+              · {s.stats.seconds.toFixed(1)} s
+            </div>
+          )}
+        </section>
+      )}
+
+      {/* ---- optimize ---- */}
+      {s.model && (
+        <section>
+          <header>5 · Optimize infill</header>
+          <label className="row">
+            <span>Material budget {s.budget}%</span>
+            <input
+              type="range"
+              min={20}
+              max={90}
+              step={1}
+              value={s.budget}
+              onChange={(e) => s.setBudget(Number(e.target.value))}
+            />
+          </label>
+          <label className="row">
+            <span>Infill pattern</span>
+            <select
+              value={s.pattern}
+              onChange={(e) => s.setPattern(e.target.value as "gyroid" | "cubic" | "grid")}
+            >
+              <option value="gyroid">Gyroid</option>
+              <option value="cubic">Cubic</option>
+              <option value="grid">Grid</option>
+            </select>
+          </label>
+          <div className="row">
+            <label className="row" style={{ flex: 1 }}>
+              <span>Walls+shells</span>
+              <input
+                type="number"
+                value={s.wallMm}
+                step={0.1}
+                min={0.2}
+                max={5}
+                onChange={(e) => s.setWallMm(Number(e.target.value))}
+              />
+              <span className="dim">mm</span>
+            </label>
+            <label className="row">
+              <span>Levels</span>
+              <select value={s.nBins} onChange={(e) => s.setNBins(Number(e.target.value))}>
+                <option value={2}>2</option>
+                <option value={3}>3</option>
+                <option value={4}>4</option>
+              </select>
+            </label>
+          </div>
+          <button className="primary" onClick={() => void s.runOptimize()} disabled={!!s.busy}>
+            Optimize infill
+          </button>
+          {s.optProgress && (
+            <div className="progress">
+              <div
+                className="bar"
+                style={{ width: `${(100 * s.optProgress.iteration) / s.optProgress.maxIter}%` }}
+              />
+              <span>
+                iteration {s.optProgress.iteration}/{s.optProgress.maxIter}
+              </span>
+            </div>
+          )}
+          {s.optSummary && <SummaryCard />}
+        </section>
+      )}
+
+      {/* ---- view + export ---- */}
+      {s.model && s.hasResult && (
+        <section>
+          <header>6 · View & export</header>
+          <div className="toolrow">
+            <ViewBtn mode="setup" label="Setup" />
+            <ViewBtn mode="deformed" label="Deformed" />
+            {s.optSummary && <ViewBtn mode="density" label="Density" />}
+            {s.optSummary && <ViewBtn mode="infill" label="Regions" />}
+          </div>
+          {s.viewMode === "deformed" && (
+            <label className="row">
+              <span>Exaggeration ×{s.deformScale.toFixed(1)}</span>
+              <input
+                type="range"
+                min={0}
+                max={3}
+                step={0.1}
+                value={s.deformScale}
+                onChange={(e) => s.setDeformScale(Number(e.target.value))}
+              />
+            </label>
+          )}
+          {s.optSummary && (
             <>
-              <div className="status ok">
-                Max deflection <b>{s.stats.maxDisplacement.toExponential(2)} mm</b> ·{" "}
-                {s.stats.iterations} iters · {s.stats.seconds.toFixed(1)} s
+              <button className="primary" onClick={() => void s.downloadThreeMf()}>
+                Download OrcaSlicer project (.3mf)
+              </button>
+              <button onClick={() => void s.downloadStls()}>
+                Download modifier STLs (.zip)
+              </button>
+              <div className="hint">
+                The 3MF opens in OrcaSlicer/Bambu Studio with the part, the modifier volumes, and
+                their infill densities already set (base infill{" "}
+                {Math.round(s.optSummary.baseDensity * 100)}% on the object). Keep your own
+                printer/filament/process profiles when prompted.
               </div>
-              <label className="rowcheck">
-                <input
-                  type="checkbox"
-                  checked={s.showDeformed}
-                  onChange={(e) => s.setShowDeformed(e.target.checked)}
-                />
-                <span>Show deformed shape (color = |u|)</span>
-              </label>
-              {s.showDeformed && (
-                <label className="row">
-                  <span>Exaggeration ×{s.deformScale.toFixed(1)}</span>
-                  <input
-                    type="range"
-                    min={0}
-                    max={3}
-                    step={0.1}
-                    value={s.deformScale}
-                    onChange={(e) => s.setDeformScale(Number(e.target.value))}
-                  />
-                </label>
-              )}
             </>
           )}
         </section>
@@ -229,6 +314,69 @@ export function Sidebar() {
       </footer>
     </div>
   );
+}
+
+function ViewBtn({ mode, label }: { mode: "setup" | "deformed" | "density" | "infill"; label: string }) {
+  const s = useStore();
+  return (
+    <button className={s.viewMode === mode ? "on" : ""} onClick={() => s.setViewMode(mode)}>
+      {label}
+    </button>
+  );
+}
+
+function SummaryCard() {
+  const s = useStore();
+  const o = s.optSummary!;
+  const stiff = Math.round(o.stiffnessVsSolid * 100);
+  const gain = (o.gainVsUniform * 100).toFixed(1);
+  return (
+    <div className="card">
+      <div className="cardrow big">
+        <span>{o.massGrams.toFixed(1)} g</span>
+        <span className="dim">of {o.massSolidGrams.toFixed(1)} g solid ({Math.round(o.massFrac * 100)}%)</span>
+      </div>
+      <div className="cardrow">
+        <span>Stiffness vs solid</span>
+        <b>{stiff}%</b>
+      </div>
+      <div className="cardrow">
+        <span>vs uniform infill, same mass</span>
+        <b>+{gain}% stiffer</b>
+      </div>
+      <div className="cardrow">
+        <span>Max deflection</span>
+        <b>{fmtDisp(o.maxDisplacement)}</b>
+      </div>
+      <div className="cardrow">
+        <span>Infill levels</span>
+        <span>
+          {o.bins.map((b) => `${Math.round(b.density * 100)}%`).join(" · ")}
+        </span>
+      </div>
+      <div className="cardrow dim small">
+        <span>
+          {o.iterations} iterations · {o.seconds.toFixed(1)} s
+          {o.effectiveBudget * 100 > s.budget + 1
+            ? ` · budget raised to ${Math.round(o.effectiveBudget * 100)}% (walls + minimum infill)`
+            : ""}
+        </span>
+      </div>
+      {o.regionCount === 0 && (
+        <div className="cardrow small" style={{ color: "#f0c674" }}>
+          <span>
+            No separate regions: walls + minimum infill already use the whole budget, so the
+            interior stays at the base density. Raise the budget to get differentiated zones.
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function fmtDisp(mm: number): string {
+  if (mm >= 0.01) return `${mm.toFixed(2)} mm`;
+  return `${(mm * 1000).toFixed(1)} µm`;
 }
 
 function BcRow({ bc }: { bc: Bc }) {

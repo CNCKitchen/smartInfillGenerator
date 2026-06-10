@@ -3,8 +3,9 @@
 
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
-import type { Bc, LoadedModel, SolveStats } from "../types";
-import type { Tool } from "../store";
+import type { Bc, LoadedModel } from "../types";
+import type { Tool, ViewMode } from "../store";
+import type { OptRegion } from "../engine/EngineClient";
 
 const BASE_COLOR = new THREE.Color(0x9aa3ad);
 const HOVER_TINT = new THREE.Color(0xc9d4e0);
@@ -56,9 +57,11 @@ export class SceneManager {
   private rbmMode: { t: number[]; r: number[]; center: number[] } | null = null;
   private rbmAmp = 1;
 
-  // Deformed view
+  // Result views
   private displacements: Float32Array | null = null;
-  private showDeformed = false;
+  private vertexDensity: Float32Array | null = null;
+  private regionMeshes: THREE.Mesh[] = [];
+  private viewMode: ViewMode = "setup";
   private deformScale = 1;
   private autoScale = 1;
 
@@ -139,8 +142,10 @@ export class SceneManager {
     this.basePositions = new Float32Array(model.positions);
     this.colors = new Float32Array(this.triCount * 9);
     this.displacements = null;
+    this.vertexDensity = null;
     this.rbmMode = null;
-    this.showDeformed = false;
+    this.viewMode = "setup";
+    this.setRegions(null);
 
     this.geometry = new THREE.BufferGeometry();
     this.geometry.setAttribute("position", new THREE.BufferAttribute(model.positions, 3));
@@ -386,48 +391,110 @@ export class SceneManager {
     ];
   }
 
-  // ---------- deformed view ----------
+  // ---------- result views ----------
 
-  setDisplacements(disp: Float32Array | null, stats: SolveStats | null) {
+  setDisplacements(disp: Float32Array | null, stats: { maxDisplacement: number } | null) {
     this.displacements = disp;
     if (disp && stats && stats.maxDisplacement > 0) {
       this.autoScale = (0.08 * this.bboxDiag) / stats.maxDisplacement;
     } else {
       this.autoScale = 1;
     }
-    this.applyPositions();
-    this.applyDispColors();
+    this.refreshView();
   }
 
-  setDeformedView(show: boolean, scale: number) {
-    this.showDeformed = show;
-    this.deformScale = scale;
-    this.applyPositions();
-    this.applyDispColors();
+  setVertexDensity(density: Float32Array | null) {
+    this.vertexDensity = density;
+    this.refreshView();
   }
 
-  private applyDispColors() {
-    if (!this.geometry || !this.colors) return;
-    if (!this.displacements || !this.showDeformed) {
-      this.repaint();
+  setRegions(regions: OptRegion[] | null) {
+    for (const m of this.regionMeshes) {
+      this.scene.remove(m);
+      m.geometry.dispose();
+      (m.material as THREE.Material).dispose();
+    }
+    this.regionMeshes = [];
+    if (!regions) {
+      this.refreshView();
       return;
     }
-    // Color by displacement magnitude, viridis-ish ramp.
-    const d = this.displacements;
-    let maxMag = 1e-12;
-    const mags = new Float32Array(d.length / 3);
-    for (let i = 0; i < mags.length; i++) {
-      mags[i] = Math.hypot(d[3 * i], d[3 * i + 1], d[3 * i + 2]);
-      maxMag = Math.max(maxMag, mags[i]);
-    }
     const c = new THREE.Color();
-    for (let i = 0; i < mags.length; i++) {
-      ramp(mags[i] / maxMag, c);
-      this.colors[3 * i] = c.r;
-      this.colors[3 * i + 1] = c.g;
-      this.colors[3 * i + 2] = c.b;
+    for (const r of regions) {
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute("position", new THREE.BufferAttribute(r.positions, 3));
+      geo.setIndex(new THREE.BufferAttribute(r.indices, 1));
+      geo.computeVertexNormals();
+      ramp(Math.min(1, r.density / 0.8), c);
+      const mat = new THREE.MeshStandardMaterial({
+        color: c.clone(),
+        transparent: true,
+        opacity: 0.62,
+        roughness: 0.6,
+        metalness: 0.0,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+      });
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.visible = false;
+      this.scene.add(mesh);
+      this.regionMeshes.push(mesh);
     }
-    (this.geometry.getAttribute("color") as THREE.BufferAttribute).needsUpdate = true;
+    this.refreshView();
+  }
+
+  setViewState(mode: ViewMode, deformScale: number) {
+    this.viewMode = mode;
+    this.deformScale = deformScale;
+    this.refreshView();
+  }
+
+  /** Re-derive positions, colors, part opacity, and overlay visibility. */
+  private refreshView() {
+    if (!this.mesh) return;
+    const mat = this.mesh.material as THREE.MeshStandardMaterial;
+    const infill = this.viewMode === "infill";
+    mat.transparent = infill;
+    mat.opacity = infill ? 0.16 : 1.0;
+    mat.depthWrite = !infill;
+    mat.needsUpdate = true;
+    for (const m of this.regionMeshes) m.visible = infill;
+    this.applyPositions();
+    this.applyColors();
+  }
+
+  private applyColors() {
+    if (!this.geometry || !this.colors) return;
+    if (this.viewMode === "deformed" && this.displacements) {
+      const d = this.displacements;
+      let maxMag = 1e-12;
+      const mags = new Float32Array(d.length / 3);
+      for (let i = 0; i < mags.length; i++) {
+        mags[i] = Math.hypot(d[3 * i], d[3 * i + 1], d[3 * i + 2]);
+        maxMag = Math.max(maxMag, mags[i]);
+      }
+      const c = new THREE.Color();
+      for (let i = 0; i < mags.length; i++) {
+        ramp(mags[i] / maxMag, c);
+        this.colors[3 * i] = c.r;
+        this.colors[3 * i + 1] = c.g;
+        this.colors[3 * i + 2] = c.b;
+      }
+      (this.geometry.getAttribute("color") as THREE.BufferAttribute).needsUpdate = true;
+      return;
+    }
+    if (this.viewMode === "density" && this.vertexDensity) {
+      const c = new THREE.Color();
+      for (let i = 0; i < this.vertexDensity.length; i++) {
+        ramp(Math.min(1, this.vertexDensity[i] / 0.8), c);
+        this.colors[3 * i] = c.r;
+        this.colors[3 * i + 1] = c.g;
+        this.colors[3 * i + 2] = c.b;
+      }
+      (this.geometry.getAttribute("color") as THREE.BufferAttribute).needsUpdate = true;
+      return;
+    }
+    this.repaint();
   }
 
   private applyPositions(rbmOffset?: number) {
@@ -444,7 +511,7 @@ export class SceneManager {
         out[i + 1] = base[i + 1] + s * u[1];
         out[i + 2] = base[i + 2] + s * u[2];
       }
-    } else if (this.displacements && this.showDeformed) {
+    } else if (this.displacements && this.viewMode === "deformed") {
       const d = this.displacements;
       const s = this.autoScale * this.deformScale;
       for (let i = 0; i < base.length; i++) out[i] = base[i] + s * d[i];

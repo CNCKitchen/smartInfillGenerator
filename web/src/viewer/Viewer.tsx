@@ -54,7 +54,9 @@ export function Viewer() {
     sceneEvents.onBcsChanged = (bcs, active) => scene.setBcs(bcs, active);
     sceneEvents.onAnimateMode = (mode) => scene.setRbmMode(mode);
     sceneEvents.onDisplacements = (d, stats) => scene.setDisplacements(d, stats);
-    sceneEvents.onDeformedView = (show, scale) => scene.setDeformedView(show, scale);
+    sceneEvents.onVertexDensity = (d) => scene.setVertexDensity(d);
+    sceneEvents.onRegions = (r) => scene.setRegions(r);
+    sceneEvents.onViewState = (mode, scale) => scene.setViewState(mode, scale);
 
     const obs = new ResizeObserver(() => {
       const el = wrapRef.current;

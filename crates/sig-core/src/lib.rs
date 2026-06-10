@@ -6,6 +6,7 @@
 //! (sequential or wasm threads via the `parallel` feature).
 
 pub mod attach;
+pub mod bins;
 pub mod bvh;
 pub mod check;
 pub mod fem;
@@ -13,8 +14,11 @@ pub mod mesh;
 pub mod mg;
 pub mod par;
 pub mod segment;
+pub mod simp;
 pub mod solve;
+pub mod threemf;
 pub mod voxel;
+pub mod zip;
 
 pub use mesh::TriMesh;
 pub use solve::{

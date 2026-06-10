@@ -306,3 +306,57 @@ footer {
   margin-top: auto;
   padding-top: 4px;
 }
+
+.toast.notice {
+  background: #1d2a3a;
+  border-color: #2f4a6b;
+  color: #b9d2ee;
+}
+
+.progress {
+  position: relative;
+  height: 22px;
+  background: #161b20;
+  border: 1px solid #39434e;
+  border-radius: 7px;
+  overflow: hidden;
+}
+
+.progress .bar {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: #2563eb88;
+  transition: width 0.2s;
+}
+
+.progress span {
+  position: relative;
+  display: block;
+  text-align: center;
+  line-height: 22px;
+  font-size: 11.5px;
+  color: #c4d3e4;
+}
+
+.card {
+  background: #161b20;
+  border: 1px solid #2f3a45;
+  border-radius: 9px;
+  padding: 9px 11px;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.cardrow {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.cardrow.big span:first-child {
+  font-size: 19px;
+  font-weight: 700;
+  color: #8ecf9f;
+}

@@ -5,6 +5,7 @@ import { useStore } from "./store";
 export function App() {
   const busy = useStore((s) => s.busy);
   const error = useStore((s) => s.error);
+  const notice = useStore((s) => s.notice);
   const clearError = useStore((s) => s.clearError);
 
   return (
@@ -22,6 +23,11 @@ export function App() {
           <div className="toast" onClick={clearError}>
             {error}
             <span className="dim"> — click to dismiss</span>
+          </div>
+        )}
+        {!error && notice && (
+          <div className="toast notice" onClick={clearError}>
+            {notice}
           </div>
         )}
       </div>

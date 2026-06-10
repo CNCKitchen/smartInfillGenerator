@@ -11,8 +11,8 @@
 use crate::fem::{invert3, ke_diag_blocks, NODE_OFFSETS};
 use crate::par::{self, UnsafeSlice};
 
-pub const NU1: usize = 2;
-pub const NU2: usize = 2;
+pub const NU1: usize = 3;
+pub const NU2: usize = 3;
 pub const OMEGA: f32 = 0.6;
 const NODE_CHUNK: usize = 4096;
 
@@ -114,26 +114,8 @@ impl Level {
 
     /// Rediscretized coarse level: half resolution, child-averaged stiffness.
     pub fn coarsen(&self) -> Self {
-        assert!(self.nx % 2 == 0 && self.ny % 2 == 0 && self.nz % 2 == 0);
+        let eps = average_coarse_eps(&self.eps, self.nx, self.ny, self.nz);
         let (nx, ny, nz) = (self.nx / 2, self.ny / 2, self.nz / 2);
-        let mut eps = vec![0f32; nx * ny * nz];
-        for cz in 0..nz {
-            for cy in 0..ny {
-                for cx in 0..nx {
-                    let mut s = 0f32;
-                    for dz in 0..2 {
-                        for dy in 0..2 {
-                            for dx in 0..2 {
-                                s += self.eps[((2 * cz + dz) * self.ny + 2 * cy + dy) * self.nx
-                                    + 2 * cx
-                                    + dx];
-                            }
-                        }
-                    }
-                    eps[(cz * ny + cy) * nx + cx] = s / 8.0;
-                }
-            }
-        }
         // KE scales linearly with h for cube cells.
         let mut ke64 = self.ke64;
         for i in 0..24 {
@@ -505,6 +487,29 @@ impl Level {
     }
 }
 
+/// Child-averaged stiffness for the next-coarser grid (fine dims must be even).
+fn average_coarse_eps(fine_eps: &[f32], fnx: usize, fny: usize, fnz: usize) -> Vec<f32> {
+    assert!(fnx % 2 == 0 && fny % 2 == 0 && fnz % 2 == 0);
+    let (nx, ny, nz) = (fnx / 2, fny / 2, fnz / 2);
+    let mut eps = vec![0f32; nx * ny * nz];
+    for cz in 0..nz {
+        for cy in 0..ny {
+            for cx in 0..nx {
+                let mut s = 0f32;
+                for dz in 0..2 {
+                    for dy in 0..2 {
+                        for dx in 0..2 {
+                            s += fine_eps[((2 * cz + dz) * fny + 2 * cy + dy) * fnx + 2 * cx + dx];
+                        }
+                    }
+                }
+                eps[(cz * ny + cy) * nx + cx] = s / 8.0;
+            }
+        }
+    }
+    eps
+}
+
 /// Restriction r_c = P^T r_f (trilinear weights), masked at coarse constrained DOFs.
 fn restrict(fine: &Level, fine_res: &[f32], coarse: &Level, out: &mut [f32]) {
     let (cmx, cmy) = (coarse.mx, coarse.my);
@@ -702,20 +707,58 @@ impl MgSolver {
         Self { levels, ws }
     }
 
+    /// Update per-cell stiffness factors in place (same void/solid topology!)
+    /// and refresh the smoother diagonals down the hierarchy. Cheap compared
+    /// to rebuilding levels — the optimization loop calls this every iteration.
+    pub fn update_eps(&mut self, eps: Vec<f32>) {
+        debug_assert_eq!(eps.len(), self.levels[0].eps.len());
+        self.levels[0].eps = eps;
+        self.levels[0].build_dinv();
+        for l in 1..self.levels.len() {
+            let f = &self.levels[l - 1];
+            let coarse = average_coarse_eps(&f.eps, f.nx, f.ny, f.nz);
+            self.levels[l].eps = coarse;
+            self.levels[l].build_dinv();
+        }
+    }
+
     /// Mixed-precision MGCG: outer CG loop and operator in f64 (so attainable
     /// accuracy is not capped by f32 cancellation in K·u), V-cycle
     /// preconditioner in f32 (the bulk of the flops). `b` must be zero at
     /// constrained DOFs; `u` is overwritten (zero initial guess).
     pub fn solve(&mut self, b: &[f64], u: &mut [f64], tol: f64, max_iter: usize) -> SolveStats {
+        u.fill(0.0);
+        self.solve_warm(b, u, tol, max_iter)
+    }
+
+    /// Like `solve`, but uses the incoming `u` as the initial guess — the
+    /// optimization loop re-solves after small density updates and converges
+    /// in a few iterations from the previous displacement field.
+    pub fn solve_warm(&mut self, b: &[f64], u: &mut [f64], tol: f64, max_iter: usize) -> SolveStats {
         let n = self.levels[0].ndof();
         assert_eq!(b.len(), n);
         assert_eq!(u.len(), n);
-        u.fill(0.0);
+        // Guard the masking invariant for arbitrary initial guesses.
+        for (i, c) in self.levels[0].constrained.iter().enumerate() {
+            if *c {
+                u[i] = 0.0;
+            }
+        }
         let norm_b = par::norm2_64(b);
         if norm_b == 0.0 {
+            u.fill(0.0);
             return SolveStats { iterations: 0, rel_residual: 0.0, converged: true };
         }
-        let mut r = b.to_vec();
+        // r = b - A u0
+        let mut r = vec![0f64; n];
+        self.levels[0].apply64(u, &mut r);
+        for i in 0..n {
+            r[i] = b[i] - r[i];
+        }
+        let res0 = par::norm2_64(&r) / norm_b;
+        if res0 <= tol {
+            return SolveStats { iterations: 0, rel_residual: res0, converged: true };
+        }
         let mut p = vec![0f64; n];
         let mut q = vec![0f64; n];
 

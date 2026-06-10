@@ -7,7 +7,7 @@ let model: Model | null = null;
 const ready = init();
 
 type Req =
-  | { id: number; op: "load"; bytes: ArrayBuffer }
+  | { id: number; op: "load"; bytes: ArrayBuffer; name: string }
   | { id: number; op: "resegment"; angle: number }
   | { id: number; op: "setMaterial"; e0: number; nu: number; density: number }
   | { id: number; op: "setGravity"; on: boolean }
@@ -19,7 +19,17 @@ type Req =
     }
   | { id: number; op: "voxelInfo" }
   | { id: number; op: "check" }
-  | { id: number; op: "solve" };
+  | { id: number; op: "solve" }
+  | {
+      id: number;
+      op: "optimize";
+      budgetPct: number;
+      pattern: string;
+      wallMm: number;
+      nBins: number;
+    }
+  | { id: number; op: "exportThreeMf" }
+  | { id: number; op: "exportStls" };
 
 self.onmessage = async (ev: MessageEvent<Req>) => {
   const msg = ev.data;
@@ -28,7 +38,7 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
     switch (msg.op) {
       case "load": {
         model?.free();
-        model = new Model(new Uint8Array(msg.bytes));
+        model = new Model(new Uint8Array(msg.bytes), msg.name);
         const positions = model.positions();
         const patchIds = model.patch_ids();
         const data = {
@@ -37,6 +47,7 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
           patchCount: model.patch_count(),
           triCount: model.triangle_count(),
           bbox: Array.from(model.bbox()),
+          meshObjects: model.mesh_object_count(),
         };
         (self as unknown as Worker).postMessage({ id: msg.id, ok: true, data }, [
           positions.buffer,
@@ -94,6 +105,50 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
           { id: msg.id, ok: true, data: { stats, displacements } },
           [displacements.buffer]
         );
+        return;
+      }
+      case "optimize": {
+        const m = requireModel();
+        const t0 = performance.now();
+        const summary = JSON.parse(
+          m.optimize(msg.budgetPct, msg.pattern, msg.wallMm, msg.nBins, (json: string, density: Float32Array) => {
+            (self as unknown as Worker).postMessage(
+              { id: msg.id, progress: true, data: JSON.parse(json), density },
+              [density.buffer]
+            );
+          })
+        );
+        summary.seconds = (performance.now() - t0) / 1000;
+        // Collect region meshes + final fields in one payload.
+        const regions: { density: number; positions: Float32Array; indices: Uint32Array }[] = [];
+        const transfer: Transferable[] = [];
+        for (let i = 0; i < m.region_count(); i++) {
+          const positions = m.region_positions(i);
+          const indices = m.region_indices(i);
+          regions.push({ density: m.region_density(i), positions, indices });
+          transfer.push(positions.buffer, indices.buffer);
+        }
+        const vertexDensity = m.vertex_density();
+        const displacements = m.vertex_displacements();
+        transfer.push(vertexDensity.buffer, displacements.buffer);
+        (self as unknown as Worker).postMessage(
+          { id: msg.id, ok: true, data: { summary, regions, vertexDensity, displacements } },
+          transfer
+        );
+        return;
+      }
+      case "exportThreeMf": {
+        const bytes = requireModel().export_3mf();
+        (self as unknown as Worker).postMessage({ id: msg.id, ok: true, data: bytes }, [
+          bytes.buffer,
+        ]);
+        return;
+      }
+      case "exportStls": {
+        const bytes = requireModel().export_stls();
+        (self as unknown as Worker).postMessage({ id: msg.id, ok: true, data: bytes }, [
+          bytes.buffer,
+        ]);
         return;
       }
     }

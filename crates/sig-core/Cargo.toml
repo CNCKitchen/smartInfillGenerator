@@ -11,6 +11,8 @@ parallel = ["dep:rayon"]
 
 [dependencies]
 rayon = { version = "1.10", optional = true }
+miniz_oxide = "0.8"
+quick-xml = "0.37"
 
 [[bin]]
 name = "bench"

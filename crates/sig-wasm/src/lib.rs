@@ -5,17 +5,33 @@
 //! the boundary as typed arrays; small results as JSON strings.
 
 use sig_core::attach::{assemble, check_problem, BcKind, BcSpec};
+use sig_core::bins::{
+    assign_bins, cleanup_small_regions, cluster_densities, extract_region, taubin_smooth,
+    RegionMesh,
+};
 use sig_core::mesh::TriMesh;
 use sig_core::segment::{segment, Segmentation};
-use sig_core::solve::{pad_for_levels, solve_nodes, SolveSettings, Solution};
+use sig_core::simp::{evaluate, optimize as simp_optimize, OptimizeParams};
+use sig_core::solve::{active_nodes, pad_for_levels, solve_nodes, SolveSettings, Solution};
+use sig_core::threemf::{export_orca_3mf, export_stl_zip, import_3mf, weld};
 use sig_core::voxel::VoxelGrid;
 use wasm_bindgen::prelude::*;
 
 const GRAVITY_MM_S2: [f64; 3] = [0.0, 0.0, -9810.0];
 
+struct OptOutput {
+    regions: Vec<RegionMesh>,
+    base_density: f64,
+    /// Final per-design-cell binned density.
+    cell_density: std::collections::HashMap<u32, f64>,
+    summary: String,
+}
+
 #[wasm_bindgen]
 pub struct Model {
     mesh: TriMesh,
+    name: String,
+    mesh_objects: usize,
     seg: Segmentation,
     bcs: Vec<BcSpec>,
     settings: SolveSettings,
@@ -25,21 +41,37 @@ pub struct Model {
     target_cells: u32,
     grid: Option<(VoxelGrid, usize)>, // padded grid + level count
     solution: Option<Solution>,
+    opt: Option<OptOutput>,
 }
 
 fn err(e: impl std::fmt::Display) -> JsValue {
     JsValue::from_str(&e.to_string())
 }
 
+fn pattern_exponent(pattern: &str) -> f64 {
+    match pattern {
+        "gyroid" => 1.5,
+        "cubic" => 1.8,
+        "grid" => 2.0,
+        _ => 2.0, // conservative generic
+    }
+}
+
 #[wasm_bindgen]
 impl Model {
-    /// Parse an STL (binary or ASCII) and segment at the default 30° crease angle.
+    /// Parse STL (binary/ASCII) or 3MF (detected by zip magic); segment at 30°.
     #[wasm_bindgen(constructor)]
-    pub fn new(stl: &[u8]) -> Result<Model, JsValue> {
-        let mesh = TriMesh::from_stl(stl).map_err(err)?;
+    pub fn new(bytes: &[u8], name: &str) -> Result<Model, JsValue> {
+        let (mesh, mesh_objects) = if bytes.len() >= 2 && &bytes[..2] == b"PK" {
+            import_3mf(bytes).map_err(err)?
+        } else {
+            (TriMesh::from_stl(bytes).map_err(err)?, 1)
+        };
         let seg = segment(&mesh, 30.0);
         Ok(Model {
             mesh,
+            name: name.to_string(),
+            mesh_objects,
             seg,
             bcs: Vec::new(),
             settings: SolveSettings::default(),
@@ -48,7 +80,13 @@ impl Model {
             target_cells: 300_000,
             grid: None,
             solution: None,
+            opt: None,
         })
+    }
+
+    /// Number of mesh objects found in the imported file (UI warns when >1).
+    pub fn mesh_object_count(&self) -> u32 {
+        self.mesh_objects as u32
     }
 
     pub fn triangle_count(&self) -> u32 {
@@ -92,11 +130,13 @@ impl Model {
         self.settings.nu = nu;
         self.density = density_g_cm3 * 1e-9;
         self.solution = None;
+        self.opt = None;
     }
 
     pub fn set_gravity(&mut self, on: bool) {
         self.gravity_on = on;
         self.solution = None;
+        self.opt = None;
     }
 
     pub fn set_resolution(&mut self, target_cells: u32) {
@@ -104,32 +144,38 @@ impl Model {
             self.target_cells = target_cells.clamp(10_000, 4_000_000);
             self.grid = None;
             self.solution = None;
+        self.opt = None;
         }
     }
 
     pub fn clear_bcs(&mut self) {
         self.bcs.clear();
         self.solution = None;
+        self.opt = None;
     }
 
     pub fn add_fixed(&mut self, tris: &[u32]) {
         self.bcs.push(BcSpec { kind: BcKind::Fixed, tris: tris.to_vec() });
         self.solution = None;
+        self.opt = None;
     }
 
     pub fn add_frictionless(&mut self, tris: &[u32]) {
         self.bcs.push(BcSpec { kind: BcKind::Frictionless, tris: tris.to_vec() });
         self.solution = None;
+        self.opt = None;
     }
 
     pub fn add_force(&mut self, tris: &[u32], fx: f64, fy: f64, fz: f64) {
         self.bcs.push(BcSpec { kind: BcKind::Force([fx, fy, fz]), tris: tris.to_vec() });
         self.solution = None;
+        self.opt = None;
     }
 
     pub fn add_pressure(&mut self, tris: &[u32], mpa: f64) {
         self.bcs.push(BcSpec { kind: BcKind::Pressure(mpa), tris: tris.to_vec() });
         self.solution = None;
+        self.opt = None;
     }
 
     fn ensure_grid(&mut self) -> Result<(), JsValue> {
@@ -231,6 +277,330 @@ impl Model {
         }
         Ok(out)
     }
+
+    /// Sample a density field (cell -> density map) at every soup vertex,
+    /// probing slightly inward and falling back to nearby solid cells.
+    fn sample_cell_field(&self, grid: &VoxelGrid, field: &std::collections::HashMap<u32, f64>) -> Vec<f32> {
+        let (nx, ny, nz) = (grid.nx, grid.ny, grid.nz);
+        let h = grid.h;
+        let cell_at = |p: [f64; 3]| -> Option<usize> {
+            let cx = ((p[0] - grid.origin[0]) / h).floor() as i64;
+            let cy = ((p[1] - grid.origin[1]) / h).floor() as i64;
+            let cz = ((p[2] - grid.origin[2]) / h).floor() as i64;
+            if cx < 0 || cy < 0 || cz < 0 || cx >= nx as i64 || cy >= ny as i64 || cz >= nz as i64 {
+                return None;
+            }
+            Some(((cz as usize) * ny + cy as usize) * nx + cx as usize)
+        };
+        let mut out = Vec::with_capacity(self.mesh.tris.len() * 3);
+        for t in &self.mesh.tris {
+            for v in 0..3 {
+                let p = [t[3 * v] as f64, t[3 * v + 1] as f64, t[3 * v + 2] as f64];
+                // Search a small neighborhood: prefer a design cell, else skin.
+                let mut val = 1.0f64;
+                let mut found = false;
+                'search: for r in 0..3i64 {
+                    for dz in -r..=r {
+                        for dy in -r..=r {
+                            for dx in -r..=r {
+                                let q = [
+                                    p[0] + dx as f64 * h,
+                                    p[1] + dy as f64 * h,
+                                    p[2] + dz as f64 * h,
+                                ];
+                                if let Some(ci) = cell_at(q) {
+                                    if let Some(&x) = field.get(&(ci as u32)) {
+                                        val = x;
+                                        found = true;
+                                        break 'search;
+                                    }
+                                    if !found && grid.scale[ci] > 0.0 {
+                                        found = true;
+                                        val = 1.0; // skin
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if found {
+                        break;
+                    }
+                }
+                out.push(val as f32);
+            }
+        }
+        out
+    }
+
+    /// Run the density optimization + binning + verification. Progress gets
+    /// called per iteration with (jsonString, Float32Array vertexDensity).
+    #[allow(clippy::too_many_arguments)]
+    pub fn optimize(
+        &mut self,
+        budget_pct: f64,
+        pattern: &str,
+        wall_mm: f64,
+        n_bins: u32,
+        progress: &js_sys::Function,
+    ) -> Result<String, JsValue> {
+        self.ensure_grid()?;
+        let exponent = pattern_exponent(pattern);
+        let n_bins = (n_bins as usize).clamp(2, 4);
+
+        // Assemble + check before burning time.
+        let (grid, levels) = self.grid.as_ref().unwrap();
+        let asm = assemble(&self.mesh, grid, &self.bcs, self.gravity_arg(), &self.settings)
+            .map_err(err)?;
+        let report = check_problem(grid, &asm);
+        if !report.ok {
+            return Err(err("model is under-constrained — fix the setup first (run Check)"));
+        }
+
+        let params = OptimizeParams {
+            budget: (budget_pct / 100.0).clamp(0.05, 1.0),
+            exponent,
+            wall_mm: wall_mm.clamp(0.2, 5.0),
+            max_iter: 24,
+            ..Default::default()
+        };
+
+        let mesh = &self.mesh;
+        let max_iter = params.max_iter;
+        // Borrow self fields disjointly for the progress closure.
+        let tris = &mesh.tris;
+        let result = simp_optimize(
+            grid,
+            *levels,
+            &asm.problem,
+            &self.settings,
+            &params,
+            |p, x_phys, design_cells| {
+                let mut field: std::collections::HashMap<u32, f64> =
+                    std::collections::HashMap::with_capacity(design_cells.len());
+                for (k, &c) in design_cells.iter().enumerate() {
+                    field.insert(c, x_phys[k]);
+                }
+                // Inline vertex sampling (cannot call &self methods here).
+                let vd = sample_field_static(tris, grid, &field);
+                let json = serde_json::json!({
+                    "iteration": p.iteration,
+                    "maxIter": max_iter,
+                    "compliance": p.compliance,
+                    "massFrac": p.mass_frac,
+                    "change": p.change,
+                })
+                .to_string();
+                let arr = js_sys::Float32Array::from(vd.as_slice());
+                let _ = progress.call2(&JsValue::NULL, &JsValue::from_str(&json), &arr);
+            },
+        )
+        .map_err(err)?;
+
+        // ---- bins ----
+        let centers = cluster_densities(&result.x, n_bins);
+        let mut bins = assign_bins(&result.x, &centers);
+        let min_cells = (result.design_cells.len() / 500).max(30);
+        cleanup_small_regions(grid, &result.design_cells, &mut bins, centers.len(), min_cells);
+        let x_binned: Vec<f64> = bins.iter().map(|&b| centers[b as usize]).collect();
+
+        // ---- verification + baselines ----
+        let (c_binned, _maxd, u_binned) = evaluate(
+            grid, *levels, &asm.problem, &self.settings, &result.skin_cells,
+            &result.design_cells, &x_binned, exponent, Some(&result.u),
+        )
+        .map_err(err)?;
+        let mean_binned = x_binned.iter().sum::<f64>() / x_binned.len().max(1) as f64;
+        let x_uniform = vec![mean_binned; x_binned.len()];
+        let (c_uniform, _, _) = evaluate(
+            grid, *levels, &asm.problem, &self.settings, &result.skin_cells,
+            &result.design_cells, &x_uniform, exponent, Some(&result.u),
+        )
+        .map_err(err)?;
+        let x_solid = vec![1.0; x_binned.len()];
+        let (c_solid, _, _) = evaluate(
+            grid, *levels, &asm.problem, &self.settings, &result.skin_cells,
+            &result.design_cells, &x_solid, exponent, Some(&result.u),
+        )
+        .map_err(err)?;
+
+        // Solution object for the deformed view.
+        let (mx, my, mz) = (grid.nx + 1, grid.ny + 1, grid.nz + 1);
+        let mut max_disp = 0f64;
+        for n in 0..mx * my * mz {
+            let m = u_binned[3 * n] * u_binned[3 * n]
+                + u_binned[3 * n + 1] * u_binned[3 * n + 1]
+                + u_binned[3 * n + 2] * u_binned[3 * n + 2];
+            max_disp = max_disp.max(m);
+        }
+        max_disp = max_disp.sqrt();
+        self.solution = Some(Solution {
+            u: u_binned.iter().map(|&v| v as f32).collect(),
+            mx,
+            my,
+            mz,
+            h: grid.h,
+            origin: grid.origin,
+            active: active_nodes(grid),
+            iterations: result.iterations,
+            rel_residual: 0.0,
+        });
+
+        // ---- regions (bins above base) ----
+        let mut bin_of_cell: std::collections::HashMap<u32, u8> = Default::default();
+        for (i, &c) in result.design_cells.iter().enumerate() {
+            bin_of_cell.insert(c, bins[i]);
+        }
+        let mut regions = Vec::new();
+        for level in 1..centers.len() {
+            let inside = |ci: usize| -> bool {
+                bin_of_cell.get(&(ci as u32)).map_or(false, |&b| b as usize >= level)
+            };
+            let mut r = extract_region(grid, &inside, 0.4);
+            if r.indices.is_empty() {
+                continue;
+            }
+            taubin_smooth(&mut r.positions, &r.indices, 8);
+            r.density = centers[level];
+            regions.push(r);
+        }
+
+        // ---- mass + summary ----
+        let cell_vol = grid.h * grid.h * grid.h;
+        let n_skin = result.skin_cells.len() as f64;
+        let n_solid = n_skin + result.design_cells.len() as f64;
+        let grams = |interior: f64| (n_skin + interior) * cell_vol * self.density * 1e6;
+        let mass_part = grams(x_binned.iter().sum::<f64>());
+        let mass_solid = grams(result.design_cells.len() as f64);
+        let mass_frac = (n_skin + x_binned.iter().sum::<f64>()) / n_solid;
+
+        let bin_counts: Vec<usize> =
+            (0..centers.len()).map(|c| bins.iter().filter(|&&b| b as usize == c).count()).collect();
+        let summary = serde_json::json!({
+            "iterations": result.iterations,
+            "bins": centers.iter().zip(&bin_counts).map(|(&d, &n)| serde_json::json!({
+                "density": d, "cells": n,
+            })).collect::<Vec<_>>(),
+            "baseDensity": centers[0],
+            "regionCount": regions.len(),
+            "massGrams": mass_part,
+            "massSolidGrams": mass_solid,
+            "massFrac": mass_frac,
+            "effectiveBudget": result.effective_budget,
+            "stiffnessVsSolid": c_solid / c_binned,
+            "gainVsUniform": c_uniform / c_binned - 1.0,
+            "maxDisplacement": max_disp,
+        })
+        .to_string();
+
+        let mut field: std::collections::HashMap<u32, f64> = Default::default();
+        for (i, &c) in result.design_cells.iter().enumerate() {
+            field.insert(c, x_binned[i]);
+        }
+        self.opt = Some(OptOutput {
+            regions,
+            base_density: centers[0],
+            cell_density: field,
+            summary: summary.clone(),
+        });
+        Ok(summary)
+    }
+
+    pub fn region_count(&self) -> u32 {
+        self.opt.as_ref().map_or(0, |o| o.regions.len() as u32)
+    }
+
+    pub fn region_density(&self, i: u32) -> f64 {
+        self.opt.as_ref().and_then(|o| o.regions.get(i as usize)).map_or(0.0, |r| r.density)
+    }
+
+    pub fn region_positions(&self, i: u32) -> Vec<f32> {
+        self.opt
+            .as_ref()
+            .and_then(|o| o.regions.get(i as usize))
+            .map_or(Vec::new(), |r| r.positions.clone())
+    }
+
+    pub fn region_indices(&self, i: u32) -> Vec<u32> {
+        self.opt
+            .as_ref()
+            .and_then(|o| o.regions.get(i as usize))
+            .map_or(Vec::new(), |r| r.indices.clone())
+    }
+
+    /// Final binned density per soup vertex (density view).
+    pub fn vertex_density(&self) -> Result<Vec<f32>, JsValue> {
+        let opt = self.opt.as_ref().ok_or_else(|| err("no optimization result"))?;
+        let (grid, _) = self.grid.as_ref().ok_or_else(|| err("no grid"))?;
+        Ok(self.sample_cell_field(grid, &opt.cell_density))
+    }
+
+    /// Orca/Bambu project 3MF with part + nested modifiers.
+    pub fn export_3mf(&self) -> Result<Vec<u8>, JsValue> {
+        let opt = self.opt.as_ref().ok_or_else(|| err("no optimization result — run optimize first"))?;
+        let part = weld(&self.mesh);
+        let name = if self.name.is_empty() { "part" } else { &self.name };
+        Ok(export_orca_3mf(name, &part, &opt.regions, opt.base_density))
+    }
+
+    /// Zip of one binary STL per modifier region.
+    pub fn export_stls(&self) -> Result<Vec<u8>, JsValue> {
+        let opt = self.opt.as_ref().ok_or_else(|| err("no optimization result — run optimize first"))?;
+        Ok(export_stl_zip(&opt.regions))
+    }
+}
+
+/// Free-function clone of sample_cell_field for use inside the progress
+/// closure (no &self available there).
+fn sample_field_static(
+    tris: &[[f32; 9]],
+    grid: &VoxelGrid,
+    field: &std::collections::HashMap<u32, f64>,
+) -> Vec<f32> {
+    let (nx, ny, nz) = (grid.nx, grid.ny, grid.nz);
+    let h = grid.h;
+    let cell_at = |p: [f64; 3]| -> Option<usize> {
+        let cx = ((p[0] - grid.origin[0]) / h).floor() as i64;
+        let cy = ((p[1] - grid.origin[1]) / h).floor() as i64;
+        let cz = ((p[2] - grid.origin[2]) / h).floor() as i64;
+        if cx < 0 || cy < 0 || cz < 0 || cx >= nx as i64 || cy >= ny as i64 || cz >= nz as i64 {
+            return None;
+        }
+        Some(((cz as usize) * ny + cy as usize) * nx + cx as usize)
+    };
+    let mut out = Vec::with_capacity(tris.len() * 3);
+    for t in tris {
+        for v in 0..3 {
+            let p = [t[3 * v] as f64, t[3 * v + 1] as f64, t[3 * v + 2] as f64];
+            let mut val = 1.0f64;
+            let mut found = false;
+            'search: for r in 0..3i64 {
+                for dz in -r..=r {
+                    for dy in -r..=r {
+                        for dx in -r..=r {
+                            let q =
+                                [p[0] + dx as f64 * h, p[1] + dy as f64 * h, p[2] + dz as f64 * h];
+                            if let Some(ci) = cell_at(q) {
+                                if let Some(&x) = field.get(&(ci as u32)) {
+                                    val = x;
+                                    found = true;
+                                    break 'search;
+                                }
+                                if !found && grid.scale[ci] > 0.0 {
+                                    found = true;
+                                    val = 1.0;
+                                }
+                            }
+                        }
+                    }
+                }
+                if found {
+                    break;
+                }
+            }
+            out.push(val as f32);
+        }
+    }
+    out
 }
 
 // ---- Phase-1 raw benchmark exports (used by wasm-bench.js via raw cargo build) ----

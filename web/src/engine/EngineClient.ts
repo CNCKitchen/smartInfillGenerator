@@ -5,6 +5,7 @@ import type { Bc, CheckReport, LoadedModel, SolveStats, VoxelInfo } from "../typ
 interface Pending {
   resolve: (v: unknown) => void;
   reject: (e: Error) => void;
+  onProgress?: (data: unknown, density: Float32Array) => void;
 }
 
 export class EngineClient {
@@ -17,25 +18,33 @@ export class EngineClient {
       type: "module",
     });
     this.worker.onmessage = (ev) => {
-      const { id, ok, data, error } = ev.data;
+      const { id, ok, data, error, progress, density } = ev.data;
       const p = this.pending.get(id);
       if (!p) return;
+      if (progress) {
+        p.onProgress?.(data, density);
+        return;
+      }
       this.pending.delete(id);
       if (ok) p.resolve(data);
       else p.reject(new Error(error));
     };
   }
 
-  private call<T>(msg: Record<string, unknown>, transfer: Transferable[] = []): Promise<T> {
+  private call<T>(
+    msg: Record<string, unknown>,
+    transfer: Transferable[] = [],
+    onProgress?: (data: unknown, density: Float32Array) => void
+  ): Promise<T> {
     const id = this.nextId++;
     return new Promise<T>((resolve, reject) => {
-      this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject });
+      this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject, onProgress });
       this.worker.postMessage({ id, ...msg }, transfer);
     });
   }
 
-  load(bytes: ArrayBuffer): Promise<LoadedModel> {
-    return this.call<LoadedModel>({ op: "load", bytes }, [bytes]);
+  load(bytes: ArrayBuffer, name: string): Promise<LoadedModel> {
+    return this.call<LoadedModel>({ op: "load", bytes, name }, [bytes]);
   }
 
   resegment(angle: number): Promise<{ patchIds: Uint32Array; patchCount: number }> {
@@ -79,6 +88,64 @@ export class EngineClient {
   solve(): Promise<{ stats: SolveStats; displacements: Float32Array }> {
     return this.call({ op: "solve" });
   }
+
+  optimize(
+    budgetPct: number,
+    pattern: string,
+    wallMm: number,
+    nBins: number,
+    onProgress: (p: OptProgress, density: Float32Array) => void
+  ): Promise<OptimizeOutput> {
+    return this.call(
+      { op: "optimize", budgetPct, pattern, wallMm, nBins },
+      [],
+      onProgress as (data: unknown, density: Float32Array) => void
+    );
+  }
+
+  exportThreeMf(): Promise<Uint8Array> {
+    return this.call({ op: "exportThreeMf" });
+  }
+
+  exportStls(): Promise<Uint8Array> {
+    return this.call({ op: "exportStls" });
+  }
+}
+
+export interface OptProgress {
+  iteration: number;
+  maxIter: number;
+  compliance: number;
+  massFrac: number;
+  change: number;
+}
+
+export interface OptRegion {
+  density: number;
+  positions: Float32Array;
+  indices: Uint32Array;
+}
+
+export interface OptSummary {
+  iterations: number;
+  bins: { density: number; cells: number }[];
+  baseDensity: number;
+  regionCount: number;
+  massGrams: number;
+  massSolidGrams: number;
+  massFrac: number;
+  effectiveBudget: number;
+  stiffnessVsSolid: number;
+  gainVsUniform: number;
+  maxDisplacement: number;
+  seconds: number;
+}
+
+export interface OptimizeOutput {
+  summary: OptSummary;
+  regions: OptRegion[];
+  vertexDensity: Float32Array;
+  displacements: Float32Array;
 }
 
 export const engine = new EngineClient();
