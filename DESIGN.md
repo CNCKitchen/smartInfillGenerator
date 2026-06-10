@@ -1,0 +1,157 @@
+# Smart Infill Generator — Design Document
+
+*Resolved via design interview, 2026-06-10. Working name: Smart Infill Generator (naming open).*
+
+## 1. Product definition
+
+A **web-based tool** that takes a 3D-printable model, lets the user define loads and
+constraints by clicking surfaces, runs a structural analysis + density optimization
+**entirely in the browser**, and exports slicer-ready files where different regions of
+the part get different sparse-infill densities — same stiffness target, less plastic
+and print time.
+
+Reference points:
+- [Strecs3D](https://github.com/tomohiron907/Strecs3D) (BSD-3) — does region
+  segmentation + 3MF export but requires *external* FEA results (VTU). We own the whole
+  pipeline including analysis and the density–stiffness iteration.
+- CNC Kitchen video ["Load dependent Infill placement: Smart Infill for FDM 3D prints!"](https://www.youtube.com/watch?v=q0YsC53mFvY)
+  — the manual version of this workflow.
+
+## 2. Resolved decisions (interview outcomes)
+
+| # | Topic | Decision |
+|---|-------|----------|
+| 1 | Architecture | **All compute in-browser (WASM).** Zero hosting cost, models never leave the machine, works offline. No server compute path in v1. |
+| 2 | Discretization | **Voxel grid** from **fast winding-number voxelization** (robust to triangle soup: holes, self-intersections, non-manifold). Matrix-free FEA with geometric multigrid. No tet meshing. |
+| 3 | Input formats | **STL + 3MF in v1.** STEP in v1.x via lazy-loaded OpenCASCADE WASM module (BREP faces become selectable surfaces). |
+| 4 | Surface selection | **Auto-segmentation** (region-growing across edges with dihedral angle < ~30°, slider-adjustable) makes CAD-derived patches one-click selectable. **Brush/lasso + click-to-grow fallback** for organic meshes. |
+| 5 | Loads & BCs (v1) | Fixed support, surface force (total N over patch, presets: normal / global −Z), pressure, gravity/self-weight, frictionless support. *Note: frictionless on arbitrary (non-axis-aligned) patches via penalty/transformed constraints along averaged patch normal.* |
+| 6 | Under-constraint check | Pre-solve: rank test of the 6 rigid-body modes against the constraint set + connected-component (floating island) check. On failure: **block the run and animate the offending rigid-body motion** so the user sees what's unconstrained. |
+| 7 | Material model | **Walls + infill core.** Boundary voxels get solid-material skin stiffness (wall count × line width; defaults 2 × 0.45 mm, plus top/bottom shells). Interior voxels get per-pattern Gibson-Ashby law **E(ρ) = E₀ · c · ρⁿ**. |
+| 8 | Optimization | **Continuous SIMP-style compliance minimization** under mass constraint using the *physical* E(ρ) (no artificial penalization — graded infill is the one case where intermediate density is printable). Optimality-criteria updates, ~50–100 multigrid solves. Then discretize to bins → **final verification solve** with binned densities + walls → report. |
+| 9 | User control | **Mass-budget slider** ("X % of solid") + **comparison card**: mass & filament estimate vs uniform-infill baseline, stiffness retained vs solid (%), max displacement, displacement heatmap. v1.x: "solve for target displacement" (auto-bisection, ~4–6 runs). |
+| 10 | Density bins | **3 bins by default, values auto-placed** by volume-weighted 1-D clustering of the optimized field. Floor 10 % (printability), cap 70 % (+ "consider solid here" flag for capped hot spots). Advanced: 2–5 bins, editable values/floor/cap. Part's own infill setting = lowest bin; modifiers = higher bins. |
+| 11 | Slicer output | **OrcaSlicer project 3MF + Bambu Studio** (shared dialect, pinned from sample — see §5) and **PrusaSlicer flavor** (`Slic3r_PE_model_config`). **Per-bin STL export always available** as universal fallback. Cura deferred. |
+| 12 | Infill patterns | Calibrated E(ρ) for **gyroid (default), cubic, grid**. All other patterns: generic Gibson-Ashby fallback + warning. Grid's anisotropy documented as limitation. |
+| 13 | Validation bar | **Solver unit tests vs analytic solutions (CI) + golden comparisons vs established FEA (CalculiX/Fusion) on ~5 representative parts.** Physical testing is post-launch content, not a release gate. |
+| 14 | Source posture | **Closed source, private repo, free beta.** All dependencies permissive (MIT/Apache/BSD/MPL); keeps commercial options open (Pro tier, vendor licensing, or open-sourcing later). |
+
+## 3. Engineering decisions (made during design, not interview-blocking)
+
+- **Units:** internal system mm–N–MPa (consistent; stresses fall out in MPa, mass via
+  tonne/mm³ → displayed in g). STL is unitless → assume mm with import-dialog override (inch/cm).
+- **Stack:** TypeScript + React + three.js (react-three-fiber) UI. **Rust → WASM core**
+  (one crate: STL/3MF parse, winding-number voxelization, segmentation, FEA, SIMP,
+  marching cubes, 3MF writers). WASM threads (SharedArrayBuffer → site needs COOP/COEP
+  headers) + SIMD. Zip/unzip via `fflate` (MIT) or Rust `zip` crate. No GPL anywhere.
+- **Solver:** 8-node hex elements, matrix-free CG preconditioned by geometric multigrid;
+  identical-element stiffness scaled per-voxel by E(ρ) — the standard topology-optimization
+  formulation (cf. the 88-line/PolyTop lineage, all permissively published math).
+- **Modifier mesh generation:** per-bin indicator field → marching cubes → Taubin
+  smoothing (no shrinkage) → **min-region cleanup** (absorb slivers below ~ a few hundred
+  voxels into the neighboring bin) → dilate by ~half a voxel so regions overlap slightly
+  (no coplanar z-fighting, no uncovered slivers). Modifiers exported **nested/overlapping,
+  ordered low→high density** — later modifiers win in Orca/Prusa, so denser regions
+  override sparser ones; gaps are impossible by construction.
+- **Performance budget:** default grid auto-sized to ~1–2 M active cells (device-memory
+  aware); resolution presets Preview / Normal / Fine. Target: full optimize < ~60 s on a
+  mid desktop at Normal. Warn when thin features span < 3 cells at chosen resolution.
+- **Materials:** presets PLA, PETG, ABS, ASA (E₀, ν, density), user-editable. Strength is
+  an advisory readout later, never a certified safety factor (FDM anisotropy).
+- **Project persistence:** single JSON project file (embedded mesh + setup) download/load;
+  auto-save to IndexedDB.
+- **Out of scope v1:** assemblies/multi-body, print-orientation anisotropy in the solver,
+  thermal/dynamic loads, mobile browsers.
+
+## 4. Pipeline
+
+```
+Import (STL/3MF) ─► Segmentation (dihedral region-growing)
+      │                     │
+      ▼                     ▼
+ Winding-number        Surface picking UI ─► Loads/BCs (N, MPa, g)
+ voxelization                │
+      │                      ▼
+      ▼              Constraint sanity: RBM rank check + islands ─► block+animate if bad
+ Voxel model (skin/core tagged)
+      │
+      ▼
+ SIMP loop: [multigrid solve → OC density update] × ~50–100   (mass budget from slider)
+      │
+      ▼
+ Volume-weighted 1-D clustering → N bins (floor/cap)
+      │
+      ▼
+ Verification solve (binned ρ + walls) ─► comparison card
+      │
+      ▼
+ Marching cubes per bin → smooth → cleanup → dilate
+      │
+      ├─► Orca/Bambu project 3MF        (part + modifier_parts, §5)
+      ├─► PrusaSlicer 3MF               (Slic3r_PE_model_config)
+      └─► per-bin STLs (universal)
+```
+
+## 5. Orca/Bambu 3MF output spec (pinned from `Cube.3mf` sample)
+
+Container (OPC zip): `[Content_Types].xml`, `_rels/.rels`,
+`3D/3dmodel.model` (+ `3D/_rels/3dmodel.model.rels`), `3D/Objects/<name>_1.model`,
+`Metadata/model_settings.config`, `Metadata/project_settings.config`, plate
+thumbnails/json. Generated by BambuStudio 02.06 / OrcaSlicer 2.4.0-alpha.
+
+Key facts to reproduce:
+- **Production extension required** (`requiredextensions="p"`): root `3dmodel.model`
+  holds one `object type="model"` composed of `<component p:path="/3D/Objects/x.model" objectid="…">`
+  entries with UUIDs; actual meshes live in the Objects file. Part mesh = objectid 1,
+  each modifier mesh = its own objectid.
+- **`Metadata/model_settings.config`** is where modifier semantics live:
+  - part: `<part id="1" subtype="normal_part">`
+  - modifier: `<part id="N" subtype="modifier_part">` with metadata keys:
+    `name`, `matrix` (row-major 4×4), `extruder` = `0`,
+    **`sparse_infill_density` value="50%"**, **`wall_loops` value="0"**
+    (sample zeroes wall loops inside modifiers so only infill changes — replicate).
+  - `<plate>` block with `model_instance` (object_id / instance_id / identify_id) and
+    `<assemble>` transform for plate placement.
+- We emit modifier meshes in part-local coordinates with identity matrices (sample's
+  non-identity matrices come from its reused cylinder primitive — not needed for us).
+- `project_settings.config` in the sample is a full 30 KB print profile. **Open question
+  for testing:** find the minimal subset Orca accepts without complaining (or template a
+  lean default profile). Test matrix across Orca 2.x and Bambu Studio versions.
+
+Extracted sample lives in `_sample_extracted/` for reference during development.
+
+## 6. E(ρ) calibration
+
+Law: `E(ρ) = E₀ · c · ρⁿ` per pattern (Gibson-Ashby). Initial constants from literature
+(bending-dominated patterns n ≈ 2; gyroid closer to n ≈ 1.3–1.5) refined with CNC Kitchen
+measured stiffness-vs-density data for gyroid/cubic/grid. Constants exposed in an advanced
+panel. Fallback pattern law: conservative generic n = 2.
+
+## 7. Top risks
+
+1. **WASM solve performance** at useful resolutions — *mitigate first* (Phase 1 spike is
+   exactly this; threads + SIMD + multigrid are the known-good recipe).
+2. **Voxel resolution vs thin walls/ribs** — feature-size warning, local refinement later.
+3. **Orca/Bambu 3MF compatibility drift** across versions — golden-file tests, minimal
+   `project_settings` strategy, version test matrix.
+4. **Segmentation quality on ugly meshes** — brush fallback guarantees a path; corpus of
+   "Thingiverse horrors" as test fixtures.
+5. **SharedArrayBuffer hosting constraints** (COOP/COEP headers) — host on a static CDN
+   that supports custom headers; single-thread fallback mode.
+
+## 8. Build plan
+
+| Phase | Scope | Exit criterion |
+|-------|-------|----------------|
+| 1. Core spike (risk-first) ✅ **done, see PHASE1_RESULTS.md** | Rust→WASM: STL parse → voxelize → multigrid elasticity solve → displacement field | Cantilever matches analytic within tolerance; ~1 M cells solved in seconds on desktop |
+| 2. Setup UI | three.js viewer, drag-drop import, segmentation + brush picking, loads/BCs, RBM check + animation | A novice can set up a bracket case unaided |
+| 3. Optimization | SIMP loop, bins + clustering, verification solve, comparison card, density/displacement views | Mass slider → stable binned result with reported stiffness retention |
+| 4. Export | Marching cubes regions, Orca/Bambu writer, Prusa writer, per-bin STLs; golden FEA comparisons (5 parts) | Sample-equivalent 3MF opens clean in Orca & Bambu with densities applied |
+| 5. Beta hardening | Dirty-mesh corpus, perf tuning, materials panel, docs/limitations page, project save | Public free beta |
+
+## 9. Open items
+
+- [ ] **Calibration data**: locate/compile CNC Kitchen stiffness-vs-density measurements for gyroid/cubic/grid (else schedule a short test series).
+- [ ] **Name/branding** for the tool.
+- [ ] Minimal `project_settings.config` experiment (what Orca tolerates) — Phase 4.
+- [ ] Orca/Bambu/Prusa version test matrix definition.

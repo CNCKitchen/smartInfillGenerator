@@ -1,0 +1,12 @@
+[package]
+name = "sig-wasm"
+version = "0.1.0"
+edition = "2021"
+license = "LicenseRef-Proprietary"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+sig-core = { path = "../sig-core", default-features = false }
