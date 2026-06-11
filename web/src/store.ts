@@ -6,13 +6,66 @@ import type {
   CheckReport,
   LoadedModel,
   Material,
+  PatternCurve,
+  PatternKey,
   ResolutionKey,
   SolveStats,
+  VoxelInfo,
 } from "./types";
-import { MATERIALS, RESOLUTIONS } from "./types";
+import { DEFAULT_CURVES, DEFAULT_MATERIALS, RESOLUTIONS } from "./types";
 
 export type Tool = "orbit" | "select" | "brush";
-export type ViewMode = "setup" | "deformed" | "density" | "infill";
+export type ViewMode = "setup" | "mesh" | "deformed" | "density" | "infill";
+
+// ---- persisted user settings (materials + infill stiffness curves) ----
+
+const SETTINGS_KEY = "sig.settings.v1";
+
+interface PersistedSettings {
+  materials: Material[];
+  curves: Record<PatternKey, PatternCurve>;
+}
+
+function loadSettings(): PersistedSettings {
+  const fallback: PersistedSettings = {
+    materials: DEFAULT_MATERIALS.map((m) => ({ ...m })),
+    curves: {
+      gyroid: { ...DEFAULT_CURVES.gyroid },
+      cubic: { ...DEFAULT_CURVES.cubic },
+      grid: { ...DEFAULT_CURVES.grid },
+    },
+  };
+  try {
+    const raw = localStorage.getItem(SETTINGS_KEY);
+    if (!raw) return fallback;
+    const p = JSON.parse(raw) as Partial<PersistedSettings>;
+    if (Array.isArray(p.materials) && p.materials.length) {
+      fallback.materials = p.materials
+        .filter((m) => m && typeof m.e0 === "number" && m.e0 > 0)
+        .map((m) => ({ name: String(m.name), e0: m.e0, nu: m.nu, density: m.density }));
+      if (!fallback.materials.length) fallback.materials = DEFAULT_MATERIALS.map((m) => ({ ...m }));
+    }
+    for (const k of ["gyroid", "cubic", "grid"] as PatternKey[]) {
+      const c = p.curves?.[k];
+      if (c && typeof c.coeff === "number" && typeof c.exponent === "number") {
+        fallback.curves[k] = { coeff: c.coeff, exponent: c.exponent };
+      }
+    }
+  } catch {
+    // corrupted storage: keep defaults
+  }
+  return fallback;
+}
+
+function saveSettings(materials: Material[], curves: Record<PatternKey, PatternCurve>) {
+  try {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify({ materials, curves }));
+  } catch {
+    // storage full/blocked: settings just won't persist
+  }
+}
+
+const initialSettings = loadSettings();
 
 interface AppState {
   // model
@@ -28,12 +81,15 @@ interface AppState {
   activeBcId: string | null;
   // physics
   material: Material;
+  materials: Material[];
+  curves: Record<PatternKey, PatternCurve>;
   gravity: boolean;
   resolution: ResolutionKey;
   // optimization inputs
   budget: number; // % of solid mass
-  pattern: "gyroid" | "cubic" | "grid";
-  wallMm: number;
+  pattern: PatternKey;
+  perimeters: number;
+  lineWidth: number; // mm
   nBins: number;
   // run state
   busy: string | null;
@@ -46,6 +102,12 @@ interface AppState {
   optSummary: OptSummary | null;
   viewMode: ViewMode;
   deformScale: number;
+  animateDeformed: boolean;
+  /** Display autoscale chosen by the viewer (deformation exaggeration base). */
+  autoScale: number;
+  voxelInfo: VoxelInfo | null;
+  voxelMeshReady: boolean;
+  settingsOpen: boolean;
 
   loadFile(name: string, bytes: ArrayBuffer): Promise<void>;
   setSegAngle(angle: number): Promise<void>;
@@ -58,19 +120,28 @@ interface AppState {
   updateBcTris(id: string, tris: Uint32Array): void;
   updateBcParams(id: string, params: Partial<Pick<Bc, "force" | "pressure">>): void;
   setMaterial(m: Material): void;
+  updateMaterial(index: number, m: Material): void;
+  addMaterial(): void;
+  removeMaterial(index: number): void;
+  resetMaterials(): void;
+  setCurve(pattern: PatternKey, c: PatternCurve): void;
+  resetCurves(): void;
+  openSettings(open: boolean): void;
   setGravity(on: boolean): void;
   setResolution(r: ResolutionKey): void;
   setBudget(v: number): void;
-  setPattern(p: "gyroid" | "cubic" | "grid"): void;
-  setWallMm(v: number): void;
+  setPattern(p: PatternKey): void;
+  setPerimeters(v: number): void;
+  setLineWidth(v: number): void;
   setNBins(v: number): void;
   runCheck(): Promise<void>;
   runSolve(): Promise<void>;
   runOptimize(): Promise<void>;
   downloadThreeMf(): Promise<void>;
   downloadStls(): Promise<void>;
-  setViewMode(mode: ViewMode): void;
+  setViewMode(mode: ViewMode): Promise<void>;
   setDeformScale(s: number): void;
+  setAnimateDeformed(on: boolean): void;
   clearError(): void;
 }
 
@@ -86,6 +157,8 @@ export interface SceneEvents {
   onVertexDensity?: (density: Float32Array | null) => void;
   onRegions?: (regions: OptRegion[] | null) => void;
   onViewState?: (mode: ViewMode, deformScale: number) => void;
+  onVoxelMesh?: (hull: Float32Array | null, edges: Float32Array | null) => void;
+  onAnimateDeformed?: (on: boolean) => void;
 }
 
 export const sceneEvents: SceneEvents = {};
@@ -99,7 +172,17 @@ function invalidateResults(set: (p: Partial<AppState>) => void, get: () => AppSt
   sceneEvents.onRegions?.(null);
   sceneEvents.onVertexDensity?.(null);
   sceneEvents.onDisplacements?.(null, null);
-  if (get().viewMode !== "setup") {
+  if (get().viewMode !== "setup" && get().viewMode !== "mesh") {
+    set({ viewMode: "setup" });
+    sceneEvents.onViewState?.("setup", get().deformScale);
+  }
+}
+
+/** Model or resolution changed: the voxel grid (and its display mesh) is stale. */
+function invalidateGrid(set: (p: Partial<AppState>) => void, get: () => AppState) {
+  set({ voxelInfo: null, voxelMeshReady: false });
+  sceneEvents.onVoxelMesh?.(null, null);
+  if (get().viewMode === "mesh") {
     set({ viewMode: "setup" });
     sceneEvents.onViewState?.("setup", get().deformScale);
   }
@@ -124,12 +207,15 @@ export const useStore = create<AppState>((set, get) => ({
   brushErase: false,
   bcs: [],
   activeBcId: null,
-  material: MATERIALS[0],
+  material: initialSettings.materials[0],
+  materials: initialSettings.materials,
+  curves: initialSettings.curves,
   gravity: false,
   resolution: "preview",
   budget: 50,
   pattern: "gyroid",
-  wallMm: 0.9,
+  perimeters: 2,
+  lineWidth: 0.45,
   nBins: 3,
   busy: null,
   error: null,
@@ -141,6 +227,11 @@ export const useStore = create<AppState>((set, get) => ({
   optSummary: null,
   viewMode: "setup",
   deformScale: 1,
+  animateDeformed: false,
+  autoScale: 1,
+  voxelInfo: null,
+  voxelMeshReady: false,
+  settingsOpen: false,
 
   async loadFile(name, bytes) {
     set({ busy: "Parsing & segmenting…", error: null, notice: null });
@@ -161,6 +252,9 @@ export const useStore = create<AppState>((set, get) => ({
         optSummary: null,
         optProgress: null,
         viewMode: "setup",
+        voxelInfo: null,
+        voxelMeshReady: false,
+        autoScale: 1,
         busy: null,
         notice:
           (model as LoadedModel & { meshObjects?: number }).meshObjects &&
@@ -174,6 +268,7 @@ export const useStore = create<AppState>((set, get) => ({
       sceneEvents.onVertexDensity?.(null);
       sceneEvents.onRegions?.(null);
       sceneEvents.onAnimateMode?.(null);
+      sceneEvents.onVoxelMesh?.(null, null);
       sceneEvents.onViewState?.("setup", get().deformScale);
     } catch (e) {
       set({ busy: null, error: e instanceof Error ? e.message : String(e) });
@@ -252,6 +347,62 @@ export const useStore = create<AppState>((set, get) => ({
     void engine.setMaterial(m.e0, m.nu, m.density);
   },
 
+  updateMaterial(index, m) {
+    const mats = get().materials.slice();
+    const wasSelected = mats[index]?.name === get().material.name;
+    mats[index] = m;
+    set({ materials: mats });
+    saveSettings(mats, get().curves);
+    if (wasSelected) {
+      set({ material: m });
+      invalidateResults(set, get);
+      void engine.setMaterial(m.e0, m.nu, m.density);
+    }
+  },
+
+  addMaterial() {
+    const mats = [...get().materials, { name: "Custom", e0: 2000, nu: 0.35, density: 1.2 }];
+    set({ materials: mats });
+    saveSettings(mats, get().curves);
+  },
+
+  removeMaterial(index) {
+    const mats = get().materials.filter((_, i) => i !== index);
+    if (!mats.length) return;
+    const removedSelected = get().materials[index]?.name === get().material.name;
+    set({ materials: mats });
+    saveSettings(mats, get().curves);
+    if (removedSelected) get().setMaterial(mats[0]);
+  },
+
+  resetMaterials() {
+    const mats = DEFAULT_MATERIALS.map((m) => ({ ...m }));
+    set({ materials: mats });
+    saveSettings(mats, get().curves);
+    const sel = mats.find((m) => m.name === get().material.name) ?? mats[0];
+    get().setMaterial(sel);
+  },
+
+  setCurve(pattern, c) {
+    const curves = { ...get().curves, [pattern]: c };
+    set({ curves });
+    saveSettings(get().materials, curves);
+  },
+
+  resetCurves() {
+    const curves = {
+      gyroid: { ...DEFAULT_CURVES.gyroid },
+      cubic: { ...DEFAULT_CURVES.cubic },
+      grid: { ...DEFAULT_CURVES.grid },
+    };
+    set({ curves });
+    saveSettings(get().materials, curves);
+  },
+
+  openSettings(open) {
+    set({ settingsOpen: open });
+  },
+
   setGravity(on) {
     set({ gravity: on });
     invalidateResults(set, get);
@@ -261,6 +412,7 @@ export const useStore = create<AppState>((set, get) => ({
   setResolution(r) {
     set({ resolution: r });
     invalidateResults(set, get);
+    invalidateGrid(set, get);
     void engine.setResolution(RESOLUTIONS[r]);
   },
 
@@ -270,8 +422,11 @@ export const useStore = create<AppState>((set, get) => ({
   setPattern(p) {
     set({ pattern: p });
   },
-  setWallMm(v) {
-    set({ wallMm: v });
+  setPerimeters(v) {
+    set({ perimeters: Math.min(8, Math.max(1, Math.round(v))) });
+  },
+  setLineWidth(v) {
+    set({ lineWidth: Math.min(1.5, Math.max(0.1, v)) });
   },
   setNBins(v) {
     set({ nBins: v });
@@ -327,10 +482,13 @@ export const useStore = create<AppState>((set, get) => ({
     sceneEvents.onAnimateMode?.(null);
     try {
       await pushBcs(get);
+      const curve = st.curves[st.pattern];
       const out = await engine.optimize(
         st.budget,
-        st.pattern,
-        st.wallMm,
+        curve.exponent,
+        curve.coeff,
+        st.perimeters,
+        st.lineWidth,
         st.nBins,
         (p, density) => {
           set({ optProgress: { iteration: p.iteration, maxIter: p.maxIter } });
@@ -385,7 +543,18 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
-  setViewMode(mode) {
+  async setViewMode(mode) {
+    if (mode === "mesh" && !get().voxelMeshReady) {
+      set({ busy: "Building analysis mesh…", error: null });
+      try {
+        const { hull, edges, info } = await engine.voxelMesh();
+        set({ voxelInfo: info, voxelMeshReady: true, busy: null });
+        sceneEvents.onVoxelMesh?.(hull, edges);
+      } catch (e) {
+        set({ busy: null, error: e instanceof Error ? e.message : String(e) });
+        return;
+      }
+    }
     set({ viewMode: mode });
     sceneEvents.onViewState?.(mode, get().deformScale);
   },
@@ -393,6 +562,11 @@ export const useStore = create<AppState>((set, get) => ({
   setDeformScale(s) {
     set({ deformScale: s });
     sceneEvents.onViewState?.(get().viewMode, s);
+  },
+
+  setAnimateDeformed(on) {
+    set({ animateDeformed: on });
+    sceneEvents.onAnimateDeformed?.(on);
   },
 
   clearError() {

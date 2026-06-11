@@ -80,12 +80,12 @@ fn optimized_bins_beat_uniform_infill_at_equal_mass() {
     let x_uniform = vec![mean; x_binned.len()];
 
     let (c_binned, maxd_binned, _) = evaluate(
-        &f.grid, f.levels, &f.problem, &f.settings, &f.skin, &f.design, &x_binned, 1.5,
+        &f.grid, f.levels, &f.problem, &f.settings, &f.skin, &f.design, &x_binned, 1.5, 1.0,
         Some(&f.u),
     )
     .expect("binned eval");
     let (c_uniform, _, _) = evaluate(
-        &f.grid, f.levels, &f.problem, &f.settings, &f.skin, &f.design, &x_uniform, 1.5,
+        &f.grid, f.levels, &f.problem, &f.settings, &f.skin, &f.design, &x_uniform, 1.5, 1.0,
         Some(&f.u),
     )
     .expect("uniform eval");
@@ -198,7 +198,7 @@ fn orca_3mf_roundtrips_through_own_zip_and_import() {
         region([3.0; 3], [10.0, 10.0, 7.0], 0.50),
     ];
 
-    let bytes = export_orca_3mf("bracket & arm", &part, &regions, 0.12);
+    let bytes = export_orca_3mf("bracket & arm", &part, &regions, 0.12, 3);
 
     // Container structure.
     let entries = read_zip(&bytes).expect("read back own zip");
@@ -223,7 +223,11 @@ fn orca_3mf_roundtrips_through_own_zip_and_import() {
     assert!(cfg.contains("sparse_infill_density\" value=\"25%\""));
     assert!(cfg.contains("sparse_infill_density\" value=\"50%\""));
     assert!(cfg.contains("sparse_infill_density\" value=\"12%\""), "base density on the object");
-    assert!(cfg.contains("wall_loops\" value=\"0\""));
+    // Modifiers must inherit the part's perimeter count (NOT 0 — that strips
+    // walls where a modifier touches the outer surface), and the object pins
+    // the same count so the print matches the analysis assumption.
+    assert_eq!(cfg.matches("wall_loops\" value=\"3\"").count(), 3, "object + 2 modifiers");
+    assert!(!cfg.contains("wall_loops\" value=\"0\""));
     assert!(cfg.contains("bracket &amp; arm"));
 
     // Geometry comes back via the import path (largest bbox = the part).
@@ -261,6 +265,16 @@ fn imports_reference_orca_sample() {
     for d in dims {
         assert!((d - 25.0).abs() < 1.0, "expected ~25mm cube, got {dims:?}");
     }
+}
+
+#[test]
+fn voxel_surface_mesh_counts() {
+    let grid = VoxelGrid::solid_box(2, 2, 2, 1.0);
+    let (tris, edges) = grid.surface_mesh();
+    // 2x2x2 block: 6 block faces x 4 cell faces, 2 tris each, 9 floats per tri.
+    assert_eq!(tris.len(), 24 * 2 * 9);
+    // 48 unique surface edge segments, 2 endpoints x 3 floats each.
+    assert_eq!(edges.len(), 48 * 6);
 }
 
 #[test]

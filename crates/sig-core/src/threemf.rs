@@ -3,7 +3,11 @@
 //! Export targets the Bambu/Orca project flavor reverse-engineered from the
 //! reference Cube.3mf: production-extension geometry split into
 //! 3D/Objects/object_1.model, with per-part settings (modifier_part +
-//! sparse_infill_density + wall_loops=0) carried in Metadata/model_settings.config.
+//! sparse_infill_density) carried in Metadata/model_settings.config.
+//! Deviation from the sample: modifiers carry the part's wall_loops count
+//! instead of 0 — a modifier that touches the outer surface would otherwise
+//! locally delete the perimeters (field-tested in OrcaSlicer). The object
+//! pins the same wall_loops so the print matches the analysis assumption.
 //! No project_settings.config is written on purpose: the user's own printer/
 //! filament/process presets stay active when the project opens.
 
@@ -74,13 +78,17 @@ fn region_to_indexed(r: &RegionMesh) -> IndexedMesh {
 /// Build the Orca/Bambu project 3MF: the part plus one nested modifier mesh
 /// per density bin above the base. `base_density` (0..1) is written as an
 /// object-level sparse_infill_density override so the lowest bin applies
-/// without touching the user's process preset. Regions must be sorted
-/// ascending by density (slicer modifier order resolves the nesting).
+/// without touching the user's process preset. `wall_loops` is the perimeter
+/// count assumed by the analysis; it is pinned on the object AND on every
+/// modifier (a 0 here would strip walls where a modifier meets the surface).
+/// Regions must be sorted ascending by density (slicer modifier order
+/// resolves the nesting).
 pub fn export_orca_3mf(
     part_name: &str,
     part: &IndexedMesh,
     regions: &[RegionMesh],
     base_density: f64,
+    wall_loops: u32,
 ) -> Vec<u8> {
     let n_objects = 1 + regions.len();
 
@@ -148,6 +156,7 @@ pub fn export_orca_3mf(
         "    <metadata key=\"sparse_infill_density\" value=\"{}%\"/>\n",
         (base_density * 100.0).round() as u32
     ));
+    cfg.push_str(&format!("    <metadata key=\"wall_loops\" value=\"{wall_loops}\"/>\n"));
     cfg.push_str("    <part id=\"1\" subtype=\"normal_part\">\n");
     cfg.push_str(&format!("      <metadata key=\"name\" value=\"{}\"/>\n", xml_escape(part_name)));
     cfg.push_str("      <metadata key=\"matrix\" value=\"1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1\"/>\n");
@@ -163,7 +172,7 @@ pub fn export_orca_3mf(
         cfg.push_str(&format!(
             "      <metadata key=\"sparse_infill_density\" value=\"{pct}%\"/>\n"
         ));
-        cfg.push_str("      <metadata key=\"wall_loops\" value=\"0\"/>\n");
+        cfg.push_str(&format!("      <metadata key=\"wall_loops\" value=\"{wall_loops}\"/>\n"));
         cfg.push_str("      <mesh_stat edges_fixed=\"0\" degenerate_facets=\"0\" facets_removed=\"0\" facets_reversed=\"0\" backwards_edges=\"0\"/>\n");
         cfg.push_str("    </part>\n");
     }

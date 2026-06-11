@@ -63,12 +63,26 @@ export interface Material {
   density: number; // g/cm³
 }
 
-export const MATERIALS: Material[] = [
+export const DEFAULT_MATERIALS: Material[] = [
   { name: "PLA", e0: 3500, nu: 0.35, density: 1.24 },
   { name: "PETG", e0: 2100, nu: 0.37, density: 1.27 },
   { name: "ABS", e0: 2250, nu: 0.37, density: 1.05 },
   { name: "ASA", e0: 2400, nu: 0.37, density: 1.07 },
 ];
+
+export type PatternKey = "gyroid" | "cubic" | "grid";
+
+/** Infill stiffness law E(ρ) = coeff · E₀ · ρ^exponent (Gibson–Ashby). */
+export interface PatternCurve {
+  coeff: number;
+  exponent: number;
+}
+
+export const DEFAULT_CURVES: Record<PatternKey, PatternCurve> = {
+  gyroid: { coeff: 1.0, exponent: 1.5 },
+  cubic: { coeff: 1.0, exponent: 1.8 },
+  grid: { coeff: 1.0, exponent: 2.0 },
+};
 
 export const RESOLUTIONS = {
   preview: 100_000,

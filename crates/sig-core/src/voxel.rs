@@ -79,4 +79,74 @@ impl VoxelGrid {
     pub fn solid_volume(&self) -> f64 {
         self.solid_count() as f64 * self.h * self.h * self.h
     }
+
+    /// Exposed-face hull of the solid cells (the mesh the solver actually
+    /// runs on, for display). Returns (triangle soup positions, deduplicated
+    /// cell-edge segments), both flat xyz f32 in world mm.
+    pub fn surface_mesh(&self) -> (Vec<f32>, Vec<f32>) {
+        let (nx, ny, nz) = (self.nx, self.ny, self.nz);
+        let h = self.h;
+        let o = self.origin;
+        // Quad corners per face direction, CCW seen from outside.
+        const FACES: [([i64; 3], [[usize; 3]; 4]); 6] = [
+            ([-1, 0, 0], [[0, 0, 0], [0, 0, 1], [0, 1, 1], [0, 1, 0]]),
+            ([1, 0, 0], [[1, 0, 0], [1, 1, 0], [1, 1, 1], [1, 0, 1]]),
+            ([0, -1, 0], [[0, 0, 0], [1, 0, 0], [1, 0, 1], [0, 0, 1]]),
+            ([0, 1, 0], [[0, 1, 0], [0, 1, 1], [1, 1, 1], [1, 1, 0]]),
+            ([0, 0, -1], [[0, 0, 0], [0, 1, 0], [1, 1, 0], [1, 0, 0]]),
+            ([0, 0, 1], [[0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1]]),
+        ];
+        let solid = |x: i64, y: i64, z: i64| -> bool {
+            if x < 0 || y < 0 || z < 0 || x >= nx as i64 || y >= ny as i64 || z >= nz as i64 {
+                return false;
+            }
+            self.scale[(z as usize * ny + y as usize) * nx + x as usize] > 0.0
+        };
+        let node_id = |p: [usize; 3]| -> u64 {
+            ((p[2] * (ny + 1) + p[1]) * (nx + 1) + p[0]) as u64
+        };
+        let mut tris: Vec<f32> = Vec::new();
+        let mut edge_set: std::collections::HashSet<(u64, u64)> = Default::default();
+        let mut edges: Vec<f32> = Vec::new();
+        for cz in 0..nz {
+            for cy in 0..ny {
+                for cx in 0..nx {
+                    if self.scale[(cz * ny + cy) * nx + cx] <= 0.0 {
+                        continue;
+                    }
+                    for (dir, corners) in &FACES {
+                        if solid(cx as i64 + dir[0], cy as i64 + dir[1], cz as i64 + dir[2]) {
+                            continue;
+                        }
+                        let q: Vec<[usize; 3]> = corners
+                            .iter()
+                            .map(|c| [cx + c[0], cy + c[1], cz + c[2]])
+                            .collect();
+                        let world = |p: [usize; 3]| -> [f32; 3] {
+                            [
+                                (o[0] + p[0] as f64 * h) as f32,
+                                (o[1] + p[1] as f64 * h) as f32,
+                                (o[2] + p[2] as f64 * h) as f32,
+                            ]
+                        };
+                        for idx in [[0, 1, 2], [0, 2, 3]] {
+                            for &k in &idx {
+                                tris.extend_from_slice(&world(q[k]));
+                            }
+                        }
+                        for k in 0..4 {
+                            let (a, b) = (q[k], q[(k + 1) % 4]);
+                            let (ia, ib) = (node_id(a), node_id(b));
+                            let key = (ia.min(ib), ia.max(ib));
+                            if edge_set.insert(key) {
+                                edges.extend_from_slice(&world(a));
+                                edges.extend_from_slice(&world(b));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        (tris, edges)
+    }
 }

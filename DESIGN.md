@@ -108,8 +108,12 @@ Key facts to reproduce:
   - part: `<part id="1" subtype="normal_part">`
   - modifier: `<part id="N" subtype="modifier_part">` with metadata keys:
     `name`, `matrix` (row-major 4×4), `extruder` = `0`,
-    **`sparse_infill_density` value="50%"**, **`wall_loops` value="0"**
-    (sample zeroes wall loops inside modifiers so only infill changes — replicate).
+    **`sparse_infill_density` value="50%"**, **`wall_loops`**.
+    **Field finding (2026-06, first manual Orca test):** the sample's
+    `wall_loops="0"` is wrong for us — a modifier that touches the outer
+    surface locally deletes the perimeters. We write the part's perimeter
+    count (user-set, default 2) on **both** the object and every modifier, so
+    the print matches the walls the analysis assumed.
   - `<plate>` block with `model_instance` (object_id / instance_id / identify_id) and
     `<assemble>` transform for plate placement.
 - We emit modifier meshes in part-local coordinates with identity matrices (sample's
@@ -146,7 +150,7 @@ panel. Fallback pattern law: conservative generic n = 2.
 | 1. Core spike (risk-first) ✅ **done, see PHASE1_RESULTS.md** | Rust→WASM: STL parse → voxelize → multigrid elasticity solve → displacement field | Cantilever matches analytic within tolerance; ~1 M cells solved in seconds on desktop |
 | 2. Setup UI ✅ **done** | three.js viewer, drag-drop import, segmentation + brush picking, loads/BCs, RBM check + animation | A novice can set up a bracket case unaided |
 | 3. Optimization ✅ **done** | SIMP loop, bins + clustering, verification solve, comparison card, density/displacement views | Mass slider → stable binned result with reported stiffness retention |
-| 4. Export ✅ **done** (Prusa writer + golden FEA comparisons still open) | Marching-tetrahedra regions, Orca/Bambu writer, per-bin STLs, 3MF import | Sample-equivalent 3MF opens clean in Orca & Bambu with densities applied — **needs first manual Orca open-test** |
+| 4. Export ✅ **done** (Prusa writer + golden FEA comparisons still open) | Marching-tetrahedra regions, Orca/Bambu writer, per-bin STLs, 3MF import | Sample-equivalent 3MF opens clean in Orca & Bambu with densities applied — **first manual Orca open-test passed** (one fix: modifiers need the part's wall_loops, not 0 — applied) |
 | 5. Beta hardening | Dirty-mesh corpus, perf tuning, materials panel, docs/limitations page, project save | Public free beta |
 
 ## 9. Open items

@@ -1,7 +1,6 @@
-import { useRef } from "react";
-import { useStore } from "../store";
-import type { Bc, BcKind } from "../types";
-import { MATERIALS } from "../types";
+import { useEffect, useRef } from "react";
+import { useStore, type ViewMode } from "../store";
+import type { Bc, BcKind, PatternKey } from "../types";
 
 const KIND_LABEL: Record<BcKind, string> = {
   fixed: "Fixed support",
@@ -27,10 +26,29 @@ export function Sidebar() {
     await s.loadFile(f.name, await f.arrayBuffer());
   };
 
+  // Leaving the supports & loads workspace snaps the tool back to Orbit so a
+  // stray click in the viewport can't silently edit a selection.
+  useEffect(() => {
+    const onDown = (e: PointerEvent) => {
+      const st = useStore.getState();
+      if (st.tool === "orbit") return;
+      const el = e.target as HTMLElement | null;
+      if (!el || el.closest("[data-bcsection]") || el.closest(".viewer")) return;
+      st.setTool("orbit");
+    };
+    document.addEventListener("pointerdown", onDown, true);
+    return () => document.removeEventListener("pointerdown", onDown, true);
+  }, []);
+
   return (
     <div className="sidebar">
       <h1>
-        Smart Infill <span>Generator</span>
+        <span className="apptitle">
+          Smart Infill <span>Generator</span>
+        </span>
+        <button className="gear" title="Settings — materials & infill curves" onClick={() => s.openSettings(true)}>
+          ⚙
+        </button>
       </h1>
 
       {/* ---- import ---- */}
@@ -76,7 +94,7 @@ export function Sidebar() {
 
       {/* ---- supports & loads ---- */}
       {s.model && (
-        <section>
+        <section data-bcsection>
           <header>2 · Supports & loads</header>
           <div className="toolrow">
             <button className={s.tool === "orbit" ? "on" : ""} onClick={() => s.setTool("orbit")}>
@@ -126,7 +144,7 @@ export function Sidebar() {
           {s.activeBcId && (
             <div className="hint">
               Click surfaces to add to the highlighted condition (click again to remove, or use the
-              brush). Shift-click always removes.
+              brush). Shift-click always removes. Clicking outside this section returns to Orbit.
             </div>
           )}
         </section>
@@ -141,17 +159,20 @@ export function Sidebar() {
             <select
               value={s.material.name}
               onChange={(e) => {
-                const m = MATERIALS.find((m) => m.name === e.target.value);
+                const m = s.materials.find((m) => m.name === e.target.value);
                 if (m) s.setMaterial(m);
               }}
             >
-              {MATERIALS.map((m) => (
+              {s.materials.map((m) => (
                 <option key={m.name}>{m.name}</option>
               ))}
             </select>
           </label>
           <div className="dim small">
-            E = {s.material.e0} MPa · ν = {s.material.nu} · ρ = {s.material.density} g/cm³
+            E = {s.material.e0} MPa · ν = {s.material.nu} · ρ = {s.material.density} g/cm³ —{" "}
+            <a className="link" onClick={() => s.openSettings(true)}>
+              edit
+            </a>
           </div>
           <label className="rowcheck">
             <input type="checkbox" checked={s.gravity} onChange={(e) => s.setGravity(e.target.checked)} />
@@ -218,10 +239,7 @@ export function Sidebar() {
           </label>
           <label className="row">
             <span>Infill pattern</span>
-            <select
-              value={s.pattern}
-              onChange={(e) => s.setPattern(e.target.value as "gyroid" | "cubic" | "grid")}
-            >
+            <select value={s.pattern} onChange={(e) => s.setPattern(e.target.value as PatternKey)}>
               <option value="gyroid">Gyroid</option>
               <option value="cubic">Cubic</option>
               <option value="grid">Grid</option>
@@ -229,17 +247,33 @@ export function Sidebar() {
           </label>
           <div className="row">
             <label className="row" style={{ flex: 1 }}>
-              <span>Walls+shells</span>
+              <span>Perimeters</span>
               <input
                 type="number"
-                value={s.wallMm}
-                step={0.1}
-                min={0.2}
-                max={5}
-                onChange={(e) => s.setWallMm(Number(e.target.value))}
+                value={s.perimeters}
+                step={1}
+                min={1}
+                max={8}
+                onChange={(e) => s.setPerimeters(Number(e.target.value))}
+              />
+            </label>
+            <label className="row">
+              <span>Line width</span>
+              <input
+                type="number"
+                value={s.lineWidth}
+                step={0.05}
+                min={0.1}
+                max={1.5}
+                onChange={(e) => s.setLineWidth(Number(e.target.value))}
               />
               <span className="dim">mm</span>
             </label>
+          </div>
+          <div className="row">
+            <div className="dim small" style={{ flex: 1 }}>
+              ≈ {(s.perimeters * s.lineWidth).toFixed(2)} mm solid skin — match your print profile
+            </div>
             <label className="row">
               <span>Levels</span>
               <select value={s.nBins} onChange={(e) => s.setNBins(Number(e.target.value))}>
@@ -268,27 +302,44 @@ export function Sidebar() {
       )}
 
       {/* ---- view + export ---- */}
-      {s.model && s.hasResult && (
+      {s.model && (
         <section>
           <header>6 · View & export</header>
           <div className="toolrow">
             <ViewBtn mode="setup" label="Setup" />
-            <ViewBtn mode="deformed" label="Deformed" />
+            <ViewBtn mode="mesh" label="Mesh" />
+            {s.hasResult && <ViewBtn mode="deformed" label="Deformed" />}
             {s.optSummary && <ViewBtn mode="density" label="Density" />}
             {s.optSummary && <ViewBtn mode="infill" label="Regions" />}
           </div>
+          {s.viewMode === "mesh" && (
+            <div className="dim small">
+              The hex mesh the solver actually runs on (winding-number voxelization at the chosen
+              resolution).
+            </div>
+          )}
           {s.viewMode === "deformed" && (
-            <label className="row">
-              <span>Exaggeration ×{s.deformScale.toFixed(1)}</span>
-              <input
-                type="range"
-                min={0}
-                max={3}
-                step={0.1}
-                value={s.deformScale}
-                onChange={(e) => s.setDeformScale(Number(e.target.value))}
-              />
-            </label>
+            <>
+              <label className="row">
+                <span>Exaggeration ×{s.deformScale.toFixed(1)}</span>
+                <input
+                  type="range"
+                  min={0}
+                  max={3}
+                  step={0.1}
+                  value={s.deformScale}
+                  onChange={(e) => s.setDeformScale(Number(e.target.value))}
+                />
+              </label>
+              <label className="rowcheck">
+                <input
+                  type="checkbox"
+                  checked={s.animateDeformed}
+                  onChange={(e) => s.setAnimateDeformed(e.target.checked)}
+                />
+                <span>Animate deflection (loop 0 → max)</span>
+              </label>
+            </>
           )}
           {s.optSummary && (
             <>
@@ -301,8 +352,9 @@ export function Sidebar() {
               <div className="hint">
                 The 3MF opens in OrcaSlicer/Bambu Studio with the part, the modifier volumes, and
                 their infill densities already set (base infill{" "}
-                {Math.round(s.optSummary.baseDensity * 100)}% on the object). Keep your own
-                printer/filament/process profiles when prompted.
+                {Math.round(s.optSummary.baseDensity * 100)}% on the object; {s.perimeters}{" "}
+                perimeters pinned on part and modifiers). Keep your own printer/filament/process
+                profiles when prompted.
               </div>
             </>
           )}
@@ -316,10 +368,10 @@ export function Sidebar() {
   );
 }
 
-function ViewBtn({ mode, label }: { mode: "setup" | "deformed" | "density" | "infill"; label: string }) {
+function ViewBtn({ mode, label }: { mode: ViewMode; label: string }) {
   const s = useStore();
   return (
-    <button className={s.viewMode === mode ? "on" : ""} onClick={() => s.setViewMode(mode)}>
+    <button className={s.viewMode === mode ? "on" : ""} onClick={() => void s.setViewMode(mode)}>
       {label}
     </button>
   );

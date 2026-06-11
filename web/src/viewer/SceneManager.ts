@@ -1,5 +1,6 @@
 // Imperative three.js layer: mesh display, patch hover/select, brush,
-// BC coloring, rigid-body-mode animation, deformed-shape overlay.
+// BC coloring + support glyphs, axis gizmo, rigid-body-mode animation,
+// deformed-shape overlay (with looping animation), density/region/voxel views.
 
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
@@ -21,6 +22,8 @@ export interface SceneCallbacks {
   onPickPatch?: (tris: Uint32Array, additive: boolean) => void;
   /** Brush stroke: triangles under the brush. */
   onBrush?: (tris: Uint32Array, erase: boolean) => void;
+  /** Viewer picked a new deformation autoscale (display exaggeration base). */
+  onAutoScale?: (autoScale: number) => void;
 }
 
 export class SceneManager {
@@ -51,7 +54,19 @@ export class SceneManager {
   private brushing = false;
   private brushCursor: THREE.Mesh | null = null;
 
-  private arrows: THREE.Object3D[] = [];
+  /** Force arrows + support glyphs (classic FEA triangles), setup view only. */
+  private bcMarkers = new THREE.Group();
+  private markerDisposables: { dispose(): void }[] = [];
+
+  // Axis gizmo (inset, bottom-right)
+  private gizmoScene = new THREE.Scene();
+  private gizmoCam = new THREE.OrthographicCamera(-1.9, 1.9, 1.9, -1.9, 0.1, 20);
+  private viewW = 0;
+  private viewH = 0;
+
+  // Analysis (voxel) mesh
+  private voxelGroup = new THREE.Group();
+  private voxelDisposables: { dispose(): void }[] = [];
 
   // Rigid-body-mode animation
   private rbmMode: { t: number[]; r: number[]; center: number[] } | null = null;
@@ -64,6 +79,7 @@ export class SceneManager {
   private viewMode: ViewMode = "setup";
   private deformScale = 1;
   private autoScale = 1;
+  private deformAnimate = false;
 
   private clock = new THREE.Clock();
   private callbacks: SceneCallbacks = {};
@@ -73,6 +89,7 @@ export class SceneManager {
     this.callbacks = callbacks;
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
     this.renderer.setPixelRatio(window.devicePixelRatio);
+    this.renderer.autoClear = false;
     this.scene.background = new THREE.Color(0x14181d);
 
     this.camera = new THREE.PerspectiveCamera(45, 1, 0.1, 10000);
@@ -96,6 +113,10 @@ export class SceneManager {
     grid.rotation.x = Math.PI / 2; // Z-up
     this.scene.add(grid);
 
+    this.scene.add(this.bcMarkers);
+    this.scene.add(this.voxelGroup);
+    this.buildGizmo();
+
     canvas.addEventListener("pointermove", this.onPointerMove);
     canvas.addEventListener("pointerdown", this.onPointerDown);
     canvas.addEventListener("pointerup", this.onPointerUp);
@@ -116,6 +137,8 @@ export class SceneManager {
 
   resize(width: number, height: number) {
     if (!this.renderer) return;
+    this.viewW = width;
+    this.viewH = height;
     this.renderer.setSize(width, height, false);
     this.camera.aspect = width / height;
     this.camera.updateProjectionMatrix();
@@ -128,6 +151,28 @@ export class SceneManager {
     this.controls.enabled = tool !== "brush";
     if (this.brushCursor) this.brushCursor.visible = tool === "brush";
     if (tool !== "select") this.setHover(null);
+  }
+
+  // ---------- axis gizmo ----------
+
+  private buildGizmo() {
+    const axes: [string, number, THREE.Vector3][] = [
+      ["X", 0xe5534b, new THREE.Vector3(1, 0, 0)],
+      ["Y", 0x57ab5a, new THREE.Vector3(0, 1, 0)],
+      ["Z", 0x539bf5, new THREE.Vector3(0, 0, 1)],
+    ];
+    for (const [label, color, dir] of axes) {
+      const arrow = new THREE.ArrowHelper(dir, new THREE.Vector3(), 1.05, color, 0.34, 0.16);
+      this.gizmoScene.add(arrow);
+      const sprite = makeTextSprite(label, color);
+      sprite.position.copy(dir).multiplyScalar(1.45);
+      this.gizmoScene.add(sprite);
+    }
+    const origin = new THREE.Mesh(
+      new THREE.SphereGeometry(0.09, 12, 8),
+      new THREE.MeshBasicMaterial({ color: 0x8fa0b3 })
+    );
+    this.gizmoScene.add(origin);
   }
 
   // ---------- model ----------
@@ -146,6 +191,7 @@ export class SceneManager {
     this.rbmMode = null;
     this.viewMode = "setup";
     this.setRegions(null);
+    this.setVoxelMesh(null, null);
 
     this.geometry = new THREE.BufferGeometry();
     this.geometry.setAttribute("position", new THREE.BufferAttribute(model.positions, 3));
@@ -164,6 +210,7 @@ export class SceneManager {
     this.setPatchIds(model.patchIds);
     this.bcs = [];
     this.activeBcId = null;
+    this.rebuildBcMarkers();
     this.repaint();
 
     // Fit camera.
@@ -214,31 +261,116 @@ export class SceneManager {
     this.bcs = bcs;
     this.activeBcId = activeBcId;
     this.repaint();
-    this.rebuildArrows();
+    this.rebuildBcMarkers();
   }
 
-  private rebuildArrows() {
-    for (const a of this.arrows) this.scene.remove(a);
-    this.arrows = [];
+  /** Force arrows + classic support triangles (4-sided cones read as ▽). */
+  private rebuildBcMarkers() {
+    for (const d of this.markerDisposables) d.dispose();
+    this.markerDisposables = [];
+    this.bcMarkers.clear();
     if (!this.basePositions) return;
     for (const bc of this.bcs) {
-      if (bc.kind !== "force" || bc.tris.length === 0 || !bc.force) continue;
-      const centroid = this.selectionCentroid(bc.tris);
-      const f = new THREE.Vector3(...bc.force);
-      if (f.lengthSq() === 0) continue;
-      const dir = f.clone().normalize();
-      const len = this.bboxDiag * 0.18;
-      const arrow = new THREE.ArrowHelper(
-        dir,
-        centroid.clone().sub(dir.clone().multiplyScalar(len)),
-        len,
-        0xff5252,
-        len * 0.25,
-        len * 0.12
-      );
-      this.scene.add(arrow);
-      this.arrows.push(arrow);
+      if (bc.tris.length === 0) continue;
+      if (bc.kind === "force" && bc.force) {
+        const f = new THREE.Vector3(...bc.force);
+        if (f.lengthSq() === 0) continue;
+        const centroid = this.selectionCentroid(bc.tris);
+        const dir = f.clone().normalize();
+        const len = this.bboxDiag * 0.18;
+        const arrow = new THREE.ArrowHelper(
+          dir,
+          centroid.clone().sub(dir.clone().multiplyScalar(len)),
+          len,
+          0xff5252,
+          len * 0.25,
+          len * 0.12
+        );
+        this.markerDisposables.push(arrow);
+        this.bcMarkers.add(arrow);
+      } else if (bc.kind === "fixed" || bc.kind === "frictionless") {
+        this.buildSupportGlyphs(bc);
+      }
     }
+    this.updateMarkerVisibility();
+  }
+
+  private buildSupportGlyphs(bc: Bc) {
+    const p = this.basePositions!;
+    // Triangle centroids + outward normals + areas of the selection.
+    const items: { c: THREE.Vector3; n: THREE.Vector3; a: number }[] = [];
+    const e1 = new THREE.Vector3();
+    const e2 = new THREE.Vector3();
+    for (const t of bc.tris) {
+      const o = 9 * t;
+      const a = new THREE.Vector3(p[o], p[o + 1], p[o + 2]);
+      const b = new THREE.Vector3(p[o + 3], p[o + 4], p[o + 5]);
+      const c = new THREE.Vector3(p[o + 6], p[o + 7], p[o + 8]);
+      e1.subVectors(b, a);
+      e2.subVectors(c, a);
+      const n = new THREE.Vector3().crossVectors(e1, e2);
+      const len = n.length();
+      if (len < 1e-12) continue;
+      n.divideScalar(len);
+      items.push({ c: a.add(b).add(c).divideScalar(3), n, a: len });
+    }
+    if (!items.length) return;
+    // Greedy farthest-point sampling, seeded at the largest triangle.
+    items.sort((u, v) => v.a - u.a);
+    const chosen = [items[0]];
+    const minD2 = items.map((it) => it.c.distanceToSquared(items[0].c));
+    const spacing2 = (0.06 * this.bboxDiag) ** 2;
+    while (chosen.length < 12) {
+      let best = -1;
+      let bd = spacing2;
+      for (let i = 0; i < items.length; i++) {
+        if (minD2[i] > bd) {
+          bd = minD2[i];
+          best = i;
+        }
+      }
+      if (best < 0) break;
+      chosen.push(items[best]);
+      for (let i = 0; i < items.length; i++) {
+        minD2[i] = Math.min(minD2[i], items[i].c.distanceToSquared(items[best].c));
+      }
+    }
+    const hCone = 0.034 * this.bboxDiag;
+    const rCone = 0.017 * this.bboxDiag;
+    // 4 radial segments: from any side the cone reads as the textbook ▽.
+    const coneGeo = new THREE.ConeGeometry(rCone, hCone, 4);
+    const mat = new THREE.MeshStandardMaterial({
+      color: BC_COLORS[bc.kind],
+      roughness: 0.5,
+      metalness: 0.05,
+      flatShading: true,
+    });
+    this.markerDisposables.push(coneGeo, mat);
+    const up = new THREE.Vector3(0, 1, 0);
+    let plateGeo: THREE.CylinderGeometry | null = null;
+    if (bc.kind === "frictionless") {
+      plateGeo = new THREE.CylinderGeometry(rCone * 1.25, rCone * 1.25, rCone * 0.18, 16);
+      this.markerDisposables.push(plateGeo);
+    }
+    for (const it of chosen) {
+      // Tip touches the surface; body sticks outward along the normal.
+      // Frictionless: small gap + plate = "support that can slide".
+      const gap = bc.kind === "frictionless" ? 0.35 * hCone : 0;
+      const cone = new THREE.Mesh(coneGeo, mat);
+      cone.quaternion.setFromUnitVectors(up, it.n.clone().negate());
+      cone.position.copy(it.c).addScaledVector(it.n, hCone / 2 + gap);
+      this.bcMarkers.add(cone);
+      if (plateGeo) {
+        const plate = new THREE.Mesh(plateGeo, mat);
+        plate.quaternion.setFromUnitVectors(up, it.n);
+        plate.position.copy(it.c).addScaledVector(it.n, rCone * 0.12);
+        this.bcMarkers.add(plate);
+      }
+    }
+  }
+
+  private updateMarkerVisibility() {
+    this.bcMarkers.visible = this.viewMode === "setup";
   }
 
   private selectionCentroid(tris: Uint32Array): THREE.Vector3 {
@@ -400,11 +532,48 @@ export class SceneManager {
     } else {
       this.autoScale = 1;
     }
+    this.callbacks.onAutoScale?.(this.autoScale);
     this.refreshView();
   }
 
   setVertexDensity(density: Float32Array | null) {
     this.vertexDensity = density;
+    this.refreshView();
+  }
+
+  setDeformAnimate(on: boolean) {
+    this.deformAnimate = on;
+    if (!on) this.applyPositions(); // restore full deflection
+  }
+
+  setVoxelMesh(hull: Float32Array | null, edges: Float32Array | null) {
+    for (const d of this.voxelDisposables) d.dispose();
+    this.voxelDisposables = [];
+    this.voxelGroup.clear();
+    if (hull && hull.length) {
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute("position", new THREE.BufferAttribute(hull, 3));
+      geo.computeVertexNormals(); // soup → flat per-face normals
+      const mat = new THREE.MeshStandardMaterial({
+        color: 0x7e8b99,
+        roughness: 0.85,
+        metalness: 0.05,
+        flatShading: true,
+        side: THREE.DoubleSide,
+        polygonOffset: true,
+        polygonOffsetFactor: 1,
+        polygonOffsetUnits: 1,
+      });
+      this.voxelDisposables.push(geo, mat);
+      this.voxelGroup.add(new THREE.Mesh(geo, mat));
+    }
+    if (edges && edges.length) {
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute("position", new THREE.BufferAttribute(edges, 3));
+      const mat = new THREE.LineBasicMaterial({ color: 0x12161b, transparent: true, opacity: 0.6 });
+      this.voxelDisposables.push(geo, mat);
+      this.voxelGroup.add(new THREE.LineSegments(geo, mat));
+    }
     this.refreshView();
   }
 
@@ -458,7 +627,10 @@ export class SceneManager {
     mat.opacity = infill ? 0.16 : 1.0;
     mat.depthWrite = !infill;
     mat.needsUpdate = true;
+    this.mesh.visible = this.viewMode !== "mesh";
+    this.voxelGroup.visible = this.viewMode === "mesh";
     for (const m of this.regionMeshes) m.visible = infill;
+    this.updateMarkerVisibility();
     this.applyPositions();
     this.applyColors();
   }
@@ -475,7 +647,7 @@ export class SceneManager {
       }
       const c = new THREE.Color();
       for (let i = 0; i < mags.length; i++) {
-        ramp(mags[i] / maxMag, c);
+        jet(mags[i] / maxMag, c);
         this.colors[3 * i] = c.r;
         this.colors[3 * i + 1] = c.g;
         this.colors[3 * i + 2] = c.b;
@@ -497,7 +669,7 @@ export class SceneManager {
     this.repaint();
   }
 
-  private applyPositions(rbmOffset?: number) {
+  private applyPositions(rbmOffset?: number, deformFactor = 1) {
     if (!this.geometry || !this.basePositions) return;
     const attr = this.geometry.getAttribute("position") as THREE.BufferAttribute;
     const out = attr.array as Float32Array;
@@ -513,7 +685,7 @@ export class SceneManager {
       }
     } else if (this.displacements && this.viewMode === "deformed") {
       const d = this.displacements;
-      const s = this.autoScale * this.deformScale;
+      const s = this.autoScale * this.deformScale * deformFactor;
       for (let i = 0; i < base.length; i++) out[i] = base[i] + s * d[i];
     } else {
       out.set(base);
@@ -526,16 +698,68 @@ export class SceneManager {
     if (this.rbmMode) {
       const t = this.clock.getElapsedTime();
       this.applyPositions(Math.sin(t * 2.0 * Math.PI * 0.66));
+    } else if (this.deformAnimate && this.viewMode === "deformed" && this.displacements) {
+      const t = this.clock.getElapsedTime();
+      // Smooth 0 → max → 0 loop, 2.4 s period.
+      this.applyPositions(undefined, 0.5 - 0.5 * Math.cos((2 * Math.PI * t) / 2.4));
     }
     this.controls.update();
-    this.renderer.render(this.scene, this.camera);
+    const r = this.renderer;
+    if (this.viewW <= 0 || this.viewH <= 0) return;
+    r.setScissorTest(false);
+    r.setViewport(0, 0, this.viewW, this.viewH);
+    r.clear();
+    r.render(this.scene, this.camera);
+    // Axis gizmo inset, bottom-right.
+    const s = 104;
+    const m = 10;
+    this.gizmoCam.position
+      .copy(this.camera.position)
+      .sub(this.controls.target)
+      .normalize()
+      .multiplyScalar(6);
+    this.gizmoCam.up.copy(this.camera.up);
+    this.gizmoCam.lookAt(0, 0, 0);
+    r.clearDepth();
+    r.setScissorTest(true);
+    r.setScissor(this.viewW - s - m, m, s, s);
+    r.setViewport(this.viewW - s - m, m, s, s);
+    r.render(this.gizmoScene, this.gizmoCam);
+    r.setScissorTest(false);
+    r.setViewport(0, 0, this.viewW, this.viewH);
   }
 }
 
-/** Compact blue→cyan→yellow→red ramp. */
+function makeTextSprite(text: string, color: number): THREE.Sprite {
+  const canvas = document.createElement("canvas");
+  canvas.width = 64;
+  canvas.height = 64;
+  const ctx = canvas.getContext("2d")!;
+  ctx.font = "bold 44px 'Segoe UI', system-ui, sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillStyle = `#${color.toString(16).padStart(6, "0")}`;
+  ctx.fillText(text, 32, 34);
+  const tex = new THREE.CanvasTexture(canvas);
+  const mat = new THREE.SpriteMaterial({ map: tex, depthTest: false, transparent: true });
+  const sprite = new THREE.Sprite(mat);
+  sprite.scale.setScalar(0.62);
+  return sprite;
+}
+
+/** Compact blue→cyan→yellow→red ramp (density + region colors). */
 function ramp(x: number, out: THREE.Color) {
   const t = Math.min(1, Math.max(0, x));
   if (t < 0.33) out.setRGB(0.15, 0.3 + 1.8 * t, 0.9);
   else if (t < 0.66) out.setRGB(0.15 + 2.4 * (t - 0.33), 0.9, 0.9 - 2.4 * (t - 0.33));
   else out.setRGB(0.95, 0.9 - 2.4 * (t - 0.66), 0.1);
+}
+
+/** Classic jet colormap (displacement view). */
+function jet(x: number, out: THREE.Color) {
+  const t = Math.min(1, Math.max(0, x));
+  const r = Math.min(1, Math.max(0, 1.5 - Math.abs(4 * t - 3)));
+  const g = Math.min(1, Math.max(0, 1.5 - Math.abs(4 * t - 2)));
+  const b = Math.min(1, Math.max(0, 1.5 - Math.abs(4 * t - 1)));
+  out.setRGB(r, g, b);
 }

@@ -1,4 +1,5 @@
 import { Sidebar } from "./ui/Sidebar";
+import { SettingsModal } from "./ui/Settings";
 import { Viewer } from "./viewer/Viewer";
 import { useStore } from "./store";
 
@@ -31,6 +32,7 @@ export function App() {
           </div>
         )}
       </div>
+      <SettingsModal />
     </div>
   );
 }

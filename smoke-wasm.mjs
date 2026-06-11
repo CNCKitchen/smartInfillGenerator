@@ -122,7 +122,8 @@ let progressCalls = 0;
 let lastDensityLen = 0;
 const t1 = performance.now();
 const summary = JSON.parse(
-  optModel.optimize(60, "gyroid", 0.9, 3, (json, density) => {
+  // gyroid law E = 1.0*E0*rho^1.5; 2 perimeters x 0.45 mm line width
+  optModel.optimize(60, 1.5, 1.0, 2, 0.45, 3, (json, density) => {
     progressCalls++;
     lastDensityLen = density.length;
     const p = JSON.parse(json);
@@ -150,8 +151,21 @@ assert(rpos.length > 0 && ridx.length % 3 === 0, "region mesh arrays");
 const vd = optModel.vertex_density();
 assert(vd.length === 36, "final vertex density buffer");
 
+// Analysis-mesh display buffers.
+const hull = optModel.voxel_hull();
+const hedges = optModel.voxel_edges();
+assert(hull.length > 0 && hull.length % 9 === 0, `voxel hull triangle soup (${hull.length / 9} tris)`);
+assert(hedges.length > 0 && hedges.length % 6 === 0, `voxel edge segments (${hedges.length / 6})`);
+
 const threeMf = optModel.export_3mf();
 assert(threeMf.length > 500 && threeMf[0] === 0x50 && threeMf[1] === 0x4b, "3MF export is a zip");
+// wall_loops from the optimize() call (2 perimeters) must land in the config.
+{
+  const td = new TextDecoder("latin1");
+  const raw = td.decode(threeMf);
+  assert(raw.includes('wall_loops" value="2"'), "3MF carries the perimeter count, not 0");
+  assert(!raw.includes('wall_loops" value="0"'), "no zero-wall modifiers");
+}
 const stlZip = optModel.export_stls();
 assert(stlZip.length > 100 && stlZip[0] === 0x50, "STL zip export");
 // Re-import our own 3MF (full circle).

@@ -21,8 +21,9 @@ const EMIN_REL: f32 = 1e-6;
 pub struct OptimizeParams {
     /// Target total mass as a fraction of the fully solid part (incl. skin).
     pub budget: f64,
-    /// Gibson-Ashby exponent of the infill pattern: E/E0 = x^n.
+    /// Gibson-Ashby law of the infill pattern: E/E0 = coeff * x^exponent.
     pub exponent: f64,
+    pub coeff: f64,
     /// Printable density bounds for interior cells.
     pub floor: f64,
     pub cap: f64,
@@ -33,7 +34,15 @@ pub struct OptimizeParams {
 
 impl Default for OptimizeParams {
     fn default() -> Self {
-        Self { budget: 0.45, exponent: 1.5, floor: 0.10, cap: 0.70, wall_mm: 0.9, max_iter: 40 }
+        Self {
+            budget: 0.45,
+            exponent: 1.5,
+            coeff: 1.0,
+            floor: 0.10,
+            cap: 0.70,
+            wall_mm: 0.9,
+            max_iter: 40,
+        }
     }
 }
 
@@ -267,19 +276,22 @@ fn cell_strain_energy(
 }
 
 /// Build the per-cell stiffness factors for a given interior density field.
+/// Infill law E/E0 = coeff * x^exponent, capped at solid (1.0).
 pub fn build_eps(
     grid: &VoxelGrid,
     skin: &[u32],
     design_cells: &[u32],
     x: &[f64],
     exponent: f64,
+    coeff: f64,
 ) -> Vec<f32> {
     let mut eps = vec![0f32; grid.cell_count()];
     for &c in skin {
         eps[c as usize] = 1.0;
     }
     for (k, &c) in design_cells.iter().enumerate() {
-        let e = EMIN_REL as f64 + (1.0 - EMIN_REL as f64) * x[k].powf(exponent);
+        let rel = (coeff * x[k].powf(exponent)).min(1.0);
+        let e = EMIN_REL as f64 + (1.0 - EMIN_REL as f64) * rel;
         eps[c as usize] = e as f32;
     }
     eps
@@ -386,7 +398,7 @@ pub fn optimize(
             fixed[3 * n as usize + d] = true;
         }
     }
-    let eps0 = build_eps(grid, &skin, &design_cells, &x, params.exponent);
+    let eps0 = build_eps(grid, &skin, &design_cells, &x, params.exponent, params.coeff);
     let finest = Level::new(nx, ny, nz, grid.h, eps0, ke64, &fixed, problem.springs.clone());
     let mut bb = b.clone();
     for (i, c) in finest.constrained.iter().enumerate() {
@@ -402,7 +414,7 @@ pub fn optimize(
         for v in x_phys.iter_mut() {
             *v = v.clamp(params.floor, params.cap);
         }
-        let eps = build_eps(grid, &skin, &design_cells, &x_phys, params.exponent);
+        let eps = build_eps(grid, &skin, &design_cells, &x_phys, params.exponent, params.coeff);
         solver.update_eps(eps);
         // Inexact inner solves are standard in topology optimization: the
         // design update tolerates sensitivity noise (filter + move limits),
@@ -415,9 +427,10 @@ pub fn optimize(
         }
 
         cell_strain_energy(&solver.levels[0], &ke64, &u, &design_cells, &mut se);
-        // dC/dx_phys = -(1-emin) * n * x^(n-1) * se
+        // dC/dx_phys = -(1-emin) * c * n * x^(n-1) * se
         for k in 0..design_cells.len() {
             sens_phys[k] = -(1.0 - EMIN_REL as f64)
+                * params.coeff
                 * params.exponent
                 * x_phys[k].powf(params.exponent - 1.0)
                 * se[k];
@@ -503,9 +516,10 @@ pub fn evaluate(
     design_cells: &[u32],
     x: &[f64],
     exponent: f64,
+    coeff: f64,
     warm: Option<&[f64]>,
 ) -> Result<(f64, f64, Vec<f64>), crate::solve::SolveError> {
-    let eps = build_eps(grid, skin, design_cells, x, exponent);
+    let eps = build_eps(grid, skin, design_cells, x, exponent, coeff);
     let b = build_rhs(grid, problem);
     let ndof = b.len();
     let mut u = vec![0f64; ndof];

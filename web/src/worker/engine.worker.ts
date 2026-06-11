@@ -18,14 +18,17 @@ type Req =
       bcs: { kind: string; tris: Uint32Array; force?: number[]; pressure?: number }[];
     }
   | { id: number; op: "voxelInfo" }
+  | { id: number; op: "voxelMesh" }
   | { id: number; op: "check" }
   | { id: number; op: "solve" }
   | {
       id: number;
       op: "optimize";
       budgetPct: number;
-      pattern: string;
-      wallMm: number;
+      exponent: number;
+      coeff: number;
+      perimeters: number;
+      lineWidth: number;
       nBins: number;
     }
   | { id: number; op: "exportThreeMf" }
@@ -91,6 +94,17 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
         (self as unknown as Worker).postMessage({ id: msg.id, ok: true, data: info });
         return;
       }
+      case "voxelMesh": {
+        const m = requireModel();
+        const hull = m.voxel_hull();
+        const edges = m.voxel_edges();
+        const info = JSON.parse(m.voxel_info());
+        (self as unknown as Worker).postMessage(
+          { id: msg.id, ok: true, data: { hull, edges, info } },
+          [hull.buffer, edges.buffer]
+        );
+        return;
+      }
       case "check": {
         const report = JSON.parse(requireModel().check());
         (self as unknown as Worker).postMessage({ id: msg.id, ok: true, data: report });
@@ -111,7 +125,7 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
         const m = requireModel();
         const t0 = performance.now();
         const summary = JSON.parse(
-          m.optimize(msg.budgetPct, msg.pattern, msg.wallMm, msg.nBins, (json: string, density: Float32Array) => {
+          m.optimize(msg.budgetPct, msg.exponent, msg.coeff, msg.perimeters, msg.lineWidth, msg.nBins, (json: string, density: Float32Array) => {
             (self as unknown as Worker).postMessage(
               { id: msg.id, progress: true, data: JSON.parse(json), density },
               [density.buffer]

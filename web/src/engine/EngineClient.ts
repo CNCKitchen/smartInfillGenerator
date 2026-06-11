@@ -91,16 +91,23 @@ export class EngineClient {
 
   optimize(
     budgetPct: number,
-    pattern: string,
-    wallMm: number,
+    exponent: number,
+    coeff: number,
+    perimeters: number,
+    lineWidth: number,
     nBins: number,
     onProgress: (p: OptProgress, density: Float32Array) => void
   ): Promise<OptimizeOutput> {
     return this.call(
-      { op: "optimize", budgetPct, pattern, wallMm, nBins },
+      { op: "optimize", budgetPct, exponent, coeff, perimeters, lineWidth, nBins },
       [],
       onProgress as (data: unknown, density: Float32Array) => void
     );
+  }
+
+  /** Exposed-face hull + cell edges of the analysis voxel grid. */
+  voxelMesh(): Promise<{ hull: Float32Array; edges: Float32Array; info: VoxelInfo }> {
+    return this.call({ op: "voxelMesh" });
   }
 
   exportThreeMf(): Promise<Uint8Array> {

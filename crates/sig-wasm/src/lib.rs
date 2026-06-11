@@ -42,19 +42,12 @@ pub struct Model {
     grid: Option<(VoxelGrid, usize)>, // padded grid + level count
     solution: Option<Solution>,
     opt: Option<OptOutput>,
+    /// Perimeter count assumed by the last optimization (written to the 3MF).
+    wall_loops: u32,
 }
 
 fn err(e: impl std::fmt::Display) -> JsValue {
     JsValue::from_str(&e.to_string())
-}
-
-fn pattern_exponent(pattern: &str) -> f64 {
-    match pattern {
-        "gyroid" => 1.5,
-        "cubic" => 1.8,
-        "grid" => 2.0,
-        _ => 2.0, // conservative generic
-    }
 }
 
 #[wasm_bindgen]
@@ -81,6 +74,7 @@ impl Model {
             grid: None,
             solution: None,
             opt: None,
+            wall_loops: 2,
         })
     }
 
@@ -334,17 +328,26 @@ impl Model {
 
     /// Run the density optimization + binning + verification. Progress gets
     /// called per iteration with (jsonString, Float32Array vertexDensity).
+    /// Infill law E/E0 = coeff * rho^exponent; skin thickness is
+    /// perimeters * line_width (and `perimeters` lands in the 3MF as
+    /// wall_loops on object + modifiers).
     #[allow(clippy::too_many_arguments)]
     pub fn optimize(
         &mut self,
         budget_pct: f64,
-        pattern: &str,
-        wall_mm: f64,
+        exponent: f64,
+        coeff: f64,
+        perimeters: u32,
+        line_width: f64,
         n_bins: u32,
         progress: &js_sys::Function,
     ) -> Result<String, JsValue> {
         self.ensure_grid()?;
-        let exponent = pattern_exponent(pattern);
+        let exponent = exponent.clamp(1.0, 3.5);
+        let coeff = coeff.clamp(0.05, 2.0);
+        let perimeters = perimeters.clamp(1, 8);
+        let wall_mm = perimeters as f64 * line_width.clamp(0.1, 1.5);
+        self.wall_loops = perimeters;
         let n_bins = (n_bins as usize).clamp(2, 4);
 
         // Assemble + check before burning time.
@@ -359,6 +362,7 @@ impl Model {
         let params = OptimizeParams {
             budget: (budget_pct / 100.0).clamp(0.05, 1.0),
             exponent,
+            coeff,
             wall_mm: wall_mm.clamp(0.2, 5.0),
             max_iter: 24,
             ..Default::default()
@@ -406,20 +410,20 @@ impl Model {
         // ---- verification + baselines ----
         let (c_binned, _maxd, u_binned) = evaluate(
             grid, *levels, &asm.problem, &self.settings, &result.skin_cells,
-            &result.design_cells, &x_binned, exponent, Some(&result.u),
+            &result.design_cells, &x_binned, exponent, coeff, Some(&result.u),
         )
         .map_err(err)?;
         let mean_binned = x_binned.iter().sum::<f64>() / x_binned.len().max(1) as f64;
         let x_uniform = vec![mean_binned; x_binned.len()];
         let (c_uniform, _, _) = evaluate(
             grid, *levels, &asm.problem, &self.settings, &result.skin_cells,
-            &result.design_cells, &x_uniform, exponent, Some(&result.u),
+            &result.design_cells, &x_uniform, exponent, coeff, Some(&result.u),
         )
         .map_err(err)?;
         let x_solid = vec![1.0; x_binned.len()];
         let (c_solid, _, _) = evaluate(
             grid, *levels, &asm.problem, &self.settings, &result.skin_cells,
-            &result.design_cells, &x_solid, exponent, Some(&result.u),
+            &result.design_cells, &x_solid, exponent, coeff, Some(&result.u),
         )
         .map_err(err)?;
 
@@ -539,7 +543,21 @@ impl Model {
         let opt = self.opt.as_ref().ok_or_else(|| err("no optimization result — run optimize first"))?;
         let part = weld(&self.mesh);
         let name = if self.name.is_empty() { "part" } else { &self.name };
-        Ok(export_orca_3mf(name, &part, &opt.regions, opt.base_density))
+        Ok(export_orca_3mf(name, &part, &opt.regions, opt.base_density, self.wall_loops))
+    }
+
+    /// Exposed-face hull of the analysis voxel grid (triangle soup, xyz f32).
+    pub fn voxel_hull(&mut self) -> Result<Vec<f32>, JsValue> {
+        self.ensure_grid()?;
+        let (grid, _) = self.grid.as_ref().unwrap();
+        Ok(grid.surface_mesh().0)
+    }
+
+    /// Deduplicated cell-edge segments of the hull (pairs of xyz f32 points).
+    pub fn voxel_edges(&mut self) -> Result<Vec<f32>, JsValue> {
+        self.ensure_grid()?;
+        let (grid, _) = self.grid.as_ref().unwrap();
+        Ok(grid.surface_mesh().1)
     }
 
     /// Zip of one binary STL per modifier region.
