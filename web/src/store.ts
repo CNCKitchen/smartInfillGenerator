@@ -101,11 +101,15 @@ function clampPct(v: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, Math.round(v)));
 }
 
-/** Budget slider band of the active optimization mode. */
+/** Budget slider band of the active optimization mode/goal. In match mode
+ *  the slider is the REFERENCE uniform infill %, which lives in the graded
+ *  printable band regardless of fill mode. */
 export function budgetBounds(s: {
   optMode: "graded" | "binary";
+  goal: "budget" | "match";
   levelSettings: LevelSettings;
 }): [number, number] {
+  if (s.goal === "match") return [s.levelSettings.floorPct, s.levelSettings.capPct];
   return s.optMode === "binary"
     ? [s.levelSettings.binaryFloorPct, 90]
     : [s.levelSettings.floorPct, s.levelSettings.capPct];
@@ -149,6 +153,9 @@ interface AppState {
   lineWidth: number; // mm
   smoothIters: number; // Taubin passes on modifier regions
   nBins: number;
+  /** Optimization goal: stiffest at a mass budget, or lightest at a
+   *  target stiffness ("as stiff as uniform X%"). */
+  goal: "budget" | "match";
   /** Graded densities vs binary (hollow/solid core). */
   optMode: "graded" | "binary";
   /** Solid-fill pattern written to the 3MF in binary mode. */
@@ -162,7 +169,7 @@ interface AppState {
   check: CheckReport | null;
   stats: SolveStats | null;
   hasResult: boolean;
-  optProgress: { iteration: number; maxIter: number } | null;
+  optProgress: { iteration: number; maxIter: number; pass?: number; passes?: number } | null;
   optSummary: OptSummary | null;
   viewMode: ViewMode;
   deformScale: number;
@@ -221,6 +228,7 @@ interface AppState {
   setLineWidth(v: number): void;
   setSmoothIters(v: number): void;
   setNBins(v: number): void;
+  setGoal(g: "budget" | "match"): void;
   setOptMode(m: "graded" | "binary"): void;
   setSolidPattern(p: "default" | "rectilinear" | "concentric"): void;
   updateLevelSettings(p: Partial<LevelSettings>): void;
@@ -414,6 +422,7 @@ export const useStore = create<AppState>((set, get) => ({
   lineWidth: 0.45,
   smoothIters: 15,
   nBins: 3,
+  goal: "budget",
   optMode: "graded",
   solidPattern: "default",
   levelSettings: initialSettings.levels,
@@ -686,6 +695,11 @@ export const useStore = create<AppState>((set, get) => ({
     set({ nBins: v });
   },
 
+  setGoal(g) {
+    set({ goal: g });
+    get().setBudget(get().budget); // re-clamp to the goal's band
+  },
+
   setOptMode(m) {
     set({ optMode: m });
     get().setBudget(get().budget); // re-clamp to the mode's printable band
@@ -840,15 +854,20 @@ export const useStore = create<AppState>((set, get) => ({
       await logGridInfo(set);
       const curve = st.curves[st.pattern];
       const binary = st.optMode === "binary";
+      const match = st.goal === "match";
       const ls = st.levelSettings;
       const manual = !binary && ls.mode === "manual" && ls.manual.length >= 2;
       appendLog(
         set,
         `Optimize (${binary ? `binary: ${ls.binaryFloorPct}% or solid` : manual ? `manual levels ${ls.manual.join("/")}%` : "graded, auto levels"}): ` +
-          `infill budget ${st.budget}% (${st.pattern}: E/E₀ = ${curve.coeff}·ρ^${curve.exponent}), ` +
+          (match
+            ? `match the stiffness of uniform ${st.budget}% — lightest design via budget secant`
+            : `infill budget ${st.budget}%`) +
+          ` (${st.pattern}: E/E₀ = ${curve.coeff}·ρ^${curve.exponent}), ` +
           `skin ${st.perimeters}×${st.lineWidth} mm — convergence when mean |Δρ| < 0.005 twice` +
           (binary ? " · optimizer SIMP-penalized p=3" : "")
       );
+      let lastPass = 0;
       const out = await engine.optimize(
         {
           budgetPct: st.budget,
@@ -863,14 +882,22 @@ export const useStore = create<AppState>((set, get) => ({
           levelsPct: binary ? [ls.binaryFloorPct, 100] : manual ? ls.manual : null,
           binary,
           solidPattern: binary && st.solidPattern !== "default" ? st.solidPattern : null,
+          goal: st.goal,
         },
         (p, density, skelPositions, skelIndices, skelDensity) => {
           set((s) => ({
-            optProgress: { iteration: p.iteration, maxIter: p.maxIter },
+            optProgress: {
+              iteration: p.iteration,
+              maxIter: p.maxIter,
+              pass: p.pass,
+              passes: p.passes,
+            },
             optSeries: [
               ...s.optSeries,
               {
-                it: p.iteration,
+                // Global sample index: match mode runs several passes whose
+                // iteration counters restart — charts want one x axis.
+                it: s.optSeries.length + 1,
                 compliance: p.compliance,
                 massFrac: p.massFrac,
                 meanInfill: p.meanInfill,
@@ -881,9 +908,18 @@ export const useStore = create<AppState>((set, get) => ({
               },
             ],
           }));
+          if (p.pass !== lastPass) {
+            lastPass = p.pass;
+            if (p.passes > 1) {
+              appendLog(
+                set,
+                `pass ${p.pass}/${p.passes}: optimizing at budget ${(p.budgetNow * 100).toFixed(1)}%`
+              );
+            }
+          }
           appendLog(
             set,
-            `  it ${String(p.iteration).padStart(2)}: C ${p.compliance.toExponential(3)} N·mm · ` +
+            `  ${p.passes > 1 ? `p${p.pass} ` : ""}it ${String(p.iteration).padStart(2)}: C ${p.compliance.toExponential(3)} N·mm · ` +
               `infill ${(p.meanInfill * 100).toFixed(1)}% · Δmax ${p.change.toFixed(3)} · ` +
               `Δmean ${p.meanChange.toFixed(4)} · CG ${p.innerIters}@${p.innerRes.toExponential(1)}`
           );
@@ -907,6 +943,15 @@ export const useStore = create<AppState>((set, get) => ({
         `  verification: stiffness ${Math.round(out.summary.stiffnessVsSolid * 100)}% of solid · ` +
           `+${(out.summary.gainVsUniform * 100).toFixed(1)}% stiffer than uniform ${Math.round(out.summary.meanInfill * 100)}% infill at equal weight`
       );
+      if (out.summary.goal === "match" && out.summary.massUniformRefGrams) {
+        const saved = 1 - out.summary.massGrams / out.summary.massUniformRefGrams;
+        appendLog(
+          set,
+          `  match: stiffness of uniform ${Math.round(out.summary.refUniformPct ?? 0)}% hit within ` +
+            `${((out.summary.matchDeviation ?? 0) * 100).toFixed(1)}% in ${out.summary.passes} passes · ` +
+            `${out.summary.massGrams.toFixed(1)} g vs ${out.summary.massUniformRefGrams.toFixed(1)} g uniform (−${(saved * 100).toFixed(0)}%)`
+        );
+      }
       const vis = out.regions.map(() => true);
       fieldCache.clear(); // stress fields belong to the previous solution
       sceneEvents.onLegendRange?.(null, null);

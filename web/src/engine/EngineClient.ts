@@ -164,11 +164,19 @@ export interface OptimizeOptions {
   binary: boolean;
   /** Object-level internal_solid_infill_pattern for the export. */
   solidPattern: string | null;
+  /** "budget" = stiffest at the given mean infill; "match" = lightest design
+   *  as stiff as a uniform print at budgetPct (secant on the budget). */
+  goal: "budget" | "match";
 }
 
 export interface OptProgress {
   iteration: number;
   maxIter: number;
+  /** Outer pass (stiffness-match mode runs several warm-started passes). */
+  pass: number;
+  passes: number;
+  /** Budget the current pass is running at (0..1). */
+  budgetNow: number;
   /** Compliance estimate from the (inexact, warm-started) inner solve. */
   compliance: number;
   /** Total mass fraction of solid (skin + interior). */
@@ -210,6 +218,20 @@ export interface OptSummary {
   maxDisplacement: number;
   /** True when the run was binary (hollow/solid) mode. */
   binary: boolean;
+  /** Optimization goal of the run. */
+  goal: "budget" | "match";
+  /** Outer passes executed (1 for budget mode). */
+  passes: number;
+  // ---- match mode only ----
+  /** Reference uniform infill the stiffness was matched to (percent). */
+  refUniformPct?: number;
+  targetCompliance?: number;
+  achievedCompliance?: number;
+  /** achieved/target − 1; positive = slightly more compliant than target. */
+  matchDeviation?: number;
+  /** Mass of the uniform reference print (same skin, ref% interior). */
+  massUniformRefGrams?: number;
+  passTrace?: { budget: number; compliance: number }[];
   seconds: number;
 }
 

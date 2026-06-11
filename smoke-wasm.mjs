@@ -193,7 +193,7 @@ const summary = JSON.parse(
   optModel.optimize(JSON.stringify({
     budgetPct: 35, exponent: 1.5, coeff: 1.0, perimeters: 2, lineWidth: 0.45,
     smoothIters: 8, nBins: 3, floorPct: 10, capPct: 70, levelsPct: null,
-    binary: false, solidPattern: null,
+    binary: false, solidPattern: null, goal: "budget",
   }), (json, density, skelPos, skelIdx, skelDen) => {
     progressCalls++;
     lastDensityLen = density.length;
@@ -293,7 +293,7 @@ const binSummary = JSON.parse(
   binModel.optimize(JSON.stringify({
     budgetPct: 30, exponent: 1.5, coeff: 1.0, perimeters: 2, lineWidth: 0.45,
     smoothIters: 4, nBins: 2, floorPct: 5, capPct: 100, levelsPct: [5, 100],
-    binary: true, solidPattern: "concentric",
+    binary: true, solidPattern: "concentric", goal: "budget",
   }), () => {})
 );
 console.log(
@@ -318,5 +318,40 @@ assert(binSummary.gainVsUniform > 0.0, "binary core beats uniform infill");
   assert(raw.includes('sparse_infill_density" value="5%"'), "base density 5%");
 }
 console.log("ok: binary mode pipeline (optimize + export)");
+
+// ---- stiffness-match goal ----
+// Lightest design as stiff as a uniform 35% print: the secant on the budget
+// must land the BINNED compliance within tolerance of the uniform reference,
+// at less mass than that reference.
+const matchModel = new Model(boxStl([0, 0, 0], [60, 12, 12]), "beam4");
+const msel = patchSelector(matchModel);
+matchModel.set_material(2400, 0.35, 1.24);
+matchModel.set_resolution(25000);
+matchModel.add_fixed(msel(0, "min"));
+matchModel.add_force(msel(0, "max"), 0, 0, -40);
+const t3 = performance.now();
+let maxPassSeen = 0;
+const matchSummary = JSON.parse(
+  matchModel.optimize(JSON.stringify({
+    budgetPct: 35, exponent: 1.5, coeff: 1.0, perimeters: 2, lineWidth: 0.45,
+    smoothIters: 4, nBins: 3, floorPct: 10, capPct: 70, levelsPct: null,
+    binary: false, solidPattern: null, goal: "match",
+  }), (json) => {
+    const p = JSON.parse(json);
+    maxPassSeen = Math.max(maxPassSeen, p.pass);
+  })
+);
+console.log(
+  `   match: ${matchSummary.passes} passes (${matchSummary.iterations} iters total) in ${((performance.now() - t3) / 1000).toFixed(1)} s; ` +
+    `target C ${matchSummary.targetCompliance.toExponential(3)} achieved ${matchSummary.achievedCompliance.toExponential(3)} ` +
+    `(dev ${(matchSummary.matchDeviation * 100).toFixed(1)}%); mass ${matchSummary.massGrams.toFixed(1)} g vs uniform ${matchSummary.massUniformRefGrams.toFixed(1)} g`
+);
+assert(matchSummary.goal === "match", "summary flags match goal");
+assert(matchSummary.passes >= 2 && maxPassSeen >= 2, "secant ran multiple warm passes");
+assert(Math.abs(matchSummary.matchDeviation) <= 0.05,
+  `binned stiffness within tolerance of the uniform reference (${(matchSummary.matchDeviation * 100).toFixed(1)}%)`);
+assert(matchSummary.massGrams < matchSummary.massUniformRefGrams,
+  "matched design is lighter than the uniform reference");
+console.log("ok: stiffness-match goal (lighter at equal stiffness)");
 
 console.log("\nALL SMOKE TESTS PASSED");

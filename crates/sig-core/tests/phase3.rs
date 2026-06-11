@@ -64,7 +64,7 @@ fn run_cantilever_optimization() -> OptFixture {
         max_iter: 30,
         ..Default::default()
     };
-    let result = optimize(&grid, levels, &asm.problem, &settings, &params, |_p, _x, _c| {})
+    let result = optimize(&grid, levels, &asm.problem, &settings, &params, None, None, |_p, _x, _c| {})
         .expect("optimize");
     OptFixture {
         grid,
@@ -271,7 +271,7 @@ fn binary_mode_solid_or_floor_beats_uniform() {
         max_iter: 30,
         ..Default::default()
     };
-    let result = optimize(&grid, levels, &asm.problem, &settings, &params, |_p, _x, _c| {})
+    let result = optimize(&grid, levels, &asm.problem, &settings, &params, None, None, |_p, _x, _c| {})
         .expect("optimize");
 
     let two = vec![0.05, 1.0];
@@ -442,7 +442,7 @@ fn conv_trace() {
         ..Default::default()
     };
     let mut prev_c = f64::INFINITY;
-    let result = optimize(&grid, levels, &asm.problem, &settings, &params, |p, _x, _c| {
+    let result = optimize(&grid, levels, &asm.problem, &settings, &params, None, None, |p, _x, _c| {
         let c_rel = if prev_c.is_finite() { (p.compliance - prev_c).abs() / p.compliance } else { f64::NAN };
         prev_c = p.compliance;
         println!(

@@ -68,6 +68,11 @@ struct OptimizeOpts {
     binary: bool,
     /// Solid-fill pattern for the export in binary mode.
     solid_pattern: Option<String>,
+    /// "budget" = stiffest design at the given mean infill (one pass);
+    /// "match" = LIGHTEST design as stiff as a uniform print at budget_pct —
+    /// a guarded secant on the budget, each pass warm-started, until the
+    /// BINNED design's compliance meets the uniform reference within 2%.
+    goal: String,
 }
 
 impl Default for OptimizeOpts {
@@ -85,6 +90,7 @@ impl Default for OptimizeOpts {
             levels_pct: None,
             binary: false,
             solid_pattern: None,
+            goal: "budget".into(),
         }
     }
 }
@@ -502,85 +508,173 @@ impl Model {
         let tris = &mesh.tris;
         // Isosurface threshold for the live "shape emerging" view.
         const SKEL_DENSITY: f64 = 0.4;
-        let result = simp_optimize(
-            grid,
-            *levels,
-            &asm.problem,
-            &self.settings,
-            &params,
-            |p, x_phys, design_cells| {
-                let mut field: std::collections::HashMap<u32, f64> =
-                    std::collections::HashMap::with_capacity(design_cells.len());
-                for (k, &c) in design_cells.iter().enumerate() {
-                    field.insert(c, x_phys[k]);
-                }
-                // Inline vertex sampling (cannot call &self methods here).
-                let vd = sample_field_static(tris, grid, &field);
-                // Evolving dense-core isosurface so the user watches the
-                // optimized shape gain detail iteration by iteration. Built
-                // on the CONTINUOUS filtered field — the level set is smooth;
-                // a binary per-cell indicator grows tent spikes wherever a
-                // single cell crosses the threshold.
-                let value = |ci: usize| field.get(&(ci as u32)).copied().unwrap_or(0.0);
-                let mut skel = extract_iso(grid, &value, SKEL_DENSITY);
-                taubin_smooth(&mut skel.positions, &skel.indices, 3);
-                let skel_density = sample_points_static(&skel.positions, grid, &field);
-                let json = serde_json::json!({
-                    "iteration": p.iteration,
-                    "maxIter": max_iter,
-                    "compliance": p.compliance,
-                    "massFrac": p.mass_frac,
-                    "meanInfill": p.mean_infill,
-                    "change": p.change,
-                    "meanChange": p.mean_change,
-                    "innerIters": p.inner_iters,
-                    "innerRes": p.inner_residual,
-                })
-                .to_string();
-                let args = js_sys::Array::of5(
-                    &JsValue::from_str(&json),
-                    &js_sys::Float32Array::from(vd.as_slice()),
-                    &js_sys::Float32Array::from(skel.positions.as_slice()),
-                    &js_sys::Uint32Array::from(skel.indices.as_slice()),
-                    &js_sys::Float32Array::from(skel_density.as_slice()),
-                );
-                let _ = progress.apply(&JsValue::NULL, &args);
-            },
-        )
-        .map_err(err)?;
 
-        // ---- bins ----
-        // Level placement: manual override (user levels / binary {floor, 1})
-        // when given, otherwise auto — floor pinned ("just so it prints"),
-        // upper levels from strain-energy-weighted clustering in stiffness
-        // space (the convex infill law makes dense infill more efficient
-        // per gram, so the load-bearing levels land high). Assignment then
-        // re-meets the mass budget via the anchored bisection.
-        let centers: Vec<f64> = match &opts.levels_pct {
-            Some(user) if !user.is_empty() => {
-                let mut l: Vec<f64> =
-                    user.iter().map(|&p| (p / 100.0).clamp(0.01, 1.0)).collect();
-                l.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                l.dedup_by(|a, b| (*a - *b).abs() < 0.005);
-                l
+        // ---- goal handling ----
+        // "match": find the LIGHTEST design as stiff as a uniform print at
+        // the reference percentage. One tight uniform solve sets the target
+        // compliance; a guarded secant then walks the budget (each pass
+        // warm-started from the previous design) until the BINNED design
+        // lands within tolerance. Compliance is smooth and monotone in the
+        // budget, so a handful of passes suffice.
+        let goal_match = opts.goal == "match";
+        const MATCH_TOL: f64 = 0.02;
+        let max_passes: usize = if goal_match { 5 } else { 1 };
+        let ref_frac = (budget_pct / 100.0).clamp(params.floor, params.cap);
+        let mut c_target = 0.0f64;
+        if goal_match {
+            let (skin_t, design_t) = sig_core::simp::classify_cells(grid, params.wall_mm);
+            if design_t.is_empty() {
+                return Err(err(
+                    "part is thinner than the wall thickness everywhere — nothing to optimize (it prints solid)",
+                ));
             }
-            _ => cluster_levels(
-                &result.x, &result.se, n_bins, eval_exp, eval_coeff, params.floor, params.cap,
-            ),
-        };
-        let target_mean = result.x.iter().sum::<f64>() / result.x.len().max(1) as f64;
-        let mut bins =
-            assign_bins_mass(&result.x, &result.se, &centers, eval_exp, eval_coeff, target_mean);
-        let min_cells = (result.design_cells.len() / 500).max(30);
-        cleanup_small_regions(grid, &result.design_cells, &mut bins, centers.len(), min_cells);
-        let x_binned: Vec<f64> = bins.iter().map(|&b| centers[b as usize]).collect();
+            let x_ref = vec![ref_frac; design_t.len()];
+            let (c_ref, _, _) = evaluate(
+                grid, *levels, &asm.problem, &self.settings, &skin_t, &design_t, &x_ref,
+                eval_exp, eval_coeff, None,
+            )
+            .map_err(err)?;
+            c_target = c_ref;
+        }
 
-        // ---- verification + baselines (calibrated pattern law) ----
-        let (c_binned, _maxd, u_binned) = evaluate(
-            grid, *levels, &asm.problem, &self.settings, &result.skin_cells,
-            &result.design_cells, &x_binned, eval_exp, eval_coeff, Some(&result.u),
-        )
-        .map_err(err)?;
+        let pass_no = std::cell::Cell::new(1usize);
+        let mut budget_k = if goal_match {
+            // Optimized designs typically match uniform stiffness at
+            // ~70–85% of the mass — start the search there.
+            (ref_frac * 0.8).max(params.floor)
+        } else {
+            (budget_pct / 100.0).clamp(0.01, 1.0)
+        };
+        let (mut lo_b, mut hi_b) = (params.floor, ref_frac);
+        let mut warm_x: Option<Vec<f64>> = None;
+        let mut warm_u: Option<Vec<f64>> = None;
+        let mut pass_trace: Vec<(f64, f64)> = Vec::new();
+        let mut total_iters = 0usize;
+        let (result, centers, bins, x_binned, c_binned, u_binned) = loop {
+            let params_k = OptimizeParams { budget: budget_k, ..params };
+            let result = simp_optimize(
+                grid,
+                *levels,
+                &asm.problem,
+                &self.settings,
+                &params_k,
+                warm_x.as_deref(),
+                warm_u.as_deref(),
+                |p, x_phys, design_cells| {
+                    let mut field: std::collections::HashMap<u32, f64> =
+                        std::collections::HashMap::with_capacity(design_cells.len());
+                    for (k, &c) in design_cells.iter().enumerate() {
+                        field.insert(c, x_phys[k]);
+                    }
+                    // Inline vertex sampling (cannot call &self methods here).
+                    let vd = sample_field_static(tris, grid, &field);
+                    // Evolving dense-core isosurface so the user watches the
+                    // optimized shape gain detail iteration by iteration.
+                    // Built on the CONTINUOUS filtered field — the level set
+                    // is smooth; a binary per-cell indicator grows tent
+                    // spikes wherever a single cell crosses the threshold.
+                    let value = |ci: usize| field.get(&(ci as u32)).copied().unwrap_or(0.0);
+                    let mut skel = extract_iso(grid, &value, SKEL_DENSITY);
+                    taubin_smooth(&mut skel.positions, &skel.indices, 3);
+                    let skel_density = sample_points_static(&skel.positions, grid, &field);
+                    let json = serde_json::json!({
+                        "iteration": p.iteration,
+                        "maxIter": max_iter,
+                        "pass": pass_no.get(),
+                        "passes": max_passes,
+                        "budgetNow": params_k.budget,
+                        "compliance": p.compliance,
+                        "massFrac": p.mass_frac,
+                        "meanInfill": p.mean_infill,
+                        "change": p.change,
+                        "meanChange": p.mean_change,
+                        "innerIters": p.inner_iters,
+                        "innerRes": p.inner_residual,
+                    })
+                    .to_string();
+                    let args = js_sys::Array::of5(
+                        &JsValue::from_str(&json),
+                        &js_sys::Float32Array::from(vd.as_slice()),
+                        &js_sys::Float32Array::from(skel.positions.as_slice()),
+                        &js_sys::Uint32Array::from(skel.indices.as_slice()),
+                        &js_sys::Float32Array::from(skel_density.as_slice()),
+                    );
+                    let _ = progress.apply(&JsValue::NULL, &args);
+                },
+            )
+            .map_err(err)?;
+            total_iters += result.iterations;
+
+            // ---- bins ----
+            // Level placement: manual override (user levels / binary
+            // {floor, 1}) when given, otherwise auto — floor pinned ("just
+            // so it prints"), upper levels from strain-energy-weighted
+            // clustering in stiffness space (the convex infill law makes
+            // dense infill more efficient per gram, so load-bearing levels
+            // land high). Assignment re-meets the budget via the anchored
+            // bisection.
+            let centers: Vec<f64> = match &opts.levels_pct {
+                Some(user) if !user.is_empty() => {
+                    let mut l: Vec<f64> =
+                        user.iter().map(|&p| (p / 100.0).clamp(0.01, 1.0)).collect();
+                    l.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    l.dedup_by(|a, b| (*a - *b).abs() < 0.005);
+                    l
+                }
+                _ => cluster_levels(
+                    &result.x, &result.se, n_bins, eval_exp, eval_coeff, params.floor, params.cap,
+                ),
+            };
+            let target_mean = result.x.iter().sum::<f64>() / result.x.len().max(1) as f64;
+            let mut bins =
+                assign_bins_mass(&result.x, &result.se, &centers, eval_exp, eval_coeff, target_mean);
+            let min_cells = (result.design_cells.len() / 500).max(30);
+            cleanup_small_regions(grid, &result.design_cells, &mut bins, centers.len(), min_cells);
+            let x_binned: Vec<f64> = bins.iter().map(|&b| centers[b as usize]).collect();
+
+            // Verification solve of the binned design (calibrated law).
+            let (c_b, _maxd, u_b) = evaluate(
+                grid, *levels, &asm.problem, &self.settings, &result.skin_cells,
+                &result.design_cells, &x_binned, eval_exp, eval_coeff, Some(&result.u),
+            )
+            .map_err(err)?;
+            pass_trace.push((budget_k, c_b));
+
+            if !goal_match {
+                break (result, centers, bins, x_binned, c_b, u_b);
+            }
+            // dev > 0: too compliant (needs more material); < 0: too stiff.
+            let dev = c_b / c_target - 1.0;
+            if dev.abs() <= MATCH_TOL || pass_no.get() >= max_passes || hi_b - lo_b < 0.005 {
+                break (result, centers, bins, x_binned, c_b, u_b);
+            }
+            if dev > 0.0 {
+                lo_b = lo_b.max(budget_k);
+            } else {
+                hi_b = hi_b.min(budget_k);
+            }
+            // Guarded secant on the last two passes; bisection fallback.
+            let n = pass_trace.len();
+            let mut next = if n >= 2 {
+                let (b1, c1) = pass_trace[n - 2];
+                let (b2, c2) = pass_trace[n - 1];
+                if (c1 - c2).abs() > 1e-12 {
+                    b2 + (c_target - c2) * (b1 - b2) / (c1 - c2)
+                } else {
+                    0.5 * (lo_b + hi_b)
+                }
+            } else {
+                0.5 * (lo_b + hi_b)
+            };
+            if !(next > lo_b + 0.002 && next < hi_b - 0.002) {
+                next = 0.5 * (lo_b + hi_b);
+            }
+            budget_k = next.clamp(params.floor, params.cap);
+            warm_x = Some(result.x.clone());
+            warm_u = Some(result.u.clone());
+            pass_no.set(pass_no.get() + 1);
+        };
+
         let mean_binned = x_binned.iter().sum::<f64>() / x_binned.len().max(1) as f64;
         let x_uniform = vec![mean_binned; x_binned.len()];
         let (c_uniform, _, _) = evaluate(
@@ -658,8 +752,8 @@ impl Model {
 
         let bin_counts: Vec<usize> =
             (0..centers.len()).map(|c| bins.iter().filter(|&&b| b as usize == c).count()).collect();
-        let summary = serde_json::json!({
-            "iterations": result.iterations,
+        let mut summary_v = serde_json::json!({
+            "iterations": total_iters,
             "converged": result.converged,
             "bins": centers.iter().zip(&bin_counts).map(|(&d, &n)| serde_json::json!({
                 "density": d, "cells": n,
@@ -678,8 +772,29 @@ impl Model {
             "gainVsUniform": c_uniform / c_binned - 1.0,
             "maxDisplacement": max_disp,
             "binary": opts.binary,
-        })
-        .to_string();
+            "goal": if goal_match { "match" } else { "budget" },
+            "passes": pass_trace.len(),
+        });
+        if goal_match {
+            let o = summary_v.as_object_mut().unwrap();
+            o.insert("refUniformPct".into(), serde_json::json!(ref_frac * 100.0));
+            o.insert("targetCompliance".into(), serde_json::json!(c_target));
+            o.insert("achievedCompliance".into(), serde_json::json!(c_binned));
+            o.insert("matchDeviation".into(), serde_json::json!(c_binned / c_target - 1.0));
+            // Mass of the uniform reference print (same skin, ref% interior).
+            o.insert(
+                "massUniformRefGrams".into(),
+                serde_json::json!(grams(ref_frac * result.design_cells.len() as f64)),
+            );
+            o.insert(
+                "passTrace".into(),
+                serde_json::json!(pass_trace
+                    .iter()
+                    .map(|&(b, c)| serde_json::json!({"budget": b, "compliance": c}))
+                    .collect::<Vec<_>>()),
+            );
+        }
+        let summary = summary_v.to_string();
 
         let mut field: std::collections::HashMap<u32, f64> = Default::default();
         for (i, &c) in result.design_cells.iter().enumerate() {

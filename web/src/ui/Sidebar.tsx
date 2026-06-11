@@ -255,6 +255,22 @@ export function Sidebar() {
           <header>5 · Optimize infill</header>
           <div className="toolrow">
             <button
+              className={s.goal === "budget" ? "on" : ""}
+              onClick={() => s.setGoal("budget")}
+              title="Maximize stiffness at a given material budget"
+            >
+              Stiffest at budget
+            </button>
+            <button
+              className={s.goal === "match" ? "on" : ""}
+              onClick={() => s.setGoal("match")}
+              title="Find the lightest design that is as stiff as a uniform print at X%"
+            >
+              Match uniform stiffness
+            </button>
+          </div>
+          <div className="toolrow">
+            <button
               className={s.optMode === "graded" ? "on" : ""}
               onClick={() => s.setOptMode("graded")}
               title="Several discrete infill densities, placed from the optimized field"
@@ -270,7 +286,9 @@ export function Sidebar() {
             </button>
           </div>
           <label className="row">
-            <span>Infill budget {s.budget}%</span>
+            <span>
+              {s.goal === "match" ? `As stiff as uniform ${s.budget}%` : `Infill budget ${s.budget}%`}
+            </span>
             <input
               type="range"
               min={budgetBounds(s)[0]}
@@ -281,9 +299,11 @@ export function Sidebar() {
             />
           </label>
           <div className="dim small">
-            {s.optMode === "binary"
-              ? `Mean interior density: cells are either ${s.levelSettings.binaryFloorPct}% (so it prints) or 100% solid. The optimizer runs SIMP-penalized so the design goes black/white.`
-              : "Mean infill of the interior — same scale as your slicer's uniform infill %. Walls and shells come on top."}
+            {s.goal === "match"
+              ? `Finds the LIGHTEST layout with the stiffness of a uniform ${s.budget}% print (a few warm-started passes search the needed budget).`
+              : s.optMode === "binary"
+                ? `Mean interior density: cells are either ${s.levelSettings.binaryFloorPct}% (so it prints) or 100% solid. The optimizer runs SIMP-penalized so the design goes black/white.`
+                : "Mean infill of the interior — same scale as your slicer's uniform infill %. Walls and shells come on top."}
           </div>
           <label className="row">
             <span>Infill pattern</span>
@@ -380,6 +400,9 @@ export function Sidebar() {
                 style={{ width: `${(100 * s.optProgress.iteration) / s.optProgress.maxIter}%` }}
               />
               <span>
+                {(s.optProgress.passes ?? 1) > 1
+                  ? `pass ${s.optProgress.pass}/${s.optProgress.passes} · `
+                  : ""}
                 iteration {s.optProgress.iteration}/{s.optProgress.maxIter}
               </span>
             </div>
@@ -566,12 +589,30 @@ function SummaryCard() {
   const stiff = Math.round(o.stiffnessVsSolid * 100);
   const gain = (o.gainVsUniform * 100).toFixed(1);
   const uniformPct = Math.round(o.meanInfill * 100);
+  const isMatch = o.goal === "match" && o.massUniformRefGrams != null;
+  const saved = isMatch ? 1 - o.massGrams / o.massUniformRefGrams! : 0;
   return (
     <div className="card">
       <div className="cardrow big">
         <span>{o.massGrams.toFixed(1)} g</span>
         <span className="dim">of {o.massSolidGrams.toFixed(1)} g solid ({Math.round(o.massFrac * 100)}%)</span>
       </div>
+      {isMatch && (
+        <div className="cardrow">
+          <span>vs {Math.round(o.refUniformPct!)}% uniform (same stiffness)</span>
+          <b>
+            −{(saved * 100).toFixed(0)}% weight ({o.massUniformRefGrams!.toFixed(1)} g → {o.massGrams.toFixed(1)} g)
+          </b>
+        </div>
+      )}
+      {isMatch && Math.abs(o.matchDeviation ?? 0) > 0.02 && (
+        <div className="cardrow small" style={{ color: "#f0c674" }}>
+          <span>
+            stiffness {((o.matchDeviation ?? 0) * 100).toFixed(1)}% off the target (search hit its
+            pass limit) — re-run or adjust the reference
+          </span>
+        </div>
+      )}
       <div className="cardrow">
         <span>vs {uniformPct}% uniform infill (same weight)</span>
         <b>+{gain}% stiffer</b>
@@ -594,8 +635,8 @@ function SummaryCard() {
         <span>
           {o.converged
             ? `converged in ${o.iterations} iterations`
-            : `stopped at the ${o.iterations}-iteration cap`}{" "}
-          · {o.seconds.toFixed(1)} s
+            : `stopped at the ${o.iterations}-iteration cap`}
+          {o.passes > 1 ? ` over ${o.passes} passes` : ""} · {o.seconds.toFixed(1)} s
           {Math.abs(o.targetInfill * 100 - s.budget) > 0.5
             ? ` · target clamped to ${Math.round(o.targetInfill * 100)}% (printable range)`
             : ""}

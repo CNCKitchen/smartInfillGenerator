@@ -374,12 +374,18 @@ fn solve_once(
 }
 
 /// Run the optimization. `progress` is called once per iteration.
+/// `x0`/`u0` warm-start the design and displacement fields — the
+/// stiffness-match outer loop re-runs at slightly different budgets, where
+/// a warm pass converges in a fraction of the iterations (the OC volume
+/// bisection shifts the mean to the new budget in the first update).
 pub fn optimize(
     grid: &VoxelGrid,
     levels: usize,
     problem: &NodeProblem,
     settings: &SolveSettings,
     params: &OptimizeParams,
+    x0: Option<&[f64]>,
+    u0: Option<&[f64]>,
     mut progress: impl FnMut(&OptimizeProgress, &[f64], &[u32]),
 ) -> Result<OptimizeResult, OptimizeError> {
     let (skin, design_cells) = classify_cells(grid, params.wall_mm);
@@ -401,7 +407,20 @@ pub fn optimize(
     let (nx, ny, nz) = (grid.nx, grid.ny, grid.nz);
     let ndof = 3 * (nx + 1) * (ny + 1) * (nz + 1);
     let mut u = vec![0f64; ndof];
+    if let Some(w) = u0 {
+        if w.len() == ndof {
+            u.copy_from_slice(w);
+        }
+    }
     let mut x = vec![target_mean; design_cells.len()];
+    if let Some(w) = x0 {
+        if w.len() == x.len() {
+            x.copy_from_slice(w);
+            for v in x.iter_mut() {
+                *v = v.clamp(params.floor, params.cap);
+            }
+        }
+    }
     let mut x_phys = vec![0f64; design_cells.len()];
     let mut se = vec![0f64; design_cells.len()];
     let mut sens_phys = vec![0f64; design_cells.len()];

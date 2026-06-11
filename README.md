@@ -46,8 +46,12 @@ Workflow in the app:
    plane** (gizmo to move/rotate, Flip, X/Y/Z presets) cuts through any
    view with stencil-filled caps, so the part and the analysis mesh read
    as solid at the cut.
-5. **Optimize infill** — choose **Graded** (several discrete densities) or
-   **Binary (hollow/solid)**: in binary mode the interior is either the
+5. **Optimize infill** — pick a goal: **Stiffest at budget** (classic — max
+   stiffness at a given mean infill) or **Match uniform stiffness** (the
+   dual: the LIGHTEST design as stiff as a uniform X% print — a few
+   warm-started passes search the needed budget; the card then leads with
+   "same stiffness as X% uniform: −N% weight"). Then choose **Graded**
+   (several discrete densities) or **Binary (hollow/solid)**: in binary mode the interior is either the
    printability floor (default 5%) or 100% solid — the optimizer runs
    SIMP-penalized (p=3) so the design converges black/white, the dense
    regions slice as solid fill (optionally pinned to rectilinear or
