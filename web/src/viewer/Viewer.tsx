@@ -68,7 +68,7 @@ export function Viewer() {
     sceneEvents.onAnimateDeformed = (on) => scene.setDeformAnimate(on);
     sceneEvents.onOptShape = (p, i, d) => scene.setOptShape(p, i, d);
     sceneEvents.onRegionVisibility = (vis) => scene.setRegionVisibility(vis);
-    sceneEvents.onScalarField = (v) => scene.setScalarField(v);
+    sceneEvents.onScalarField = (v, flip) => scene.setScalarField(v, flip ?? false);
     sceneEvents.onLegendRange = (min, max) => scene.setLegendRange(min, max);
     sceneEvents.onShowExtremes = (on, unit) => scene.setShowExtremes(on, unit);
     sceneEvents.onSectionState = (on) => scene.setSection(on);
@@ -120,19 +120,22 @@ export function Viewer() {
 
 // ---- color-scale legend overlay ----
 
-function jetCss(): string {
+function jetCss(flip = false): string {
   const stops: string[] = [];
   for (let i = 0; i <= 8; i++) {
-    const t = i / 8;
+    const pos = i / 8;
+    const t = flip ? 1 - pos : pos;
     const r = Math.round(255 * Math.min(1, Math.max(0, 1.5 - Math.abs(4 * t - 3))));
     const g = Math.round(255 * Math.min(1, Math.max(0, 1.5 - Math.abs(4 * t - 2))));
     const b = Math.round(255 * Math.min(1, Math.max(0, 1.5 - Math.abs(4 * t - 1))));
-    stops.push(`rgb(${r},${g},${b}) ${(100 * t).toFixed(1)}%`);
+    stops.push(`rgb(${r},${g},${b}) ${(100 * pos).toFixed(1)}%`);
   }
   return `linear-gradient(to top, ${stops.join(", ")})`;
 }
 
 const JET_GRADIENT = jetCss();
+// Safety factor: red marks the LOW (critical) end of the scale.
+const JET_GRADIENT_FLIP = jetCss(true);
 // Matches ramp() in SceneManager (density + region colors).
 const RAMP_GRADIENT =
   "linear-gradient(to top, #264de6 0%, #26e4e6 33%, #f0e61c 66%, #f21519 100%)";
@@ -224,13 +227,14 @@ function Legend() {
     const effMin = legendMin ?? autoMin;
     const effMax = legendMax ?? autoMax;
     const overridden = legendMin !== null || legendMax !== null;
-    const fmt = (v: number) => (isField ? fmtField(v, unit) : fmtDisp(v));
-    const hint = unit === "MPa" ? "MPa" : unit === "mm" ? "mm" : "strain";
+    const isSf = resultField === "sf";
+    const fmt = (v: number) => (isSf ? v.toFixed(2) : isField ? fmtField(v, unit) : fmtDisp(v));
+    const hint = unit === "MPa" ? "MPa" : unit === "mm" ? "mm" : isSf ? "factor" : "strain";
     return (
       <div className="legend">
         <div className="legendtitle">{isField ? def!.label : "Displacement |u|"}</div>
         <div className="legendbody">
-          <div className="legendbar" style={{ background: JET_GRADIENT }} />
+          <div className="legendbar" style={{ background: isSf ? JET_GRADIENT_FLIP : JET_GRADIENT }} />
           <div className="legendlabels">
             <EditableBound
               value={effMax}

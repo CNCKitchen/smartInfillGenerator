@@ -12,7 +12,7 @@ const ready = init();
 type Req =
   | { id: number; op: "load"; bytes: ArrayBuffer; name: string }
   | { id: number; op: "resegment"; angle: number }
-  | { id: number; op: "setMaterial"; e0: number; nu: number; density: number }
+  | { id: number; op: "setMaterial"; e0: number; nu: number; density: number; strength: number }
   | { id: number; op: "setGravity"; on: boolean }
   | { id: number; op: "setResolution"; cells: number }
   | {
@@ -92,7 +92,7 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
         return;
       }
       case "setMaterial":
-        requireModel().set_material(msg.e0, msg.nu, msg.density);
+        requireModel().set_material(msg.e0, msg.nu, msg.density, msg.strength);
         break;
       case "setGravity":
         requireModel().set_gravity(msg.on);

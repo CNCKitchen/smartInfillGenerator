@@ -95,7 +95,13 @@ export class SceneManager {
   private optShapeMesh: THREE.Mesh | null = null;
 
   // Scalar result field (stress/strain) overriding displacement colors.
-  private scalarField: { values: Float32Array; min: number; max: number } | null = null;
+  // flip = inverted colormap (safety factor: red marks the LOW values).
+  private scalarField: {
+    values: Float32Array;
+    min: number;
+    max: number;
+    flip: boolean;
+  } | null = null;
   /** User override of the color-scale range (click-to-edit legend). */
   private legendRange: { min: number | null; max: number | null } = { min: null, max: null };
 
@@ -777,8 +783,9 @@ export class SceneManager {
     this.refreshView();
   }
 
-  /** Stress/strain scalars per soup vertex; null reverts to |u| coloring. */
-  setScalarField(values: Float32Array | null) {
+  /** Stress/strain scalars per soup vertex; null reverts to |u| coloring.
+   *  `flip` inverts the colormap (safety factor: red = the critical LOW). */
+  setScalarField(values: Float32Array | null, flip = false) {
     if (values && values.length) {
       let min = Infinity;
       let max = -Infinity;
@@ -786,7 +793,7 @@ export class SceneManager {
         min = Math.min(min, values[i]);
         max = Math.max(max, values[i]);
       }
-      this.scalarField = { values, min, max };
+      this.scalarField = { values, min, max, flip };
     } else {
       this.scalarField = null;
     }
@@ -1073,7 +1080,8 @@ export class SceneManager {
         const hi = this.legendRange.max ?? sf.max;
         const inv = hi - lo > 1e-30 ? 1 / (hi - lo) : 0;
         for (let i = 0; i < sf.values.length; i++) {
-          this.uvs[2 * i] = Math.min(1, Math.max(0, (sf.values[i] - lo) * inv));
+          const t = Math.min(1, Math.max(0, (sf.values[i] - lo) * inv));
+          this.uvs[2 * i] = sf.flip ? 1 - t : t;
           this.uvs[2 * i + 1] = 0.5;
         }
         uvAttr.needsUpdate = true;
@@ -1144,6 +1152,9 @@ export class SceneManager {
     }
     if (this.extremesUnit === "MPa") {
       return `${Math.abs(v) >= 0.01 || v === 0 ? v.toPrecision(3) : v.toExponential(1)} MPa`;
+    }
+    if (this.extremesUnit === "×") {
+      return `${v.toFixed(2)}×`; // safety factor
     }
     return v === 0 ? "0" : v.toExponential(2);
   }

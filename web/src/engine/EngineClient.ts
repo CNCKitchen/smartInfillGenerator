@@ -61,8 +61,8 @@ export class EngineClient {
     return this.call({ op: "resegment", angle });
   }
 
-  setMaterial(e0: number, nu: number, density: number): Promise<void> {
-    return this.call({ op: "setMaterial", e0, nu, density });
+  setMaterial(e0: number, nu: number, density: number, strength: number): Promise<void> {
+    return this.call({ op: "setMaterial", e0, nu, density, strength });
   }
 
   setGravity(on: boolean): Promise<void> {

@@ -478,6 +478,7 @@ export function Sidebar() {
                   onChange={(e) => void s.setResultField(e.target.value)}
                 >
                   <option value="u">Displacement |u|</option>
+                  <option value="sf">Safety factor σₜ/σᵥᴹ</option>
                   <optgroup label="Stress (MPa)">
                     {RESULT_FIELDS.filter((f) => f.unit === "MPa").map((f) => (
                       <option key={f.value} value={f.value}>
@@ -486,7 +487,7 @@ export function Sidebar() {
                     ))}
                   </optgroup>
                   <optgroup label="Strain">
-                    {RESULT_FIELDS.filter((f) => f.unit === "").map((f) => (
+                    {RESULT_FIELDS.filter((f) => f.unit === "" && f.value !== "sf").map((f) => (
                       <option key={f.value} value={f.value}>
                         {f.label}
                       </option>
@@ -494,6 +495,13 @@ export function Sidebar() {
                   </optgroup>
                 </select>
               </label>
+              {s.resultField === "sf" && (
+                <div className="dim small">
+                  σₜ from the material table; the allowable of graded infill scales with the same
+                  E(ρ) law as its stiffness (first-order). Red marks the lowest factor — enable
+                  "Mark min/max" to pin it.
+                </div>
+              )}
               <label className="row">
                 <span>Exaggeration ×{s.deformScale.toFixed(1)}</span>
                 <input

@@ -40,8 +40,11 @@ Workflow in the app:
 4. **Verify** — `Check setup` animates any remaining rigid-body freedom;
    `Solve once` shows the deformed shape (jet colormap + value legend,
    exaggeration slider + readout, optional 0→max deflection animation).
-   A **Result field** selector switches between displacement, stress
-   (von Mises, σxx/σyy/σzz, τxy/τyz/τzx in MPa) and strain (equivalent +
+   A **Result field** selector switches between displacement, a **safety
+   factor** (σₜ/σᵥM with the material's tensile strength; graded infill's
+   allowable scales with the same E(ρ) law as its stiffness; inverted
+   colormap — red marks the critical low), stress (von Mises,
+   σxx/σyy/σzz, τxy/τyz/τzx in MPa) and strain (equivalent +
    components) — cell-center values mapped to the surface. A **section
    plane** (gizmo to move/rotate, Flip, X/Y/Z presets) cuts through any
    view with stencil-filled caps, so the part and the analysis mesh read

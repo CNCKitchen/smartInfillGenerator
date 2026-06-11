@@ -69,7 +69,14 @@ function loadSettings(): PersistedSettings {
     if (Array.isArray(p.materials) && p.materials.length) {
       fallback.materials = p.materials
         .filter((m) => m && typeof m.e0 === "number" && m.e0 > 0)
-        .map((m) => ({ name: String(m.name), e0: m.e0, nu: m.nu, density: m.density }));
+        .map((m) => ({
+          name: String(m.name),
+          e0: m.e0,
+          nu: m.nu,
+          density: m.density,
+          // Pre-strength saves: default to the PLA-ish 50 MPa.
+          strength: typeof m.strength === "number" && m.strength > 0 ? m.strength : 50,
+        }));
       if (!fallback.materials.length) fallback.materials = DEFAULT_MATERIALS.map((m) => ({ ...m }));
     }
     for (const k of ["gyroid", "cubic", "grid"] as PatternKey[]) {
@@ -315,6 +322,7 @@ async function logGridInfo(set: SetState) {
 }
 
 function fieldUnit(kind: string): string {
+  if (kind === "sf") return "×"; // marker labels show a plain factor
   return RESULT_FIELDS.find((f) => f.value === kind)?.unit ?? "";
 }
 
@@ -338,8 +346,9 @@ export interface SceneEvents {
     density?: Float32Array | null
   ) => void;
   onRegionVisibility?: (visible: boolean[]) => void;
-  /** Stress/strain scalars for the deformed view (null = |u| colors). */
-  onScalarField?: (values: Float32Array | null) => void;
+  /** Stress/strain scalars for the deformed view (null = |u| colors).
+   *  flip inverts the colormap (safety factor: red = critical LOW). */
+  onScalarField?: (values: Float32Array | null, flip?: boolean) => void;
   /** User override of the color-scale range (nulls = auto). */
   onLegendRange?: (min: number | null, max: number | null) => void;
   /** Min/max location markers; unit drives the label formatting. */
@@ -460,7 +469,7 @@ export const useStore = create<AppState>((set, get) => ({
     try {
       const model = await engine.load(bytes, name.replace(/\.(stl|3mf)$/i, ""));
       const m = get().material;
-      await engine.setMaterial(m.e0, m.nu, m.density);
+      await engine.setMaterial(m.e0, m.nu, m.density, m.strength);
       await engine.setResolution(RESOLUTIONS[get().resolution]);
       set({
         fileName: name,
@@ -591,7 +600,7 @@ export const useStore = create<AppState>((set, get) => ({
   setMaterial(m) {
     set({ material: m });
     invalidateResults(set, get);
-    void engine.setMaterial(m.e0, m.nu, m.density);
+    void engine.setMaterial(m.e0, m.nu, m.density, m.strength);
   },
 
   updateMaterial(index, m) {
@@ -603,12 +612,15 @@ export const useStore = create<AppState>((set, get) => ({
     if (wasSelected) {
       set({ material: m });
       invalidateResults(set, get);
-      void engine.setMaterial(m.e0, m.nu, m.density);
+      void engine.setMaterial(m.e0, m.nu, m.density, m.strength);
     }
   },
 
   addMaterial() {
-    const mats = [...get().materials, { name: "Custom", e0: 2000, nu: 0.35, density: 1.2 }];
+    const mats = [
+      ...get().materials,
+      { name: "Custom", e0: 2000, nu: 0.35, density: 1.2, strength: 40 },
+    ];
     set({ materials: mats });
     saveSettings(mats, get().curves, get().levelSettings);
   },
@@ -1064,7 +1076,8 @@ export const useStore = create<AppState>((set, get) => ({
         max = Math.max(max, values[i]);
       }
       set({ fieldRange: { min, max } });
-      sceneEvents.onScalarField?.(values);
+      // Safety factor: invert the colormap so red marks the critical LOW.
+      sceneEvents.onScalarField?.(values, kind === "sf");
     } catch (e) {
       set({ error: e instanceof Error ? e.message : String(e), resultField: "u", fieldRange: null });
       sceneEvents.onScalarField?.(null);

@@ -27,8 +27,8 @@ export function SettingsModal() {
 
         <h3>Materials</h3>
         <div className="dim small">
-          E in MPa, ρ in g/cm³. Editing the material in use invalidates current results. Saved in
-          this browser.
+          E and σₜ (tensile strength, drives the safety-factor plot) in MPa, ρ in g/cm³. Editing
+          the material in use invalidates current results. Saved in this browser.
         </div>
         <table className="settingstable">
           <thead>
@@ -37,6 +37,7 @@ export function SettingsModal() {
               <th>E (MPa)</th>
               <th>ν</th>
               <th>ρ (g/cm³)</th>
+              <th>σₜ (MPa)</th>
               <th />
             </tr>
           </thead>
@@ -81,6 +82,16 @@ export function SettingsModal() {
                     step={0.01}
                     onCommit={(v) =>
                       s.updateMaterial(i, { ...m, density: Math.max(0.1, v) })
+                    }
+                  />
+                </td>
+                <td>
+                  <NumInput
+                    value={m.strength}
+                    min={1}
+                    step={1}
+                    onCommit={(v) =>
+                      s.updateMaterial(i, { ...m, strength: Math.max(1, v) })
                     }
                   />
                 </td>

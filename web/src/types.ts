@@ -70,13 +70,16 @@ export interface Material {
   e0: number; // MPa
   nu: number;
   density: number; // g/cm³
+  /** Tensile strength in MPa (printed, conservative datasheet value) —
+   *  drives the safety-factor plot. */
+  strength: number;
 }
 
 export const DEFAULT_MATERIALS: Material[] = [
-  { name: "PLA", e0: 3500, nu: 0.35, density: 1.24 },
-  { name: "PETG", e0: 2100, nu: 0.37, density: 1.27 },
-  { name: "ABS", e0: 2250, nu: 0.37, density: 1.05 },
-  { name: "ASA", e0: 2400, nu: 0.37, density: 1.07 },
+  { name: "PLA", e0: 3500, nu: 0.35, density: 1.24, strength: 50 },
+  { name: "PETG", e0: 2100, nu: 0.37, density: 1.27, strength: 45 },
+  { name: "ABS", e0: 2250, nu: 0.37, density: 1.05, strength: 38 },
+  { name: "ASA", e0: 2400, nu: 0.37, density: 1.07, strength: 43 },
 ];
 
 export type PatternKey = "gyroid" | "cubic" | "grid";
@@ -111,6 +114,7 @@ export interface ResultFieldDef {
 
 export const RESULT_FIELDS: ResultFieldDef[] = [
   { value: "u", label: "Displacement |u|", unit: "mm" },
+  { value: "sf", label: "Safety factor σₜ/σᵥM", unit: "" },
   { value: "vm", label: "von Mises σ", unit: "MPa" },
   { value: "sxx", label: "Normal σxx", unit: "MPa" },
   { value: "syy", label: "Normal σyy", unit: "MPa" },

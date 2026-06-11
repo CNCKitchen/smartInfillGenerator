@@ -88,7 +88,7 @@ const bbox = Array.from(model.bbox());
 assert(Math.abs(bbox[3] - 40) < 1e-4, "bbox hi.x = 40");
 
 const sel = patchSelector(model);
-model.set_material(2000, 0.3, 1.24);
+model.set_material(2000, 0.3, 1.24, 50);
 model.set_resolution(50000);
 
 // Under-constrained: force only.
@@ -135,6 +135,12 @@ const sxxf = model.result_field("sxx");
 assert(fmin(sxxf) < 0 && fmax(sxxf) > 0, "bending: sigma_xx tension + compression present");
 const ezzf = model.result_field("ezz");
 assert(ezzf.length === nTri * 3, "strain field per vertex");
+// Safety factor: sigma_t·rel(rho) / sigma_vM, capped at 99.
+const sff = model.result_field("sf");
+assert(sff.length === nTri * 3 && sff.every((v) => Number.isFinite(v) && v > 0 && v <= 99),
+  "safety factor field per vertex (finite, positive, capped)");
+assert(fmin(sff) > 1 && fmin(sff) < 99,
+  `min safety factor sensible for a lightly loaded beam (${fmin(sff).toFixed(1)})`);
 // Tip vertices (x=40) deflect downward; root (x=0) stays.
 let tipUz = 0, tipN = 0, rootUz = 0, rootN = 0;
 const pos = model.positions();
@@ -176,7 +182,7 @@ assert(model.patch_count() === 6, "resegment at 60 deg still 6 patches");
 const optModel = new Model(boxStl([0, 0, 0], [60, 12, 12]), "beam2");
 const optTri = optModel.triangle_count();
 const osel = patchSelector(optModel);
-optModel.set_material(2400, 0.35, 1.24);
+optModel.set_material(2400, 0.35, 1.24, 50);
 optModel.set_resolution(60000);
 optModel.add_fixed(osel(0, "min"));
 optModel.add_force(osel(0, "max"), 0, 0, -40);
@@ -284,7 +290,7 @@ assert(reimported.triangle_count() >= 12, "exported 3MF re-imports (part wins by
 // Smaller grid for speed: the point is the pipeline, not the physics here.
 const binModel = new Model(boxStl([0, 0, 0], [60, 12, 12]), "beam3");
 const bsel = patchSelector(binModel);
-binModel.set_material(2400, 0.35, 1.24);
+binModel.set_material(2400, 0.35, 1.24, 50);
 binModel.set_resolution(25000);
 binModel.add_fixed(bsel(0, "min"));
 binModel.add_force(bsel(0, "max"), 0, 0, -40);
@@ -325,7 +331,7 @@ console.log("ok: binary mode pipeline (optimize + export)");
 // at less mass than that reference.
 const matchModel = new Model(boxStl([0, 0, 0], [60, 12, 12]), "beam4");
 const msel = patchSelector(matchModel);
-matchModel.set_material(2400, 0.35, 1.24);
+matchModel.set_material(2400, 0.35, 1.24, 50);
 matchModel.set_resolution(25000);
 matchModel.add_fixed(msel(0, "min"));
 matchModel.add_force(msel(0, "max"), 0, 0, -40);

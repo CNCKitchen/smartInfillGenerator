@@ -115,6 +115,8 @@ pub struct Model {
     settings: SolveSettings,
     /// tonne/mm³
     density: f64,
+    /// Tensile strength (MPa) of the solid material — safety-factor plot.
+    strength: f64,
     gravity_on: bool,
     target_cells: u32,
     grid: Option<(VoxelGrid, usize)>, // padded grid + level count
@@ -173,6 +175,7 @@ impl Model {
             bcs: Vec::new(),
             settings: SolveSettings::default(),
             density: 1.24e-9, // PLA
+            strength: 50.0,   // PLA tensile, MPa
             gravity_on: false,
             target_cells: 300_000,
             grid: None,
@@ -223,11 +226,12 @@ impl Model {
         }
     }
 
-    /// e0 in MPa, density in g/cm³.
-    pub fn set_material(&mut self, e0: f64, nu: f64, density_g_cm3: f64) {
+    /// e0 in MPa, density in g/cm³, tensile strength in MPa.
+    pub fn set_material(&mut self, e0: f64, nu: f64, density_g_cm3: f64, strength_mpa: f64) {
         self.settings.e0 = e0;
         self.settings.nu = nu;
         self.density = density_g_cm3 * 1e-9;
+        self.strength = strength_mpa.max(0.1);
         self.solution = None;
         self.opt = None;
     }
@@ -877,11 +881,20 @@ impl Model {
     }
 
     /// Stress/strain scalar per soup vertex, from the current solution.
-    /// Kinds: "vm" | "sxx" | "syy" | "szz" | "sxy" | "syz" | "szx" (MPa) and
-    /// "evm" | "exx" | "eyy" | "ezz" | "gxy" | "gyz" | "gzx" (strain).
+    /// Kinds: "vm" | "sxx" | "syy" | "szz" | "sxy" | "syz" | "szx" (MPa),
+    /// "evm" | "exx" | "eyy" | "ezz" | "gxy" | "gyz" | "gzx" (strain), and
+    /// "sf" — safety factor σ_allow/σ_vM, where the allowable of graded
+    /// infill scales with the SAME relative factor as its stiffness
+    /// (Gibson–Ashby strength tracks stiffness to first order; the skin
+    /// carries the full tensile strength). Capped at 99.
     /// Evaluated at cell centers with the eps the solve actually used.
     pub fn result_field(&self, kind: &str) -> Result<Vec<f32>, JsValue> {
-        let kind = FieldKind::parse(kind).ok_or_else(|| err("unknown result field"))?;
+        let sf = kind == "sf";
+        let kind = if sf {
+            FieldKind::VonMises
+        } else {
+            FieldKind::parse(kind).ok_or_else(|| err("unknown result field"))?
+        };
         let sol =
             self.solution.as_ref().ok_or_else(|| err("no solution — run Solve or Optimize"))?;
         let (grid, _) = self.grid.as_ref().ok_or_else(|| err("no grid"))?;
@@ -893,7 +906,13 @@ impl Model {
                 &scale_eps
             }
         };
-        let cells = cell_field(grid, &sol.u, self.settings.e0, self.settings.nu, eps, kind);
+        let mut cells = cell_field(grid, &sol.u, self.settings.e0, self.settings.nu, eps, kind);
+        if sf {
+            for (i, v) in cells.iter_mut().enumerate() {
+                let allow = self.strength as f32 * eps[i];
+                *v = (allow / v.max(1e-9)).min(99.0);
+            }
+        }
         Ok(sample_cell_values(&self.mesh.tris, grid, &cells))
     }
 

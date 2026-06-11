@@ -56,8 +56,11 @@ Reference points:
 - **Performance budget:** default grid auto-sized to ~1–2 M active cells (device-memory
   aware); resolution presets Preview / Normal / Fine. Target: full optimize < ~60 s on a
   mid desktop at Normal. Warn when thin features span < 3 cells at chosen resolution.
-- **Materials:** presets PLA, PETG, ABS, ASA (E₀, ν, density), user-editable. Strength is
-  an advisory readout later, never a certified safety factor (FDM anisotropy).
+- **Materials:** presets PLA, PETG, ABS, ASA (E₀, ν, density, tensile strength σₜ),
+  user-editable. The safety-factor plot (2026-06: σₜ·rel(ρ)/σᵥM per cell, graded infill's
+  allowable scaled with the same Gibson-Ashby factor as its stiffness, inverted colormap
+  so red = critical low) is an ADVISORY readout, never a certified safety factor — FDM
+  anisotropy and layer adhesion are not modeled.
 - **Project persistence:** single JSON project file (embedded mesh + setup) download/load;
   auto-save to IndexedDB.
 - **Out of scope v1:** assemblies/multi-body, print-orientation anisotropy in the solver,
