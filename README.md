@@ -17,7 +17,7 @@ npm run dev     # opens on http://localhost:5173
 ```
 
 The app is laid out like an instrument ("Werkbank" design): a top bar with the
-part and the Export action, a numbered **step rail** (the orange carriage marks
+part chip and Settings, a numbered **step rail** (the orange carriage marks
 where you are), a panel showing only the active step, the viewport (view modes
 top-center, result controls riding on the view itself, section plane
 bottom-left), a **results dock** on the right after an optimization, and a
@@ -49,20 +49,25 @@ Workflow in the app:
    the cell size snaps to wall/k so the printed skin is resolved by an exact
    integer number of cell layers (the panel shows the resulting h and k, and
    warns when the skin is only one cell). The `Mesh` view shows the actual
-   voxel grid the solver runs on.
+   voxel grid the solver runs on — its legend can **tint the skin cells**,
+   and with the Section on, the mesh view drops WHOLE cells on the far side
+   of the plane (voxel-true cut) so the interior cells and the modeled skin
+   thickness stay inspectable instead of a hollow planar slice.
 4. **Verify** — `Check setup` animates any remaining rigid-body freedom.
    `Solve once` analyzes either **As printed** — skin solid, interior at the
    uniform infill through the calibrated E(ρ) curve; this turns the tool
    into a general FDM-FEA: mass at the print settings, max deflection and
-   the **min safety factor** land in the results dock — or **Solid
+   the **min safety factor** (worst of material vs layer adhesion, the dock
+   states which one governs) land in the results dock — or **Solid
    material** (fully dense E₀, the CAD-ideal reference: run both to see
    what printing costs you). Either way the run lands in the **Results**
    view, where review happens on the
    viewport itself: the **result field** picker sits right under the view
-   tabs (displacement, a **safety factor** σₜ/σᵥM — graded infill's
-   allowable scales with the same E(ρ) law as its stiffness, inverted
-   colormap so red marks the critical low —, stress von Mises /
-   σxx/σyy/σzz / τxy/τyz/τzx in MPa, strain equivalent + components;
+   tabs (displacement, three **safety factors** — material σₜ/σᵥM, layer
+   adhesion σₜᶻ vs tension across the layers, and the worst-case min of
+   both; graded infill's allowables scale with the same E(ρ) law as its
+   stiffness, inverted colormap so red marks the critical low —, stress
+   von Mises / σxx/σyy/σzz / τxy/τyz/τzx in MPa, strain equivalent + components;
    cell-center values mapped to the surface), **▶ Play deflection**
    (0→max loop) bottom-center, and the legend carries the click-to-edit
    color scale, a **mark min/max** toggle, and the click-to-edit

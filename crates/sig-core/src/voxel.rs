@@ -87,6 +87,20 @@ impl VoxelGrid {
     /// runs on, for display). Returns (triangle soup positions, deduplicated
     /// cell-edge segments), both flat xyz f32 in world mm.
     pub fn surface_mesh(&self) -> (Vec<f32>, Vec<f32>) {
+        let (t, e, _) = self.surface_mesh_where(&|_| true);
+        (t, e)
+    }
+
+    /// Like `surface_mesh`, but only cells with `keep(ci)` participate —
+    /// faces appear wherever a kept cell borders void OR a dropped cell.
+    /// This is the voxel-true section view: dropping the cells on one side
+    /// of a plane exposes the interior CELLS (skin thickness inspectable)
+    /// instead of a planar cut. Also returns the owning cell index per
+    /// emitted TRIANGLE so callers can color skin vs interior.
+    pub fn surface_mesh_where(
+        &self,
+        keep: &dyn Fn(usize) -> bool,
+    ) -> (Vec<f32>, Vec<f32>, Vec<u32>) {
         let (nx, ny, nz) = (self.nx, self.ny, self.nz);
         let h = self.h;
         let o = self.origin;
@@ -99,26 +113,30 @@ impl VoxelGrid {
             ([0, 0, -1], [[0, 0, 0], [0, 1, 0], [1, 1, 0], [1, 0, 0]]),
             ([0, 0, 1], [[0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1]]),
         ];
-        let solid = |x: i64, y: i64, z: i64| -> bool {
+        let visible = |x: i64, y: i64, z: i64| -> bool {
+            // A face is drawn when the neighbor is void, outside, or dropped.
             if x < 0 || y < 0 || z < 0 || x >= nx as i64 || y >= ny as i64 || z >= nz as i64 {
                 return false;
             }
-            self.scale[(z as usize * ny + y as usize) * nx + x as usize] > 0.0
+            let ci = (z as usize * ny + y as usize) * nx + x as usize;
+            self.scale[ci] > 0.0 && keep(ci)
         };
         let node_id = |p: [usize; 3]| -> u64 {
             ((p[2] * (ny + 1) + p[1]) * (nx + 1) + p[0]) as u64
         };
         let mut tris: Vec<f32> = Vec::new();
+        let mut cell_of_tri: Vec<u32> = Vec::new();
         let mut edge_set: std::collections::HashSet<(u64, u64)> = Default::default();
         let mut edges: Vec<f32> = Vec::new();
         for cz in 0..nz {
             for cy in 0..ny {
                 for cx in 0..nx {
-                    if self.scale[(cz * ny + cy) * nx + cx] <= 0.0 {
+                    let ci = (cz * ny + cy) * nx + cx;
+                    if self.scale[ci] <= 0.0 || !keep(ci) {
                         continue;
                     }
                     for (dir, corners) in &FACES {
-                        if solid(cx as i64 + dir[0], cy as i64 + dir[1], cz as i64 + dir[2]) {
+                        if visible(cx as i64 + dir[0], cy as i64 + dir[1], cz as i64 + dir[2]) {
                             continue;
                         }
                         let q: Vec<[usize; 3]> = corners
@@ -136,6 +154,7 @@ impl VoxelGrid {
                             for &k in &idx {
                                 tris.extend_from_slice(&world(q[k]));
                             }
+                            cell_of_tri.push(ci as u32);
                         }
                         for k in 0..4 {
                             let (a, b) = (q[k], q[(k + 1) % 4]);
@@ -150,7 +169,7 @@ impl VoxelGrid {
                 }
             }
         }
-        (tris, edges)
+        (tris, edges, cell_of_tri)
     }
 }
 

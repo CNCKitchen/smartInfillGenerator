@@ -61,8 +61,14 @@ export class EngineClient {
     return this.call({ op: "resegment", angle });
   }
 
-  setMaterial(e0: number, nu: number, density: number, strength: number): Promise<void> {
-    return this.call({ op: "setMaterial", e0, nu, density, strength });
+  setMaterial(
+    e0: number,
+    nu: number,
+    density: number,
+    strength: number,
+    strengthZ: number
+  ): Promise<void> {
+    return this.call({ op: "setMaterial", e0, nu, density, strength, strengthZ });
   }
 
   setGravity(on: boolean): Promise<void> {
@@ -129,6 +135,16 @@ export class EngineClient {
   /** Exposed-face hull + cell edges of the analysis voxel grid. */
   voxelMesh(): Promise<{ hull: Float32Array; edges: Float32Array; info: VoxelInfo }> {
     return this.call({ op: "voxelMesh" });
+  }
+
+  /** Voxel mesh with a per-vertex skin mask, optionally cut by a plane —
+   *  cells on the dropped side vanish entirely (voxel-true section).
+   *  Plane in three.js convention: kept side is normal·p + constant ≥ 0. */
+  voxelMeshCut(
+    plane: { normal: [number, number, number]; constant: number } | null,
+    wall: number
+  ): Promise<{ hull: Float32Array; skin: Float32Array; edges: Float32Array; info: VoxelInfo }> {
+    return this.call({ op: "voxelMeshCut", plane, wall });
   }
 
   /** Isosurface of the final continuous density field at `threshold` (0..1). */

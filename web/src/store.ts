@@ -69,14 +69,22 @@ function loadSettings(): PersistedSettings {
     if (Array.isArray(p.materials) && p.materials.length) {
       fallback.materials = p.materials
         .filter((m) => m && typeof m.e0 === "number" && m.e0 > 0)
-        .map((m) => ({
-          name: String(m.name),
-          e0: m.e0,
-          nu: m.nu,
-          density: m.density,
+        .map((m) => {
           // Pre-strength saves: default to the PLA-ish 50 MPa.
-          strength: typeof m.strength === "number" && m.strength > 0 ? m.strength : 50,
-        }));
+          const strength = typeof m.strength === "number" && m.strength > 0 ? m.strength : 50;
+          return {
+            name: String(m.name),
+            e0: m.e0,
+            nu: m.nu,
+            density: m.density,
+            strength,
+            // Pre-anisotropy saves: layer adhesion ≈ 70% of σₜ.
+            strengthZ:
+              typeof m.strengthZ === "number" && m.strengthZ > 0
+                ? m.strengthZ
+                : Math.round(0.7 * strength),
+          };
+        });
       if (!fallback.materials.length) fallback.materials = DEFAULT_MATERIALS.map((m) => ({ ...m }));
     }
     for (const k of ["gyroid", "cubic", "grid"] as PatternKey[]) {
@@ -168,6 +176,8 @@ interface AppState {
   analyzeMode: "printed" | "solid";
   /** Extras of the last as-printed solve (results dock); null = solid run. */
   printedStats: PrintedSummary | null;
+  /** Mesh view: tint the skin cells (within wall thickness of the surface). */
+  meshSkinTint: boolean;
   // optimization inputs
   budget: number; // infill budget: target mean interior density in %
   smoothIters: number; // Taubin passes on modifier regions
@@ -249,6 +259,9 @@ interface AppState {
   setPrintInfill(v: number): void;
   setSnapVoxel(on: boolean): void;
   setAnalyzeMode(m: "printed" | "solid"): void;
+  setMeshSkinTint(on: boolean): void;
+  /** Scene → store: the section plane moved (three.js plane convention). */
+  onSectionPlaneMoved(normal: [number, number, number], constant: number): void;
   setSmoothIters(v: number): void;
   setNBins(v: number): void;
   setGoal(g: "budget" | "match"): void;
@@ -294,6 +307,9 @@ export interface PrintedSummary {
   lineWidth: number;
   /** Minimum safety factor over the part; null if the field fetch failed. */
   minSf: number | null;
+  /** Which strength limit produced the minimum: in-layer material (σᵥᴹ)
+   *  or layer adhesion (σzz tension). */
+  sfGoverns: "material" | "layer" | null;
 }
 
 /** One optimizer iteration for the nerd-log convergence charts. */
@@ -311,6 +327,10 @@ export interface OptIterSample {
 let bcCounter = 0;
 let isoTimer: ReturnType<typeof setTimeout> | null = null;
 let smoothTimer: ReturnType<typeof setTimeout> | null = null;
+let meshCutTimer: ReturnType<typeof setTimeout> | null = null;
+/** Last section plane reported by the scene (three.js convention:
+ *  kept side is normal·p + constant ≥ 0). */
+let lastSectionPlane: { normal: [number, number, number]; constant: number } | null = null;
 /** Per-kind cache of fetched stress/strain fields (cleared on invalidation). */
 const fieldCache = new Map<string, Float32Array>();
 
@@ -353,7 +373,7 @@ async function logGridInfo(set: SetState) {
 }
 
 function fieldUnit(kind: string): string {
-  if (kind === "sf") return "×"; // marker labels show a plain factor
+  if (kind.startsWith("sf")) return "×"; // marker labels show a plain factor
   return RESULT_FIELDS.find((f) => f.value === kind)?.unit ?? "";
 }
 
@@ -367,7 +387,16 @@ export interface SceneEvents {
   onVertexDensity?: (density: Float32Array | null) => void;
   onRegions?: (regions: OptRegion[] | null) => void;
   onViewState?: (mode: ViewMode, deformScale: number) => void;
-  onVoxelMesh?: (hull: Float32Array | null, edges: Float32Array | null) => void;
+  onVoxelMesh?: (
+    hull: Float32Array | null,
+    edges: Float32Array | null,
+    skin?: Float32Array | null
+  ) => void;
+  /** Tint skin cells in the mesh view. */
+  onMeshSkinTint?: (on: boolean) => void;
+  /** Voxel-true section active: the scene must NOT plane-clip the voxel
+   *  group (the cut already lives in the geometry) and hides its cap. */
+  onVoxelCutActive?: (on: boolean) => void;
   onAnimateDeformed?: (on: boolean) => void;
   /** Live optimization skeleton or density-threshold cutaway mesh,
    *  optionally colored by a per-vertex density scalar. */
@@ -401,6 +430,30 @@ async function pushSnap(get: () => AppState) {
   const s = get();
   if (!s.model) return; // nothing loaded yet — loadFile pushes the snap
   await engine.setSnapWall(s.snapVoxel ? s.perimeters * s.lineWidth : 0);
+}
+
+/** (Re)build the Mesh-view voxel hull: full, or voxel-true cut by the
+ *  section plane (whole cells dropped — the interior cells become visible,
+ *  so the skin thickness can be inspected instead of a planar cut). */
+async function refreshMeshView(set: SetState, get: () => AppState): Promise<boolean> {
+  const st = get();
+  if (!st.model || st.viewMode !== "mesh") return true;
+  const wall = st.perimeters * st.lineWidth;
+  const cutting = st.sectionOn && lastSectionPlane !== null;
+  try {
+    const { hull, edges, skin, info } = await engine.voxelMeshCut(
+      cutting ? lastSectionPlane : null,
+      wall
+    );
+    if (get().viewMode !== "mesh") return true; // user moved on mid-fetch
+    set({ voxelInfo: info, voxelMeshReady: true });
+    sceneEvents.onVoxelCutActive?.(cutting);
+    sceneEvents.onVoxelMesh?.(hull, edges, skin);
+    return true;
+  } catch (e) {
+    set({ error: e instanceof Error ? e.message : String(e) });
+    return false;
+  }
 }
 
 function invalidateResults(set: (p: Partial<AppState>) => void, get: () => AppState) {
@@ -473,6 +526,7 @@ export const useStore = create<AppState>((set, get) => ({
   snapVoxel: true,
   analyzeMode: "printed",
   printedStats: null,
+  meshSkinTint: false,
   smoothIters: 15,
   nBins: 3,
   goal: "budget",
@@ -517,7 +571,7 @@ export const useStore = create<AppState>((set, get) => ({
     try {
       const model = await engine.load(bytes, name.replace(/\.(stl|3mf)$/i, ""));
       const m = get().material;
-      await engine.setMaterial(m.e0, m.nu, m.density, m.strength);
+      await engine.setMaterial(m.e0, m.nu, m.density, m.strength, m.strengthZ);
       await engine.setResolution(RESOLUTIONS[get().resolution]);
       // A fresh wasm Model defaults to snap off; push the current setting.
       // (Inline, not pushSnap: the store's `model` isn't set yet.)
@@ -655,7 +709,7 @@ export const useStore = create<AppState>((set, get) => ({
   setMaterial(m) {
     set({ material: m });
     invalidateResults(set, get);
-    void engine.setMaterial(m.e0, m.nu, m.density, m.strength);
+    void engine.setMaterial(m.e0, m.nu, m.density, m.strength, m.strengthZ);
   },
 
   updateMaterial(index, m) {
@@ -667,14 +721,14 @@ export const useStore = create<AppState>((set, get) => ({
     if (wasSelected) {
       set({ material: m });
       invalidateResults(set, get);
-      void engine.setMaterial(m.e0, m.nu, m.density, m.strength);
+      void engine.setMaterial(m.e0, m.nu, m.density, m.strength, m.strengthZ);
     }
   },
 
   addMaterial() {
     const mats = [
       ...get().materials,
-      { name: "Custom", e0: 2000, nu: 0.35, density: 1.2, strength: 40 },
+      { name: "Custom", e0: 2000, nu: 0.35, density: 1.2, strength: 40, strengthZ: 28 },
     ];
     set({ materials: mats });
     saveSettings(mats, get().curves, get().levelSettings);
@@ -768,6 +822,20 @@ export const useStore = create<AppState>((set, get) => ({
   },
   setAnalyzeMode(m) {
     set({ analyzeMode: m });
+  },
+
+  setMeshSkinTint(on) {
+    set({ meshSkinTint: on });
+    sceneEvents.onMeshSkinTint?.(on);
+  },
+
+  onSectionPlaneMoved(normal, constant) {
+    lastSectionPlane = { normal, constant };
+    if (get().viewMode !== "mesh" || !get().sectionOn) return;
+    if (meshCutTimer) clearTimeout(meshCutTimer);
+    meshCutTimer = setTimeout(() => {
+      void refreshMeshView(set, get);
+    }, 140);
   },
   setSmoothIters(v) {
     const iters = Math.min(40, Math.max(0, Math.round(v)));
@@ -931,6 +999,7 @@ export const useStore = create<AppState>((set, get) => ({
           perimeters: st0.perimeters,
           lineWidth: st0.lineWidth,
           minSf: null,
+          sfGoverns: null,
         };
         appendLog(
           set,
@@ -972,18 +1041,30 @@ export const useStore = create<AppState>((set, get) => ({
       sceneEvents.onDisplacements?.(displacements, stats);
       sceneEvents.onViewState?.("deformed", get().deformScale);
       if (printedSummary) {
-        // Min safety factor for the dock — the field is cached, so picking
-        // "Safety factor" in the viewer afterwards is instant.
+        // Min safety factors for the dock — both limits, so the dock can say
+        // WHICH one governs. Fields are cached: picking them in the viewer
+        // afterwards is instant.
         try {
-          const sf = await engine.resultField("sf");
-          fieldCache.set("sf", sf);
-          let minSf = Infinity;
-          for (let i = 0; i < sf.length; i++) minSf = Math.min(minSf, sf[i]);
+          const [sfm, sfz] = await Promise.all([
+            engine.resultField("sfm"),
+            engine.resultField("sfz"),
+          ]);
+          fieldCache.set("sfm", sfm);
+          fieldCache.set("sfz", sfz);
+          let minM = Infinity;
+          let minZ = Infinity;
+          for (let i = 0; i < sfm.length; i++) minM = Math.min(minM, sfm[i]);
+          for (let i = 0; i < sfz.length; i++) minZ = Math.min(minZ, sfz[i]);
+          const minSf = Math.min(minM, minZ);
           if (Number.isFinite(minSf) && get().printedStats) {
-            set({ printedStats: { ...get().printedStats!, minSf } });
+            const governs = minZ < minM ? "layer" : "material";
+            set({ printedStats: { ...get().printedStats!, minSf, sfGoverns: governs } });
             appendLog(
               set,
-              `  min safety factor ${minSf.toFixed(2)}× (σₜ ${m.strength} MPa, infill allowable scaled by E(ρ))`
+              `  min safety factor ${minSf.toFixed(2)}× — ` +
+                (governs === "layer"
+                  ? `layer adhesion governs (σₜᶻ ${m.strengthZ} MPa vs σzz tension)`
+                  : `material governs (σₜ ${m.strength} MPa vs σᵥᴹ)`)
             );
           }
         } catch {
@@ -1175,17 +1256,22 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   async setViewMode(mode) {
-    if (mode === "mesh" && !get().voxelMeshReady) {
-      set({ busy: "Building analysis mesh…", error: null });
-      try {
-        const { hull, edges, info } = await engine.voxelMesh();
-        set({ voxelInfo: info, voxelMeshReady: true, busy: null });
-        sceneEvents.onVoxelMesh?.(hull, edges);
-      } catch (e) {
-        set({ busy: null, error: e instanceof Error ? e.message : String(e) });
-        return;
+    if (mode === "mesh") {
+      const first = !get().voxelMeshReady;
+      if (first) set({ busy: "Building analysis mesh…", error: null });
+      const prev = get().viewMode;
+      set({ viewMode: "mesh" });
+      sceneEvents.onViewState?.("mesh", get().deformScale);
+      const ok = await refreshMeshView(set, get);
+      if (first) set({ busy: null });
+      if (!ok) {
+        set({ viewMode: prev });
+        sceneEvents.onViewState?.(prev, get().deformScale);
       }
+      return;
     }
+    // Leaving the mesh view: plane clipping owns sectioning again.
+    sceneEvents.onVoxelCutActive?.(false);
     set({ viewMode: mode });
     sceneEvents.onViewState?.(mode, get().deformScale);
   },
@@ -1225,7 +1311,7 @@ export const useStore = create<AppState>((set, get) => ({
       }
       set({ fieldRange: { min, max } });
       // Safety factor: invert the colormap so red marks the critical LOW.
-      sceneEvents.onScalarField?.(values, kind === "sf");
+      sceneEvents.onScalarField?.(values, kind.startsWith("sf"));
     } catch (e) {
       set({ error: e instanceof Error ? e.message : String(e), resultField: "u", fieldRange: null });
       sceneEvents.onScalarField?.(null);
@@ -1247,6 +1333,8 @@ export const useStore = create<AppState>((set, get) => ({
     const on = !get().sectionOn;
     set({ sectionOn: on });
     sceneEvents.onSectionState?.(on);
+    // Mesh view sections by dropping whole cells, not by plane-clipping.
+    if (get().viewMode === "mesh") void refreshMeshView(set, get);
   },
 
   flipSection() {

@@ -37,13 +37,17 @@ export function ViewportChips() {
             value={s.resultField}
             onChange={(e) => void s.setResultField(e.target.value)}
             title={
-              s.resultField === "sf"
-                ? "σₜ from the material table; graded infill's allowable scales with the same E(ρ) law as its stiffness (first-order, advisory)"
+              s.resultField.startsWith("sf")
+                ? "Allowables from the material table; graded infill scales with the same E(ρ) law as its stiffness. Worst case = min(material σᵥᴹ check, layer-adhesion σzz-tension check). Advisory."
                 : "Scalar plotted on the deformed shape"
             }
           >
             <option value="u">Displacement |u|</option>
-            <option value="sf">Safety factor σₜ/σᵥᴹ</option>
+            <optgroup label="Safety factor">
+              <option value="sf">Safety factor — worst case</option>
+              <option value="sfm">Safety factor — material σₜ/σᵥᴹ</option>
+              <option value="sfz">Safety factor — layer adhesion</option>
+            </optgroup>
             <optgroup label="Stress (MPa)">
               {RESULT_FIELDS.filter((f) => f.unit === "MPa").map((f) => (
                 <option key={f.value} value={f.value}>
@@ -52,7 +56,7 @@ export function ViewportChips() {
               ))}
             </optgroup>
             <optgroup label="Strain">
-              {RESULT_FIELDS.filter((f) => f.unit === "" && f.value !== "sf").map((f) => (
+              {RESULT_FIELDS.filter((f) => f.unit === "" && !f.value.startsWith("sf")).map((f) => (
                 <option key={f.value} value={f.value}>
                   {f.label}
                 </option>

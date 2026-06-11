@@ -136,6 +136,9 @@ pub struct Model {
     density: f64,
     /// Tensile strength (MPa) of the solid material — safety-factor plot.
     strength: f64,
+    /// Layer-adhesion strength (MPa): tension PERPENDICULAR to the layers
+    /// (σzz, build direction Z-up). Drives the conservative SF variants.
+    strength_z: f64,
     gravity_on: bool,
     target_cells: u32,
     /// Snap the voxel size to wall/k (0 = off) so the printed skin is
@@ -196,8 +199,9 @@ impl Model {
             seg,
             bcs: Vec::new(),
             settings: SolveSettings::default(),
-            density: 1.24e-9, // PLA
-            strength: 50.0,   // PLA tensile, MPa
+            density: 1.24e-9,  // PLA
+            strength: 50.0,    // PLA tensile, MPa
+            strength_z: 35.0,  // PLA layer adhesion, MPa
             gravity_on: false,
             target_cells: 300_000,
             snap_wall: 0.0,
@@ -249,12 +253,21 @@ impl Model {
         }
     }
 
-    /// e0 in MPa, density in g/cm³, tensile strength in MPa.
-    pub fn set_material(&mut self, e0: f64, nu: f64, density_g_cm3: f64, strength_mpa: f64) {
+    /// e0 in MPa, density in g/cm³, strengths in MPa (in-layer tensile and
+    /// layer-adhesion / cross-layer).
+    pub fn set_material(
+        &mut self,
+        e0: f64,
+        nu: f64,
+        density_g_cm3: f64,
+        strength_mpa: f64,
+        strength_z_mpa: f64,
+    ) {
         self.settings.e0 = e0;
         self.settings.nu = nu;
         self.density = density_g_cm3 * 1e-9;
         self.strength = strength_mpa.max(0.1);
+        self.strength_z = strength_z_mpa.max(0.1);
         self.solution = None;
         self.opt = None;
     }
@@ -981,12 +994,6 @@ impl Model {
     /// carries the full tensile strength). Capped at 99.
     /// Evaluated at cell centers with the eps the solve actually used.
     pub fn result_field(&self, kind: &str) -> Result<Vec<f32>, JsValue> {
-        let sf = kind == "sf";
-        let kind = if sf {
-            FieldKind::VonMises
-        } else {
-            FieldKind::parse(kind).ok_or_else(|| err("unknown result field"))?
-        };
         let sol =
             self.solution.as_ref().ok_or_else(|| err("no solution — run Solve or Optimize"))?;
         let (grid, _) = self.grid.as_ref().ok_or_else(|| err("no grid"))?;
@@ -998,13 +1005,48 @@ impl Model {
                 &scale_eps
             }
         };
-        let mut cells = cell_field(grid, &sol.u, self.settings.e0, self.settings.nu, eps, kind);
-        if sf {
-            for (i, v) in cells.iter_mut().enumerate() {
+        // Safety factors: allowable = strength × the SAME relative factor as
+        // the stiffness (Gibson–Ashby, first order; the skin carries full
+        // strength). "sfm" checks the material against σ_vM; "sfz" checks
+        // layer adhesion against TENSION across the layers (σzz > 0 only —
+        // compression doesn't delaminate); "sf" is the per-cell worst of
+        // both. All capped at 99.
+        let sf_material = || -> Vec<f32> {
+            let mut c = cell_field(
+                grid, &sol.u, self.settings.e0, self.settings.nu, eps, FieldKind::VonMises,
+            );
+            for (i, v) in c.iter_mut().enumerate() {
                 let allow = self.strength as f32 * eps[i];
                 *v = (allow / v.max(1e-9)).min(99.0);
             }
-        }
+            c
+        };
+        let sf_layer = || -> Result<Vec<f32>, JsValue> {
+            let szz = FieldKind::parse("szz").ok_or_else(|| err("szz field missing"))?;
+            let mut c =
+                cell_field(grid, &sol.u, self.settings.e0, self.settings.nu, eps, szz);
+            for (i, v) in c.iter_mut().enumerate() {
+                let allow = self.strength_z as f32 * eps[i];
+                *v = if *v <= 1e-9 { 99.0 } else { (allow / *v).min(99.0) };
+            }
+            Ok(c)
+        };
+        let cells = match kind {
+            "sfm" => sf_material(),
+            "sfz" => sf_layer()?,
+            "sf" => {
+                let mut a = sf_material();
+                let b = sf_layer()?;
+                for (va, &vb) in a.iter_mut().zip(&b) {
+                    *va = va.min(vb);
+                }
+                a
+            }
+            _ => {
+                let k = FieldKind::parse(kind).ok_or_else(|| err("unknown result field"))?;
+                cell_field(grid, &sol.u, self.settings.e0, self.settings.nu, eps, k)
+            }
+        };
         Ok(sample_cell_values(&self.mesh.tris, grid, &cells))
     }
 
@@ -1022,6 +1064,53 @@ impl Model {
             opt.base_density,
             opt.perimeters,
             opt.solid_pattern.as_deref(),
+        ))
+    }
+
+    /// Voxel mesh for the Mesh view, optionally cut by a plane: cells whose
+    /// CENTER satisfies n·c + constant < 0 are dropped entirely, exposing the
+    /// interior cells (voxel-true section — skin thickness inspectable)
+    /// instead of a planar cut. Returns [positions f32 (9/tri),
+    /// skin f32 (3/tri, 1 = within wall_mm of the surface), edges f32].
+    pub fn voxel_mesh_cut(
+        &mut self,
+        cut: bool,
+        nx: f64,
+        ny: f64,
+        nz: f64,
+        constant: f64,
+        wall_mm: f64,
+    ) -> Result<js_sys::Array, JsValue> {
+        self.ensure_grid()?;
+        let (grid, _) = self.grid.as_ref().unwrap();
+        let (skin, _) = sig_core::simp::classify_cells(grid, wall_mm.clamp(0.2, 5.0));
+        let skin_set: std::collections::HashSet<u32> = skin.into_iter().collect();
+        let (gnx, gny) = (grid.nx, grid.ny);
+        let (h, o) = (grid.h, grid.origin);
+        let keep = move |ci: usize| -> bool {
+            if !cut {
+                return true;
+            }
+            let cx = ci % gnx;
+            let cy = (ci / gnx) % gny;
+            let cz = ci / (gnx * gny);
+            // Match three.js clipping: keep where distance = n·p + c ≥ 0.
+            let d = nx * (o[0] + (cx as f64 + 0.5) * h)
+                + ny * (o[1] + (cy as f64 + 0.5) * h)
+                + nz * (o[2] + (cz as f64 + 0.5) * h)
+                + constant;
+            d >= 0.0
+        };
+        let (tris, edges, cell_of_tri) = grid.surface_mesh_where(&keep);
+        let mut skin_flag = Vec::with_capacity(cell_of_tri.len() * 3);
+        for &c in &cell_of_tri {
+            let f = if skin_set.contains(&c) { 1.0f32 } else { 0.0 };
+            skin_flag.extend_from_slice(&[f, f, f]);
+        }
+        Ok(js_sys::Array::of3(
+            &js_sys::Float32Array::from(tris.as_slice()),
+            &js_sys::Float32Array::from(skin_flag.as_slice()),
+            &js_sys::Float32Array::from(edges.as_slice()),
         ))
     }
 

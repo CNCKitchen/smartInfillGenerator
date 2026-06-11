@@ -32,18 +32,6 @@ export function TopBar() {
       <button className="ghost" onClick={() => s.openSettings(true)} title="Materials, infill stiffness curves, density levels">
         ⚙ Settings
       </button>
-      <button
-        className="primary"
-        disabled={!s.optSummary}
-        onClick={() => void s.downloadThreeMf()}
-        title={
-          s.optSummary
-            ? "Download the OrcaSlicer / Bambu Studio project"
-            : "Run Optimize infill first — the 3MF carries the graded regions"
-        }
-      >
-        Export 3MF
-      </button>
     </header>
   );
 }

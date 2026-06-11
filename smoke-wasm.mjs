@@ -88,7 +88,7 @@ const bbox = Array.from(model.bbox());
 assert(Math.abs(bbox[3] - 40) < 1e-4, "bbox hi.x = 40");
 
 const sel = patchSelector(model);
-model.set_material(2000, 0.3, 1.24, 50);
+model.set_material(2000, 0.3, 1.24, 50, 35);
 model.set_resolution(50000);
 
 // Under-constrained: force only.
@@ -211,6 +211,33 @@ model.add_force(sel(0, "max"), 0, 0, -5);
   assert(sfPrintedMin < sfSolidMin,
     `printed min SF below solid's (${sfPrintedMin.toFixed(1)} < ${sfSolidMin.toFixed(1)})`);
 
+  // Anisotropic strength: sf = elementwise worst of material (sigma_vM vs
+  // sigma_t) and layer adhesion (tension sigma_zz vs sigma_t_z).
+  const sfm = model.result_field("sfm");
+  const sfz = model.result_field("sfz");
+  let worstOk = sfm.length === sfPrinted.length && sfz.length === sfPrinted.length;
+  for (let i = 0; worstOk && i < sfPrinted.length; i++) {
+    if (Math.abs(sfPrinted[i] - Math.min(sfm[i], sfz[i])) > 1e-3) worstOk = false;
+  }
+  assert(worstOk, "sf = elementwise min(sfm, sfz)");
+  assert(fmin(sfm) >= sfPrintedMin - 1e-6 && fmin(sfz) >= sfPrintedMin - 1e-6,
+    `worst SF is the most conservative (m ${fmin(sfm).toFixed(1)}, z ${fmin(sfz).toFixed(1)}, worst ${sfPrintedMin.toFixed(1)})`);
+
+  // Voxel mesh with skin mask + voxel-true section cut.
+  const full = model.voxel_mesh_cut(false, 0, 0, 0, 0, 0.9);
+  const fullPos = full[0], fullSkin = full[1], fullEdges = full[2];
+  assert(fullPos.length > 0 && fullPos.length % 9 === 0, "voxel mesh positions (9 floats/tri)");
+  assert(fullSkin.length === fullPos.length / 3, "skin mask one value per vertex");
+  assert(fullEdges.length > 0 && fullEdges.length % 6 === 0, "voxel mesh edges");
+  assert(fullSkin.every((v) => v > 0.5), "uncut hull shows only skin cells (all faces touch the surface)");
+  // Drop the half with x > 20 (three.js plane convention: keep n·p + c >= 0).
+  const cutArr = model.voxel_mesh_cut(true, -1, 0, 0, 20, 0.9);
+  const cutPos = cutArr[0], cutSkin = cutArr[1];
+  assert(cutPos.length > 0 && cutPos.length < fullPos.length, "cut mesh is a strict subset");
+  const interiorShare = cutSkin.reduce((a, v) => a + (v < 0.5 ? 1 : 0), 0) / cutSkin.length;
+  assert(interiorShare > 0.02,
+    `voxel cut exposes interior cells (${(100 * interiorShare).toFixed(1)}% of cut-mesh vertices)`);
+
   model.set_snap_wall(0); // back to nominal sizing for the remaining sections
 }
 console.log("ok: as-printed verify (snap + skin/infill solve + SF)");
@@ -224,7 +251,7 @@ assert(model.patch_count() === 6, "resegment at 60 deg still 6 patches");
 const optModel = new Model(boxStl([0, 0, 0], [60, 12, 12]), "beam2");
 const optTri = optModel.triangle_count();
 const osel = patchSelector(optModel);
-optModel.set_material(2400, 0.35, 1.24, 50);
+optModel.set_material(2400, 0.35, 1.24, 50, 35);
 optModel.set_resolution(60000);
 optModel.add_fixed(osel(0, "min"));
 optModel.add_force(osel(0, "max"), 0, 0, -40);
@@ -332,7 +359,7 @@ assert(reimported.triangle_count() >= 12, "exported 3MF re-imports (part wins by
 // Smaller grid for speed: the point is the pipeline, not the physics here.
 const binModel = new Model(boxStl([0, 0, 0], [60, 12, 12]), "beam3");
 const bsel = patchSelector(binModel);
-binModel.set_material(2400, 0.35, 1.24, 50);
+binModel.set_material(2400, 0.35, 1.24, 50, 35);
 binModel.set_resolution(25000);
 binModel.add_fixed(bsel(0, "min"));
 binModel.add_force(bsel(0, "max"), 0, 0, -40);
@@ -373,7 +400,7 @@ console.log("ok: binary mode pipeline (optimize + export)");
 // at less mass than that reference.
 const matchModel = new Model(boxStl([0, 0, 0], [60, 12, 12]), "beam4");
 const msel = patchSelector(matchModel);
-matchModel.set_material(2400, 0.35, 1.24, 50);
+matchModel.set_material(2400, 0.35, 1.24, 50, 35);
 matchModel.set_resolution(25000);
 matchModel.add_fixed(msel(0, "min"));
 matchModel.add_force(msel(0, "max"), 0, 0, -40);

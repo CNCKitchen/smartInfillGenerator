@@ -55,7 +55,13 @@ function PrintedResults() {
       <div className="dro hero">
         <div className="dro-label">
           <span>Min safety factor</span>
-          <span>σₜ {s.material.strength} MPa</span>
+          <span>
+            {p.sfGoverns === "layer"
+              ? `layer adhesion governs · σₜᶻ ${s.material.strengthZ} MPa`
+              : p.sfGoverns === "material"
+                ? `material governs · σₜ ${s.material.strength} MPa`
+                : `σₜ ${s.material.strength} / σₜᶻ ${s.material.strengthZ} MPa`}
+          </span>
         </div>
         <div className="dro-window">
           <b>{p.minSf !== null ? p.minSf.toFixed(2) : "—"}</b>
@@ -84,7 +90,7 @@ function PrintedResults() {
       </div>
       <div className="kv">
         <span>Advisory</span>
-        <b>isotropic · no layer adhesion</b>
+        <b>homogenized infill · static linear</b>
       </div>
       {p.skinLayers === 1 && (
         <div className="warnrow">

@@ -32,6 +32,9 @@ export interface SceneCallbacks {
   onBrush?: (tris: Uint32Array, erase: boolean) => void;
   /** Viewer picked a new deformation autoscale (display exaggeration base). */
   onAutoScale?: (autoScale: number) => void;
+  /** Section plane changed (three.js convention: kept side is
+   *  normal·p + constant ≥ 0) — the mesh view recuts its voxels from this. */
+  onSectionMoved?: (normal: [number, number, number], constant: number) => void;
 }
 
 export class SceneManager {
@@ -126,6 +129,11 @@ export class SceneManager {
   private sectionQuadDisposables: { dispose(): void }[] = [];
   private capPart: THREE.Object3D[] = [];
   private capVoxel: THREE.Object3D[] = [];
+  /** Per-vertex skin mask of the current voxel hull (1 = skin cell). */
+  private voxelSkin: Float32Array | null = null;
+  private meshSkinTint = false;
+  /** The voxel hull already carries the section cut in its geometry. */
+  private voxelCutActive = false;
   private capDisposables: { dispose(): void }[] = [];
 
   // Colormaps are sampled per-fragment from 1D LUT textures via the uv
@@ -656,16 +664,19 @@ export class SceneManager {
     if (!on) this.applyPositions(); // restore full deflection
   }
 
-  setVoxelMesh(hull: Float32Array | null, edges: Float32Array | null) {
+  setVoxelMesh(hull: Float32Array | null, edges: Float32Array | null, skin?: Float32Array | null) {
     for (const d of this.voxelDisposables) d.dispose();
     this.voxelDisposables = [];
     this.voxelGroup.clear();
+    this.voxelSkin = skin ?? null;
     if (hull && hull.length) {
       const geo = new THREE.BufferGeometry();
       geo.setAttribute("position", new THREE.BufferAttribute(hull, 3));
+      geo.setAttribute("color", new THREE.BufferAttribute(new Float32Array(hull.length), 3));
       geo.computeVertexNormals(); // soup → flat per-face normals
       const mat = new THREE.MeshStandardMaterial({
-        color: 0x7e8b99,
+        color: 0xffffff, // actual color lives in the vertex attribute
+        vertexColors: true,
         roughness: 0.85,
         metalness: 0.05,
         flatShading: true,
@@ -676,6 +687,7 @@ export class SceneManager {
       });
       this.voxelDisposables.push(geo, mat);
       this.voxelGroup.add(new THREE.Mesh(geo, mat));
+      this.applyMeshTint();
     }
     if (edges && edges.length) {
       const geo = new THREE.BufferGeometry();
@@ -687,6 +699,41 @@ export class SceneManager {
     if (this.sectionTranslate) this.rebuildCapGroups();
     this.refreshClipping();
     this.refreshView();
+  }
+
+  /** Tint the skin cells (within wall thickness) in the mesh view. */
+  setMeshSkinTint(on: boolean) {
+    this.meshSkinTint = on;
+    this.applyMeshTint();
+  }
+
+  /** Voxel-true section active: the cut lives in the geometry, so the voxel
+   *  group must NOT also be plane-clipped (and its stencil cap hides). */
+  setVoxelCutActive(on: boolean) {
+    if (this.voxelCutActive === on) return;
+    this.voxelCutActive = on;
+    this.refreshClipping();
+    this.updateSectionVisibility();
+  }
+
+  private applyMeshTint() {
+    const hullMesh = this.voxelGroup.children.find(
+      (c): c is THREE.Mesh => c instanceof THREE.Mesh
+    );
+    if (!hullMesh) return;
+    const colors = hullMesh.geometry.getAttribute("color") as THREE.BufferAttribute | undefined;
+    if (!colors) return;
+    const arr = colors.array as Float32Array;
+    const skin = this.voxelSkin;
+    // base 0x7e8b99; skin tint: Werkbank orange family, kept light enough
+    // that the cell edges stay readable.
+    for (let v = 0; v < arr.length / 3; v++) {
+      const isSkin = this.meshSkinTint && !!skin && skin[v] > 0.5;
+      arr[3 * v] = isSkin ? 0.851 : 0.494;
+      arr[3 * v + 1] = isSkin ? 0.486 : 0.545;
+      arr[3 * v + 2] = isSkin ? 0.165 : 0.6;
+    }
+    colors.needsUpdate = true;
   }
 
   /** Live optimization skeleton or density-threshold cutaway mesh. When a
@@ -822,6 +869,7 @@ export class SceneManager {
     if (on) this.ensureSectionObjects();
     this.refreshClipping();
     this.refreshView();
+    if (on) this.emitSectionMoved(); // mesh view recuts from the plane
   }
 
   flipSection() {
@@ -917,6 +965,12 @@ export class SceneManager {
         cap.quaternion.copy(this.sectionProxy.quaternion);
       }
     }
+    this.emitSectionMoved();
+  }
+
+  private emitSectionMoved() {
+    const p = this.sectionPlane;
+    this.callbacks.onSectionMoved?.([p.normal.x, p.normal.y, p.normal.z], p.constant);
   }
 
   /** Stencil-buffer cap (three.js clipping_stencil technique): back faces of
@@ -997,21 +1051,26 @@ export class SceneManager {
   /** Push/remove the clipping plane on every content material. */
   private refreshClipping() {
     const planes = this.sectionOn ? [this.sectionPlane] : null;
-    const apply = (mat: THREE.Material | THREE.Material[] | undefined) => {
+    // The voxel hull never plane-clips while it carries a voxel-true cut.
+    const voxelPlanes = this.sectionOn && !this.voxelCutActive ? [this.sectionPlane] : null;
+    const apply = (
+      mat: THREE.Material | THREE.Material[] | undefined,
+      p: THREE.Plane[] | null
+    ) => {
       if (!mat) return;
       for (const m of Array.isArray(mat) ? mat : [mat]) {
         const had = (m.clippingPlanes?.length ?? 0) > 0;
-        const want = !!planes;
+        const want = !!p;
         if (had !== want) {
-          m.clippingPlanes = planes;
+          m.clippingPlanes = p;
           m.needsUpdate = true;
         }
       }
     };
-    apply(this.mesh?.material);
-    for (const c of this.voxelGroup.children) apply((c as THREE.Mesh).material);
-    for (const m of this.regionMeshes) apply(m.material);
-    apply(this.optShapeMesh?.material ?? undefined);
+    apply(this.mesh?.material, planes);
+    for (const c of this.voxelGroup.children) apply((c as THREE.Mesh).material, voxelPlanes);
+    for (const m of this.regionMeshes) apply(m.material, planes);
+    apply(this.optShapeMesh?.material ?? undefined, planes);
   }
 
   private updateSectionVisibility() {
@@ -1027,7 +1086,7 @@ export class SceneManager {
     const mat = this.mesh?.material as THREE.MeshStandardMaterial | undefined;
     const partCap = this.sectionOn && !!this.mesh?.visible && !!mat && !mat.transparent;
     for (const o of this.capPart) o.visible = partCap;
-    const voxCap = this.sectionOn && this.voxelGroup.visible;
+    const voxCap = this.sectionOn && this.voxelGroup.visible && !this.voxelCutActive;
     for (const o of this.capVoxel) o.visible = voxCap;
   }
 

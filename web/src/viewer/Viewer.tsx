@@ -54,6 +54,9 @@ export function Viewer() {
       onAutoScale: (autoScale) => {
         useStore.setState({ autoScale });
       },
+      onSectionMoved: (normal, constant) => {
+        useStore.getState().onSectionPlaneMoved(normal, constant);
+      },
     });
 
     sceneEvents.onModelLoaded = (m) => scene.setModel(m);
@@ -64,7 +67,9 @@ export function Viewer() {
     sceneEvents.onVertexDensity = (d) => scene.setVertexDensity(d);
     sceneEvents.onRegions = (r) => scene.setRegions(r);
     sceneEvents.onViewState = (mode, scale) => scene.setViewState(mode, scale);
-    sceneEvents.onVoxelMesh = (hull, edges) => scene.setVoxelMesh(hull, edges);
+    sceneEvents.onVoxelMesh = (hull, edges, skin) => scene.setVoxelMesh(hull, edges, skin);
+    sceneEvents.onMeshSkinTint = (on) => scene.setMeshSkinTint(on);
+    sceneEvents.onVoxelCutActive = (on) => scene.setVoxelCutActive(on);
     sceneEvents.onAnimateDeformed = (on) => scene.setDeformAnimate(on);
     sceneEvents.onOptShape = (p, i, d) => scene.setOptShape(p, i, d);
     sceneEvents.onRegionVisibility = (vis) => scene.setRegionVisibility(vis);
@@ -230,7 +235,7 @@ function Legend() {
     const effMin = legendMin ?? autoMin;
     const effMax = legendMax ?? autoMax;
     const overridden = legendMin !== null || legendMax !== null;
-    const isSf = resultField === "sf";
+    const isSf = resultField.startsWith("sf");
     const fmt = (v: number) => (isSf ? v.toFixed(2) : isField ? fmtField(v, unit) : fmtDisp(v));
     const hint = unit === "MPa" ? "MPa" : unit === "mm" ? "mm" : isSf ? "factor" : "strain";
     return (
@@ -307,18 +312,51 @@ function Legend() {
     );
   }
   if (viewMode === "mesh" && voxelInfo) {
-    return (
-      <div className="legend">
-        <div className="legendtitle">Analysis mesh</div>
-        <div className="legendnote">
-          {voxelInfo.solid.toLocaleString()} hex cells
-          <br />
-          h = {voxelInfo.h.toFixed(2)} mm
-          <br />
-          {voxelInfo.nx}×{voxelInfo.ny}×{voxelInfo.nz} grid
-        </div>
-      </div>
-    );
+    return <MeshLegend />;
   }
   return null;
+}
+
+/** Mesh-view legend: grid stats + the skin-cell tint toggle. */
+function MeshLegend() {
+  const voxelInfo = useStore((s) => s.voxelInfo)!;
+  const meshSkinTint = useStore((s) => s.meshSkinTint);
+  const setMeshSkinTint = useStore((s) => s.setMeshSkinTint);
+  const sectionOn = useStore((s) => s.sectionOn);
+  const perimeters = useStore((s) => s.perimeters);
+  const lineWidth = useStore((s) => s.lineWidth);
+  return (
+    <div className="legend">
+      <div className="legendtitle">Analysis mesh</div>
+      <div className="legendnote">
+        {voxelInfo.solid.toLocaleString()} hex cells
+        <br />
+        h = {voxelInfo.h.toFixed(2)} mm
+        <br />
+        {voxelInfo.nx}×{voxelInfo.ny}×{voxelInfo.nz} grid
+      </div>
+      <label className="legendcheck">
+        <input
+          type="checkbox"
+          checked={meshSkinTint}
+          onChange={(e) => setMeshSkinTint(e.target.checked)}
+        />
+        <span>color skin cells</span>
+      </label>
+      <div className="legendnote">
+        skin = {(perimeters * lineWidth).toFixed(2)} mm wall
+        {sectionOn ? (
+          <>
+            <br />
+            section hides whole cells — the interior (and the skin thickness) stays inspectable
+          </>
+        ) : (
+          <>
+            <br />
+            turn on Section to look inside
+          </>
+        )}
+      </div>
+    </div>
+  );
 }

@@ -77,16 +77,26 @@ Reference points:
   whose accuracy IS the accuracy of the measured E(ρ) calibration. Voxel size optionally
   snaps to wall/k (`pick_voxel_size`) so the skin is an exact integer number of cell
   layers (`classify_cells` uses layers = round(wall/h)); hard 4M-cell cap, snap abandoned
-  when even k = 1 would exceed it. Stated approximations: nominal skin thickness exact
-  only on flat faces (voxel staircase on curves), ONE isotropic skin thickness (real
-  top/bottom shells are layers × layer height — not modeled separately yet), homogenized
-  infill, no FDM anisotropy. Print properties (perimeters, line width, pattern, infill %)
-  live in step 3 "Properties", shared by verify, optimizer and export — no duplicates.
-- **Materials:** presets PLA, PETG, ABS, ASA (E₀, ν, density, tensile strength σₜ),
-  user-editable. The safety-factor plot (2026-06: σₜ·rel(ρ)/σᵥM per cell, graded infill's
-  allowable scaled with the same Gibson-Ashby factor as its stiffness, inverted colormap
-  so red = critical low) is an ADVISORY readout, never a certified safety factor — FDM
-  anisotropy and layer adhesion are not modeled.
+  when even k = 1 would exceed it. The Mesh view exposes the model: a skin-cell tint
+  (legend checkbox) and a VOXEL-TRUE section — cells on the far side of the plane drop
+  out entirely (`surface_mesh_where`, plane in three.js normal·p + c ≥ 0 convention,
+  recut debounced while the gizmo drags) so the interior cells and the modeled wall
+  thickness are inspectable instead of a hollow planar slice. Stated approximations:
+  nominal skin thickness exact only on flat faces (voxel staircase on curves), ONE
+  isotropic skin thickness (real top/bottom shells are layers × layer height — not
+  modeled separately yet), homogenized infill, stiffness isotropic (strength anisotropy
+  IS modeled via the SF variants). Print properties (perimeters, line width, pattern,
+  infill %) live in step 3 "Properties", shared by verify, optimizer and export — no
+  duplicates.
+- **Materials:** presets PLA, PETG, ABS, ASA (E₀, ν, density, tensile strength σₜ, layer
+  adhesion σₜᶻ), user-editable. Safety factors (2026-06): three fields — "material"
+  (σₜ·rel(ρ)/σᵥM), "layer adhesion" (σₜᶻ·rel(ρ) vs TENSION σzz across the layers, Z-up
+  build direction; compression cannot delaminate → SF 99), and the default "worst case"
+  = per-cell min of both (the results dock states which limit governs). Graded infill's
+  allowables scale with the same Gibson-Ashby factor as its stiffness; inverted colormap,
+  red = critical low. ADVISORY readouts: STRENGTH anisotropy is modeled this way, but
+  stiffness anisotropy and shear-mode delamination are not, and none of it is a certified
+  safety factor.
 - **Project persistence:** single JSON project file (embedded mesh + setup) download/load;
   auto-save to IndexedDB.
 - **Out of scope v1:** assemblies/multi-body, print-orientation anisotropy in the solver,

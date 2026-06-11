@@ -27,8 +27,10 @@ export function SettingsModal() {
 
         <h3>Materials</h3>
         <div className="dim small">
-          E and σₜ (tensile strength, drives the safety-factor plot) in MPa, ρ in g/cm³. Editing
-          the material in use invalidates current results. Saved in this browser.
+          E, σₜ (in-layer tensile strength) and σₜᶻ (layer adhesion — tension across the layers,
+          typically 50–80% of σₜ) in MPa, ρ in g/cm³. The strengths drive the safety-factor
+          plots; the worst-case factor uses whichever limit governs. Editing the material in use
+          invalidates current results. Saved in this browser.
         </div>
         <table className="settingstable">
           <thead>
@@ -38,6 +40,7 @@ export function SettingsModal() {
               <th>ν</th>
               <th>ρ (g/cm³)</th>
               <th>σₜ (MPa)</th>
+              <th>σₜᶻ (MPa)</th>
               <th />
             </tr>
           </thead>
@@ -92,6 +95,16 @@ export function SettingsModal() {
                     step={1}
                     onCommit={(v) =>
                       s.updateMaterial(i, { ...m, strength: Math.max(1, v) })
+                    }
+                  />
+                </td>
+                <td>
+                  <NumInput
+                    value={m.strengthZ}
+                    min={1}
+                    step={1}
+                    onCommit={(v) =>
+                      s.updateMaterial(i, { ...m, strengthZ: Math.max(1, v) })
                     }
                   />
                 </td>

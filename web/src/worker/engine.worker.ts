@@ -12,7 +12,15 @@ const ready = init();
 type Req =
   | { id: number; op: "load"; bytes: ArrayBuffer; name: string }
   | { id: number; op: "resegment"; angle: number }
-  | { id: number; op: "setMaterial"; e0: number; nu: number; density: number; strength: number }
+  | {
+      id: number;
+      op: "setMaterial";
+      e0: number;
+      nu: number;
+      density: number;
+      strength: number;
+      strengthZ: number;
+    }
   | { id: number; op: "setGravity"; on: boolean }
   | { id: number; op: "setResolution"; cells: number }
   | {
@@ -28,6 +36,12 @@ type Req =
     }
   | { id: number; op: "voxelInfo" }
   | { id: number; op: "voxelMesh" }
+  | {
+      id: number;
+      op: "voxelMeshCut";
+      plane: { normal: [number, number, number]; constant: number } | null;
+      wall: number;
+    }
   | { id: number; op: "check" }
   | { id: number; op: "solve" }
   | { id: number; op: "setSnapWall"; wall: number }
@@ -99,7 +113,7 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
         return;
       }
       case "setMaterial":
-        requireModel().set_material(msg.e0, msg.nu, msg.density, msg.strength);
+        requireModel().set_material(msg.e0, msg.nu, msg.density, msg.strength, msg.strengthZ);
         break;
       case "setGravity":
         requireModel().set_gravity(msg.on);
@@ -137,6 +151,27 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
         (self as unknown as Worker).postMessage(
           { id: msg.id, ok: true, data: { hull, edges, info } },
           [hull.buffer, edges.buffer]
+        );
+        return;
+      }
+      case "voxelMeshCut": {
+        const m = requireModel();
+        const p = msg.plane;
+        const arr = m.voxel_mesh_cut(
+          p !== null,
+          p?.normal[0] ?? 0,
+          p?.normal[1] ?? 0,
+          p?.normal[2] ?? 0,
+          p?.constant ?? 0,
+          msg.wall
+        );
+        const hull = arr[0] as Float32Array;
+        const skin = arr[1] as Float32Array;
+        const edges = arr[2] as Float32Array;
+        const info = JSON.parse(m.voxel_info());
+        (self as unknown as Worker).postMessage(
+          { id: msg.id, ok: true, data: { hull, skin, edges, info } },
+          [hull.buffer, skin.buffer, edges.buffer]
         );
         return;
       }
