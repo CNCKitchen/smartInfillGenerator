@@ -328,6 +328,16 @@ fn subdivision_preserves_area_and_respects_cap() {
     // Already-fine mesh passes through unchanged.
     let fine = s.subdivided(10.0, 1_000_000);
     assert_eq!(fine.len(), s.len());
+    // Parent map covers every child and references valid originals; every
+    // original triangle has at least one child.
+    let (s2, parents) = m.subdivided_with_parents(1.0, 1_000_000);
+    assert_eq!(parents.len(), s2.len());
+    assert!(parents.iter().all(|&p| (p as usize) < m.len()));
+    let mut seen = vec![false; m.len()];
+    for &p in &parents {
+        seen[p as usize] = true;
+    }
+    assert!(seen.iter().all(|&b| b), "every original triangle has children");
 }
 
 #[test]

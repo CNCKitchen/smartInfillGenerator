@@ -41,6 +41,11 @@ pub struct Model {
     mesh: TriMesh,
     /// Original tessellation as imported — exported 3MFs carry this one.
     mesh_orig: TriMesh,
+    /// Original-triangle index per working-mesh triangle. Segmentation runs
+    /// on the original mesh and is mapped through this: subdivision creates
+    /// T-junctions along shared edges (neighbors get different n), so
+    /// segmenting the subdivided soup would fragment flat surfaces.
+    parents: Vec<u32>,
     name: String,
     mesh_objects: usize,
     seg: Segmentation,
@@ -59,6 +64,15 @@ fn err(e: impl std::fmt::Display) -> JsValue {
     JsValue::from_str(&e.to_string())
 }
 
+/// Patch ids computed on the original mesh, carried onto the subdivided
+/// working mesh (each child inherits its parent triangle's patch).
+fn remap_segmentation(orig: &Segmentation, parents: &[u32]) -> Segmentation {
+    Segmentation {
+        patch_of_tri: parents.iter().map(|&p| orig.patch_of_tri[p as usize]).collect(),
+        patch_count: orig.patch_count,
+    }
+}
+
 #[wasm_bindgen]
 impl Model {
     /// Parse STL (binary/ASCII) or 3MF (detected by zip magic); segment at 30°.
@@ -72,20 +86,21 @@ impl Model {
         // Refine the display/analysis tessellation: edges capped at ~1/60 of
         // the diagonal so deflection curves are visible on coarse STLs.
         // Dense meshes pass through unchanged (160k-triangle budget).
-        let mesh = match mesh_orig.bounds() {
+        let (mesh, parents) = match mesh_orig.bounds() {
             Some((lo, hi)) => {
                 let diag = ((hi[0] - lo[0]).powi(2)
                     + (hi[1] - lo[1]).powi(2)
                     + (hi[2] - lo[2]).powi(2))
                 .sqrt();
-                mesh_orig.subdivided(diag / 60.0, 160_000)
+                mesh_orig.subdivided_with_parents(diag / 60.0, 160_000)
             }
-            None => mesh_orig.clone(),
+            None => (mesh_orig.clone(), (0..mesh_orig.len() as u32).collect()),
         };
-        let seg = segment(&mesh, 30.0);
+        let seg = remap_segmentation(&segment(&mesh_orig, 30.0), &parents);
         Ok(Model {
             mesh,
             mesh_orig,
+            parents,
             name: name.to_string(),
             mesh_objects,
             seg,
@@ -129,7 +144,8 @@ impl Model {
 
     /// Re-run segmentation with a different crease angle (degrees).
     pub fn resegment(&mut self, angle_deg: f64) {
-        self.seg = segment(&self.mesh, angle_deg.clamp(1.0, 89.0));
+        self.seg =
+            remap_segmentation(&segment(&self.mesh_orig, angle_deg.clamp(1.0, 89.0)), &self.parents);
     }
 
     /// [lox, loy, loz, hix, hiy, hiz] in mm.
@@ -372,7 +388,7 @@ impl Model {
         let coeff = coeff.clamp(0.05, 2.0);
         let perimeters = perimeters.clamp(1, 8);
         let wall_mm = perimeters as f64 * line_width.clamp(0.1, 1.5);
-        let smooth_iters = (smooth_iters as usize).min(30);
+        let smooth_iters = (smooth_iters as usize).min(60);
         let n_bins = (n_bins as usize).clamp(2, 4);
 
         // Assemble + check before burning time.
@@ -562,7 +578,7 @@ impl Model {
     /// the smoothing slider). Affects display AND subsequent exports.
     pub fn resmooth_regions(&mut self, iters: u32) -> Result<(), JsValue> {
         let opt = self.opt.as_mut().ok_or_else(|| err("no optimization result"))?;
-        opt.regions = smooth_regions(&opt.regions_raw, (iters as usize).min(30));
+        opt.regions = smooth_regions(&opt.regions_raw, (iters as usize).min(60));
         Ok(())
     }
 

@@ -26,26 +26,28 @@ export function Sidebar() {
     await s.loadFile(f.name, await f.arrayBuffer());
   };
 
-  // Leaving the supports & loads workspace (clicking another step) or
+  // Leaving the boundary-conditions workspace (clicking another step) or
   // pressing Esc snaps the tool back to plain orbiting so a stray click in
-  // the viewport can't silently edit a selection.
+  // the viewport can't silently edit a selection. Disarm on CLICK (deferred),
+  // not pointerdown: disarming re-renders and shifts the layout between
+  // press and release, which eats the first click on Check/Solve.
   useEffect(() => {
-    const onDown = (e: PointerEvent) => {
+    const onClick = (e: MouseEvent) => {
       const st = useStore.getState();
       if (st.tool === "orbit") return;
       const el = e.target as HTMLElement | null;
       if (!el || el.closest("[data-bcsection]") || el.closest(".viewer")) return;
-      st.setTool("orbit");
+      setTimeout(() => useStore.getState().setTool("orbit"), 0);
     };
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
       const st = useStore.getState();
       if (st.tool !== "orbit") st.setTool("orbit");
     };
-    document.addEventListener("pointerdown", onDown, true);
+    document.addEventListener("click", onClick, true);
     document.addEventListener("keydown", onKey);
     return () => {
-      document.removeEventListener("pointerdown", onDown, true);
+      document.removeEventListener("click", onClick, true);
       document.removeEventListener("keydown", onKey);
     };
   }, []);
@@ -105,7 +107,7 @@ export function Sidebar() {
       {/* ---- supports & loads ---- */}
       {s.model && (
         <section data-bcsection>
-          <header>2 · Supports & loads</header>
+          <header>2 · Boundary conditions</header>
           {s.bcs.map((bc) => (
             <BcRow key={bc.id} bc={bc} />
           ))}
@@ -305,7 +307,7 @@ export function Sidebar() {
             <input
               type="range"
               min={0}
-              max={20}
+              max={40}
               step={1}
               value={s.smoothIters}
               onChange={(e) => s.setSmoothIters(Number(e.target.value))}

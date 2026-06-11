@@ -39,6 +39,14 @@ impl TriMesh {
     /// exist. Total output is capped near `max_tris` by scaling n down, so
     /// already-dense meshes pass through unchanged.
     pub fn subdivided(&self, target_edge: f64, max_tris: usize) -> TriMesh {
+        self.subdivided_with_parents(target_edge, max_tris).0
+    }
+
+    /// Like `subdivided`, additionally returning the ORIGINAL triangle index
+    /// for every output triangle. Needed by anything semantic (segmentation
+    /// patches): neighbors subdivide at different n, so T-junction vertices
+    /// along shared edges do not weld and per-child analysis would fragment.
+    pub fn subdivided_with_parents(&self, target_edge: f64, max_tris: usize) -> (TriMesh, Vec<u32>) {
         let target = target_edge.max(1e-9);
         let mut ns: Vec<usize> = Vec::with_capacity(self.tris.len());
         let mut total: usize = 0;
@@ -63,9 +71,12 @@ impl TriMesh {
             }
         }
         let mut out: Vec<[f32; 9]> = Vec::new();
-        for (t, &n) in self.tris.iter().zip(&ns) {
+        let mut parents: Vec<u32> = Vec::new();
+        for (ti, (t, &n)) in self.tris.iter().zip(&ns).enumerate() {
+            let before = out.len();
             if n <= 1 {
                 out.push(*t);
+                parents.push(ti as u32);
                 continue;
             }
             let p = |k: usize| [t[3 * k] as f64, t[3 * k + 1] as f64, t[3 * k + 2] as f64];
@@ -93,8 +104,11 @@ impl TriMesh {
                     }
                 }
             }
+            for _ in before..out.len() {
+                parents.push(ti as u32);
+            }
         }
-        TriMesh::from_triangles(out)
+        (TriMesh::from_triangles(out), parents)
     }
 
     pub fn len(&self) -> usize {

@@ -241,7 +241,7 @@ export const useStore = create<AppState>((set, get) => ({
   pattern: "gyroid",
   perimeters: 2,
   lineWidth: 0.45,
-  smoothIters: 8,
+  smoothIters: 15,
   nBins: 3,
   busy: null,
   error: null,
@@ -460,7 +460,7 @@ export const useStore = create<AppState>((set, get) => ({
     set({ lineWidth: Math.min(1.5, Math.max(0.1, v)) });
   },
   setSmoothIters(v) {
-    const iters = Math.min(20, Math.max(0, Math.round(v)));
+    const iters = Math.min(40, Math.max(0, Math.round(v)));
     set({ smoothIters: iters });
     // Live re-smooth of an existing result (also affects later exports).
     if (!get().optSummary) return;
@@ -586,7 +586,7 @@ export const useStore = create<AppState>((set, get) => ({
         optSummary: out.summary,
         optProgress: null,
         busy: null,
-        viewMode: "infill",
+        viewMode: "density",
         stats: {
           iterations: out.summary.iterations,
           relResidual: 0,
@@ -596,7 +596,6 @@ export const useStore = create<AppState>((set, get) => ({
         hasResult: true,
         regionInfos: out.regions.map((r) => ({ density: r.density })),
         regionVisible: vis,
-        densityThreshold: 0,
       });
       sceneEvents.onOptShape?.(null, null);
       sceneEvents.onVertexDensity?.(out.vertexDensity);
@@ -605,7 +604,10 @@ export const useStore = create<AppState>((set, get) => ({
       });
       sceneEvents.onRegions?.(out.regions);
       sceneEvents.onRegionVisibility?.(vis);
-      sceneEvents.onViewState?.("infill", get().deformScale);
+      // Land in the density view with a 25% cutaway by default — the
+      // interior structure is the result, not the painted surface.
+      sceneEvents.onViewState?.("density", get().deformScale);
+      get().setDensityThreshold(25);
     } catch (e) {
       sceneEvents.onOptShape?.(null, null);
       set({ busy: null, optProgress: null, error: e instanceof Error ? e.message : String(e) });

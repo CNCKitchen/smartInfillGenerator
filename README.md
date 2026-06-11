@@ -24,11 +24,12 @@ Workflow in the app:
    original mesh. Adjust the surface-detection angle if patches come out too
    coarse/fine. An axis gizmo (bottom-right) shows the orientation; supports
    are marked with classic FEA triangles. Parallel projection throughout.
-2. **Supports & loads** — add Fixed / Slide / Force / Pressure conditions,
-   then arm **Pick surface** or **Brush** (below the condition list) to
-   assign surfaces to the highlighted one. Orbiting is always active; Esc or
-   clicking another step disarms the tool. (Self-weight exists in the engine
-   but is hidden in the UI — negligible for desktop plastic prints.)
+2. **Boundary conditions** — add Fixed / Slide / Force / Pressure
+   conditions, then arm **Pick surface** or **Brush** (below the condition
+   list) to assign surfaces to the highlighted one. Orbiting is always
+   active; Esc or clicking another step disarms the tool. (Self-weight
+   exists in the engine but is hidden in the UI — negligible for desktop
+   plastic prints.)
 3. **Material & analysis** — material presets (editable in ⚙ Settings,
    persisted per browser), resolution (Preview recommended for the first
    pass). The `Mesh` view shows the actual voxel mesh the solver runs on.
@@ -42,9 +43,9 @@ Workflow in the app:
    shape is shown live each iteration; the loop stops on a design-stationarity
    criterion (iteration cap is only a safety net). The card reports mass,
    stiffness vs solid, and the gain over uniform infill at equal mass.
-   Afterwards the Density view has a cutaway slider (show only material
-   denser than a threshold) and the Regions view a per-region visibility
-   list.
+   The run lands in the Density view with a 25% cutaway by default; the
+   slider sweeps the threshold, and the Regions view has a per-region
+   visibility list.
 6. **Export** — `.3mf` project (part + nested modifier volumes with
    `sparse_infill_density` set, base density on the object — densities are
    the ONLY override; walls/shells inherit from your profile) for
