@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
 
 import { useStore } from "../store";
+import { NumInput } from "./NumInput";
 import type { PatternKey } from "../types";
 
 const PATTERN_LABEL: Record<PatternKey, string> = {
@@ -49,39 +50,36 @@ export function SettingsModal() {
                   />
                 </td>
                 <td>
-                  <input
-                    type="number"
+                  <NumInput
                     value={m.e0}
                     min={10}
                     step={50}
-                    onChange={(e) =>
-                      s.updateMaterial(i, { ...m, e0: Math.max(10, Number(e.target.value)) })
+                    onCommit={(v) =>
+                      s.updateMaterial(i, { ...m, e0: Math.max(10, v) })
                     }
                   />
                 </td>
                 <td>
-                  <input
-                    type="number"
+                  <NumInput
                     value={m.nu}
                     min={0}
                     max={0.49}
                     step={0.01}
-                    onChange={(e) =>
+                    onCommit={(v) =>
                       s.updateMaterial(i, {
                         ...m,
-                        nu: Math.min(0.49, Math.max(0, Number(e.target.value))),
+                        nu: Math.min(0.49, Math.max(0, v)),
                       })
                     }
                   />
                 </td>
                 <td>
-                  <input
-                    type="number"
+                  <NumInput
                     value={m.density}
                     min={0.1}
                     step={0.01}
-                    onChange={(e) =>
-                      s.updateMaterial(i, { ...m, density: Math.max(0.1, Number(e.target.value)) })
+                    onCommit={(v) =>
+                      s.updateMaterial(i, { ...m, density: Math.max(0.1, v) })
                     }
                   />
                 </td>
@@ -127,31 +125,29 @@ export function SettingsModal() {
                 <tr key={p}>
                   <td>{PATTERN_LABEL[p]}</td>
                   <td>
-                    <input
-                      type="number"
+                    <NumInput
                       value={c.coeff}
                       min={0.05}
                       max={2}
                       step={0.05}
-                      onChange={(e) =>
+                      onCommit={(v) =>
                         s.setCurve(p, {
                           ...c,
-                          coeff: Math.min(2, Math.max(0.05, Number(e.target.value))),
+                          coeff: Math.min(2, Math.max(0.05, v)),
                         })
                       }
                     />
                   </td>
                   <td>
-                    <input
-                      type="number"
+                    <NumInput
                       value={c.exponent}
                       min={1}
                       max={3.5}
                       step={0.05}
-                      onChange={(e) =>
+                      onCommit={(v) =>
                         s.setCurve(p, {
                           ...c,
-                          exponent: Math.min(3.5, Math.max(1, Number(e.target.value))),
+                          exponent: Math.min(3.5, Math.max(1, v)),
                         })
                       }
                     />

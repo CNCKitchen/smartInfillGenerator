@@ -5,7 +5,7 @@
 //! region extraction, 3MF export/import roundtrips (incl. the reference
 //! Cube.3mf sample from OrcaSlicer/Bambu Studio).
 
-use sig_core::attach::{assemble, BcKind, BcSpec};
+use sig_core::attach::{assemble, check_problem, BcKind, BcSpec};
 use sig_core::bins::{
     assign_bins, cleanup_small_regions, cluster_densities, extract_region, taubin_smooth,
     RegionMesh,
@@ -474,6 +474,49 @@ fn displacement_sampling_ignores_inactive_nodes() {
     assert!((sol.sample_displacement([1.5, 1.5, 2.1])[0] - 2.0).abs() < 1e-9);
     // Deep in the void: nearest-active fallback, not a stuck zero.
     assert!((sol.sample_displacement([3.9, 3.9, 3.9])[0] - 2.0).abs() < 1e-9);
+}
+
+#[test]
+fn elastic_foundation_settles_by_sigma_over_k() {
+    use sig_core::solve::solve_nodes;
+    // 10x10x20 mm column standing on an elastic (Winkler) foundation, uniform
+    // pressure on top: the base must settle by u = sigma/k and the top adds
+    // the column's own elastic shortening sigma*L/E. Validates the area-
+    // consistent spring assembly AND the springs-only (no Dirichlet) path.
+    let col = primitives::boxx([0.0; 3], [10.0, 10.0, 20.0]);
+    let grid0 = VoxelGrid::voxelize(&col, 1.0);
+    // nu = 0 keeps the column uniaxial (no Poisson barreling) for a clean
+    // analytic reference.
+    let settings = SolveSettings { e0: 2000.0, nu: 0.0, tol: 1e-7, ..Default::default() };
+    let (grid, levels) = pad_for_levels(&grid0, settings.max_levels);
+    let k = 10.0; // N/mm^3 bedding modulus
+    let sigma = 0.5; // MPa on the top face, pushing down
+    let bcs = vec![
+        BcSpec { kind: BcKind::Elastic(k), tris: face_tris(4) }, // -z face
+        BcSpec { kind: BcKind::Pressure(sigma), tris: face_tris(5) }, // +z face
+    ];
+    let asm = assemble(&col, &grid, &bcs, None, &settings).unwrap();
+    let report = check_problem(&grid, &asm);
+    assert!(report.ok, "elastic springs alone must constrain all rigid-body modes");
+    let sol = solve_nodes(&grid, levels, &asm.problem, &settings).expect("solve");
+    assert!(sol.converged);
+
+    let settle = sigma / k; // 0.05 mm foundation compression
+    let u_base = sol.sample_displacement([5.0, 5.0, 0.0]);
+    assert!(
+        (u_base[2] + settle).abs() < 0.08 * settle,
+        "base settles by sigma/k: got {} expected {}",
+        u_base[2],
+        -settle
+    );
+    let shorten = sigma * 20.0 / settings.e0; // 0.005 mm elastic shortening
+    let u_top = sol.sample_displacement([5.0, 5.0, 20.0]);
+    assert!(
+        (u_top[2] + settle + shorten).abs() < 0.08 * (settle + shorten),
+        "top = settle + shortening: got {} expected {}",
+        u_top[2],
+        -(settle + shorten)
+    );
 }
 
 #[test]

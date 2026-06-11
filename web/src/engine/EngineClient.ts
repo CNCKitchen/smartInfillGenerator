@@ -80,6 +80,7 @@ export class EngineClient {
       tris: new Uint32Array(bc.tris),
       force: bc.force,
       pressure: bc.pressure,
+      stiffness: bc.stiffness,
     }));
     return this.call(
       { op: "setBcs", bcs: payload },

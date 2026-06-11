@@ -19,6 +19,7 @@ const HOVER_TINT = new THREE.Color(0xffb224);
 const BC_COLORS: Record<string, THREE.Color> = {
   fixed: new THREE.Color(0x3b82f6),
   frictionless: new THREE.Color(0x22d3ee),
+  elastic: new THREE.Color(0x34d399),
   force: new THREE.Color(0xef4444),
   pressure: new THREE.Color(0xf59e0b),
 };
@@ -366,7 +367,7 @@ export class SceneManager {
         );
         this.markerDisposables.push(arrow);
         this.bcMarkers.add(arrow);
-      } else if (bc.kind === "fixed" || bc.kind === "frictionless") {
+      } else if (bc.kind === "fixed" || bc.kind === "frictionless" || bc.kind === "elastic") {
         this.buildSupportGlyphs(bc);
       }
     }
@@ -430,10 +431,27 @@ export class SceneManager {
       plateGeo = new THREE.CylinderGeometry(rCone * 1.25, rCone * 1.25, rCone * 0.18, 16);
       this.markerDisposables.push(plateGeo);
     }
+    // Elastic: the textbook spring symbol — a coil between surface and cone.
+    let coilGeo: THREE.TubeGeometry | null = null;
+    const coilH = 0.55 * hCone;
+    if (bc.kind === "elastic") {
+      const turns = 3.5;
+      const coilR = rCone * 0.45;
+      const pts: THREE.Vector3[] = [];
+      for (let i = 0; i <= 40; i++) {
+        const t = i / 40;
+        const ang = t * turns * Math.PI * 2;
+        pts.push(new THREE.Vector3(Math.cos(ang) * coilR, t * coilH, Math.sin(ang) * coilR));
+      }
+      coilGeo = new THREE.TubeGeometry(new THREE.CatmullRomCurve3(pts), 60, coilR * 0.22, 5, false);
+      this.markerDisposables.push(coilGeo);
+    }
     for (const it of chosen) {
       // Tip touches the surface; body sticks outward along the normal.
       // Frictionless: small gap + plate = "support that can slide".
-      const gap = bc.kind === "frictionless" ? 0.35 * hCone : 0;
+      // Elastic: coil at the surface, cone behind it = "support on a spring".
+      const gap =
+        bc.kind === "frictionless" ? 0.35 * hCone : bc.kind === "elastic" ? coilH : 0;
       const cone = new THREE.Mesh(coneGeo, mat);
       cone.quaternion.setFromUnitVectors(up, it.n.clone().negate());
       cone.position.copy(it.c).addScaledVector(it.n, hCone / 2 + gap);
@@ -443,6 +461,12 @@ export class SceneManager {
         plate.quaternion.setFromUnitVectors(up, it.n);
         plate.position.copy(it.c).addScaledVector(it.n, rCone * 0.12);
         this.bcMarkers.add(plate);
+      }
+      if (coilGeo) {
+        const coil = new THREE.Mesh(coilGeo, mat);
+        coil.quaternion.setFromUnitVectors(up, it.n);
+        coil.position.copy(it.c);
+        this.bcMarkers.add(coil);
       }
     }
   }

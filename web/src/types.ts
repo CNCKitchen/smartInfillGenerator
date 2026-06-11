@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
 
-export type BcKind = "fixed" | "frictionless" | "force" | "pressure";
+export type BcKind = "fixed" | "frictionless" | "elastic" | "force" | "pressure";
 
 export interface Bc {
   id: string;
@@ -12,6 +12,8 @@ export interface Bc {
   force?: [number, number, number];
   /** Pressure in MPa (pressure only). */
   pressure?: number;
+  /** Foundation bedding modulus in N/mm³, σ = k·u (elastic only). */
+  stiffness?: number;
 }
 
 export interface RbmMode {

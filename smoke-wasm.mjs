@@ -154,6 +154,19 @@ JSON.parse(model.check());
 JSON.parse(model.solve());
 console.log("ok: frictionless + pressure paths solve");
 
+// Elastic (Winkler) support: springs-only constraint passes the RBM check
+// and solves — no Dirichlet nodes anywhere.
+model.clear_bcs();
+model.add_elastic(sel(2, "min"), 50);
+model.add_force(sel(2, "max"), 0, 0, -5);
+report = JSON.parse(model.check());
+assert(report.ok === true, "elastic springs alone constrain the part");
+{
+  const estats = JSON.parse(model.solve());
+  assert(estats.converged && estats.maxDisplacement > 0, "elastic-support solve converges");
+}
+console.log("ok: elastic foundation path solves");
+
 // Resegmentation.
 model.resegment(60);
 assert(model.patch_count() === 6, "resegment at 60 deg still 6 patches");

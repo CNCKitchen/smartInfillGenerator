@@ -24,12 +24,16 @@ Workflow in the app:
    original mesh. Adjust the surface-detection angle if patches come out too
    coarse/fine. An axis gizmo (bottom-right) shows the orientation; supports
    are marked with classic FEA triangles. Parallel projection throughout.
-2. **Boundary conditions** — add Fixed / Slide / Force / Pressure
+2. **Boundary conditions** — add Fixed / Elastic / Slide / Force / Pressure
    conditions, then arm **Pick surface** or **Brush** (below the condition
    list) to assign surfaces to the highlighted one. Orbiting is always
-   active; Esc or clicking another step disarms the tool. (Self-weight
-   exists in the engine but is hidden in the UI — negligible for desktop
-   plastic prints.)
+   active; Esc or clicking another step disarms the tool. **Elastic** is a
+   Winkler foundation (bedding modulus k in N/mm³, σ = k·u — foam ~0.1,
+   rubber pad ~2, printed-plastic mount ~50–500, bolted steel ≥ 5000):
+   use it instead of Fixed when the real mount is compliant — a rigid
+   Fixed patch artificially stiffens the part and concentrates stress at
+   the patch edges. (Self-weight exists in the engine but is hidden in
+   the UI — negligible for desktop plastic prints.)
 3. **Material & analysis** — material presets (editable in ⚙ Settings,
    persisted per browser), resolution (Preview recommended for the first
    pass). The `Mesh` view shows the actual voxel mesh the solver runs on.

@@ -3,12 +3,14 @@
 
 import { useEffect, useRef } from "react";
 import { useStore, type ViewMode } from "../store";
+import { NumInput } from "./NumInput";
 import { RESULT_FIELDS } from "../types";
 import type { Bc, BcKind, PatternKey } from "../types";
 
 const KIND_LABEL: Record<BcKind, string> = {
   fixed: "Fixed support",
   frictionless: "Frictionless support",
+  elastic: "Elastic support",
   force: "Force",
   pressure: "Pressure",
 };
@@ -16,6 +18,7 @@ const KIND_LABEL: Record<BcKind, string> = {
 const KIND_DOT: Record<BcKind, string> = {
   fixed: "#3b82f6",
   frictionless: "#22d3ee",
+  elastic: "#34d399",
   force: "#ef4444",
   pressure: "#f59e0b",
 };
@@ -118,6 +121,7 @@ export function Sidebar() {
 
           <div className="addrow">
             <button onClick={() => s.addBc("fixed")}>+ Fixed</button>
+            <button onClick={() => s.addBc("elastic")}>+ Elastic</button>
             <button onClick={() => s.addBc("frictionless")}>+ Slide</button>
             <button onClick={() => s.addBc("force")}>+ Force</button>
             <button onClick={() => s.addBc("pressure")}>+ Pressure</button>
@@ -275,24 +279,22 @@ export function Sidebar() {
           <div className="row">
             <label className="row" style={{ flex: 1 }}>
               <span>Perimeters</span>
-              <input
-                type="number"
+              <NumInput
                 value={s.perimeters}
                 step={1}
                 min={1}
                 max={8}
-                onChange={(e) => s.setPerimeters(Number(e.target.value))}
+                onCommit={(v) => s.setPerimeters(v)}
               />
             </label>
             <label className="row">
               <span>Line width</span>
-              <input
-                type="number"
+              <NumInput
                 value={s.lineWidth}
                 step={0.05}
                 min={0.1}
                 max={1.5}
-                onChange={(e) => s.setLineWidth(Number(e.target.value))}
+                onCommit={(v) => s.setLineWidth(v)}
               />
               <span className="dim">mm</span>
             </label>
@@ -615,13 +617,12 @@ function BcRow({ bc }: { bc: Bc }) {
           {(["X", "Y", "Z"] as const).map((axis, i) => (
             <label key={axis}>
               F{axis}
-              <input
-                type="number"
+              <NumInput
                 value={bc.force![i]}
                 step={1}
-                onChange={(e) => {
+                onCommit={(v) => {
                   const f = [...bc.force!] as [number, number, number];
-                  f[i] = Number(e.target.value);
+                  f[i] = v;
                   s.updateBcParams(bc.id, { force: f });
                 }}
               />
@@ -634,14 +635,33 @@ function BcRow({ bc }: { bc: Bc }) {
         <div className="bcparams" onClick={(e) => e.stopPropagation()}>
           <label>
             p
-            <input
-              type="number"
-              value={bc.pressure}
+            <NumInput
+              value={bc.pressure ?? 0}
               step={0.01}
-              onChange={(e) => s.updateBcParams(bc.id, { pressure: Number(e.target.value) })}
+              onCommit={(v) => s.updateBcParams(bc.id, { pressure: v })}
             />
           </label>
           <span className="dim">MPa</span>
+        </div>
+      )}
+      {bc.kind === "elastic" && (
+        <div onClick={(e) => e.stopPropagation()}>
+          <div className="bcparams">
+            <label>
+              k
+              <NumInput
+                value={bc.stiffness ?? 100}
+                step={10}
+                min={0.01}
+                onCommit={(v) => s.updateBcParams(bc.id, { stiffness: Math.max(0.01, v) })}
+              />
+            </label>
+            <span className="dim">N/mm³ foundation stiffness</span>
+          </div>
+          <div className="dim small">
+            σ = k·u at the surface (k ≈ E/t of what's underneath): foam ~0.1, 3 mm rubber pad
+            ~2, printed-plastic mount ~50–500, bolted to steel ≥ 5000 (≈ fixed).
+          </div>
         </div>
       )}
     </div>

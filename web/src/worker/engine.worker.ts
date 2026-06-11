@@ -18,7 +18,13 @@ type Req =
   | {
       id: number;
       op: "setBcs";
-      bcs: { kind: string; tris: Uint32Array; force?: number[]; pressure?: number }[];
+      bcs: {
+        kind: string;
+        tris: Uint32Array;
+        force?: number[];
+        pressure?: number;
+        stiffness?: number;
+      }[];
     }
   | { id: number; op: "voxelInfo" }
   | { id: number; op: "voxelMesh" }
@@ -105,6 +111,7 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
         for (const bc of msg.bcs) {
           if (bc.kind === "fixed") m.add_fixed(bc.tris);
           else if (bc.kind === "frictionless") m.add_frictionless(bc.tris);
+          else if (bc.kind === "elastic") m.add_elastic(bc.tris, bc.stiffness ?? 100);
           else if (bc.kind === "force") {
             const f = bc.force ?? [0, 0, 0];
             m.add_force(bc.tris, f[0], f[1], f[2]);

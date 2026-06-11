@@ -210,6 +210,14 @@ impl Model {
         self.opt = None;
     }
 
+    /// Elastic ("soft") support: Winkler foundation, bedding modulus k in
+    /// N/mm³ (surface pressure per unit displacement, σ = k·u).
+    pub fn add_elastic(&mut self, tris: &[u32], k: f64) {
+        self.bcs.push(BcSpec { kind: BcKind::Elastic(k.clamp(1e-4, 1e7)), tris: tris.to_vec() });
+        self.solution = None;
+        self.opt = None;
+    }
+
     pub fn add_force(&mut self, tris: &[u32], fx: f64, fy: f64, fz: f64) {
         self.bcs.push(BcSpec { kind: BcKind::Force([fx, fy, fz]), tris: tris.to_vec() });
         self.solution = None;

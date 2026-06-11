@@ -144,7 +144,7 @@ interface AppState {
   removeBc(id: string): void;
   setActiveBc(id: string | null): void;
   updateBcTris(id: string, tris: Uint32Array): void;
-  updateBcParams(id: string, params: Partial<Pick<Bc, "force" | "pressure">>): void;
+  updateBcParams(id: string, params: Partial<Pick<Bc, "force" | "pressure" | "stiffness">>): void;
   setMaterial(m: Material): void;
   updateMaterial(index: number, m: Material): void;
   addMaterial(): void;
@@ -473,6 +473,8 @@ export const useStore = create<AppState>((set, get) => ({
       tris: new Uint32Array(0),
       force: kind === "force" ? [0, 0, -10] : undefined,
       pressure: kind === "pressure" ? 0.1 : undefined,
+      // ~printed-plastic mount; bolted-to-steel would be >= 5000 (≈ fixed).
+      stiffness: kind === "elastic" ? 100 : undefined,
     };
     set({ bcs: [...get().bcs, bc], activeBcId: bc.id, tool: "select" });
     invalidateResults(set, get);

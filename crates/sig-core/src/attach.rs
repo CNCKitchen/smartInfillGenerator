@@ -23,6 +23,13 @@ const ATTACH_DIST_CELLS: f64 = 0.9;
 pub enum BcKind {
     Fixed,
     Frictionless,
+    /// Elastic ("soft") support: Winkler foundation with bedding modulus k in
+    /// N/mm³ (surface pressure per unit displacement, σ = k·u). Each attached
+    /// node gets three axis springs of k × its tributary selection area —
+    /// a compliant mount instead of a rigid wall, so the part is not
+    /// artificially stiffened and the support-edge stress singularity of a
+    /// Fixed patch is spread out physically.
+    Elastic(f64),
     /// Total force vector (N), split equally over attached nodes.
     Force([f64; 3]),
     /// Pressure (MPa), applied as total force -p * (sum of selected area vectors).
@@ -141,6 +148,26 @@ pub fn assemble(
                 for &n in &nodes {
                     problem.springs.push((n, normal, k));
                     constraints.push(ConstraintDir { pos: node_pos(n), dir: normal });
+                }
+            }
+            BcKind::Elastic(k_found) => {
+                // Consistent Winkler foundation: node spring = modulus times
+                // the node's tributary area of the selection, so the total
+                // foundation stiffness is k * A regardless of resolution.
+                let k_found = k_found.max(0.0);
+                let w = area_weights(mesh, &sel, &nodes, grid);
+                for (i, &n) in nodes.iter().enumerate() {
+                    let k = k_found * w[i];
+                    if k <= 0.0 {
+                        continue;
+                    }
+                    let p = node_pos(n);
+                    for d in 0..3 {
+                        let mut dir = [0f64; 3];
+                        dir[d] = 1.0;
+                        problem.springs.push((n, dir, k));
+                        constraints.push(ConstraintDir { pos: p, dir });
+                    }
                 }
             }
             BcKind::Force(f) => {
