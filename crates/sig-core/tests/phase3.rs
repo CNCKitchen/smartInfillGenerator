@@ -246,6 +246,60 @@ fn bin_placement_ab() {
 }
 
 #[test]
+fn binary_mode_solid_or_floor_beats_uniform() {
+    // Binary (hollow/solid) mode: the optimizer runs with SIMP penalization
+    // p=3 and bounds [0.05, 1.0] so the field converges toward the extremes;
+    // the result is quantized to exactly {floor, solid} with the
+    // mass-constrained assignment and evaluated with the PHYSICAL pattern
+    // law (n=1.5) — which is exact at both endpoints.
+    let beam = primitives::boxx([0.0; 3], [60.0, 10.0, 10.0]);
+    let grid0 = VoxelGrid::voxelize(&beam, 1.0);
+    let settings = SolveSettings { e0: 2400.0, nu: 0.35, tol: 1e-5, ..Default::default() };
+    let (grid, levels) = pad_for_levels(&grid0, settings.max_levels);
+    let bcs = vec![
+        BcSpec { kind: BcKind::Fixed, tris: face_tris(0) },
+        BcSpec { kind: BcKind::Force([0.0, 0.0, -30.0]), tris: face_tris(1) },
+    ];
+    let asm = assemble(&beam, &grid, &bcs, None, &settings).unwrap();
+    let params = OptimizeParams {
+        budget: 0.35,
+        exponent: 3.0, // penalization — optimizer only
+        coeff: 1.0,
+        floor: 0.05,
+        cap: 1.0,
+        wall_mm: 1.0,
+        max_iter: 30,
+        ..Default::default()
+    };
+    let result = optimize(&grid, levels, &asm.problem, &settings, &params, |_p, _x, _c| {})
+        .expect("optimize");
+
+    let two = vec![0.05, 1.0];
+    let target = result.x.iter().sum::<f64>() / result.x.len() as f64;
+    let mut bins = assign_bins_mass(&result.x, &result.se, &two, 1.5, 1.0, target);
+    cleanup_small_regions(&grid, &result.design_cells, &mut bins, two.len(), 30);
+    let x_binned: Vec<f64> = bins.iter().map(|&b| two[b as usize]).collect();
+    assert!(x_binned.iter().all(|&v| v == 0.05 || v == 1.0), "strictly two-level design");
+    assert!(x_binned.iter().any(|&v| v == 1.0), "has solid cells");
+    let mean = x_binned.iter().sum::<f64>() / x_binned.len() as f64;
+    assert!((mean - target).abs() < 0.05, "binned mean {mean:.3} tracks target {target:.3}");
+
+    let (c_binned, _, _) = evaluate(
+        &grid, levels, &asm.problem, &settings, &result.skin_cells, &result.design_cells,
+        &x_binned, 1.5, 1.0, Some(&result.u),
+    )
+    .unwrap();
+    let x_uniform = vec![mean; x_binned.len()];
+    let (c_uniform, _, _) = evaluate(
+        &grid, levels, &asm.problem, &settings, &result.skin_cells, &result.design_cells,
+        &x_uniform, 1.5, 1.0, Some(&result.u),
+    )
+    .unwrap();
+    let gain = c_uniform / c_binned;
+    assert!(gain > 1.10, "solid-or-hollow core should clearly beat uniform: {gain:.3}");
+}
+
+#[test]
 fn clustering_recovers_separated_levels() {
     let mut values = Vec::new();
     values.extend(std::iter::repeat(0.12).take(100));
@@ -279,7 +333,7 @@ fn orca_3mf_roundtrips_through_own_zip_and_import() {
         region([3.0; 3], [10.0, 10.0, 7.0], 0.50),
     ];
 
-    let bytes = export_orca_3mf("bracket & arm", &part, &regions, 0.12, 3);
+    let bytes = export_orca_3mf("bracket & arm", &part, &regions, 0.12, 3, None);
 
     // Container structure.
     let entries = read_zip(&bytes).expect("read back own zip");
@@ -311,7 +365,21 @@ fn orca_3mf_roundtrips_through_own_zip_and_import() {
     assert!(cfg.contains("wall_loops\" value=\"3\""), "user perimeter count on the part");
     let object_level = &cfg[..cfg.find("<part").unwrap()];
     assert!(object_level.contains("wall_loops"), "wall_loops at object level, not in a part");
+    assert!(!cfg.contains("internal_solid_infill_pattern"), "no solid pattern unless requested");
     assert!(cfg.contains("bracket &amp; arm"));
+
+    // Binary mode requests a solid-fill pattern — object level only.
+    let bytes2 = export_orca_3mf("p", &part, &regions, 0.05, 2, Some("concentric"));
+    let entries2 = read_zip(&bytes2).unwrap();
+    let cfg2 = entries2
+        .iter()
+        .find(|(n, _)| n == "Metadata/model_settings.config")
+        .map(|(_, d)| String::from_utf8_lossy(d).into_owned())
+        .unwrap();
+    assert_eq!(cfg2.matches("internal_solid_infill_pattern").count(), 1);
+    assert!(cfg2.contains("internal_solid_infill_pattern\" value=\"concentric\""));
+    let obj2 = &cfg2[..cfg2.find("<part").unwrap()];
+    assert!(obj2.contains("internal_solid_infill_pattern"), "solid pattern at object level");
 
     // Geometry comes back via the import path (largest bbox = the part).
     let (mesh, count) = import_3mf(&bytes).expect("import own 3mf");

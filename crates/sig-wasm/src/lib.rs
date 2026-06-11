@@ -37,7 +37,56 @@ struct OptOutput {
     /// Perimeter count the analysis skin assumed — exported as the part-level
     /// wall_loops so the print matches the simulation.
     perimeters: u32,
+    /// Object-level internal_solid_infill_pattern for the export (binary
+    /// mode's rectilinear/concentric solid fill); None = profile default.
+    solid_pattern: Option<String>,
     summary: String,
+}
+
+/// Options for `Model::optimize`, passed as one JSON object from the worker.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct OptimizeOpts {
+    /// Target mean interior infill density in percent.
+    budget_pct: f64,
+    /// Calibrated infill law E/E0 = coeff·ρ^exponent of the chosen pattern —
+    /// used for ALL stiffness evaluation (verification, baselines, stress).
+    exponent: f64,
+    coeff: f64,
+    perimeters: u32,
+    line_width: f64,
+    smooth_iters: u32,
+    n_bins: u32,
+    /// Printable density band in percent. Graded default 10–70.
+    floor_pct: f64,
+    cap_pct: f64,
+    /// Manual level override in percent; None/empty = auto placement.
+    levels_pct: Option<Vec<f64>>,
+    /// Binary (hollow/solid) mode: the OPTIMIZER runs with SIMP penalization
+    /// p = 3 so the field converges toward {floor, 1} before quantization;
+    /// evaluation still uses the calibrated law (exact at both endpoints).
+    binary: bool,
+    /// Solid-fill pattern for the export in binary mode.
+    solid_pattern: Option<String>,
+}
+
+impl Default for OptimizeOpts {
+    fn default() -> Self {
+        Self {
+            budget_pct: 25.0,
+            exponent: 1.5,
+            coeff: 1.0,
+            perimeters: 2,
+            line_width: 0.45,
+            smooth_iters: 15,
+            n_bins: 3,
+            floor_pct: 10.0,
+            cap_pct: 70.0,
+            levels_pct: None,
+            binary: false,
+            solid_pattern: None,
+        }
+    }
 }
 
 #[wasm_bindgen]
@@ -389,37 +438,39 @@ impl Model {
         out
     }
 
-    /// Run the density optimization + binning + verification. `budget_pct`
-    /// is the target mean INFILL density of the interior in percent — the
-    /// number a user compares to a slicer's uniform infill setting (the solid
-    /// skin is on top of it). Progress gets
+    /// Run the density optimization + binning + verification. `opts_json`
+    /// is an OptimizeOpts object; budgetPct is the target mean INFILL
+    /// density of the interior in percent — the number a user compares to a
+    /// slicer's uniform infill setting (the solid skin is on top of it).
+    /// Progress gets
     /// called per iteration with (jsonString, Float32Array vertexDensity,
     /// Float32Array skeletonPositions, Uint32Array skeletonIndices) — the
     /// skeleton is the evolving isosurface of cells denser than 40%.
-    /// Infill law E/E0 = coeff * rho^exponent; skin thickness is
-    /// perimeters * line_width. The perimeter count is also written into the
+    /// The perimeter count is also written into the
     /// exported 3MF as the PART's wall_loops (modifiers never pin walls), so
     /// the print matches the analysis assumption.
-    /// `smooth_iters` = Taubin passes applied to the exported regions.
-    #[allow(clippy::too_many_arguments)]
     pub fn optimize(
         &mut self,
-        budget_pct: f64,
-        exponent: f64,
-        coeff: f64,
-        perimeters: u32,
-        line_width: f64,
-        smooth_iters: u32,
-        n_bins: u32,
+        opts_json: &str,
         progress: &js_sys::Function,
     ) -> Result<String, JsValue> {
         self.ensure_grid()?;
-        let exponent = exponent.clamp(1.0, 3.5);
-        let coeff = coeff.clamp(0.05, 2.0);
-        let perimeters = perimeters.clamp(1, 8);
-        let wall_mm = perimeters as f64 * line_width.clamp(0.1, 1.5);
-        let smooth_iters = (smooth_iters as usize).min(60);
-        let n_bins = (n_bins as usize).clamp(2, 4);
+        let opts: OptimizeOpts = serde_json::from_str(opts_json).map_err(err)?;
+        // Calibrated pattern law: every stiffness EVALUATION uses this.
+        let eval_exp = opts.exponent.clamp(1.0, 3.5);
+        let eval_coeff = opts.coeff.clamp(0.05, 2.0);
+        // Optimizer law: binary mode swaps in SIMP penalization p=3 so the
+        // continuous field converges toward {floor, solid} — quantizing a
+        // physically-graded (n≈1.5) field straight to two levels would
+        // throw away far more.
+        let (opt_exp, opt_coeff) = if opts.binary { (3.0, 1.0) } else { (eval_exp, eval_coeff) };
+        let floor = (opts.floor_pct / 100.0).clamp(0.01, 0.5);
+        let cap = (opts.cap_pct / 100.0).clamp(floor + 0.05, 1.0);
+        let budget_pct = opts.budget_pct;
+        let perimeters = opts.perimeters.clamp(1, 8);
+        let wall_mm = perimeters as f64 * opts.line_width.clamp(0.1, 1.5);
+        let smooth_iters = (opts.smooth_iters as usize).min(60);
+        let n_bins = (opts.n_bins as usize).clamp(2, 4);
 
         // Assemble + check before burning time.
         let (grid, levels) = self.grid.as_ref().unwrap();
@@ -434,8 +485,10 @@ impl Model {
             // Budget = target mean INFILL density of the interior — the
             // engine clamps it to the printable [floor, cap] band.
             budget: (budget_pct / 100.0).clamp(0.01, 1.0),
-            exponent,
-            coeff,
+            exponent: opt_exp,
+            coeff: opt_coeff,
+            floor,
+            cap,
             wall_mm: wall_mm.clamp(0.2, 5.0),
             // Cap is a safety net; the change-based convergence criterion
             // normally stops the loop earlier.
@@ -497,38 +550,48 @@ impl Model {
         .map_err(err)?;
 
         // ---- bins ----
-        // Level placement: floor pinned ("just so it prints"), upper levels
-        // from strain-energy-weighted clustering in stiffness space — the
-        // convex infill law makes dense infill more efficient per gram, so
-        // the load-bearing levels land high. Assignment then re-meets the
-        // mass budget via a bisected first-order compliance/mass tradeoff.
-        let centers = cluster_levels(
-            &result.x, &result.se, n_bins, exponent, coeff, params.floor, params.cap,
-        );
+        // Level placement: manual override (user levels / binary {floor, 1})
+        // when given, otherwise auto — floor pinned ("just so it prints"),
+        // upper levels from strain-energy-weighted clustering in stiffness
+        // space (the convex infill law makes dense infill more efficient
+        // per gram, so the load-bearing levels land high). Assignment then
+        // re-meets the mass budget via the anchored bisection.
+        let centers: Vec<f64> = match &opts.levels_pct {
+            Some(user) if !user.is_empty() => {
+                let mut l: Vec<f64> =
+                    user.iter().map(|&p| (p / 100.0).clamp(0.01, 1.0)).collect();
+                l.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                l.dedup_by(|a, b| (*a - *b).abs() < 0.005);
+                l
+            }
+            _ => cluster_levels(
+                &result.x, &result.se, n_bins, eval_exp, eval_coeff, params.floor, params.cap,
+            ),
+        };
         let target_mean = result.x.iter().sum::<f64>() / result.x.len().max(1) as f64;
         let mut bins =
-            assign_bins_mass(&result.x, &result.se, &centers, exponent, coeff, target_mean);
+            assign_bins_mass(&result.x, &result.se, &centers, eval_exp, eval_coeff, target_mean);
         let min_cells = (result.design_cells.len() / 500).max(30);
         cleanup_small_regions(grid, &result.design_cells, &mut bins, centers.len(), min_cells);
         let x_binned: Vec<f64> = bins.iter().map(|&b| centers[b as usize]).collect();
 
-        // ---- verification + baselines ----
+        // ---- verification + baselines (calibrated pattern law) ----
         let (c_binned, _maxd, u_binned) = evaluate(
             grid, *levels, &asm.problem, &self.settings, &result.skin_cells,
-            &result.design_cells, &x_binned, exponent, coeff, Some(&result.u),
+            &result.design_cells, &x_binned, eval_exp, eval_coeff, Some(&result.u),
         )
         .map_err(err)?;
         let mean_binned = x_binned.iter().sum::<f64>() / x_binned.len().max(1) as f64;
         let x_uniform = vec![mean_binned; x_binned.len()];
         let (c_uniform, _, _) = evaluate(
             grid, *levels, &asm.problem, &self.settings, &result.skin_cells,
-            &result.design_cells, &x_uniform, exponent, coeff, Some(&result.u),
+            &result.design_cells, &x_uniform, eval_exp, eval_coeff, Some(&result.u),
         )
         .map_err(err)?;
         let x_solid = vec![1.0; x_binned.len()];
         let (c_solid, _, _) = evaluate(
             grid, *levels, &asm.problem, &self.settings, &result.skin_cells,
-            &result.design_cells, &x_solid, exponent, coeff, Some(&result.u),
+            &result.design_cells, &x_solid, eval_exp, eval_coeff, Some(&result.u),
         )
         .map_err(err)?;
 
@@ -548,8 +611,8 @@ impl Model {
             &result.skin_cells,
             &result.design_cells,
             &x_binned,
-            exponent,
-            coeff,
+            eval_exp,
+            eval_coeff,
         ));
         self.solution = Some(Solution {
             u: u_binned.iter().map(|&v| v as f32).collect(),
@@ -614,6 +677,7 @@ impl Model {
             "stiffnessVsSolid": c_solid / c_binned,
             "gainVsUniform": c_uniform / c_binned - 1.0,
             "maxDisplacement": max_disp,
+            "binary": opts.binary,
         })
         .to_string();
 
@@ -629,6 +693,7 @@ impl Model {
             design_cells: result.design_cells,
             x_cont: result.x,
             perimeters,
+            solid_pattern: opts.solid_pattern.clone(),
             summary: summary.clone(),
         });
         Ok(summary)
@@ -724,7 +789,14 @@ impl Model {
         let opt = self.opt.as_ref().ok_or_else(|| err("no optimization result — run optimize first"))?;
         let part = weld(&self.mesh_orig);
         let name = if self.name.is_empty() { "part" } else { &self.name };
-        Ok(export_orca_3mf(name, &part, &opt.regions, opt.base_density, opt.perimeters))
+        Ok(export_orca_3mf(
+            name,
+            &part,
+            &opt.regions,
+            opt.base_density,
+            opt.perimeters,
+            opt.solid_pattern.as_deref(),
+        ))
     }
 
     /// Exposed-face hull of the analysis voxel grid (triangle soup, xyz f32).

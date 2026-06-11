@@ -84,16 +84,20 @@ fn region_to_indexed(r: &RegionMesh) -> IndexedMesh {
 /// per density bin above the base. `base_density` (0..1) and `wall_loops`
 /// (the perimeter count the analysis assumed) are written as object-level
 /// overrides so the print matches the simulation without touching the user's
-/// process preset. Modifiers override ONLY the infill density — walls/shells
-/// inherit from the part (a modifier wall key strips/changes perimeters
-/// wherever it touches the surface). Regions must be sorted ascending by
-/// density (slicer modifier order resolves the nesting).
+/// process preset. `solid_pattern` (e.g. "rectilinear" / "concentric"), when
+/// given, sets the object-level internal_solid_infill_pattern — used by the
+/// binary (hollow/solid) mode where the dense regions slice as solid fill.
+/// Modifiers override ONLY the infill density — walls/shells inherit from
+/// the part (a modifier wall key strips/changes perimeters wherever it
+/// touches the surface). Regions must be sorted ascending by density
+/// (slicer modifier order resolves the nesting).
 pub fn export_orca_3mf(
     part_name: &str,
     part: &IndexedMesh,
     regions: &[RegionMesh],
     base_density: f64,
     wall_loops: u32,
+    solid_pattern: Option<&str>,
 ) -> Vec<u8> {
     let n_objects = 1 + regions.len();
 
@@ -162,6 +166,12 @@ pub fn export_orca_3mf(
         (base_density * 100.0).round() as u32
     ));
     cfg.push_str(&format!("    <metadata key=\"wall_loops\" value=\"{wall_loops}\"/>\n"));
+    if let Some(p) = solid_pattern {
+        cfg.push_str(&format!(
+            "    <metadata key=\"internal_solid_infill_pattern\" value=\"{}\"/>\n",
+            xml_escape(p)
+        ));
+    }
     cfg.push_str("    <part id=\"1\" subtype=\"normal_part\">\n");
     cfg.push_str(&format!("      <metadata key=\"name\" value=\"{}\"/>\n", xml_escape(part_name)));
     cfg.push_str("      <metadata key=\"matrix\" value=\"1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1\"/>\n");

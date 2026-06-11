@@ -33,13 +33,8 @@ type Req =
   | {
       id: number;
       op: "optimize";
-      budgetPct: number;
-      exponent: number;
-      coeff: number;
-      perimeters: number;
-      lineWidth: number;
-      smoothIters: number;
-      nBins: number;
+      /** OptimizeOptions object — serialized to JSON for the wasm API. */
+      opts: Record<string, unknown>;
     }
   | { id: number; op: "densityShape"; threshold: number }
   | { id: number; op: "resmooth"; iters: number }
@@ -156,13 +151,7 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
         const t0 = performance.now();
         const summary = JSON.parse(
           m.optimize(
-            msg.budgetPct,
-            msg.exponent,
-            msg.coeff,
-            msg.perimeters,
-            msg.lineWidth,
-            msg.smoothIters,
-            msg.nBins,
+            JSON.stringify(msg.opts),
             (
               json: string,
               density: Float32Array,

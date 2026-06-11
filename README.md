@@ -46,17 +46,25 @@ Workflow in the app:
    plane** (gizmo to move/rotate, Flip, X/Y/Z presets) cuts through any
    view with stencil-filled caps, so the part and the analysis mesh read
    as solid at the cut.
-5. **Optimize infill** — pick an infill budget (the target MEAN interior
-   density, 10–70% — same scale as your slicer's uniform infill setting;
-   walls/shells come on top), pattern (gyroid/cubic/grid — E(ρ) curves
-   editable in ⚙ Settings), perimeters × line width (the solid skin the
-   analysis assumes — the perimeter count is also written into the
-   exported 3MF so the print matches; line width stays profile-controlled),
-   region smoothing, and number of density levels. Levels are auto-placed
-   from the optimized field: the bottom one is pinned at the 10% printability
-   floor ("just so it prints"), the load-bearing ones land high (the convex
-   E(ρ) law makes dense infill stiffer per gram), and the assignment re-meets
-   your mass budget after quantization. The evolving dense-core
+5. **Optimize infill** — choose **Graded** (several discrete densities) or
+   **Binary (hollow/solid)**: in binary mode the interior is either the
+   printability floor (default 5%) or 100% solid — the optimizer runs
+   SIMP-penalized (p=3) so the design converges black/white, the dense
+   regions slice as solid fill (optionally pinned to rectilinear or
+   concentric via object-level `internal_solid_infill_pattern`), and the
+   comparison still uses the calibrated pattern curve. Then pick an infill
+   budget (the target MEAN interior density — same scale as your slicer's
+   uniform infill setting; walls/shells come on top), pattern
+   (gyroid/cubic/grid — E(ρ) curves editable in ⚙ Settings), perimeters ×
+   line width (the solid skin the analysis assumes — the perimeter count is
+   also written into the exported 3MF so the print matches; line width stays
+   profile-controlled), region smoothing, and number of density levels.
+   Levels are auto-placed from the optimized field: the bottom one is pinned
+   at the printability floor ("just so it prints"), the load-bearing ones
+   land high (the convex E(ρ) law makes dense infill stiffer per gram), and
+   the assignment re-meets your mass budget after quantization. Floor, cap,
+   and a fixed manual level list (use the densities you have calibration
+   data for) are editable in ⚙ Settings. The evolving dense-core
    shape is shown live each iteration; the loop stops on a design-stationarity
    criterion (iteration cap is only a safety net). The card reports the
    headline comparison — **"vs X% uniform infill at the same weight: +Y%

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
 
+import { useEffect, useState } from "react";
 import { useStore } from "../store";
 import { NumInput } from "./NumInput";
 import type { PatternKey } from "../types";
@@ -166,7 +167,105 @@ export function SettingsModal() {
           Changed curves apply to the next optimization run. E(ρ) values are relative to the solid
           material; the table shows the resulting stiffness at 20% and 50% infill.
         </div>
+
+        <h3>Density levels</h3>
+        <div className="dim small">
+          The printable band and how the discrete levels are chosen. Floor = "just so it prints"
+          (also the budget slider's minimum); pin the levels manually to match densities you have
+          calibration data for.
+        </div>
+        <div className="row">
+          <label className="row">
+            <span>Floor</span>
+            <NumInput
+              value={s.levelSettings.floorPct}
+              min={5}
+              max={30}
+              step={1}
+              onCommit={(v) => s.updateLevelSettings({ floorPct: Math.min(30, Math.max(5, Math.round(v))) })}
+            />
+            <span className="dim">%</span>
+          </label>
+          <label className="row">
+            <span>Cap</span>
+            <NumInput
+              value={s.levelSettings.capPct}
+              min={40}
+              max={100}
+              step={5}
+              onCommit={(v) => s.updateLevelSettings({ capPct: Math.min(100, Math.max(40, Math.round(v))) })}
+            />
+            <span className="dim">%</span>
+          </label>
+          <label className="row">
+            <span>Binary floor</span>
+            <NumInput
+              value={s.levelSettings.binaryFloorPct}
+              min={3}
+              max={15}
+              step={1}
+              onCommit={(v) =>
+                s.updateLevelSettings({ binaryFloorPct: Math.min(15, Math.max(3, Math.round(v))) })
+              }
+            />
+            <span className="dim">%</span>
+          </label>
+        </div>
+        <div className="row">
+          <label className="row">
+            <span>Placement</span>
+            <select
+              value={s.levelSettings.mode}
+              onChange={(e) =>
+                s.updateLevelSettings({ mode: e.target.value as "auto" | "manual" })
+              }
+            >
+              <option value="auto">Auto (from the optimized field)</option>
+              <option value="manual">Manual list</option>
+            </select>
+          </label>
+          {s.levelSettings.mode === "manual" && <ManualLevelsInput />}
+        </div>
+        <div className="hint">
+          Auto pins the bottom level at the floor and places the load-bearing levels high (dense
+          infill is stiffer per gram). Manual levels still get the mass-true assignment, so the
+          budget is met either way.
+        </div>
       </div>
     </div>
+  );
+}
+
+/** Comma-separated manual level list, parsed/validated on commit. */
+function ManualLevelsInput() {
+  const s = useStore();
+  const [text, setText] = useState(s.levelSettings.manual.join(", "));
+  useEffect(() => {
+    setText(s.levelSettings.manual.join(", "));
+  }, [s.levelSettings.manual]);
+  const commit = () => {
+    const vals = text
+      .split(/[,;\s]+/)
+      .map(Number)
+      .filter((v) => Number.isFinite(v) && v >= 1 && v <= 100)
+      .map(Math.round);
+    const uniq = [...new Set(vals)].sort((a, b) => a - b);
+    if (uniq.length >= 2) s.updateLevelSettings({ manual: uniq });
+    else setText(s.levelSettings.manual.join(", "));
+  };
+  return (
+    <label className="row" style={{ flex: 1 }}>
+      <span>Levels %</span>
+      <input
+        type="text"
+        value={text}
+        placeholder="10, 40, 70"
+        onChange={(e) => setText(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+        }}
+      />
+    </label>
   );
 }

@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
 
 import { useEffect, useRef } from "react";
-import { useStore, type ViewMode } from "../store";
+import { budgetBounds, useStore, type ViewMode } from "../store";
 import { NumInput } from "./NumInput";
 import { RESULT_FIELDS } from "../types";
 import type { Bc, BcKind, PatternKey } from "../types";
@@ -253,20 +253,37 @@ export function Sidebar() {
       {s.model && (
         <section>
           <header>5 · Optimize infill</header>
+          <div className="toolrow">
+            <button
+              className={s.optMode === "graded" ? "on" : ""}
+              onClick={() => s.setOptMode("graded")}
+              title="Several discrete infill densities, placed from the optimized field"
+            >
+              Graded
+            </button>
+            <button
+              className={s.optMode === "binary" ? "on" : ""}
+              onClick={() => s.setOptMode("binary")}
+              title="Hollow or solid: interior is either the printability floor or 100% dense"
+            >
+              Binary (hollow/solid)
+            </button>
+          </div>
           <label className="row">
             <span>Infill budget {s.budget}%</span>
             <input
               type="range"
-              min={10}
-              max={70}
+              min={budgetBounds(s)[0]}
+              max={budgetBounds(s)[1]}
               step={1}
               value={s.budget}
               onChange={(e) => s.setBudget(Number(e.target.value))}
             />
           </label>
           <div className="dim small">
-            Mean infill of the interior — same scale as your slicer's uniform infill %. Walls and
-            shells come on top.
+            {s.optMode === "binary"
+              ? `Mean interior density: cells are either ${s.levelSettings.binaryFloorPct}% (so it prints) or 100% solid. The optimizer runs SIMP-penalized so the design goes black/white.`
+              : "Mean infill of the interior — same scale as your slicer's uniform infill %. Walls and shells come on top."}
           </div>
           <label className="row">
             <span>Infill pattern</span>
@@ -276,6 +293,21 @@ export function Sidebar() {
               <option value="grid">Grid</option>
             </select>
           </label>
+          {s.optMode === "binary" && (
+            <label className="row">
+              <span>Solid fill</span>
+              <select
+                value={s.solidPattern}
+                onChange={(e) =>
+                  s.setSolidPattern(e.target.value as "default" | "rectilinear" | "concentric")
+                }
+              >
+                <option value="default">Profile default</option>
+                <option value="rectilinear">Rectilinear</option>
+                <option value="concentric">Concentric</option>
+              </select>
+            </label>
+          )}
           <div className="row">
             <label className="row" style={{ flex: 1 }}>
               <span>Perimeters</span>
@@ -304,14 +336,22 @@ export function Sidebar() {
               ≈ {(s.perimeters * s.lineWidth).toFixed(2)} mm solid skin — perimeters go into the
               3MF; match the line width to your profile
             </div>
-            <label className="row">
-              <span>Levels</span>
-              <select value={s.nBins} onChange={(e) => s.setNBins(Number(e.target.value))}>
-                <option value={2}>2</option>
-                <option value={3}>3</option>
-                <option value={4}>4</option>
-              </select>
-            </label>
+            {s.optMode === "binary" ? (
+              <span className="dim small">2 levels (hollow/solid)</span>
+            ) : s.levelSettings.mode === "manual" ? (
+              <span className="dim small" title="Manual levels — change in ⚙ Settings">
+                levels {s.levelSettings.manual.join("/")}%
+              </span>
+            ) : (
+              <label className="row">
+                <span>Levels</span>
+                <select value={s.nBins} onChange={(e) => s.setNBins(Number(e.target.value))}>
+                  <option value={2}>2</option>
+                  <option value={3}>3</option>
+                  <option value={4}>4</option>
+                </select>
+              </label>
+            )}
           </div>
           <label className="row">
             <span>Region smoothing {s.smoothIters === 0 ? "off" : `${s.smoothIters}×`}</span>

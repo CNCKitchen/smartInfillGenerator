@@ -190,7 +190,11 @@ const t1 = performance.now();
 const summary = JSON.parse(
   // 35% infill budget (mean interior density); gyroid law E = 1.0*E0*rho^1.5;
   // 2 perimeters x 0.45 mm line width; 8 smoothing passes
-  optModel.optimize(35, 1.5, 1.0, 2, 0.45, 8, 3, (json, density, skelPos, skelIdx, skelDen) => {
+  optModel.optimize(JSON.stringify({
+    budgetPct: 35, exponent: 1.5, coeff: 1.0, perimeters: 2, lineWidth: 0.45,
+    smoothIters: 8, nBins: 3, floorPct: 10, capPct: 70, levelsPct: null,
+    binary: false, solidPattern: null,
+  }), (json, density, skelPos, skelIdx, skelDen) => {
     progressCalls++;
     lastDensityLen = density.length;
     if (skelIdx && skelIdx.length) skelTris = skelIdx.length / 3;
@@ -275,5 +279,44 @@ assert(stlZip.length > 100 && stlZip[0] === 0x50, "STL zip export");
 // Re-import our own 3MF (full circle; re-import subdivides for display again).
 const reimported = new Model(threeMf, "roundtrip");
 assert(reimported.triangle_count() >= 12, "exported 3MF re-imports (part wins by bbox)");
+
+// ---- binary (hollow/solid) mode ----
+// Smaller grid for speed: the point is the pipeline, not the physics here.
+const binModel = new Model(boxStl([0, 0, 0], [60, 12, 12]), "beam3");
+const bsel = patchSelector(binModel);
+binModel.set_material(2400, 0.35, 1.24);
+binModel.set_resolution(25000);
+binModel.add_fixed(bsel(0, "min"));
+binModel.add_force(bsel(0, "max"), 0, 0, -40);
+const t2 = performance.now();
+const binSummary = JSON.parse(
+  binModel.optimize(JSON.stringify({
+    budgetPct: 30, exponent: 1.5, coeff: 1.0, perimeters: 2, lineWidth: 0.45,
+    smoothIters: 4, nBins: 2, floorPct: 5, capPct: 100, levelsPct: [5, 100],
+    binary: true, solidPattern: "concentric",
+  }), () => {})
+);
+console.log(
+  `   binary: ${binSummary.iterations} iters in ${((performance.now() - t2) / 1000).toFixed(1)} s; ` +
+    `bins ${binSummary.bins.map((b) => b.density).join("/")}, ` +
+    `mean ${(binSummary.meanInfill * 100).toFixed(1)}%, vs uniform +${(binSummary.gainVsUniform * 100).toFixed(1)}%`
+);
+assert(binSummary.binary === true, "summary flags binary mode");
+assert(binSummary.bins.length === 2, "binary = exactly two levels");
+assert(Math.abs(binSummary.bins[0].density - 0.05) < 1e-9, "bottom level = 5% printability floor");
+assert(Math.abs(binSummary.bins[1].density - 1.0) < 1e-9, "top level = solid");
+assert(Math.abs(binSummary.meanInfill - 0.3) < 0.05, `binary mean tracks budget (${binSummary.meanInfill})`);
+assert(binSummary.gainVsUniform > 0.0, "binary core beats uniform infill");
+{
+  const binMf = binModel.export_3mf();
+  const raw = new TextDecoder("latin1").decode(binMf);
+  assert(raw.includes('internal_solid_infill_pattern" value="concentric"'),
+    "binary export carries the solid-fill pattern");
+  assert(raw.indexOf("internal_solid_infill_pattern") < raw.indexOf("<part "),
+    "solid pattern at object level");
+  assert(raw.includes('sparse_infill_density" value="100%"'), "solid region modifier at 100%");
+  assert(raw.includes('sparse_infill_density" value="5%"'), "base density 5%");
+}
+console.log("ok: binary mode pipeline (optimize + export)");
 
 console.log("\nALL SMOKE TESTS PASSED");

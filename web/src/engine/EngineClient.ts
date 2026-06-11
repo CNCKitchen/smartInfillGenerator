@@ -101,13 +101,7 @@ export class EngineClient {
   }
 
   optimize(
-    budgetPct: number,
-    exponent: number,
-    coeff: number,
-    perimeters: number,
-    lineWidth: number,
-    smoothIters: number,
-    nBins: number,
+    opts: OptimizeOptions,
     onProgress: (
       p: OptProgress,
       density: Float32Array,
@@ -116,11 +110,7 @@ export class EngineClient {
       skelDensity?: Float32Array
     ) => void
   ): Promise<OptimizeOutput> {
-    return this.call(
-      { op: "optimize", budgetPct, exponent, coeff, perimeters, lineWidth, smoothIters, nBins },
-      [],
-      onProgress as Pending["onProgress"]
-    );
+    return this.call({ op: "optimize", opts }, [], onProgress as Pending["onProgress"]);
   }
 
   /** Exposed-face hull + cell edges of the analysis voxel grid. */
@@ -152,6 +142,28 @@ export class EngineClient {
   exportStls(): Promise<Uint8Array> {
     return this.call({ op: "exportStls" });
   }
+}
+
+/** Mirrors the wasm OptimizeOpts (serialized to JSON in the worker). */
+export interface OptimizeOptions {
+  /** Target mean interior infill density in percent. */
+  budgetPct: number;
+  /** Calibrated pattern law E/E₀ = coeff·ρ^exponent — used for evaluation. */
+  exponent: number;
+  coeff: number;
+  perimeters: number;
+  lineWidth: number;
+  smoothIters: number;
+  nBins: number;
+  /** Printable density band in percent. */
+  floorPct: number;
+  capPct: number;
+  /** Manual level override in percent; null = auto placement. */
+  levelsPct: number[] | null;
+  /** Binary (hollow/solid) mode — optimizer runs SIMP-penalized (p=3). */
+  binary: boolean;
+  /** Object-level internal_solid_infill_pattern for the export. */
+  solidPattern: string | null;
 }
 
 export interface OptProgress {
@@ -196,6 +208,8 @@ export interface OptSummary {
   stiffnessVsSolid: number;
   gainVsUniform: number;
   maxDisplacement: number;
+  /** True when the run was binary (hollow/solid) mode. */
+  binary: boolean;
   seconds: number;
 }
 

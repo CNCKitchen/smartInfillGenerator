@@ -24,9 +24,32 @@ export type ViewMode = "setup" | "mesh" | "deformed" | "density" | "infill";
 
 const SETTINGS_KEY = "sig.settings.v1";
 
+/** Density-level configuration (⚙ Settings, persisted per browser). */
+export interface LevelSettings {
+  /** Printability floor in % — graded mode's pinned bottom level. */
+  floorPct: number;
+  /** Densest allowed graded level in %. */
+  capPct: number;
+  /** Auto = place levels from the optimized field; manual = fixed list. */
+  mode: "auto" | "manual";
+  /** Manual levels in % (used when mode === "manual"). */
+  manual: number[];
+  /** Printability floor for the binary (hollow/solid) mode in %. */
+  binaryFloorPct: number;
+}
+
+const DEFAULT_LEVELS: LevelSettings = {
+  floorPct: 10,
+  capPct: 70,
+  mode: "auto",
+  manual: [10, 40, 70],
+  binaryFloorPct: 5,
+};
+
 interface PersistedSettings {
   materials: Material[];
   curves: Record<PatternKey, PatternCurve>;
+  levels: LevelSettings;
 }
 
 function loadSettings(): PersistedSettings {
@@ -37,6 +60,7 @@ function loadSettings(): PersistedSettings {
       cubic: { ...DEFAULT_CURVES.cubic },
       grid: { ...DEFAULT_CURVES.grid },
     },
+    levels: { ...DEFAULT_LEVELS, manual: [...DEFAULT_LEVELS.manual] },
   };
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
@@ -54,15 +78,46 @@ function loadSettings(): PersistedSettings {
         fallback.curves[k] = { coeff: c.coeff, exponent: c.exponent };
       }
     }
+    const l = p.levels;
+    if (l && typeof l === "object") {
+      if (typeof l.floorPct === "number") fallback.levels.floorPct = clampPct(l.floorPct, 5, 30);
+      if (typeof l.capPct === "number") fallback.levels.capPct = clampPct(l.capPct, 40, 100);
+      if (l.mode === "manual") fallback.levels.mode = "manual";
+      if (Array.isArray(l.manual)) {
+        const m = l.manual.filter((v) => typeof v === "number" && v >= 1 && v <= 100);
+        if (m.length >= 2) fallback.levels.manual = m;
+      }
+      if (typeof l.binaryFloorPct === "number") {
+        fallback.levels.binaryFloorPct = clampPct(l.binaryFloorPct, 3, 15);
+      }
+    }
   } catch {
     // corrupted storage: keep defaults
   }
   return fallback;
 }
 
-function saveSettings(materials: Material[], curves: Record<PatternKey, PatternCurve>) {
+function clampPct(v: number, lo: number, hi: number): number {
+  return Math.min(hi, Math.max(lo, Math.round(v)));
+}
+
+/** Budget slider band of the active optimization mode. */
+export function budgetBounds(s: {
+  optMode: "graded" | "binary";
+  levelSettings: LevelSettings;
+}): [number, number] {
+  return s.optMode === "binary"
+    ? [s.levelSettings.binaryFloorPct, 90]
+    : [s.levelSettings.floorPct, s.levelSettings.capPct];
+}
+
+function saveSettings(
+  materials: Material[],
+  curves: Record<PatternKey, PatternCurve>,
+  levels: LevelSettings
+) {
   try {
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify({ materials, curves }));
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify({ materials, curves, levels }));
   } catch {
     // storage full/blocked: settings just won't persist
   }
@@ -88,12 +143,18 @@ interface AppState {
   curves: Record<PatternKey, PatternCurve>;
   resolution: ResolutionKey;
   // optimization inputs
-  budget: number; // infill budget: target mean interior density in % (10–70)
+  budget: number; // infill budget: target mean interior density in %
   pattern: PatternKey;
   perimeters: number;
   lineWidth: number; // mm
   smoothIters: number; // Taubin passes on modifier regions
   nBins: number;
+  /** Graded densities vs binary (hollow/solid core). */
+  optMode: "graded" | "binary";
+  /** Solid-fill pattern written to the 3MF in binary mode. */
+  solidPattern: "default" | "rectilinear" | "concentric";
+  /** Density-level configuration (persisted with materials/curves). */
+  levelSettings: LevelSettings;
   // run state
   busy: string | null;
   error: string | null;
@@ -160,6 +221,9 @@ interface AppState {
   setLineWidth(v: number): void;
   setSmoothIters(v: number): void;
   setNBins(v: number): void;
+  setOptMode(m: "graded" | "binary"): void;
+  setSolidPattern(p: "default" | "rectilinear" | "concentric"): void;
+  updateLevelSettings(p: Partial<LevelSettings>): void;
   setRegionVisible(index: number, on: boolean): void;
   setDensityThreshold(v: number): void;
   setResultField(kind: string): Promise<void>;
@@ -350,6 +414,9 @@ export const useStore = create<AppState>((set, get) => ({
   lineWidth: 0.45,
   smoothIters: 15,
   nBins: 3,
+  optMode: "graded",
+  solidPattern: "default",
+  levelSettings: initialSettings.levels,
   busy: null,
   error: null,
   notice: null,
@@ -523,7 +590,7 @@ export const useStore = create<AppState>((set, get) => ({
     const wasSelected = mats[index]?.name === get().material.name;
     mats[index] = m;
     set({ materials: mats });
-    saveSettings(mats, get().curves);
+    saveSettings(mats, get().curves, get().levelSettings);
     if (wasSelected) {
       set({ material: m });
       invalidateResults(set, get);
@@ -534,7 +601,7 @@ export const useStore = create<AppState>((set, get) => ({
   addMaterial() {
     const mats = [...get().materials, { name: "Custom", e0: 2000, nu: 0.35, density: 1.2 }];
     set({ materials: mats });
-    saveSettings(mats, get().curves);
+    saveSettings(mats, get().curves, get().levelSettings);
   },
 
   removeMaterial(index) {
@@ -542,14 +609,14 @@ export const useStore = create<AppState>((set, get) => ({
     if (!mats.length) return;
     const removedSelected = get().materials[index]?.name === get().material.name;
     set({ materials: mats });
-    saveSettings(mats, get().curves);
+    saveSettings(mats, get().curves, get().levelSettings);
     if (removedSelected) get().setMaterial(mats[0]);
   },
 
   resetMaterials() {
     const mats = DEFAULT_MATERIALS.map((m) => ({ ...m }));
     set({ materials: mats });
-    saveSettings(mats, get().curves);
+    saveSettings(mats, get().curves, get().levelSettings);
     const sel = mats.find((m) => m.name === get().material.name) ?? mats[0];
     get().setMaterial(sel);
   },
@@ -557,7 +624,7 @@ export const useStore = create<AppState>((set, get) => ({
   setCurve(pattern, c) {
     const curves = { ...get().curves, [pattern]: c };
     set({ curves });
-    saveSettings(get().materials, curves);
+    saveSettings(get().materials, curves, get().levelSettings);
   },
 
   resetCurves() {
@@ -567,7 +634,7 @@ export const useStore = create<AppState>((set, get) => ({
       grid: { ...DEFAULT_CURVES.grid },
     };
     set({ curves });
-    saveSettings(get().materials, curves);
+    saveSettings(get().materials, curves, get().levelSettings);
   },
 
   openSettings(open) {
@@ -582,8 +649,10 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   setBudget(v) {
-    // Infill budget: mean interior density, bounded by the printable band.
-    set({ budget: Math.min(70, Math.max(10, Math.round(v))) });
+    // Infill budget: mean interior density, bounded by the printable band
+    // of the active mode (graded: floor..cap; binary: binary floor..90).
+    const [lo, hi] = budgetBounds(get());
+    set({ budget: Math.min(hi, Math.max(lo, Math.round(v))) });
   },
   setPattern(p) {
     set({ pattern: p });
@@ -615,6 +684,23 @@ export const useStore = create<AppState>((set, get) => ({
   },
   setNBins(v) {
     set({ nBins: v });
+  },
+
+  setOptMode(m) {
+    set({ optMode: m });
+    get().setBudget(get().budget); // re-clamp to the mode's printable band
+  },
+
+  setSolidPattern(p) {
+    set({ solidPattern: p });
+  },
+
+  updateLevelSettings(p) {
+    const levels = { ...get().levelSettings, ...p };
+    if (levels.capPct < levels.floorPct + 10) levels.capPct = levels.floorPct + 10;
+    set({ levelSettings: levels });
+    saveSettings(get().materials, get().curves, levels);
+    get().setBudget(get().budget); // floor/cap moved: re-clamp
   },
 
   setRegionVisible(index, on) {
@@ -753,20 +839,31 @@ export const useStore = create<AppState>((set, get) => ({
       await pushBcs(get);
       await logGridInfo(set);
       const curve = st.curves[st.pattern];
+      const binary = st.optMode === "binary";
+      const ls = st.levelSettings;
+      const manual = !binary && ls.mode === "manual" && ls.manual.length >= 2;
       appendLog(
         set,
-        `Optimize: infill budget ${st.budget}% (${st.pattern}: E/E₀ = ${curve.coeff}·ρ^${curve.exponent}), ` +
-          `skin ${st.perimeters}×${st.lineWidth} mm, ${st.nBins} levels — ` +
-          `convergence when mean |Δρ| < 0.005 twice`
+        `Optimize (${binary ? `binary: ${ls.binaryFloorPct}% or solid` : manual ? `manual levels ${ls.manual.join("/")}%` : "graded, auto levels"}): ` +
+          `infill budget ${st.budget}% (${st.pattern}: E/E₀ = ${curve.coeff}·ρ^${curve.exponent}), ` +
+          `skin ${st.perimeters}×${st.lineWidth} mm — convergence when mean |Δρ| < 0.005 twice` +
+          (binary ? " · optimizer SIMP-penalized p=3" : "")
       );
       const out = await engine.optimize(
-        st.budget,
-        curve.exponent,
-        curve.coeff,
-        st.perimeters,
-        st.lineWidth,
-        st.smoothIters,
-        st.nBins,
+        {
+          budgetPct: st.budget,
+          exponent: curve.exponent,
+          coeff: curve.coeff,
+          perimeters: st.perimeters,
+          lineWidth: st.lineWidth,
+          smoothIters: st.smoothIters,
+          nBins: st.nBins,
+          floorPct: binary ? ls.binaryFloorPct : ls.floorPct,
+          capPct: binary ? 100 : ls.capPct,
+          levelsPct: binary ? [ls.binaryFloorPct, 100] : manual ? ls.manual : null,
+          binary,
+          solidPattern: binary && st.solidPattern !== "default" ? st.solidPattern : null,
+        },
         (p, density, skelPositions, skelIndices, skelDensity) => {
           set((s) => ({
             optProgress: { iteration: p.iteration, maxIter: p.maxIter },
