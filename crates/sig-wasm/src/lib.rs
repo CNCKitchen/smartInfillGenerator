@@ -34,6 +34,9 @@ struct OptOutput {
     /// Continuous (pre-binning) field for the density-threshold isosurface.
     design_cells: Vec<u32>,
     x_cont: Vec<f64>,
+    /// Perimeter count the analysis skin assumed — exported as the part-level
+    /// wall_loops so the print matches the simulation.
+    perimeters: u32,
     summary: String,
 }
 
@@ -380,7 +383,9 @@ impl Model {
     /// Float32Array skeletonPositions, Uint32Array skeletonIndices) — the
     /// skeleton is the evolving isosurface of cells denser than 40%.
     /// Infill law E/E0 = coeff * rho^exponent; skin thickness is
-    /// perimeters * line_width (analysis only — the 3MF never pins walls).
+    /// perimeters * line_width. The perimeter count is also written into the
+    /// exported 3MF as the PART's wall_loops (modifiers never pin walls), so
+    /// the print matches the analysis assumption.
     /// `smooth_iters` = Taubin passes applied to the exported regions.
     #[allow(clippy::too_many_arguments)]
     pub fn optimize(
@@ -592,6 +597,7 @@ impl Model {
             cell_density: field,
             design_cells: result.design_cells,
             x_cont: result.x,
+            perimeters,
             summary: summary.clone(),
         });
         Ok(summary)
@@ -681,12 +687,13 @@ impl Model {
     }
 
     /// Orca/Bambu project 3MF with part + nested modifiers. The part mesh is
-    /// the ORIGINAL import tessellation (display subdivision stays internal).
+    /// the ORIGINAL import tessellation (display subdivision stays internal);
+    /// the part carries the perimeter count the optimization assumed.
     pub fn export_3mf(&self) -> Result<Vec<u8>, JsValue> {
         let opt = self.opt.as_ref().ok_or_else(|| err("no optimization result — run optimize first"))?;
         let part = weld(&self.mesh_orig);
         let name = if self.name.is_empty() { "part" } else { &self.name };
-        Ok(export_orca_3mf(name, &part, &opt.regions, opt.base_density))
+        Ok(export_orca_3mf(name, &part, &opt.regions, opt.base_density, opt.perimeters))
     }
 
     /// Exposed-face hull of the analysis voxel grid (triangle soup, xyz f32).

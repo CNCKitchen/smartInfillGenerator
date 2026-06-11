@@ -8,10 +8,11 @@
 //! 3D/Objects/object_1.model, with per-part settings (modifier_part +
 //! sparse_infill_density) carried in Metadata/model_settings.config.
 //! Deviation from the sample (two rounds of real-Orca testing): modifiers
-//! override ONLY sparse_infill_density — no wall_loops anywhere. The sample's
-//! wall_loops=0 strips perimeters where a modifier touches the surface, and
-//! pinning a count overrides the user's process profile; omitting the key
-//! makes every region inherit the part's own perimeter settings.
+//! override ONLY sparse_infill_density — never wall keys. The sample's
+//! wall_loops=0 strips perimeters where a modifier touches the surface, so
+//! every region must inherit the part's own perimeter settings. The PART
+//! (object level) does carry wall_loops = the perimeter count the user set
+//! in the app, so the print matches the solid skin the analysis assumed.
 //! No project_settings.config is written on purpose: the user's own printer/
 //! filament/process presets stay active when the project opens.
 
@@ -80,17 +81,19 @@ fn region_to_indexed(r: &RegionMesh) -> IndexedMesh {
 }
 
 /// Build the Orca/Bambu project 3MF: the part plus one nested modifier mesh
-/// per density bin above the base. `base_density` (0..1) is written as an
-/// object-level sparse_infill_density override so the lowest bin applies
-/// without touching the user's process preset. Modifiers override ONLY the
-/// infill density — walls/shells inherit from the part's profile (no
-/// wall_loops keys are written). Regions must be sorted ascending by density
-/// (slicer modifier order resolves the nesting).
+/// per density bin above the base. `base_density` (0..1) and `wall_loops`
+/// (the perimeter count the analysis assumed) are written as object-level
+/// overrides so the print matches the simulation without touching the user's
+/// process preset. Modifiers override ONLY the infill density — walls/shells
+/// inherit from the part (a modifier wall key strips/changes perimeters
+/// wherever it touches the surface). Regions must be sorted ascending by
+/// density (slicer modifier order resolves the nesting).
 pub fn export_orca_3mf(
     part_name: &str,
     part: &IndexedMesh,
     regions: &[RegionMesh],
     base_density: f64,
+    wall_loops: u32,
 ) -> Vec<u8> {
     let n_objects = 1 + regions.len();
 
@@ -158,6 +161,7 @@ pub fn export_orca_3mf(
         "    <metadata key=\"sparse_infill_density\" value=\"{}%\"/>\n",
         (base_density * 100.0).round() as u32
     ));
+    cfg.push_str(&format!("    <metadata key=\"wall_loops\" value=\"{wall_loops}\"/>\n"));
     cfg.push_str("    <part id=\"1\" subtype=\"normal_part\">\n");
     cfg.push_str(&format!("      <metadata key=\"name\" value=\"{}\"/>\n", xml_escape(part_name)));
     cfg.push_str("      <metadata key=\"matrix\" value=\"1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1\"/>\n");

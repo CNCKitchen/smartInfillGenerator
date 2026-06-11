@@ -228,11 +228,15 @@ assert(iso[2].length * 3 === iso[0].length, "cutaway carries per-vertex density"
 
 const threeMf = optModel.export_3mf();
 assert(threeMf.length > 500 && threeMf[0] === 0x50 && threeMf[1] === 0x4b, "3MF export is a zip");
-// Modifiers override ONLY the infill density — walls inherit from the part.
+// The part carries the perimeter count from the optimize call (2 above);
+// modifiers override ONLY the infill density — walls inherit from the part.
 {
   const td = new TextDecoder("latin1");
   const raw = td.decode(threeMf);
-  assert(!raw.includes("wall_loops"), "no wall_loops anywhere (inherit from profile)");
+  const hits = raw.split("wall_loops").length - 1;
+  assert(hits === 1, "wall_loops written exactly once (object level)");
+  assert(raw.includes('wall_loops" value="2"'), "wall_loops = perimeters set in optimize");
+  assert(raw.indexOf("wall_loops") < raw.indexOf("<part "), "wall_loops at object level, not in a part");
   assert(raw.includes("sparse_infill_density"), "densities present");
 }
 const stlZip = optModel.export_stls();

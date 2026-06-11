@@ -201,7 +201,7 @@ fn orca_3mf_roundtrips_through_own_zip_and_import() {
         region([3.0; 3], [10.0, 10.0, 7.0], 0.50),
     ];
 
-    let bytes = export_orca_3mf("bracket & arm", &part, &regions, 0.12);
+    let bytes = export_orca_3mf("bracket & arm", &part, &regions, 0.12, 3);
 
     // Container structure.
     let entries = read_zip(&bytes).expect("read back own zip");
@@ -226,10 +226,13 @@ fn orca_3mf_roundtrips_through_own_zip_and_import() {
     assert!(cfg.contains("sparse_infill_density\" value=\"25%\""));
     assert!(cfg.contains("sparse_infill_density\" value=\"50%\""));
     assert!(cfg.contains("sparse_infill_density\" value=\"12%\""), "base density on the object");
-    // Modifiers override ONLY the infill density. No wall_loops anywhere:
-    // 0 strips perimeters where a modifier touches the surface, and a pinned
-    // count would override the user's process profile (real-Orca finding).
-    assert!(!cfg.contains("wall_loops"), "walls must inherit from the part profile");
+    // The PART carries the perimeter count the analysis assumed; modifiers
+    // override ONLY the infill density — a modifier wall key strips/changes
+    // perimeters where it touches the surface (real-Orca finding).
+    assert_eq!(cfg.matches("wall_loops").count(), 1, "wall_loops exactly once");
+    assert!(cfg.contains("wall_loops\" value=\"3\""), "user perimeter count on the part");
+    let object_level = &cfg[..cfg.find("<part").unwrap()];
+    assert!(object_level.contains("wall_loops"), "wall_loops at object level, not in a part");
     assert!(cfg.contains("bracket &amp; arm"));
 
     // Geometry comes back via the import path (largest bbox = the part).

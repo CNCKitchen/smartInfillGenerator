@@ -295,7 +295,8 @@ export function Sidebar() {
           </div>
           <div className="row">
             <div className="dim small" style={{ flex: 1 }}>
-              ≈ {(s.perimeters * s.lineWidth).toFixed(2)} mm solid skin — match your print profile
+              ≈ {(s.perimeters * s.lineWidth).toFixed(2)} mm solid skin — perimeters go into the
+              3MF; match the line width to your profile
             </div>
             <label className="row">
               <span>Levels</span>
