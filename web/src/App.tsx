@@ -3,6 +3,7 @@
 
 import { Sidebar } from "./ui/Sidebar";
 import { SettingsModal } from "./ui/Settings";
+import { NerdLog } from "./ui/NerdLog";
 import { Viewer } from "./viewer/Viewer";
 import { useStore } from "./store";
 
@@ -17,6 +18,7 @@ export function App() {
       <Sidebar />
       <div className="main">
         <Viewer />
+        <NerdLog />
         {busy && (
           <div className="busy">
             <div className="spinner" />

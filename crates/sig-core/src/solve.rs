@@ -191,6 +191,9 @@ pub struct Solution {
     /// False when the iteration cap hit before `tol` — the field is still
     /// the best available approximation (residual reported above).
     pub converged: bool,
+    /// Relative residual per MGCG iteration (element 0 = initial residual).
+    /// Empty for solutions assembled outside solve_nodes (e.g. optimizer).
+    pub residuals: Vec<f32>,
 }
 
 impl Solution {
@@ -390,6 +393,7 @@ pub fn solve_nodes(
         iterations: stats.iterations,
         rel_residual: stats.rel_residual,
         converged: stats.converged,
+        residuals: std::mem::take(&mut solver.last_trace),
     })
 }
 

@@ -42,6 +42,8 @@ export interface SolveStats {
   maxDisplacement: number;
   /** Wall time measured in the worker, seconds. */
   seconds: number;
+  /** Relative residual per MGCG iteration (element 0 = initial residual). */
+  residuals?: number[];
 }
 
 export interface VoxelInfo {

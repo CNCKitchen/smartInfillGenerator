@@ -29,7 +29,7 @@ Reference points:
 | 6 | Under-constraint check | Pre-solve: rank test of the 6 rigid-body modes against the constraint set + connected-component (floating island) check. On failure: **block the run and animate the offending rigid-body motion** so the user sees what's unconstrained. |
 | 7 | Material model | **Walls + infill core.** Boundary voxels get solid-material skin stiffness (wall count × line width; defaults 2 × 0.45 mm, plus top/bottom shells). Interior voxels get per-pattern Gibson-Ashby law **E(ρ) = E₀ · c · ρⁿ**. |
 | 8 | Optimization | **Continuous SIMP-style compliance minimization** under mass constraint using the *physical* E(ρ) (no artificial penalization — graded infill is the one case where intermediate density is printable). Optimality-criteria updates, ~50–100 multigrid solves. Then discretize to bins → **final verification solve** with binned densities + walls → report. |
-| 9 | User control | **Mass-budget slider** ("X % of solid") + **comparison card**: mass & filament estimate vs uniform-infill baseline, stiffness retained vs solid (%), max displacement, displacement heatmap. v1.x: "solve for target displacement" (auto-bisection, ~4–6 runs). |
+| 9 | User control | **Infill-budget slider** ("X %" = target MEAN INTERIOR infill density, 10–70 — same scale as a slicer's uniform infill setting; the solid skin comes on top; revised 2026-06 from a total-mass % so low values make sense and the reference comparison is honest) + **comparison card**: "vs X% uniform infill at the same weight: +Y% stiffer", stiffness retained vs solid (%), mass, max displacement. v1.x: "solve for target displacement" (auto-bisection, ~4–6 runs). |
 | 10 | Density bins | **3 bins by default, values auto-placed** by volume-weighted 1-D clustering of the optimized field. Floor 10 % (printability), cap 70 % (+ "consider solid here" flag for capped hot spots). Advanced: 2–5 bins, editable values/floor/cap. Part's own infill setting = lowest bin; modifiers = higher bins. |
 | 11 | Slicer output | **OrcaSlicer project 3MF + Bambu Studio** (shared dialect, pinned from sample — see §5) and **PrusaSlicer flavor** (`Slic3r_PE_model_config`). **Per-bin STL export always available** as universal fallback. Cura deferred. |
 | 12 | Infill patterns | Calibrated E(ρ) for **gyroid (default), cubic, grid**. All other patterns: generic Gibson-Ashby fallback + warning. Grid's anisotropy documented as limitation. |
@@ -76,7 +76,7 @@ Import (STL/3MF) ─► Segmentation (dihedral region-growing)
  Voxel model (skin/core tagged)
       │
       ▼
- SIMP loop: [multigrid solve → OC density update] × ~50–100   (mass budget from slider)
+ SIMP loop: [multigrid solve → OC density update] × ~50–100   (infill budget from slider)
       │
       ▼
  Volume-weighted 1-D clustering → N bins (floor/cap)

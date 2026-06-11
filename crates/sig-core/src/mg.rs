@@ -682,6 +682,9 @@ fn coarse_pcg(level: &Level, b: &[f32], x: &mut [f32]) {
 pub struct MgSolver {
     pub levels: Vec<Level>,
     ws: Workspaces,
+    /// Relative residual after each CG iteration of the LAST solve (element 0
+    /// is the initial residual) — convergence-plot material, refreshed per call.
+    pub last_trace: Vec<f32>,
 }
 
 pub struct SolveStats {
@@ -711,7 +714,7 @@ impl MgSolver {
             t: levels.iter().map(|l| vec![0f32; l.ndof()]).collect(),
             t2: levels.iter().map(|l| vec![0f32; l.ndof()]).collect(),
         };
-        Self { levels, ws }
+        Self { levels, ws, last_trace: Vec::new() }
     }
 
     /// Update per-cell stiffness factors in place (same void/solid topology!)
@@ -745,6 +748,7 @@ impl MgSolver {
         let n = self.levels[0].ndof();
         assert_eq!(b.len(), n);
         assert_eq!(u.len(), n);
+        self.last_trace.clear();
         // Guard the masking invariant for arbitrary initial guesses.
         for (i, c) in self.levels[0].constrained.iter().enumerate() {
             if *c {
@@ -763,6 +767,7 @@ impl MgSolver {
             r[i] = b[i] - r[i];
         }
         let res0 = par::norm2_64(&r) / norm_b;
+        self.last_trace.push(res0 as f32);
         if res0 <= tol {
             return SolveStats { iterations: 0, rel_residual: res0, converged: true };
         }
@@ -785,6 +790,7 @@ impl MgSolver {
             par::axpy64(u, alpha, &p);
             par::axpy64(&mut r, -alpha, &q);
             res = par::norm2_64(&r) / norm_b;
+            self.last_trace.push(res as f32);
             if res <= tol {
                 return SolveStats { iterations: it + 1, rel_residual: res, converged: true };
             }

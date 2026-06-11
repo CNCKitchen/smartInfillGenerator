@@ -156,9 +156,20 @@ export class EngineClient {
 export interface OptProgress {
   iteration: number;
   maxIter: number;
+  /** Compliance estimate from the (inexact, warm-started) inner solve. */
   compliance: number;
+  /** Total mass fraction of solid (skin + interior). */
   massFrac: number;
+  /** Mean infill density over the interior cells. */
+  meanInfill: number;
+  /** Max per-cell density change of this design update. */
   change: number;
+  /** Mean per-cell density change (the convergence signal, threshold 0.005). */
+  meanChange: number;
+  /** MGCG iterations the inner solve spent this iteration. */
+  innerIters: number;
+  /** Relative residual the inner solve reached. */
+  innerRes: number;
 }
 
 export interface OptRegion {
@@ -176,7 +187,11 @@ export interface OptSummary {
   massGrams: number;
   massSolidGrams: number;
   massFrac: number;
-  effectiveBudget: number;
+  /** Achieved mean infill of the binned layout (0..1) — the uniform-print
+   *  percentage the comparison references ("vs X% uniform, same weight"). */
+  meanInfill: number;
+  /** Requested infill budget after printable-floor/cap clamping (0..1). */
+  targetInfill: number;
   stiffnessVsSolid: number;
   gainVsUniform: number;
   maxDisplacement: number;

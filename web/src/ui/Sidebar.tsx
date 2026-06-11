@@ -250,16 +250,20 @@ export function Sidebar() {
         <section>
           <header>5 · Optimize infill</header>
           <label className="row">
-            <span>Material budget {s.budget}%</span>
+            <span>Infill budget {s.budget}%</span>
             <input
               type="range"
-              min={1}
-              max={90}
+              min={10}
+              max={70}
               step={1}
               value={s.budget}
               onChange={(e) => s.setBudget(Number(e.target.value))}
             />
           </label>
+          <div className="dim small">
+            Mean infill of the interior — same scale as your slicer's uniform infill %. Walls and
+            shells come on top.
+          </div>
           <label className="row">
             <span>Infill pattern</span>
             <select value={s.pattern} onChange={(e) => s.setPattern(e.target.value as PatternKey)}>
@@ -519,6 +523,7 @@ function SummaryCard() {
   const o = s.optSummary!;
   const stiff = Math.round(o.stiffnessVsSolid * 100);
   const gain = (o.gainVsUniform * 100).toFixed(1);
+  const uniformPct = Math.round(o.meanInfill * 100);
   return (
     <div className="card">
       <div className="cardrow big">
@@ -526,12 +531,12 @@ function SummaryCard() {
         <span className="dim">of {o.massSolidGrams.toFixed(1)} g solid ({Math.round(o.massFrac * 100)}%)</span>
       </div>
       <div className="cardrow">
-        <span>Stiffness vs solid</span>
-        <b>{stiff}%</b>
+        <span>vs {uniformPct}% uniform infill (same weight)</span>
+        <b>+{gain}% stiffer</b>
       </div>
       <div className="cardrow">
-        <span>vs uniform infill, same mass</span>
-        <b>+{gain}% stiffer</b>
+        <span>Stiffness vs 100% solid</span>
+        <b>{stiff}%</b>
       </div>
       <div className="cardrow">
         <span>Max deflection</span>
@@ -549,16 +554,16 @@ function SummaryCard() {
             ? `converged in ${o.iterations} iterations`
             : `stopped at the ${o.iterations}-iteration cap`}{" "}
           · {o.seconds.toFixed(1)} s
-          {o.effectiveBudget * 100 > s.budget + 1
-            ? ` · budget raised to ${Math.round(o.effectiveBudget * 100)}% (walls + minimum infill)`
+          {Math.abs(o.targetInfill * 100 - s.budget) > 0.5
+            ? ` · target clamped to ${Math.round(o.targetInfill * 100)}% (printable range)`
             : ""}
         </span>
       </div>
       {o.regionCount === 0 && (
         <div className="cardrow small" style={{ color: "#f0c674" }}>
           <span>
-            No separate regions: walls + minimum infill already use the whole budget, so the
-            interior stays at the base density. Raise the budget to get differentiated zones.
+            No separate regions: the whole interior ended at one density level. Raise the infill
+            budget (or the number of levels) to get differentiated zones.
           </span>
         </div>
       )}

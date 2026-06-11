@@ -22,7 +22,9 @@ const EMIN_REL: f32 = 1e-6;
 
 #[derive(Clone, Copy, Debug)]
 pub struct OptimizeParams {
-    /// Target total mass as a fraction of the fully solid part (incl. skin).
+    /// Target mean INFILL density of the interior (design) cells — the number
+    /// a user compares to a slicer's uniform infill percentage. The solid
+    /// skin is always 100% and is NOT part of this budget.
     pub budget: f64,
     /// Gibson-Ashby law of the infill pattern: E/E0 = coeff * x^exponent.
     pub exponent: f64,
@@ -38,7 +40,7 @@ pub struct OptimizeParams {
 impl Default for OptimizeParams {
     fn default() -> Self {
         Self {
-            budget: 0.45,
+            budget: 0.25,
             exponent: 1.5,
             coeff: 1.0,
             floor: 0.10,
@@ -52,12 +54,18 @@ impl Default for OptimizeParams {
 pub struct OptimizeProgress {
     pub iteration: usize,
     pub compliance: f64,
-    /// Current total mass fraction of solid.
+    /// Current total mass fraction of solid (skin + interior).
     pub mass_frac: f64,
+    /// Current mean infill density over the interior cells.
+    pub mean_infill: f64,
     /// Max per-cell density change of this design update.
     pub change: f64,
     /// Mean per-cell density change (the convergence signal).
     pub mean_change: f64,
+    /// MGCG iterations spent on this outer iteration's solve.
+    pub inner_iters: usize,
+    /// Relative residual that inner solve reached.
+    pub inner_residual: f64,
 }
 
 pub struct OptimizeResult {
@@ -67,7 +75,7 @@ pub struct OptimizeResult {
     pub design_cells: Vec<u32>,
     /// Cell ids of skin cells (always solid).
     pub skin_cells: Vec<u32>,
-    /// Achieved budget (after feasibility clamping).
+    /// Target mean infill actually used (budget clamped to [floor, cap]).
     pub effective_budget: f64,
     pub iterations: usize,
     /// True if the design-change criterion fired before the iteration cap.
@@ -377,10 +385,10 @@ pub fn optimize(
     let n_solid = (skin.len() + design_cells.len()) as f64;
     let n_int = design_cells.len() as f64;
 
-    // Feasible interior mean density for the requested budget.
-    let raw = (params.budget * n_solid - skin.len() as f64) / n_int;
-    let target_mean = raw.clamp(params.floor, params.cap);
-    let effective_budget = (skin.len() as f64 + target_mean * n_int) / n_solid;
+    // The budget IS the target interior mean (infill %), so the result is
+    // directly comparable to a uniform print at the same slicer percentage.
+    let target_mean = params.budget.clamp(params.floor, params.cap);
+    let effective_budget = target_mean;
 
     let filter = DensityFilter::build(grid, &design_cells, 1.6);
     let ke64 = ke_hex(settings.e0, settings.nu, grid.h);
@@ -432,7 +440,7 @@ pub fn optimize(
         // keep creeping toward the true solution for tens of iterations and
         // the design never becomes stationary.
         let (tol_i, cap_i) = if last_mean_change < 0.012 { (2e-4, 60) } else { (5e-4, 15) };
-        let _ = solver.solve_warm(&bb, &mut u, tol_i, cap_i);
+        let inner = solver.solve_warm(&bb, &mut u, tol_i, cap_i);
         compliance = 0.0;
         for i in 0..ndof {
             compliance += bb[i] * u[i];
@@ -507,11 +515,19 @@ pub fn optimize(
         last_mean_change = mean_change;
         x.copy_from_slice(&x_new);
 
-        let mass_frac = (skin.len() as f64
-            + x_phys.iter().sum::<f64>())
-            / n_solid;
+        let sum_x = x_phys.iter().sum::<f64>();
+        let mass_frac = (skin.len() as f64 + sum_x) / n_solid;
         progress(
-            &OptimizeProgress { iteration: it + 1, compliance, mass_frac, change, mean_change },
+            &OptimizeProgress {
+                iteration: it + 1,
+                compliance,
+                mass_frac,
+                mean_infill: sum_x / n_int,
+                change,
+                mean_change,
+                inner_iters: inner.iterations,
+                inner_residual: inner.rel_residual,
+            },
             &x_phys,
             &design_cells,
         );

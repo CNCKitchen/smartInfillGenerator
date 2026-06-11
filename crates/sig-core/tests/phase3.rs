@@ -44,10 +44,10 @@ fn run_cantilever_optimization() -> OptFixture {
         BcSpec { kind: BcKind::Force([0.0, 0.0, -30.0]), tris: face_tris(1) },
     ];
     let asm = assemble(&beam, &grid, &bcs, None, &settings).unwrap();
-    // Budget must leave the interior headroom: the 1 mm solid skin alone is
-    // ~38% of this beam's mass, so 0.6 puts the interior mean near 0.35.
+    // Budget = target mean INFILL density (interior only; skin is extra).
+    // 35% leaves room to differentiate in both directions [0.10, 0.70].
     let params = OptimizeParams {
-        budget: 0.6,
+        budget: 0.35,
         exponent: 1.5,
         wall_mm: 1.0,
         max_iter: 30,
@@ -289,7 +289,7 @@ fn conv_trace() {
     ];
     let asm = assemble(&beam, &grid, &bcs, None, &settings).unwrap();
     let params = OptimizeParams {
-        budget: 0.6,
+        budget: 0.35,
         exponent: 1.5,
         wall_mm: 0.9,
         max_iter: 40,
@@ -464,6 +464,7 @@ fn displacement_sampling_ignores_inactive_nodes() {
         iterations: 1,
         rel_residual: 0.0,
         converged: true,
+        residuals: Vec::new(),
     };
     // Inside the solid cell: exact either way.
     assert!((sol.sample_displacement([1.5, 1.5, 1.5])[0] - 2.0).abs() < 1e-9);

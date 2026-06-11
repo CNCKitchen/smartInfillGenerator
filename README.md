@@ -42,14 +42,17 @@ Workflow in the app:
    plane** (gizmo to move/rotate, Flip, X/Y/Z presets) cuts through any
    view with stencil-filled caps, so the part and the analysis mesh read
    as solid at the cut.
-5. **Optimize infill** — pick a mass budget, pattern (gyroid/cubic/grid —
-   E(ρ) curves editable in ⚙ Settings), perimeters × line width (the solid
-   skin the analysis assumes — the perimeter count is also written into the
+5. **Optimize infill** — pick an infill budget (the target MEAN interior
+   density, 10–70% — same scale as your slicer's uniform infill setting;
+   walls/shells come on top), pattern (gyroid/cubic/grid — E(ρ) curves
+   editable in ⚙ Settings), perimeters × line width (the solid skin the
+   analysis assumes — the perimeter count is also written into the
    exported 3MF so the print matches; line width stays profile-controlled),
    region smoothing, and number of density levels. The evolving dense-core
    shape is shown live each iteration; the loop stops on a design-stationarity
-   criterion (iteration cap is only a safety net). The card reports mass,
-   stiffness vs solid, and the gain over uniform infill at equal mass.
+   criterion (iteration cap is only a safety net). The card reports the
+   headline comparison — **"vs X% uniform infill at the same weight: +Y%
+   stiffer"** — plus stiffness vs solid, mass, and max deflection.
    The run lands in the Density view with a 25% cutaway by default; the
    slider sweeps the threshold, and the Regions view has a per-region
    visibility list.
@@ -58,6 +61,13 @@ Workflow in the app:
    `wall_loops` count the analysis assumed — modifiers override ONLY density,
    so walls inherit cleanly) for OrcaSlicer/Bambu Studio, or a `.zip` of
    modifier STLs for any slicer.
+
+A **"Log for nerds"** drawer (bottom-left of the viewer) streams the raw
+telemetry: voxel grid stats, RBM check results, MGCG iterations/residuals,
+and one line per optimizer iteration (compliance, mean infill, design change,
+inner CG effort) — with live convergence charts for compliance, design
+change vs the 0.005 stationarity threshold, inner CG iterations, and the
+solver residual curve.
 
 ## Repo layout
 

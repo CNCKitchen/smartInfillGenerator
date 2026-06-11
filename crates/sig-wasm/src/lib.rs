@@ -303,6 +303,9 @@ impl Model {
             "relResidual": sol.rel_residual,
             "converged": sol.converged,
             "maxDisplacement": sol.max_displacement(),
+            // Per-MGCG-iteration relative residual (element 0 = initial) —
+            // the nerd-log convergence plot.
+            "residuals": sol.residuals.clone(),
         })
         .to_string();
         self.solution = Some(sol);
@@ -378,7 +381,10 @@ impl Model {
         out
     }
 
-    /// Run the density optimization + binning + verification. Progress gets
+    /// Run the density optimization + binning + verification. `budget_pct`
+    /// is the target mean INFILL density of the interior in percent — the
+    /// number a user compares to a slicer's uniform infill setting (the solid
+    /// skin is on top of it). Progress gets
     /// called per iteration with (jsonString, Float32Array vertexDensity,
     /// Float32Array skeletonPositions, Uint32Array skeletonIndices) — the
     /// skeleton is the evolving isosurface of cells denser than 40%.
@@ -417,8 +423,8 @@ impl Model {
         }
 
         let params = OptimizeParams {
-            // 1% is allowed: the skin + 10% interior floor dominate down
-            // there, the card reports the effective (raised) budget.
+            // Budget = target mean INFILL density of the interior — the
+            // engine clamps it to the printable [floor, cap] band.
             budget: (budget_pct / 100.0).clamp(0.01, 1.0),
             exponent,
             coeff,
@@ -463,8 +469,11 @@ impl Model {
                     "maxIter": max_iter,
                     "compliance": p.compliance,
                     "massFrac": p.mass_frac,
+                    "meanInfill": p.mean_infill,
                     "change": p.change,
                     "meanChange": p.mean_change,
+                    "innerIters": p.inner_iters,
+                    "innerRes": p.inner_residual,
                 })
                 .to_string();
                 let args = js_sys::Array::of5(
@@ -536,6 +545,7 @@ impl Model {
             iterations: result.iterations,
             rel_residual: 0.0,
             converged: true,
+            residuals: Vec::new(),
         });
 
         // ---- regions (bins above base) ----
@@ -579,7 +589,11 @@ impl Model {
             "massGrams": mass_part,
             "massSolidGrams": mass_solid,
             "massFrac": mass_frac,
-            "effectiveBudget": result.effective_budget,
+            // Achieved mean infill of the binned layout — the uniform-print
+            // percentage the comparison card references ("vs X% uniform").
+            "meanInfill": mean_binned,
+            // Requested budget after printable-floor/cap clamping.
+            "targetInfill": result.effective_budget,
             "stiffnessVsSolid": c_solid / c_binned,
             "gainVsUniform": c_uniform / c_binned - 1.0,
             "maxDisplacement": max_disp,

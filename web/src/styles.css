@@ -564,3 +564,102 @@ footer {
   padding: 4px 6px;
   font-size: 13px;
 }
+
+/* ---- "Log for nerds" drawer ---- */
+
+.nerdlog-toggle {
+  position: absolute;
+  left: 12px;
+  bottom: 12px;
+  font-size: 12px;
+  opacity: 0.85;
+  background: #1b2026d8;
+}
+
+.nerdlog {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 340px;
+  background: #161b21f2;
+  border-top: 1px solid #2a323b;
+  display: flex;
+  flex-direction: column;
+  padding: 8px 12px 10px;
+  gap: 8px;
+  backdrop-filter: blur(2px);
+}
+
+.nl-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.nl-head button {
+  padding: 3px 9px;
+  font-size: 12px;
+}
+
+.nl-charts {
+  display: flex;
+  gap: 8px;
+  flex-wrap: nowrap;
+  overflow-x: auto;
+}
+
+.nl-chart .nl-frame {
+  fill: #1d232b;
+  stroke: #2a323b;
+}
+
+.nl-chart .nl-title {
+  fill: #8fa0b3;
+  font-size: 10px;
+  letter-spacing: 0.3px;
+}
+
+.nl-chart .nl-val {
+  font-size: 10px;
+  font-family: Consolas, "Cascadia Mono", monospace;
+}
+
+.nl-chart .nl-empty {
+  fill: #4a5462;
+  font-size: 14px;
+}
+
+.nl-chart .nl-threshold {
+  stroke: #e2606a;
+  stroke-dasharray: 4 3;
+  stroke-width: 1;
+  opacity: 0.8;
+}
+
+.nl-log {
+  flex: 1;
+  overflow-y: auto;
+  font-family: Consolas, "Cascadia Mono", monospace;
+  font-size: 11.5px;
+  line-height: 1.5;
+  background: #12161b;
+  border: 1px solid #242c35;
+  border-radius: 8px;
+  padding: 6px 10px;
+  white-space: pre-wrap;
+}
+
+.nl-line {
+  display: flex;
+  gap: 10px;
+}
+
+.nl-time {
+  color: #5b6878;
+  flex: none;
+}
+
+.nl-msg {
+  word-break: break-word;
+}

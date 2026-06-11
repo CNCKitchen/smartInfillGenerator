@@ -88,7 +88,7 @@ interface AppState {
   curves: Record<PatternKey, PatternCurve>;
   resolution: ResolutionKey;
   // optimization inputs
-  budget: number; // % of solid mass
+  budget: number; // infill budget: target mean interior density in % (10–70)
   pattern: PatternKey;
   perimeters: number;
   lineWidth: number; // mm
@@ -127,6 +127,13 @@ interface AppState {
   showExtremes: boolean;
   // Section plane.
   sectionOn: boolean;
+  // "Log for nerds": solver/optimizer telemetry + convergence series.
+  logOpen: boolean;
+  logLines: LogLine[];
+  /** One sample per optimizer iteration of the LAST/running optimization. */
+  optSeries: OptIterSample[];
+  /** MGCG residual history of the last plain solve (log-scale plot). */
+  solveResiduals: number[];
 
   loadFile(name: string, bytes: ArrayBuffer): Promise<void>;
   setSegAngle(angle: number): Promise<void>;
@@ -161,6 +168,8 @@ interface AppState {
   toggleSection(): void;
   flipSection(): void;
   setSectionAxis(axis: "x" | "y" | "z"): void;
+  setLogOpen(open: boolean): void;
+  clearLog(): void;
   runCheck(): Promise<void>;
   runSolve(): Promise<void>;
   runOptimize(): Promise<void>;
@@ -172,11 +181,66 @@ interface AppState {
   clearError(): void;
 }
 
+export interface LogLine {
+  t: string;
+  msg: string;
+}
+
+/** One optimizer iteration for the nerd-log convergence charts. */
+export interface OptIterSample {
+  it: number;
+  compliance: number;
+  massFrac: number;
+  meanInfill: number;
+  change: number;
+  meanChange: number;
+  innerIters: number;
+  innerRes: number;
+}
+
 let bcCounter = 0;
 let isoTimer: ReturnType<typeof setTimeout> | null = null;
 let smoothTimer: ReturnType<typeof setTimeout> | null = null;
 /** Per-kind cache of fetched stress/strain fields (cleared on invalidation). */
 const fieldCache = new Map<string, Float32Array>();
+
+const MAX_LOG_LINES = 800;
+
+function logTime(): string {
+  return new Date().toLocaleTimeString([], { hour12: false });
+}
+
+type SetState = (p: Partial<AppState> | ((s: AppState) => Partial<AppState>)) => void;
+
+function appendLog(set: SetState, msg: string) {
+  set((s) => ({
+    logLines: [...s.logLines.slice(-(MAX_LOG_LINES - 1)), { t: logTime(), msg }],
+  }));
+}
+
+/** Log the analysis grid when it (re)builds — entry of check/solve/optimize. */
+async function logGridInfo(set: SetState) {
+  try {
+    const info = await engine.voxelInfo();
+    const prev = useStore.getState().voxelInfo;
+    if (
+      !prev ||
+      prev.nx !== info.nx ||
+      prev.ny !== info.ny ||
+      prev.nz !== info.nz ||
+      prev.solid !== info.solid
+    ) {
+      appendLog(
+        set,
+        `Voxel grid ${info.nx}×${info.ny}×${info.nz} @ h=${info.h.toFixed(2)} mm — ` +
+          `${info.solid.toLocaleString()} solid of ${info.cells.toLocaleString()} cells`
+      );
+    }
+    set({ voxelInfo: info });
+  } catch {
+    // grid not buildable yet — the caller surfaces the real error
+  }
+}
 
 function fieldUnit(kind: string): string {
   return RESULT_FIELDS.find((f) => f.value === kind)?.unit ?? "";
@@ -280,7 +344,7 @@ export const useStore = create<AppState>((set, get) => ({
   materials: initialSettings.materials,
   curves: initialSettings.curves,
   resolution: "preview",
-  budget: 50,
+  budget: 25,
   pattern: "gyroid",
   perimeters: 2,
   lineWidth: 0.45,
@@ -310,6 +374,10 @@ export const useStore = create<AppState>((set, get) => ({
   legendMax: null,
   showExtremes: false,
   sectionOn: false,
+  logOpen: false,
+  logLines: [],
+  optSeries: [],
+  solveResiduals: [],
 
   async loadFile(name, bytes) {
     set({ busy: "Parsing & segmenting…", error: null, notice: null });
@@ -360,6 +428,15 @@ export const useStore = create<AppState>((set, get) => ({
       sceneEvents.onOptShape?.(null, null);
       sceneEvents.onModelLoaded?.(model);
       sceneEvents.onViewState?.("setup", get().deformScale);
+      const [bx, by, bz] = [
+        model.bbox[3] - model.bbox[0],
+        model.bbox[4] - model.bbox[1],
+        model.bbox[5] - model.bbox[2],
+      ];
+      appendLog(
+        set,
+        `Loaded "${name}" — ${model.triCount.toLocaleString()} display triangles, bbox ${bx.toFixed(1)}×${by.toFixed(1)}×${bz.toFixed(1)} mm`
+      );
     } catch (e) {
       set({ busy: null, error: e instanceof Error ? e.message : String(e) });
     }
@@ -503,7 +580,8 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   setBudget(v) {
-    set({ budget: v });
+    // Infill budget: mean interior density, bounded by the printable band.
+    set({ budget: Math.min(70, Math.max(10, Math.round(v))) });
   },
   setPattern(p) {
     set({ pattern: p });
@@ -566,17 +644,38 @@ export const useStore = create<AppState>((set, get) => ({
     }, 140);
   },
 
+  setLogOpen(open) {
+    set({ logOpen: open });
+  },
+
+  clearLog() {
+    set({ logLines: [] });
+  },
+
   async runCheck() {
     if (!get().model) return;
     set({ busy: "Voxelizing & checking constraints…", error: null });
     try {
       await pushBcs(get);
+      await logGridInfo(set);
       const report = await engine.check();
       set({ check: report, busy: null });
       const bad = report.components.find((c) => !c.constrained && c.mode);
       sceneEvents.onAnimateMode?.(bad?.mode ?? null);
+      appendLog(
+        set,
+        report.ok
+          ? `Check: OK — ${report.islandCount} ${report.islandCount === 1 ? "body" : "bodies"}, fully constrained` +
+              (report.components[0] ? ` (λ ratio ${report.components[0].lambdaRatio.toExponential(1)})` : "")
+          : `Check: UNDER-CONSTRAINED — ${report.islandCount} ${report.islandCount === 1 ? "body" : "bodies"}; ` +
+              report.components
+                .map((c, i) => `#${i + 1}: ${c.cells.toLocaleString()} cells, ${c.constrained ? "ok" : "free"}`)
+                .join(", ")
+      );
     } catch (e) {
-      set({ busy: null, error: e instanceof Error ? e.message : String(e) });
+      const msg = e instanceof Error ? e.message : String(e);
+      set({ busy: null, error: msg });
+      appendLog(set, `Check failed: ${msg}`);
     }
   },
 
@@ -586,11 +685,13 @@ export const useStore = create<AppState>((set, get) => ({
     sceneEvents.onAnimateMode?.(null);
     try {
       await pushBcs(get);
+      await logGridInfo(set);
       const report = await engine.check();
       set({ check: report });
       if (!report.ok) {
         const bad = report.components.find((c) => !c.constrained && c.mode);
         sceneEvents.onAnimateMode?.(bad?.mode ?? null);
+        appendLog(set, "Solve aborted: model is under-constrained");
         set({
           busy: null,
           error:
@@ -600,11 +701,20 @@ export const useStore = create<AppState>((set, get) => ({
         });
         return;
       }
+      const m = get().material;
+      appendLog(set, `Solve: ${m.name} (E₀ ${m.e0} MPa, ν ${m.nu}) …`);
       const { stats, displacements } = await engine.solve();
       fieldCache.clear(); // stress fields belong to the previous solution
       sceneEvents.onLegendRange?.(null, null);
+      appendLog(
+        set,
+        `Solve ${stats.converged ? "converged" : "stopped at the iteration cap"}: ` +
+          `${stats.iterations} MGCG iterations → rel. residual ${stats.relResidual.toExponential(1)} ` +
+          `in ${stats.seconds.toFixed(1)} s · max |u| ${stats.maxDisplacement.toExponential(2)} mm`
+      );
       set({
         stats,
+        solveResiduals: stats.residuals ?? [],
         hasResult: true,
         viewMode: "deformed",
         busy: null,
@@ -620,18 +730,33 @@ export const useStore = create<AppState>((set, get) => ({
       sceneEvents.onDisplacements?.(displacements, stats);
       sceneEvents.onViewState?.("deformed", get().deformScale);
     } catch (e) {
-      set({ busy: null, error: e instanceof Error ? e.message : String(e) });
+      const msg = e instanceof Error ? e.message : String(e);
+      set({ busy: null, error: msg });
+      appendLog(set, `Solve failed: ${msg}`);
     }
   },
 
   async runOptimize() {
     const st = get();
     if (!st.model) return;
-    set({ busy: "Optimizing infill…", error: null, optProgress: null, optSummary: null });
+    set({
+      busy: "Optimizing infill…",
+      error: null,
+      optProgress: null,
+      optSummary: null,
+      optSeries: [],
+    });
     sceneEvents.onAnimateMode?.(null);
     try {
       await pushBcs(get);
+      await logGridInfo(set);
       const curve = st.curves[st.pattern];
+      appendLog(
+        set,
+        `Optimize: infill budget ${st.budget}% (${st.pattern}: E/E₀ = ${curve.coeff}·ρ^${curve.exponent}), ` +
+          `skin ${st.perimeters}×${st.lineWidth} mm, ${st.nBins} levels — ` +
+          `convergence when mean |Δρ| < 0.005 twice`
+      );
       const out = await engine.optimize(
         st.budget,
         curve.exponent,
@@ -641,7 +766,28 @@ export const useStore = create<AppState>((set, get) => ({
         st.smoothIters,
         st.nBins,
         (p, density, skelPositions, skelIndices, skelDensity) => {
-          set({ optProgress: { iteration: p.iteration, maxIter: p.maxIter } });
+          set((s) => ({
+            optProgress: { iteration: p.iteration, maxIter: p.maxIter },
+            optSeries: [
+              ...s.optSeries,
+              {
+                it: p.iteration,
+                compliance: p.compliance,
+                massFrac: p.massFrac,
+                meanInfill: p.meanInfill,
+                change: p.change,
+                meanChange: p.meanChange,
+                innerIters: p.innerIters,
+                innerRes: p.innerRes,
+              },
+            ],
+          }));
+          appendLog(
+            set,
+            `  it ${String(p.iteration).padStart(2)}: C ${p.compliance.toExponential(3)} N·mm · ` +
+              `infill ${(p.meanInfill * 100).toFixed(1)}% · Δmax ${p.change.toFixed(3)} · ` +
+              `Δmean ${p.meanChange.toFixed(4)} · CG ${p.innerIters}@${p.innerRes.toExponential(1)}`
+          );
           if (get().viewMode !== "density") {
             set({ viewMode: "density" });
             sceneEvents.onViewState?.("density", get().deformScale);
@@ -650,6 +796,17 @@ export const useStore = create<AppState>((set, get) => ({
           // Watch the optimized shape gain detail iteration by iteration.
           sceneEvents.onOptShape?.(skelPositions ?? null, skelIndices ?? null, skelDensity ?? null);
         }
+      );
+      appendLog(
+        set,
+        `Optimize ${out.summary.converged ? `converged in ${out.summary.iterations} iterations` : `stopped at the ${out.summary.iterations}-iteration cap`} ` +
+          `(${out.summary.seconds.toFixed(1)} s) · levels ${out.summary.bins.map((b) => `${Math.round(b.density * 100)}%`).join("/")} · ` +
+          `mean infill ${(out.summary.meanInfill * 100).toFixed(1)}% · mass ${out.summary.massGrams.toFixed(1)} g (${Math.round(out.summary.massFrac * 100)}% of solid)`
+      );
+      appendLog(
+        set,
+        `  verification: stiffness ${Math.round(out.summary.stiffnessVsSolid * 100)}% of solid · ` +
+          `+${(out.summary.gainVsUniform * 100).toFixed(1)}% stiffer than uniform ${Math.round(out.summary.meanInfill * 100)}% infill at equal weight`
       );
       const vis = out.regions.map(() => true);
       fieldCache.clear(); // stress fields belong to the previous solution
@@ -687,7 +844,9 @@ export const useStore = create<AppState>((set, get) => ({
       get().setDensityThreshold(25);
     } catch (e) {
       sceneEvents.onOptShape?.(null, null);
-      set({ busy: null, optProgress: null, error: e instanceof Error ? e.message : String(e) });
+      const msg = e instanceof Error ? e.message : String(e);
+      set({ busy: null, optProgress: null, error: msg });
+      appendLog(set, `Optimize failed: ${msg}`);
     }
   },
 

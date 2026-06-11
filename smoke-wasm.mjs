@@ -115,6 +115,12 @@ const stats = JSON.parse(model.solve());
 const dt = ((performance.now() - t0) / 1000).toFixed(2);
 console.log(`   solve: ${stats.iterations} iters, res ${stats.relResidual.toExponential(1)}, ${dt} s`);
 assert(stats.maxDisplacement > 0.01 && stats.maxDisplacement < 10, `sane max displacement (${stats.maxDisplacement.toFixed(4)} mm)`);
+// Residual trace for the nerd-log convergence chart: element 0 is the
+// initial residual, one entry per CG iteration after that, monotone-ish down.
+assert(Array.isArray(stats.residuals) && stats.residuals.length === stats.iterations + 1,
+  `residual trace has ${stats.iterations + 1} entries (got ${stats.residuals?.length})`);
+assert(stats.residuals[stats.residuals.length - 1] <= stats.residuals[0],
+  "residual trace decreases");
 
 const disp = model.vertex_displacements();
 assert(disp.length === nTri * 9, "per-vertex displacement buffer");
@@ -153,7 +159,7 @@ model.resegment(60);
 assert(model.patch_count() === 6, "resegment at 60 deg still 6 patches");
 
 // ---- full optimization pipeline ----
-// Roomier beam: walls must not eat the whole budget (60x12x12 mm).
+// Roomy beam (60x12x12 mm): enough interior beyond the skin to optimize.
 const optModel = new Model(boxStl([0, 0, 0], [60, 12, 12]), "beam2");
 const optTri = optModel.triangle_count();
 const osel = patchSelector(optModel);
@@ -166,17 +172,24 @@ let progressCalls = 0;
 let lastDensityLen = 0;
 let skelTris = 0;
 let skelColored = false;
+let progressTelemetryOk = false;
 const t1 = performance.now();
 const summary = JSON.parse(
-  // gyroid law E = 1.0*E0*rho^1.5; 2 perimeters x 0.45 mm line width; 8 smoothing passes
-  optModel.optimize(60, 1.5, 1.0, 2, 0.45, 8, 3, (json, density, skelPos, skelIdx, skelDen) => {
+  // 35% infill budget (mean interior density); gyroid law E = 1.0*E0*rho^1.5;
+  // 2 perimeters x 0.45 mm line width; 8 smoothing passes
+  optModel.optimize(35, 1.5, 1.0, 2, 0.45, 8, 3, (json, density, skelPos, skelIdx, skelDen) => {
     progressCalls++;
     lastDensityLen = density.length;
     if (skelIdx && skelIdx.length) skelTris = skelIdx.length / 3;
     if (skelPos && skelDen && skelDen.length * 3 === skelPos.length) skelColored = true;
     const p = JSON.parse(json);
+    // Nerd-log telemetry: every iteration reports the inner solve + infill.
+    if (p.meanInfill > 0 && p.meanInfill < 1 && Number.isFinite(p.innerRes) && p.innerIters >= 0)
+      progressTelemetryOk = true;
     if (p.iteration % 10 === 0)
-      console.log(`   opt iter ${p.iteration}/${p.maxIter}, mass ${(p.massFrac * 100).toFixed(1)}%`);
+      console.log(
+        `   opt iter ${p.iteration}/${p.maxIter}, infill ${(p.meanInfill * 100).toFixed(1)}%, CG ${p.innerIters}`
+      );
   })
 );
 console.log(
@@ -188,10 +201,15 @@ console.log(
 assert(progressCalls >= 5, `progress callback fired (${progressCalls}x)`);
 assert(lastDensityLen === optTri * 3, "live vertex density (1 scalar per soup vertex)");
 assert(typeof summary.converged === "boolean", "summary reports convergence");
+assert(progressTelemetryOk, "progress carries meanInfill + inner-solve telemetry");
 assert(skelTris > 0, `live skeleton isosurface streamed (${skelTris} tris last)`);
 assert(skelColored, "skeleton carries per-vertex density for legend coloring");
 assert(summary.bins.length >= 2, "at least 2 density bins");
 assert(summary.massFrac > 0.2 && summary.massFrac < 1.0, `sane mass fraction ${summary.massFrac.toFixed(2)}`);
+// Infill-budget semantics: the achieved mean infill lands near the request
+// (binning shifts it slightly), and the clamped target echoes the input.
+assert(Math.abs(summary.targetInfill - 0.35) < 1e-9, `target infill echoes request (${summary.targetInfill})`);
+assert(Math.abs(summary.meanInfill - 0.35) < 0.08, `mean infill near budget (${(summary.meanInfill * 100).toFixed(1)}%)`);
 assert(summary.stiffnessVsSolid > 0.1 && summary.stiffnessVsSolid <= 1.05, "sane stiffness ratio");
 assert(summary.gainVsUniform > -0.02, `binned not worse than uniform (${(summary.gainVsUniform * 100).toFixed(2)}%)`);
 
