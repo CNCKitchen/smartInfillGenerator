@@ -283,6 +283,17 @@ export function Sidebar() {
               </select>
             </label>
           </div>
+          <label className="row">
+            <span>Region smoothing {s.smoothIters === 0 ? "off" : `${s.smoothIters}×`}</span>
+            <input
+              type="range"
+              min={0}
+              max={20}
+              step={1}
+              value={s.smoothIters}
+              onChange={(e) => s.setSmoothIters(Number(e.target.value))}
+            />
+          </label>
           <button className="primary" onClick={() => void s.runOptimize()} disabled={!!s.busy}>
             Optimize infill
           </button>
@@ -316,6 +327,47 @@ export function Sidebar() {
             <div className="dim small">
               The hex mesh the solver actually runs on (winding-number voxelization at the chosen
               resolution).
+            </div>
+          )}
+          {s.viewMode === "density" && s.optSummary && (
+            <>
+              <label className="row">
+                <span>
+                  {s.densityThreshold >= 10 ? `Cutaway ρ ≥ ${s.densityThreshold}%` : "Cutaway off"}
+                </span>
+                <input
+                  type="range"
+                  min={0}
+                  max={70}
+                  step={1}
+                  value={s.densityThreshold}
+                  onChange={(e) => s.setDensityThreshold(Number(e.target.value))}
+                />
+              </label>
+              <div className="dim small">
+                Shows only material denser than the threshold — look inside the part instead of
+                just its painted surface.
+              </div>
+            </>
+          )}
+          {s.viewMode === "infill" && s.regionInfos.length > 0 && (
+            <div className="regionlist">
+              {s.regionInfos.map((r, i) => (
+                <label key={i} className="regionrow">
+                  <input
+                    type="checkbox"
+                    checked={s.regionVisible[i] !== false}
+                    onChange={(e) => s.setRegionVisible(i, e.target.checked)}
+                  />
+                  <span className="dot" style={{ background: rampCss(r.density / 0.8) }} />
+                  <span>
+                    Modifier {i + 1} — infill {Math.round(r.density * 100)}%
+                  </span>
+                </label>
+              ))}
+              <div className="dim small">
+                Regions nest (denser inside sparser) — toggle to inspect one at a time.
+              </div>
             </div>
           )}
           {s.viewMode === "deformed" && (
@@ -352,9 +404,8 @@ export function Sidebar() {
               <div className="hint">
                 The 3MF opens in OrcaSlicer/Bambu Studio with the part, the modifier volumes, and
                 their infill densities already set (base infill{" "}
-                {Math.round(s.optSummary.baseDensity * 100)}% on the object; {s.perimeters}{" "}
-                perimeters pinned on part and modifiers). Keep your own printer/filament/process
-                profiles when prompted.
+                {Math.round(s.optSummary.baseDensity * 100)}% on the object). Only densities are
+                overridden — walls, shells, and everything else come from your own profiles.
               </div>
             </>
           )}
@@ -408,7 +459,10 @@ function SummaryCard() {
       </div>
       <div className="cardrow dim small">
         <span>
-          {o.iterations} iterations · {o.seconds.toFixed(1)} s
+          {o.converged
+            ? `converged in ${o.iterations} iterations`
+            : `stopped at the ${o.iterations}-iteration cap`}{" "}
+          · {o.seconds.toFixed(1)} s
           {o.effectiveBudget * 100 > s.budget + 1
             ? ` · budget raised to ${Math.round(o.effectiveBudget * 100)}% (walls + minimum infill)`
             : ""}
@@ -429,6 +483,21 @@ function SummaryCard() {
 function fmtDisp(mm: number): string {
   if (mm >= 0.01) return `${mm.toFixed(2)} mm`;
   return `${(mm * 1000).toFixed(1)} µm`;
+}
+
+/** Mirrors the viewer's region color ramp for the legend dots. */
+function rampCss(x: number): string {
+  const t = Math.min(1, Math.max(0, x));
+  let r: number, g: number, b: number;
+  if (t < 0.33) {
+    r = 0.15; g = 0.3 + 1.8 * t; b = 0.9;
+  } else if (t < 0.66) {
+    r = 0.15 + 2.4 * (t - 0.33); g = 0.9; b = 0.9 - 2.4 * (t - 0.33);
+  } else {
+    r = 0.95; g = 0.9 - 2.4 * (t - 0.66); b = 0.1;
+  }
+  const c = (v: number) => Math.round(255 * Math.min(1, Math.max(0, v)));
+  return `rgb(${c(r)},${c(g)},${c(b)})`;
 }
 
 function BcRow({ bc }: { bc: Bc }) {

@@ -62,6 +62,8 @@ export function Viewer() {
     sceneEvents.onViewState = (mode, scale) => scene.setViewState(mode, scale);
     sceneEvents.onVoxelMesh = (hull, edges) => scene.setVoxelMesh(hull, edges);
     sceneEvents.onAnimateDeformed = (on) => scene.setDeformAnimate(on);
+    sceneEvents.onOptShape = (p, i) => scene.setOptShape(p, i);
+    sceneEvents.onRegionVisibility = (vis) => scene.setRegionVisibility(vis);
 
     const obs = new ResizeObserver(() => {
       const el = wrapRef.current;

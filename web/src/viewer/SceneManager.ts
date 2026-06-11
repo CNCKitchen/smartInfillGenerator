@@ -29,7 +29,9 @@ export interface SceneCallbacks {
 export class SceneManager {
   private renderer!: THREE.WebGLRenderer;
   private scene = new THREE.Scene();
-  private camera!: THREE.PerspectiveCamera;
+  // Parallel projection (engineering convention) — lengths stay comparable.
+  private camera!: THREE.OrthographicCamera;
+  private orthoHalf = 120;
   private controls!: OrbitControls;
   private raycaster = new THREE.Raycaster();
   private pointer = new THREE.Vector2();
@@ -76,10 +78,22 @@ export class SceneManager {
   private displacements: Float32Array | null = null;
   private vertexDensity: Float32Array | null = null;
   private regionMeshes: THREE.Mesh[] = [];
+  private regionVisible: boolean[] = [];
   private viewMode: ViewMode = "setup";
   private deformScale = 1;
   private autoScale = 1;
   private deformAnimate = false;
+
+  // Live optimization skeleton / density-threshold cutaway.
+  private optShapeMesh: THREE.Mesh | null = null;
+
+  // Colormaps are sampled per-fragment from 1D LUT textures via the uv
+  // channel — per-vertex colors interpolate straight through RGB and turn
+  // jet into blue→purple→red on coarse meshes.
+  private lutJet = makeLut(jet);
+  private lutRamp = makeLut(ramp);
+  private uvs: Float32Array | null = null;
+  private scalarMode: "none" | "jet" | "ramp" = "none";
 
   private clock = new THREE.Clock();
   private callbacks: SceneCallbacks = {};
@@ -92,7 +106,7 @@ export class SceneManager {
     this.renderer.autoClear = false;
     this.scene.background = new THREE.Color(0x14181d);
 
-    this.camera = new THREE.PerspectiveCamera(45, 1, 0.1, 10000);
+    this.camera = new THREE.OrthographicCamera(-120, 120, 120, -120, 0.1, 10000);
     this.camera.position.set(120, -160, 110);
     this.camera.up.set(0, 0, 1); // printer convention: Z up
 
@@ -140,7 +154,15 @@ export class SceneManager {
     this.viewW = width;
     this.viewH = height;
     this.renderer.setSize(width, height, false);
-    this.camera.aspect = width / height;
+    this.updateFrustum();
+  }
+
+  private updateFrustum() {
+    const aspect = this.viewH > 0 ? this.viewW / this.viewH : 1;
+    this.camera.left = -this.orthoHalf * aspect;
+    this.camera.right = this.orthoHalf * aspect;
+    this.camera.top = this.orthoHalf;
+    this.camera.bottom = -this.orthoHalf;
     this.camera.updateProjectionMatrix();
   }
 
@@ -196,7 +218,10 @@ export class SceneManager {
     this.geometry = new THREE.BufferGeometry();
     this.geometry.setAttribute("position", new THREE.BufferAttribute(model.positions, 3));
     this.geometry.setAttribute("color", new THREE.BufferAttribute(this.colors, 3));
+    this.uvs = new Float32Array(this.triCount * 3 * 2);
+    this.geometry.setAttribute("uv", new THREE.BufferAttribute(this.uvs, 2));
     this.geometry.computeVertexNormals();
+    this.scalarMode = "none";
 
     const material = new THREE.MeshStandardMaterial({
       vertexColors: true,
@@ -213,16 +238,18 @@ export class SceneManager {
     this.rebuildBcMarkers();
     this.repaint();
 
-    // Fit camera.
+    // Fit camera (parallel projection: frustum half-height from the bbox).
     const [lx, ly, lz, hx, hy, hz] = model.bbox;
     const center = new THREE.Vector3((lx + hx) / 2, (ly + hy) / 2, (lz + hz) / 2);
     this.bboxDiag = Math.hypot(hx - lx, hy - ly, hz - lz) || 100;
-    const dist = this.bboxDiag * 1.8;
+    const dist = this.bboxDiag * 2.2;
     this.camera.position.set(center.x + dist * 0.7, center.y - dist * 0.8, center.z + dist * 0.55);
     this.controls.target.copy(center);
-    this.camera.near = this.bboxDiag / 1000;
+    this.camera.near = this.bboxDiag / 100;
     this.camera.far = this.bboxDiag * 50;
-    this.camera.updateProjectionMatrix();
+    this.camera.zoom = 1;
+    this.orthoHalf = this.bboxDiag * 0.62;
+    this.updateFrustum();
     this.controls.update();
 
     if (!this.brushCursor) {
@@ -577,6 +604,36 @@ export class SceneManager {
     this.refreshView();
   }
 
+  /** Live optimization skeleton or density-threshold cutaway mesh. */
+  setOptShape(positions: Float32Array | null, indices: Uint32Array | null) {
+    if (this.optShapeMesh) {
+      this.scene.remove(this.optShapeMesh);
+      this.optShapeMesh.geometry.dispose();
+      (this.optShapeMesh.material as THREE.Material).dispose();
+      this.optShapeMesh = null;
+    }
+    if (positions && indices && indices.length) {
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+      geo.setIndex(new THREE.BufferAttribute(indices, 1));
+      geo.computeVertexNormals();
+      const mat = new THREE.MeshStandardMaterial({
+        color: 0xd9974f,
+        roughness: 0.55,
+        metalness: 0.05,
+        side: THREE.DoubleSide,
+      });
+      this.optShapeMesh = new THREE.Mesh(geo, mat);
+      this.scene.add(this.optShapeMesh);
+    }
+    this.refreshView();
+  }
+
+  setRegionVisibility(vis: boolean[]) {
+    this.regionVisible = vis;
+    this.refreshView();
+  }
+
   setRegions(regions: OptRegion[] | null) {
     for (const m of this.regionMeshes) {
       this.scene.remove(m);
@@ -584,6 +641,7 @@ export class SceneManager {
       (m.material as THREE.Material).dispose();
     }
     this.regionMeshes = [];
+    this.regionVisible = [];
     if (!regions) {
       this.refreshView();
       return;
@@ -623,49 +681,70 @@ export class SceneManager {
     if (!this.mesh) return;
     const mat = this.mesh.material as THREE.MeshStandardMaterial;
     const infill = this.viewMode === "infill";
-    mat.transparent = infill;
-    mat.opacity = infill ? 0.16 : 1.0;
-    mat.depthWrite = !infill;
+    // Density view with an opt shape (live skeleton / cutaway): ghost the
+    // part so the interior structure is what you actually see.
+    const showShape = this.viewMode === "density" && !!this.optShapeMesh;
+    if (this.optShapeMesh) this.optShapeMesh.visible = showShape;
+    const ghost = infill || showShape;
+    mat.transparent = ghost;
+    mat.opacity = ghost ? 0.15 : 1.0;
+    mat.depthWrite = !ghost;
     mat.needsUpdate = true;
     this.mesh.visible = this.viewMode !== "mesh";
     this.voxelGroup.visible = this.viewMode === "mesh";
-    for (const m of this.regionMeshes) m.visible = infill;
+    this.regionMeshes.forEach((m, i) => {
+      m.visible = infill && this.regionVisible[i] !== false;
+    });
     this.updateMarkerVisibility();
     this.applyPositions();
     this.applyColors();
   }
 
+  /** Switch the part material between BC vertex colors and a scalar LUT. */
+  private setSurfaceMaterialMode(mode: "none" | "jet" | "ramp") {
+    if (!this.mesh || mode === this.scalarMode) return;
+    this.scalarMode = mode;
+    const mat = this.mesh.material as THREE.MeshStandardMaterial;
+    if (mode === "none") {
+      mat.map = null;
+      mat.vertexColors = true;
+    } else {
+      mat.map = mode === "jet" ? this.lutJet : this.lutRamp;
+      mat.vertexColors = false;
+    }
+    mat.needsUpdate = true;
+  }
+
   private applyColors() {
-    if (!this.geometry || !this.colors) return;
+    if (!this.geometry || !this.colors || !this.uvs) return;
+    const uvAttr = this.geometry.getAttribute("uv") as THREE.BufferAttribute;
     if (this.viewMode === "deformed" && this.displacements) {
       const d = this.displacements;
       let maxMag = 1e-12;
-      const mags = new Float32Array(d.length / 3);
-      for (let i = 0; i < mags.length; i++) {
+      const n = d.length / 3;
+      const mags = new Float32Array(n);
+      for (let i = 0; i < n; i++) {
         mags[i] = Math.hypot(d[3 * i], d[3 * i + 1], d[3 * i + 2]);
         maxMag = Math.max(maxMag, mags[i]);
       }
-      const c = new THREE.Color();
-      for (let i = 0; i < mags.length; i++) {
-        jet(mags[i] / maxMag, c);
-        this.colors[3 * i] = c.r;
-        this.colors[3 * i + 1] = c.g;
-        this.colors[3 * i + 2] = c.b;
+      for (let i = 0; i < n; i++) {
+        this.uvs[2 * i] = mags[i] / maxMag;
+        this.uvs[2 * i + 1] = 0.5;
       }
-      (this.geometry.getAttribute("color") as THREE.BufferAttribute).needsUpdate = true;
+      uvAttr.needsUpdate = true;
+      this.setSurfaceMaterialMode("jet");
       return;
     }
     if (this.viewMode === "density" && this.vertexDensity) {
-      const c = new THREE.Color();
       for (let i = 0; i < this.vertexDensity.length; i++) {
-        ramp(Math.min(1, this.vertexDensity[i] / 0.8), c);
-        this.colors[3 * i] = c.r;
-        this.colors[3 * i + 1] = c.g;
-        this.colors[3 * i + 2] = c.b;
+        this.uvs[2 * i] = Math.min(1, this.vertexDensity[i] / 0.8);
+        this.uvs[2 * i + 1] = 0.5;
       }
-      (this.geometry.getAttribute("color") as THREE.BufferAttribute).needsUpdate = true;
+      uvAttr.needsUpdate = true;
+      this.setSurfaceMaterialMode("ramp");
       return;
     }
+    this.setSurfaceMaterialMode("none");
     this.repaint();
   }
 
@@ -762,4 +841,24 @@ function jet(x: number, out: THREE.Color) {
   const g = Math.min(1, Math.max(0, 1.5 - Math.abs(4 * t - 2)));
   const b = Math.min(1, Math.max(0, 1.5 - Math.abs(4 * t - 1)));
   out.setRGB(r, g, b);
+}
+
+/** Bake a colormap into a 1D texture, sampled per-fragment via uv.x. */
+function makeLut(fn: (t: number, out: THREE.Color) => void): THREE.DataTexture {
+  const n = 256;
+  const data = new Uint8Array(n * 4);
+  const c = new THREE.Color();
+  for (let i = 0; i < n; i++) {
+    fn(i / (n - 1), c);
+    data[4 * i] = Math.round(255 * c.r);
+    data[4 * i + 1] = Math.round(255 * c.g);
+    data[4 * i + 2] = Math.round(255 * c.b);
+    data[4 * i + 3] = 255;
+  }
+  const tex = new THREE.DataTexture(data, n, 1, THREE.RGBAFormat);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.minFilter = THREE.LinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  tex.needsUpdate = true;
+  return tex;
 }

@@ -5,7 +5,12 @@ import type { Bc, CheckReport, LoadedModel, SolveStats, VoxelInfo } from "../typ
 interface Pending {
   resolve: (v: unknown) => void;
   reject: (e: Error) => void;
-  onProgress?: (data: unknown, density: Float32Array) => void;
+  onProgress?: (
+    data: unknown,
+    density: Float32Array,
+    skelPositions?: Float32Array,
+    skelIndices?: Uint32Array
+  ) => void;
 }
 
 export class EngineClient {
@@ -18,11 +23,11 @@ export class EngineClient {
       type: "module",
     });
     this.worker.onmessage = (ev) => {
-      const { id, ok, data, error, progress, density } = ev.data;
+      const { id, ok, data, error, progress, density, skelPositions, skelIndices } = ev.data;
       const p = this.pending.get(id);
       if (!p) return;
       if (progress) {
-        p.onProgress?.(data, density);
+        p.onProgress?.(data, density, skelPositions, skelIndices);
         return;
       }
       this.pending.delete(id);
@@ -95,19 +100,30 @@ export class EngineClient {
     coeff: number,
     perimeters: number,
     lineWidth: number,
+    smoothIters: number,
     nBins: number,
-    onProgress: (p: OptProgress, density: Float32Array) => void
+    onProgress: (
+      p: OptProgress,
+      density: Float32Array,
+      skelPositions?: Float32Array,
+      skelIndices?: Uint32Array
+    ) => void
   ): Promise<OptimizeOutput> {
     return this.call(
-      { op: "optimize", budgetPct, exponent, coeff, perimeters, lineWidth, nBins },
+      { op: "optimize", budgetPct, exponent, coeff, perimeters, lineWidth, smoothIters, nBins },
       [],
-      onProgress as (data: unknown, density: Float32Array) => void
+      onProgress as Pending["onProgress"]
     );
   }
 
   /** Exposed-face hull + cell edges of the analysis voxel grid. */
   voxelMesh(): Promise<{ hull: Float32Array; edges: Float32Array; info: VoxelInfo }> {
     return this.call({ op: "voxelMesh" });
+  }
+
+  /** Isosurface of the final continuous density field at `threshold` (0..1). */
+  densityShape(threshold: number): Promise<{ positions: Float32Array; indices: Uint32Array }> {
+    return this.call({ op: "densityShape", threshold });
   }
 
   exportThreeMf(): Promise<Uint8Array> {
@@ -135,6 +151,7 @@ export interface OptRegion {
 
 export interface OptSummary {
   iterations: number;
+  converged: boolean;
   bins: { density: number; cells: number }[];
   baseDensity: number;
   regionCount: number;

@@ -90,6 +90,7 @@ interface AppState {
   pattern: PatternKey;
   perimeters: number;
   lineWidth: number; // mm
+  smoothIters: number; // Taubin passes on modifier regions
   nBins: number;
   // run state
   busy: string | null;
@@ -108,6 +109,11 @@ interface AppState {
   voxelInfo: VoxelInfo | null;
   voxelMeshReady: boolean;
   settingsOpen: boolean;
+  /** Densities of the extracted modifier regions (for the region list). */
+  regionInfos: { density: number }[];
+  regionVisible: boolean[];
+  /** Density cutaway threshold in %, 0 = off (surface paint only). */
+  densityThreshold: number;
 
   loadFile(name: string, bytes: ArrayBuffer): Promise<void>;
   setSegAngle(angle: number): Promise<void>;
@@ -133,7 +139,10 @@ interface AppState {
   setPattern(p: PatternKey): void;
   setPerimeters(v: number): void;
   setLineWidth(v: number): void;
+  setSmoothIters(v: number): void;
   setNBins(v: number): void;
+  setRegionVisible(index: number, on: boolean): void;
+  setDensityThreshold(v: number): void;
   runCheck(): Promise<void>;
   runSolve(): Promise<void>;
   runOptimize(): Promise<void>;
@@ -146,6 +155,7 @@ interface AppState {
 }
 
 let bcCounter = 0;
+let isoTimer: ReturnType<typeof setTimeout> | null = null;
 
 /** Events the 3D scene listens to (kept out of React rendering). */
 export interface SceneEvents {
@@ -159,6 +169,9 @@ export interface SceneEvents {
   onViewState?: (mode: ViewMode, deformScale: number) => void;
   onVoxelMesh?: (hull: Float32Array | null, edges: Float32Array | null) => void;
   onAnimateDeformed?: (on: boolean) => void;
+  /** Live optimization skeleton or density-threshold cutaway mesh. */
+  onOptShape?: (positions: Float32Array | null, indices: Uint32Array | null) => void;
+  onRegionVisibility?: (visible: boolean[]) => void;
 }
 
 export const sceneEvents: SceneEvents = {};
@@ -168,10 +181,19 @@ async function pushBcs(get: () => AppState) {
 }
 
 function invalidateResults(set: (p: Partial<AppState>) => void, get: () => AppState) {
-  set({ check: null, stats: null, hasResult: false, optSummary: null });
+  set({
+    check: null,
+    stats: null,
+    hasResult: false,
+    optSummary: null,
+    regionInfos: [],
+    regionVisible: [],
+    densityThreshold: 0,
+  });
   sceneEvents.onRegions?.(null);
   sceneEvents.onVertexDensity?.(null);
   sceneEvents.onDisplacements?.(null, null);
+  sceneEvents.onOptShape?.(null, null);
   if (get().viewMode !== "setup" && get().viewMode !== "mesh") {
     set({ viewMode: "setup" });
     sceneEvents.onViewState?.("setup", get().deformScale);
@@ -216,6 +238,7 @@ export const useStore = create<AppState>((set, get) => ({
   pattern: "gyroid",
   perimeters: 2,
   lineWidth: 0.45,
+  smoothIters: 8,
   nBins: 3,
   busy: null,
   error: null,
@@ -232,6 +255,9 @@ export const useStore = create<AppState>((set, get) => ({
   voxelInfo: null,
   voxelMeshReady: false,
   settingsOpen: false,
+  regionInfos: [],
+  regionVisible: [],
+  densityThreshold: 0,
 
   async loadFile(name, bytes) {
     set({ busy: "Parsing & segmenting…", error: null, notice: null });
@@ -428,8 +454,40 @@ export const useStore = create<AppState>((set, get) => ({
   setLineWidth(v) {
     set({ lineWidth: Math.min(1.5, Math.max(0.1, v)) });
   },
+  setSmoothIters(v) {
+    set({ smoothIters: Math.min(20, Math.max(0, Math.round(v))) });
+  },
   setNBins(v) {
     set({ nBins: v });
+  },
+
+  setRegionVisible(index, on) {
+    const vis = get().regionVisible.slice();
+    vis[index] = on;
+    set({ regionVisible: vis });
+    sceneEvents.onRegionVisibility?.(vis);
+  },
+
+  setDensityThreshold(v) {
+    set({ densityThreshold: v });
+    if (isoTimer) clearTimeout(isoTimer);
+    isoTimer = setTimeout(() => {
+      void (async () => {
+        const st = get();
+        if (!st.optSummary) return;
+        if (v < 10) {
+          // Below the printable floor everything is "inside" — cutaway off.
+          sceneEvents.onOptShape?.(null, null);
+          return;
+        }
+        try {
+          const { positions, indices } = await engine.densityShape(v / 100);
+          if (get().densityThreshold === v) sceneEvents.onOptShape?.(positions, indices);
+        } catch {
+          // grid/result vanished mid-drag: ignore
+        }
+      })();
+    }, 140);
   },
 
   async runCheck() {
@@ -489,16 +547,20 @@ export const useStore = create<AppState>((set, get) => ({
         curve.coeff,
         st.perimeters,
         st.lineWidth,
+        st.smoothIters,
         st.nBins,
-        (p, density) => {
+        (p, density, skelPositions, skelIndices) => {
           set({ optProgress: { iteration: p.iteration, maxIter: p.maxIter } });
           if (get().viewMode !== "density") {
             set({ viewMode: "density" });
             sceneEvents.onViewState?.("density", get().deformScale);
           }
           sceneEvents.onVertexDensity?.(density);
+          // Watch the optimized shape gain detail iteration by iteration.
+          sceneEvents.onOptShape?.(skelPositions ?? null, skelIndices ?? null);
         }
       );
+      const vis = out.regions.map(() => true);
       set({
         optSummary: out.summary,
         optProgress: null,
@@ -511,14 +573,20 @@ export const useStore = create<AppState>((set, get) => ({
           seconds: out.summary.seconds,
         },
         hasResult: true,
+        regionInfos: out.regions.map((r) => ({ density: r.density })),
+        regionVisible: vis,
+        densityThreshold: 0,
       });
+      sceneEvents.onOptShape?.(null, null);
       sceneEvents.onVertexDensity?.(out.vertexDensity);
       sceneEvents.onDisplacements?.(out.displacements, {
         maxDisplacement: out.summary.maxDisplacement,
       });
       sceneEvents.onRegions?.(out.regions);
+      sceneEvents.onRegionVisibility?.(vis);
       sceneEvents.onViewState?.("infill", get().deformScale);
     } catch (e) {
+      sceneEvents.onOptShape?.(null, null);
       set({ busy: null, optProgress: null, error: e instanceof Error ? e.message : String(e) });
     }
   },

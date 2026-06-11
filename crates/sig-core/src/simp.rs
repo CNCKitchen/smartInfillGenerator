@@ -51,7 +51,10 @@ pub struct OptimizeProgress {
     pub compliance: f64,
     /// Current total mass fraction of solid.
     pub mass_frac: f64,
+    /// Max per-cell density change of this design update.
     pub change: f64,
+    /// Mean per-cell density change (the convergence signal).
+    pub mean_change: f64,
 }
 
 pub struct OptimizeResult {
@@ -64,6 +67,8 @@ pub struct OptimizeResult {
     /// Achieved budget (after feasibility clamping).
     pub effective_budget: f64,
     pub iterations: usize,
+    /// True if the design-change criterion fired before the iteration cap.
+    pub converged: bool,
     pub compliance: f64,
     /// Last displacement field (padded node grid, f64) — warm start / reuse.
     pub u: Vec<f64>,
@@ -390,6 +395,9 @@ pub fn optimize(
     let mut sens = vec![0f64; design_cells.len()];
     let mut compliance = f64::INFINITY;
     let mut iterations = 0;
+    let mut converged = false;
+    let mut small_streak = 0usize;
+    let mut last_mean_change = f64::INFINITY;
 
     // Build the hierarchy ONCE; iterations only swap stiffness values in.
     let mut fixed = vec![false; ndof];
@@ -416,11 +424,14 @@ pub fn optimize(
         }
         let eps = build_eps(grid, &skin, &design_cells, &x_phys, params.exponent, params.coeff);
         solver.update_eps(eps);
-        // Inexact inner solves are standard in topology optimization: the
-        // design update tolerates sensitivity noise (filter + move limits),
-        // so cap the MGCG work per iteration instead of converging tightly.
-        // Only the final verification solve needs full accuracy.
-        let _ = solver.solve_warm(&bb, &mut u, 5e-4, 15);
+        // Inexact inner solves are standard in topology optimization: while
+        // the layout is forming, sensitivity noise is tolerated (filter +
+        // move limits), so cap the MGCG work. Once the design slows down,
+        // spend real solve effort — otherwise u (and the sensitivities)
+        // keep creeping toward the true solution for tens of iterations and
+        // the design never becomes stationary.
+        let (tol_i, cap_i) = if last_mean_change < 0.012 { (2e-4, 60) } else { (5e-4, 15) };
+        let _ = solver.solve_warm(&bb, &mut u, tol_i, cap_i);
         compliance = 0.0;
         for i in 0..ndof {
             compliance += bb[i] * u[i];
@@ -438,7 +449,12 @@ pub fn optimize(
         filter.apply_t(&sens_phys, &mut sens);
 
         // OC update with bisection on the volume multiplier.
-        let move_limit = 0.15;
+        // Move-limit continuation: full steps while the layout forms, then
+        // geometric decay. This kills the OC 2-cycle (cells ping-ponging at
+        // +/-move forever) so the design actually becomes stationary instead
+        // of dithering until the iteration cap.
+        let move_limit =
+            if it < 10 { 0.15 } else { (0.15 * 0.92f64.powi(it as i32 - 9)).max(0.05) };
         let (mut lo, mut hi) = (1e-12f64, 1e12f64);
         let mut x_new = vec![0f64; x.len()];
         for _ in 0..60 {
@@ -469,21 +485,43 @@ pub fn optimize(
                 break;
             }
         }
-        let mut change = 0f64;
-        for k in 0..x.len() {
-            change = change.max((x_new[k] - x[k]).abs());
+        // Oscillation damping: OC settles into a global 2-cycle once the
+        // layout has formed (the field flips between two states forever).
+        // Averaging consecutive designs cancels the cycle geometrically
+        // while passing real drift through; without it the convergence
+        // criterion never fires.
+        if it >= 12 {
+            for k in 0..x.len() {
+                x_new[k] = 0.5 * (x_new[k] + x[k]);
+            }
         }
+        let mut change = 0f64;
+        let mut mean_change = 0f64;
+        for k in 0..x.len() {
+            let d = (x_new[k] - x[k]).abs();
+            change = change.max(d);
+            mean_change += d;
+        }
+        mean_change /= x.len().max(1) as f64;
+        last_mean_change = mean_change;
         x.copy_from_slice(&x_new);
 
         let mass_frac = (skin.len() as f64
             + x_phys.iter().sum::<f64>())
             / n_solid;
         progress(
-            &OptimizeProgress { iteration: it + 1, compliance, mass_frac, change },
+            &OptimizeProgress { iteration: it + 1, compliance, mass_frac, change, mean_change },
             &x_phys,
             &design_cells,
         );
-        if change < 0.02 && it >= 8 {
+        // Converged when the design is stationary in the mean on two
+        // consecutive iterations. Max-change is not usable (single boundary
+        // cells oscillate), and the compliance estimate from inexact
+        // warm-started solves creeps for many iterations, so the field
+        // itself is the only honest signal. The iteration cap is a safety net.
+        small_streak = if mean_change < 0.005 { small_streak + 1 } else { 0 };
+        if small_streak >= 2 && it >= 6 {
+            converged = true;
             break;
         }
     }
@@ -500,6 +538,7 @@ pub fn optimize(
         skin_cells: skin,
         effective_budget,
         iterations,
+        converged,
         compliance,
         u,
     })

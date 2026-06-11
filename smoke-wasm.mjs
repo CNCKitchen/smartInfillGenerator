@@ -120,25 +120,30 @@ optModel.add_force(new Uint32Array([2, 3]), 0, 0, -40);
 
 let progressCalls = 0;
 let lastDensityLen = 0;
+let skelTris = 0;
 const t1 = performance.now();
 const summary = JSON.parse(
-  // gyroid law E = 1.0*E0*rho^1.5; 2 perimeters x 0.45 mm line width
-  optModel.optimize(60, 1.5, 1.0, 2, 0.45, 3, (json, density) => {
+  // gyroid law E = 1.0*E0*rho^1.5; 2 perimeters x 0.45 mm line width; 8 smoothing passes
+  optModel.optimize(60, 1.5, 1.0, 2, 0.45, 8, 3, (json, density, skelPos, skelIdx) => {
     progressCalls++;
     lastDensityLen = density.length;
+    if (skelIdx && skelIdx.length) skelTris = skelIdx.length / 3;
+    if (skelPos && skelPos.length % 3 !== 0) throw new Error("bad skeleton positions");
     const p = JSON.parse(json);
     if (p.iteration % 10 === 0)
       console.log(`   opt iter ${p.iteration}/${p.maxIter}, mass ${(p.massFrac * 100).toFixed(1)}%`);
   })
 );
 console.log(
-  `   optimize: ${summary.iterations} iters in ${((performance.now() - t1) / 1000).toFixed(1)} s; ` +
+  `   optimize: ${summary.iterations} iters (converged=${summary.converged}) in ${((performance.now() - t1) / 1000).toFixed(1)} s; ` +
     `mass ${summary.massGrams.toFixed(1)}/${summary.massSolidGrams.toFixed(1)} g, ` +
     `stiffness vs solid ${(summary.stiffnessVsSolid * 100).toFixed(0)}%, ` +
     `vs uniform +${(summary.gainVsUniform * 100).toFixed(1)}%, bins ${summary.bins.map((b) => b.density).join("/")}`
 );
 assert(progressCalls >= 5, `progress callback fired (${progressCalls}x)`);
 assert(lastDensityLen === 36, "live vertex density (1 scalar per soup vertex)");
+assert(typeof summary.converged === "boolean", "summary reports convergence");
+assert(skelTris > 0, `live skeleton isosurface streamed (${skelTris} tris last)`);
 assert(summary.bins.length >= 2, "at least 2 density bins");
 assert(summary.massFrac > 0.2 && summary.massFrac < 1.0, `sane mass fraction ${summary.massFrac.toFixed(2)}`);
 assert(summary.stiffnessVsSolid > 0.1 && summary.stiffnessVsSolid <= 1.05, "sane stiffness ratio");
@@ -157,14 +162,19 @@ const hedges = optModel.voxel_edges();
 assert(hull.length > 0 && hull.length % 9 === 0, `voxel hull triangle soup (${hull.length / 9} tris)`);
 assert(hedges.length > 0 && hedges.length % 6 === 0, `voxel edge segments (${hedges.length / 6})`);
 
+// Density-threshold cutaway isosurface.
+const iso = optModel.density_isosurface(0.3);
+assert(iso.length === 2 && iso[0].length > 0 && iso[1].length % 3 === 0,
+  `density isosurface at 30% (${iso[1].length / 3} tris)`);
+
 const threeMf = optModel.export_3mf();
 assert(threeMf.length > 500 && threeMf[0] === 0x50 && threeMf[1] === 0x4b, "3MF export is a zip");
-// wall_loops from the optimize() call (2 perimeters) must land in the config.
+// Modifiers override ONLY the infill density — walls inherit from the part.
 {
   const td = new TextDecoder("latin1");
   const raw = td.decode(threeMf);
-  assert(raw.includes('wall_loops" value="2"'), "3MF carries the perimeter count, not 0");
-  assert(!raw.includes('wall_loops" value="0"'), "no zero-wall modifiers");
+  assert(!raw.includes("wall_loops"), "no wall_loops anywhere (inherit from profile)");
+  assert(raw.includes("sparse_infill_density"), "densities present");
 }
 const stlZip = optModel.export_stls();
 assert(stlZip.length > 100 && stlZip[0] === 0x50, "STL zip export");

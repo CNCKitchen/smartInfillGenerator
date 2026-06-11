@@ -32,13 +32,18 @@ Workflow in the app:
    exaggeration slider + readout, optional 0→max deflection animation).
 5. **Optimize infill** — pick a mass budget, pattern (gyroid/cubic/grid —
    E(ρ) curves editable in ⚙ Settings), perimeters × line width (the solid
-   skin the analysis assumes), and number of density levels. Watch the
-   density field evolve live; the card reports mass, stiffness vs solid, and
-   the gain over uniform infill at equal mass.
+   skin the analysis assumes — analysis only, never written to the slicer),
+   region smoothing, and number of density levels. The evolving dense-core
+   shape is shown live each iteration; the loop stops on a design-stationarity
+   criterion (iteration cap is only a safety net). The card reports mass,
+   stiffness vs solid, and the gain over uniform infill at equal mass.
+   Afterwards the Density view has a cutaway slider (show only material
+   denser than a threshold) and the Regions view a per-region visibility
+   list.
 6. **Export** — `.3mf` project (part + nested modifier volumes with
-   `sparse_infill_density` set, base density on the object, the perimeter
-   count pinned on part + modifiers) for OrcaSlicer/Bambu Studio, or a
-   `.zip` of modifier STLs for any slicer.
+   `sparse_infill_density` set, base density on the object — densities are
+   the ONLY override; walls/shells inherit from your profile) for
+   OrcaSlicer/Bambu Studio, or a `.zip` of modifier STLs for any slicer.
 
 ## Repo layout
 
@@ -68,10 +73,12 @@ cd web && npm run build                                           # production b
 - Phases 1–4 of DESIGN.md are implemented and tested (engine: 24 tests; full
   pipeline smoke incl. optimization quality: binned layout measured ~14–16 %
   stiffer than uniform infill at equal mass on the cantilever fixture).
-- The exported 3MF **opens in a real OrcaSlicer install** (first manual test
-  2026-06). One fix came out of it: modifiers now carry the part's
-  `wall_loops` (user-set perimeter count) instead of the sample's `0`, which
-  stripped perimeters wherever a modifier touched the outer surface.
+- The exported 3MF **opens in a real OrcaSlicer install** (manual tests
+  2026-06). Final format decision from those tests: modifiers override
+  ONLY `sparse_infill_density` — the sample's `wall_loops=0` strips
+  perimeters where a modifier touches the surface, and pinning a count
+  would override the user's process profile, so no wall keys are written
+  at all.
 - Single-threaded WASM: optimization at Preview resolution takes ~½–2 min
   depending on part size (live density view while it runs). wasm threads are
   the planned next multiplier (~5–8×).

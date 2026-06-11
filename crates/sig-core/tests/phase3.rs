@@ -198,7 +198,7 @@ fn orca_3mf_roundtrips_through_own_zip_and_import() {
         region([3.0; 3], [10.0, 10.0, 7.0], 0.50),
     ];
 
-    let bytes = export_orca_3mf("bracket & arm", &part, &regions, 0.12, 3);
+    let bytes = export_orca_3mf("bracket & arm", &part, &regions, 0.12);
 
     // Container structure.
     let entries = read_zip(&bytes).expect("read back own zip");
@@ -223,11 +223,10 @@ fn orca_3mf_roundtrips_through_own_zip_and_import() {
     assert!(cfg.contains("sparse_infill_density\" value=\"25%\""));
     assert!(cfg.contains("sparse_infill_density\" value=\"50%\""));
     assert!(cfg.contains("sparse_infill_density\" value=\"12%\""), "base density on the object");
-    // Modifiers must inherit the part's perimeter count (NOT 0 — that strips
-    // walls where a modifier touches the outer surface), and the object pins
-    // the same count so the print matches the analysis assumption.
-    assert_eq!(cfg.matches("wall_loops\" value=\"3\"").count(), 3, "object + 2 modifiers");
-    assert!(!cfg.contains("wall_loops\" value=\"0\""));
+    // Modifiers override ONLY the infill density. No wall_loops anywhere:
+    // 0 strips perimeters where a modifier touches the surface, and a pinned
+    // count would override the user's process profile (real-Orca finding).
+    assert!(!cfg.contains("wall_loops"), "walls must inherit from the part profile");
     assert!(cfg.contains("bracket &amp; arm"));
 
     // Geometry comes back via the import path (largest bbox = the part).
@@ -265,6 +264,42 @@ fn imports_reference_orca_sample() {
     for d in dims {
         assert!((d - 25.0).abs() < 1.0, "expected ~25mm cube, got {dims:?}");
     }
+}
+
+/// Diagnostic: print the convergence signals per iteration on the smoke-test
+/// fixture. Run with: cargo test -p sig-core --test phase3 conv_trace -- --ignored --nocapture
+#[test]
+#[ignore]
+fn conv_trace() {
+    let beam = primitives::boxx([0.0; 3], [60.0, 12.0, 12.0]);
+    // ~60k cells like the wasm smoke fixture.
+    let h = (60.0f64 * 12.0 * 12.0 / 60_000.0).cbrt();
+    let grid0 = VoxelGrid::voxelize(&beam, h);
+    let settings = SolveSettings { e0: 2400.0, nu: 0.35, tol: 1e-5, ..Default::default() };
+    let (grid, levels) = pad_for_levels(&grid0, settings.max_levels);
+    let bcs = vec![
+        BcSpec { kind: BcKind::Fixed, tris: face_tris(0) },
+        BcSpec { kind: BcKind::Force([0.0, 0.0, -40.0]), tris: face_tris(1) },
+    ];
+    let asm = assemble(&beam, &grid, &bcs, None, &settings).unwrap();
+    let params = OptimizeParams {
+        budget: 0.6,
+        exponent: 1.5,
+        wall_mm: 0.9,
+        max_iter: 40,
+        ..Default::default()
+    };
+    let mut prev_c = f64::INFINITY;
+    let result = optimize(&grid, levels, &asm.problem, &settings, &params, |p, _x, _c| {
+        let c_rel = if prev_c.is_finite() { (p.compliance - prev_c).abs() / p.compliance } else { f64::NAN };
+        prev_c = p.compliance;
+        println!(
+            "it {:>2}  C {:.6e}  c_rel {:.2e}  max_dx {:.4}  mean_dx {:.5}",
+            p.iteration, p.compliance, c_rel, p.change, p.mean_change
+        );
+    })
+    .expect("optimize");
+    println!("converged = {}, iterations = {}", result.converged, result.iterations);
 }
 
 #[test]

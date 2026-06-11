@@ -22,12 +22,13 @@ body {
 }
 
 .sidebar {
-  width: 320px;
-  min-width: 320px;
+  width: 384px;
+  min-width: 384px;
   padding: 14px 16px;
   background: #1b2026;
   border-right: 1px solid #2a323b;
   overflow-y: auto;
+  overflow-x: hidden;
   display: flex;
   flex-direction: column;
   gap: 14px;
@@ -115,6 +116,8 @@ button:disabled {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
 }
 
 .row span {
@@ -436,6 +439,21 @@ footer {
   font-size: 11px;
   color: #76879a;
   line-height: 1.5;
+}
+
+/* ---- region list (Regions view) ---- */
+
+.regionlist {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.regionrow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
 }
 
 /* ---- settings modal ---- */

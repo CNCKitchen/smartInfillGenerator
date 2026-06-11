@@ -29,8 +29,10 @@ type Req =
       coeff: number;
       perimeters: number;
       lineWidth: number;
+      smoothIters: number;
       nBins: number;
     }
+  | { id: number; op: "densityShape"; threshold: number }
   | { id: number; op: "exportThreeMf" }
   | { id: number; op: "exportStls" };
 
@@ -125,12 +127,26 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
         const m = requireModel();
         const t0 = performance.now();
         const summary = JSON.parse(
-          m.optimize(msg.budgetPct, msg.exponent, msg.coeff, msg.perimeters, msg.lineWidth, msg.nBins, (json: string, density: Float32Array) => {
-            (self as unknown as Worker).postMessage(
-              { id: msg.id, progress: true, data: JSON.parse(json), density },
-              [density.buffer]
-            );
-          })
+          m.optimize(
+            msg.budgetPct,
+            msg.exponent,
+            msg.coeff,
+            msg.perimeters,
+            msg.lineWidth,
+            msg.smoothIters,
+            msg.nBins,
+            (
+              json: string,
+              density: Float32Array,
+              skelPositions: Float32Array,
+              skelIndices: Uint32Array
+            ) => {
+              (self as unknown as Worker).postMessage(
+                { id: msg.id, progress: true, data: JSON.parse(json), density, skelPositions, skelIndices },
+                [density.buffer, skelPositions.buffer, skelIndices.buffer]
+              );
+            }
+          )
         );
         summary.seconds = (performance.now() - t0) / 1000;
         // Collect region meshes + final fields in one payload.
@@ -148,6 +164,16 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
         (self as unknown as Worker).postMessage(
           { id: msg.id, ok: true, data: { summary, regions, vertexDensity, displacements } },
           transfer
+        );
+        return;
+      }
+      case "densityShape": {
+        const arr = requireModel().density_isosurface(msg.threshold);
+        const positions = arr[0] as Float32Array;
+        const indices = arr[1] as Uint32Array;
+        (self as unknown as Worker).postMessage(
+          { id: msg.id, ok: true, data: { positions, indices } },
+          [positions.buffer, indices.buffer]
         );
         return;
       }

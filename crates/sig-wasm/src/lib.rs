@@ -24,6 +24,9 @@ struct OptOutput {
     base_density: f64,
     /// Final per-design-cell binned density.
     cell_density: std::collections::HashMap<u32, f64>,
+    /// Continuous (pre-binning) field for the density-threshold isosurface.
+    design_cells: Vec<u32>,
+    x_cont: Vec<f64>,
     summary: String,
 }
 
@@ -42,8 +45,6 @@ pub struct Model {
     grid: Option<(VoxelGrid, usize)>, // padded grid + level count
     solution: Option<Solution>,
     opt: Option<OptOutput>,
-    /// Perimeter count assumed by the last optimization (written to the 3MF).
-    wall_loops: u32,
 }
 
 fn err(e: impl std::fmt::Display) -> JsValue {
@@ -74,7 +75,6 @@ impl Model {
             grid: None,
             solution: None,
             opt: None,
-            wall_loops: 2,
         })
     }
 
@@ -327,10 +327,12 @@ impl Model {
     }
 
     /// Run the density optimization + binning + verification. Progress gets
-    /// called per iteration with (jsonString, Float32Array vertexDensity).
+    /// called per iteration with (jsonString, Float32Array vertexDensity,
+    /// Float32Array skeletonPositions, Uint32Array skeletonIndices) — the
+    /// skeleton is the evolving isosurface of cells denser than 40%.
     /// Infill law E/E0 = coeff * rho^exponent; skin thickness is
-    /// perimeters * line_width (and `perimeters` lands in the 3MF as
-    /// wall_loops on object + modifiers).
+    /// perimeters * line_width (analysis only — the 3MF never pins walls).
+    /// `smooth_iters` = Taubin passes applied to the exported regions.
     #[allow(clippy::too_many_arguments)]
     pub fn optimize(
         &mut self,
@@ -339,6 +341,7 @@ impl Model {
         coeff: f64,
         perimeters: u32,
         line_width: f64,
+        smooth_iters: u32,
         n_bins: u32,
         progress: &js_sys::Function,
     ) -> Result<String, JsValue> {
@@ -347,7 +350,7 @@ impl Model {
         let coeff = coeff.clamp(0.05, 2.0);
         let perimeters = perimeters.clamp(1, 8);
         let wall_mm = perimeters as f64 * line_width.clamp(0.1, 1.5);
-        self.wall_loops = perimeters;
+        let smooth_iters = (smooth_iters as usize).min(30);
         let n_bins = (n_bins as usize).clamp(2, 4);
 
         // Assemble + check before burning time.
@@ -364,7 +367,9 @@ impl Model {
             exponent,
             coeff,
             wall_mm: wall_mm.clamp(0.2, 5.0),
-            max_iter: 24,
+            // Cap is a safety net; the change-based convergence criterion
+            // normally stops the loop earlier.
+            max_iter: 40,
             ..Default::default()
         };
 
@@ -372,6 +377,8 @@ impl Model {
         let max_iter = params.max_iter;
         // Borrow self fields disjointly for the progress closure.
         let tris = &mesh.tris;
+        // Isosurface threshold for the live "shape emerging" view.
+        const SKEL_DENSITY: f64 = 0.4;
         let result = simp_optimize(
             grid,
             *levels,
@@ -386,16 +393,28 @@ impl Model {
                 }
                 // Inline vertex sampling (cannot call &self methods here).
                 let vd = sample_field_static(tris, grid, &field);
+                // Evolving dense-core isosurface so the user watches the
+                // optimized shape gain detail iteration by iteration.
+                let inside =
+                    |ci: usize| field.get(&(ci as u32)).map_or(false, |&x| x >= SKEL_DENSITY);
+                let mut skel = extract_region(grid, &inside, 0.5);
+                taubin_smooth(&mut skel.positions, &skel.indices, 4);
                 let json = serde_json::json!({
                     "iteration": p.iteration,
                     "maxIter": max_iter,
                     "compliance": p.compliance,
                     "massFrac": p.mass_frac,
                     "change": p.change,
+                    "meanChange": p.mean_change,
                 })
                 .to_string();
-                let arr = js_sys::Float32Array::from(vd.as_slice());
-                let _ = progress.call2(&JsValue::NULL, &JsValue::from_str(&json), &arr);
+                let args = js_sys::Array::of4(
+                    &JsValue::from_str(&json),
+                    &js_sys::Float32Array::from(vd.as_slice()),
+                    &js_sys::Float32Array::from(skel.positions.as_slice()),
+                    &js_sys::Uint32Array::from(skel.indices.as_slice()),
+                );
+                let _ = progress.apply(&JsValue::NULL, &args);
             },
         )
         .map_err(err)?;
@@ -463,7 +482,9 @@ impl Model {
             if r.indices.is_empty() {
                 continue;
             }
-            taubin_smooth(&mut r.positions, &r.indices, 8);
+            if smooth_iters > 0 {
+                taubin_smooth(&mut r.positions, &r.indices, smooth_iters);
+            }
             r.density = centers[level];
             regions.push(r);
         }
@@ -481,6 +502,7 @@ impl Model {
             (0..centers.len()).map(|c| bins.iter().filter(|&&b| b as usize == c).count()).collect();
         let summary = serde_json::json!({
             "iterations": result.iterations,
+            "converged": result.converged,
             "bins": centers.iter().zip(&bin_counts).map(|(&d, &n)| serde_json::json!({
                 "density": d, "cells": n,
             })).collect::<Vec<_>>(),
@@ -504,9 +526,32 @@ impl Model {
             regions,
             base_density: centers[0],
             cell_density: field,
+            design_cells: result.design_cells,
+            x_cont: result.x,
             summary: summary.clone(),
         });
         Ok(summary)
+    }
+
+    /// Isosurface of the final continuous density field at `threshold`
+    /// (0..1): everything denser than the threshold, smoothed. Returns
+    /// [Float32Array positions, Uint32Array indices] for the cutaway view.
+    pub fn density_isosurface(&self, threshold: f64) -> Result<js_sys::Array, JsValue> {
+        let opt = self.opt.as_ref().ok_or_else(|| err("no optimization result"))?;
+        let (grid, _) = self.grid.as_ref().ok_or_else(|| err("no grid"))?;
+        let mut field: std::collections::HashMap<u32, f64> =
+            std::collections::HashMap::with_capacity(opt.design_cells.len());
+        for (i, &c) in opt.design_cells.iter().enumerate() {
+            field.insert(c, opt.x_cont[i]);
+        }
+        let t = threshold.clamp(0.0, 1.0);
+        let inside = |ci: usize| field.get(&(ci as u32)).map_or(false, |&x| x >= t);
+        let mut r = extract_region(grid, &inside, 0.5);
+        taubin_smooth(&mut r.positions, &r.indices, 5);
+        Ok(js_sys::Array::of2(
+            &js_sys::Float32Array::from(r.positions.as_slice()),
+            &js_sys::Uint32Array::from(r.indices.as_slice()),
+        ))
     }
 
     pub fn region_count(&self) -> u32 {
@@ -543,7 +588,7 @@ impl Model {
         let opt = self.opt.as_ref().ok_or_else(|| err("no optimization result — run optimize first"))?;
         let part = weld(&self.mesh);
         let name = if self.name.is_empty() { "part" } else { &self.name };
-        Ok(export_orca_3mf(name, &part, &opt.regions, opt.base_density, self.wall_loops))
+        Ok(export_orca_3mf(name, &part, &opt.regions, opt.base_density))
     }
 
     /// Exposed-face hull of the analysis voxel grid (triangle soup, xyz f32).
