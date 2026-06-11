@@ -93,3 +93,29 @@ export const RESOLUTIONS = {
 } as const;
 
 export type ResolutionKey = keyof typeof RESOLUTIONS;
+
+/** Result fields selectable in the Deformed view. `u` is computed client-side
+ *  from the displacement buffer; the rest come from the engine. */
+export interface ResultFieldDef {
+  value: string;
+  label: string;
+  unit: "mm" | "MPa" | "";
+}
+
+export const RESULT_FIELDS: ResultFieldDef[] = [
+  { value: "u", label: "Displacement |u|", unit: "mm" },
+  { value: "vm", label: "von Mises σ", unit: "MPa" },
+  { value: "sxx", label: "Normal σxx", unit: "MPa" },
+  { value: "syy", label: "Normal σyy", unit: "MPa" },
+  { value: "szz", label: "Normal σzz", unit: "MPa" },
+  { value: "sxy", label: "Shear τxy", unit: "MPa" },
+  { value: "syz", label: "Shear τyz", unit: "MPa" },
+  { value: "szx", label: "Shear τzx", unit: "MPa" },
+  { value: "evm", label: "von Mises ε", unit: "" },
+  { value: "exx", label: "Normal εxx", unit: "" },
+  { value: "eyy", label: "Normal εyy", unit: "" },
+  { value: "ezz", label: "Normal εzz", unit: "" },
+  { value: "gxy", label: "Shear γxy", unit: "" },
+  { value: "gyz", label: "Shear γyz", unit: "" },
+  { value: "gzx", label: "Shear γzx", unit: "" },
+];

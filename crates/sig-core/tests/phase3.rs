@@ -390,6 +390,48 @@ fn subdivision_preserves_area_and_respects_cap() {
 }
 
 #[test]
+fn column_compression_stress_matches_nominal() {
+    use sig_core::solve::{solve_nodes, NodeProblem};
+    use sig_core::stress::{cell_field, FieldKind};
+    // 8x8x16 mm column, E=2000, clamped bottom, 64 N total down on top:
+    // nominal sigma_zz = -64/(8*8) = -1 MPa away from the ends.
+    let grid0 = VoxelGrid::solid_box(8, 8, 16, 1.0);
+    let settings = SolveSettings { e0: 2000.0, nu: 0.3, ..Default::default() };
+    let (grid, levels) = pad_for_levels(&grid0, settings.max_levels);
+    let (mx, my) = (grid.nx + 1, grid.ny + 1);
+    let mut np = NodeProblem::default();
+    let mut top = Vec::new();
+    for y in 0..=8usize {
+        for x in 0..=8usize {
+            np.fixed.push((y * mx + x) as u32);
+            top.push(((16 * my + y) * mx + x) as u32);
+        }
+    }
+    let per_node = -64.0 / top.len() as f64;
+    for &n in &top {
+        np.forces.push((n, [0.0, 0.0, per_node]));
+    }
+    let sol = solve_nodes(&grid, levels, &np, &settings).expect("solve");
+    assert!(sol.converged);
+
+    let eps = grid.scale.clone();
+    let szz = cell_field(&grid, &sol.u, settings.e0, settings.nu, &eps, FieldKind::Szz);
+    let vm = cell_field(&grid, &sol.u, settings.e0, settings.nu, &eps, FieldKind::VonMises);
+    let ezz = cell_field(&grid, &sol.u, settings.e0, settings.nu, &eps, FieldKind::Ezz);
+    let sxx = cell_field(&grid, &sol.u, settings.e0, settings.nu, &eps, FieldKind::Sxx);
+    let ci = grid.cell_index(4, 4, 8); // center, mid-height (St-Venant zone)
+    assert!((szz[ci] + 1.0).abs() < 0.06, "sigma_zz {} vs -1 MPa", szz[ci]);
+    assert!((vm[ci] - 1.0).abs() < 0.06, "von Mises {} vs 1 MPa", vm[ci]);
+    assert!(sxx[ci].abs() < 0.08, "sigma_xx {} ~ 0", sxx[ci]);
+    // Uniaxial: eps_zz = sigma/E = -5e-4.
+    assert!(
+        (ezz[ci] as f64 + 5e-4).abs() < 3e-5,
+        "eps_zz {} vs -5e-4",
+        ezz[ci]
+    );
+}
+
+#[test]
 fn displacement_sampling_ignores_inactive_nodes() {
     use sig_core::solve::{active_nodes, Solution};
     // One solid cell at (1,1,1) in an otherwise empty 4^3 grid.

@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import { SceneManager } from "./SceneManager";
 import { sceneEvents, useStore } from "../store";
+import { RESULT_FIELDS } from "../types";
 
 function union(a: Uint32Array, b: Uint32Array): Uint32Array {
   const s = new Set<number>(a as unknown as number[]);
@@ -64,6 +65,11 @@ export function Viewer() {
     sceneEvents.onAnimateDeformed = (on) => scene.setDeformAnimate(on);
     sceneEvents.onOptShape = (p, i, d) => scene.setOptShape(p, i, d);
     sceneEvents.onRegionVisibility = (vis) => scene.setRegionVisibility(vis);
+    sceneEvents.onScalarField = (v) => scene.setScalarField(v);
+    sceneEvents.onSectionState = (on) => scene.setSection(on);
+    sceneEvents.onSectionMode = (m) => scene.setSectionMode(m);
+    sceneEvents.onSectionFlip = () => scene.flipSection();
+    sceneEvents.onSectionAxis = (a) => scene.setSectionAxis(a);
 
     const obs = new ResizeObserver(() => {
       const el = wrapRef.current;
@@ -132,6 +138,16 @@ function fmtDisp(mm: number): string {
   return `${(mm * 1000).toFixed(1)} µm`;
 }
 
+function fmtField(v: number, unit: string): string {
+  if (unit === "MPa") {
+    const a = Math.abs(v);
+    if (a >= 0.01 || a === 0) return `${v.toPrecision(3)} MPa`;
+    return `${v.toExponential(1)} MPa`;
+  }
+  // strain: dimensionless, engineering notation
+  return v === 0 ? "0" : v.toExponential(2);
+}
+
 function Legend() {
   const viewMode = useStore((s) => s.viewMode);
   const stats = useStore((s) => s.stats);
@@ -139,11 +155,33 @@ function Legend() {
   const deformScale = useStore((s) => s.deformScale);
   const optSummary = useStore((s) => s.optSummary);
   const voxelInfo = useStore((s) => s.voxelInfo);
+  const resultField = useStore((s) => s.resultField);
+  const fieldRange = useStore((s) => s.fieldRange);
 
   if (viewMode === "deformed" && stats) {
-    const max = stats.maxDisplacement;
     const total = autoScale * deformScale;
     const totalLabel = total >= 9.5 ? `×${Math.round(total)}` : `×${total.toFixed(1)}`;
+    const def = RESULT_FIELDS.find((f) => f.value === resultField);
+    if (resultField !== "u" && def && fieldRange) {
+      return (
+        <div className="legend">
+          <div className="legendtitle">{def.label}</div>
+          <div className="legendbody">
+            <div className="legendbar" style={{ background: JET_GRADIENT }} />
+            <div className="legendlabels">
+              <span>{fmtField(fieldRange.max, def.unit)}</span>
+              <span>{fmtField((fieldRange.min + fieldRange.max) / 2, def.unit)}</span>
+              <span>{fmtField(fieldRange.min, def.unit)}</span>
+            </div>
+          </div>
+          <div className="legendnote">
+            shape exaggerated {totalLabel}
+            {deformScale === 0 ? " (undeformed)" : ""}
+          </div>
+        </div>
+      );
+    }
+    const max = stats.maxDisplacement;
     return (
       <div className="legend">
         <div className="legendtitle">Displacement |u|</div>

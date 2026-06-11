@@ -16,6 +16,7 @@ pub mod par;
 pub mod segment;
 pub mod simp;
 pub mod solve;
+pub mod stress;
 pub mod threemf;
 pub mod voxel;
 pub mod zip;

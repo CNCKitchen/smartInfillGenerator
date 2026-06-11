@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
 import { useStore, type ViewMode } from "../store";
+import { RESULT_FIELDS } from "../types";
 import type { Bc, BcKind, PatternKey } from "../types";
 
 const KIND_LABEL: Record<BcKind, string> = {
@@ -398,6 +399,29 @@ export function Sidebar() {
           {s.viewMode === "deformed" && (
             <>
               <label className="row">
+                <span>Result field</span>
+                <select
+                  value={s.resultField}
+                  onChange={(e) => void s.setResultField(e.target.value)}
+                >
+                  <option value="u">Displacement |u|</option>
+                  <optgroup label="Stress (MPa)">
+                    {RESULT_FIELDS.filter((f) => f.unit === "MPa").map((f) => (
+                      <option key={f.value} value={f.value}>
+                        {f.label}
+                      </option>
+                    ))}
+                  </optgroup>
+                  <optgroup label="Strain">
+                    {RESULT_FIELDS.filter((f) => f.unit === "").map((f) => (
+                      <option key={f.value} value={f.value}>
+                        {f.label}
+                      </option>
+                    ))}
+                  </optgroup>
+                </select>
+              </label>
+              <label className="row">
                 <span>Exaggeration ×{s.deformScale.toFixed(1)}</span>
                 <input
                   type="range"
@@ -416,7 +440,45 @@ export function Sidebar() {
                 />
                 <span>Animate deflection (loop 0 → max)</span>
               </label>
+              {s.resultField !== "u" && (
+                <div className="dim small">
+                  Cell-center values mapped to the surface — stair-step concentrations at the
+                  voxel boundary are approximate.
+                </div>
+              )}
             </>
+          )}
+          <div className="toolrow">
+            <button className={s.sectionOn ? "on" : ""} onClick={() => s.toggleSection()}>
+              Section plane
+            </button>
+            {s.sectionOn && (
+              <>
+                <button
+                  className={s.sectionMode === "translate" ? "on" : ""}
+                  onClick={() => s.setSectionMode("translate")}
+                >
+                  Move
+                </button>
+                <button
+                  className={s.sectionMode === "rotate" ? "on" : ""}
+                  onClick={() => s.setSectionMode("rotate")}
+                >
+                  Rotate
+                </button>
+                <button onClick={() => s.flipSection()}>Flip</button>
+              </>
+            )}
+          </div>
+          {s.sectionOn && (
+            <div className="row">
+              <span className="dim small">Align normal</span>
+              <div className="toolrow" style={{ flex: 1 }}>
+                <button onClick={() => s.setSectionAxis("x")}>X</button>
+                <button onClick={() => s.setSectionAxis("y")}>Y</button>
+                <button onClick={() => s.setSectionAxis("z")}>Z</button>
+              </div>
+            </div>
           )}
           {s.optSummary && (
             <>

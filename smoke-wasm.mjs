@@ -115,6 +115,17 @@ assert(stats.maxDisplacement > 0.01 && stats.maxDisplacement < 10, `sane max dis
 
 const disp = model.vertex_displacements();
 assert(disp.length === nTri * 9, "per-vertex displacement buffer");
+
+// Stress/strain result fields.
+const fmax = (a) => a.reduce((m, v) => Math.max(m, v), -Infinity);
+const fmin = (a) => a.reduce((m, v) => Math.min(m, v), Infinity);
+const vmf = model.result_field("vm");
+assert(vmf.length === nTri * 3 && vmf.every((v) => Number.isFinite(v)), "von Mises field per vertex");
+assert(fmax(vmf) > 0, "von Mises has nonzero peak");
+const sxxf = model.result_field("sxx");
+assert(fmin(sxxf) < 0 && fmax(sxxf) > 0, "bending: sigma_xx tension + compression present");
+const ezzf = model.result_field("ezz");
+assert(ezzf.length === nTri * 3, "strain field per vertex");
 // Tip vertices (x=40) deflect downward; root (x=0) stays.
 let tipUz = 0, tipN = 0, rootUz = 0, rootN = 0;
 const pos = model.positions();

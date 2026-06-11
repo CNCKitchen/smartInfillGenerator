@@ -4,6 +4,7 @@
 
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { TransformControls } from "three/addons/controls/TransformControls.js";
 import type { Bc, LoadedModel } from "../types";
 import type { Tool, ViewMode } from "../store";
 import type { OptRegion } from "../engine/EngineClient";
@@ -89,6 +90,19 @@ export class SceneManager {
   // Live optimization skeleton / density-threshold cutaway.
   private optShapeMesh: THREE.Mesh | null = null;
 
+  // Scalar result field (stress/strain) overriding displacement colors.
+  private scalarField: { values: Float32Array; min: number; max: number } | null = null;
+
+  // Section plane: clipping + stencil caps + transform gizmo.
+  private sectionOn = false;
+  private sectionPlane = new THREE.Plane(new THREE.Vector3(-1, 0, 0), 0);
+  private sectionProxy = new THREE.Object3D();
+  private sectionControls: TransformControls | null = null;
+  private sectionHelper: THREE.PlaneHelper | null = null;
+  private capPart: THREE.Object3D[] = [];
+  private capVoxel: THREE.Object3D[] = [];
+  private capDisposables: { dispose(): void }[] = [];
+
   // Colormaps are sampled per-fragment from 1D LUT textures via the uv
   // channel — per-vertex colors interpolate straight through RGB and turn
   // jet into blue→purple→red on coarse meshes.
@@ -103,9 +117,11 @@ export class SceneManager {
 
   init(canvas: HTMLCanvasElement, callbacks: SceneCallbacks) {
     this.callbacks = callbacks;
-    this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+    // stencil: required for the filled section caps (default off since r163).
+    this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true, stencil: true });
     this.renderer.setPixelRatio(window.devicePixelRatio);
     this.renderer.autoClear = false;
+    this.renderer.localClippingEnabled = true;
     this.scene.background = new THREE.Color(0x14181d);
 
     this.camera = new THREE.OrthographicCamera(-120, 120, 120, -120, 0.1, 10000);
@@ -243,6 +259,7 @@ export class SceneManager {
     this.setPatchIds(model.patchIds);
     this.bcs = [];
     this.activeBcId = null;
+    this.scalarField = null;
     this.rebuildBcMarkers();
     this.repaint();
 
@@ -272,6 +289,24 @@ export class SceneManager {
       this.brushCursor.visible = false;
       this.scene.add(this.brushCursor);
     }
+
+    // Section plane follows the new part.
+    if (this.sectionControls) {
+      this.sectionProxy.position.copy(this.controls.target);
+      this.syncSectionFromProxy();
+      if (this.sectionHelper) {
+        this.scene.remove(this.sectionHelper);
+        this.sectionHelper.dispose();
+        this.sectionHelper = new THREE.PlaneHelper(
+          this.sectionPlane,
+          this.bboxDiag * 1.1,
+          0x4f9cf9
+        );
+        this.scene.add(this.sectionHelper);
+      }
+      this.rebuildCapGroups();
+    }
+    this.refreshClipping();
   }
 
   setPatchIds(patchIds: Uint32Array) {
@@ -609,6 +644,8 @@ export class SceneManager {
       this.voxelDisposables.push(geo, mat);
       this.voxelGroup.add(new THREE.LineSegments(geo, mat));
     }
+    if (this.sectionControls) this.rebuildCapGroups();
+    this.refreshClipping();
     this.refreshView();
   }
 
@@ -656,6 +693,7 @@ export class SceneManager {
       this.optShapeMesh = new THREE.Mesh(geo, mat);
       this.scene.add(this.optShapeMesh);
     }
+    this.refreshClipping();
     this.refreshView();
   }
 
@@ -697,6 +735,7 @@ export class SceneManager {
       this.scene.add(mesh);
       this.regionMeshes.push(mesh);
     }
+    this.refreshClipping();
     this.refreshView();
   }
 
@@ -704,6 +743,199 @@ export class SceneManager {
     this.viewMode = mode;
     this.deformScale = deformScale;
     this.refreshView();
+  }
+
+  /** Stress/strain scalars per soup vertex; null reverts to |u| coloring. */
+  setScalarField(values: Float32Array | null) {
+    if (values && values.length) {
+      let min = Infinity;
+      let max = -Infinity;
+      for (let i = 0; i < values.length; i++) {
+        min = Math.min(min, values[i]);
+        max = Math.max(max, values[i]);
+      }
+      this.scalarField = { values, min, max };
+    } else {
+      this.scalarField = null;
+    }
+    this.refreshView();
+  }
+
+  // ---------- section plane ----------
+
+  setSection(on: boolean) {
+    this.sectionOn = on;
+    if (on) this.ensureSectionObjects();
+    if (this.sectionControls) this.sectionControls.enabled = on;
+    this.refreshClipping();
+    this.refreshView();
+  }
+
+  setSectionMode(mode: "translate" | "rotate") {
+    this.sectionControls?.setMode(mode);
+  }
+
+  flipSection() {
+    this.sectionProxy.rotateX(Math.PI); // local +Z (= plane normal) flips
+    this.syncSectionFromProxy();
+  }
+
+  setSectionAxis(axis: "x" | "y" | "z") {
+    const n =
+      axis === "x"
+        ? new THREE.Vector3(1, 0, 0)
+        : axis === "y"
+          ? new THREE.Vector3(0, 1, 0)
+          : new THREE.Vector3(0, 0, 1);
+    this.sectionProxy.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), n);
+    this.syncSectionFromProxy();
+  }
+
+  private ensureSectionObjects() {
+    if (!this.sectionControls) {
+      this.sectionProxy.position.copy(this.controls.target);
+      this.sectionProxy.quaternion.setFromUnitVectors(
+        new THREE.Vector3(0, 0, 1),
+        new THREE.Vector3(1, 0, 0)
+      );
+      this.scene.add(this.sectionProxy);
+      const tc = new TransformControls(this.camera, this.renderer.domElement);
+      tc.setSize(0.8);
+      tc.addEventListener("dragging-changed", (e: { value?: unknown }) => {
+        this.controls.enabled = !e.value && this.tool !== "brush";
+      });
+      tc.addEventListener("objectChange", () => this.syncSectionFromProxy());
+      tc.attach(this.sectionProxy);
+      this.scene.add(tc.getHelper());
+      this.sectionControls = tc;
+      this.sectionHelper = new THREE.PlaneHelper(this.sectionPlane, this.bboxDiag * 1.1, 0x4f9cf9);
+      this.scene.add(this.sectionHelper);
+      this.syncSectionFromProxy();
+    }
+    this.rebuildCapGroups();
+  }
+
+  private syncSectionFromProxy() {
+    const n = new THREE.Vector3(0, 0, 1).applyQuaternion(this.sectionProxy.quaternion);
+    this.sectionPlane.setFromNormalAndCoplanarPoint(n, this.sectionProxy.position);
+    // Caps lie exactly on the plane.
+    for (const group of [this.capPart, this.capVoxel]) {
+      const cap = group[2] as THREE.Mesh | undefined;
+      if (cap) {
+        cap.position.copy(this.sectionProxy.position);
+        cap.quaternion.copy(this.sectionProxy.quaternion);
+      }
+    }
+  }
+
+  /** Stencil-buffer cap (three.js clipping_stencil technique): back faces of
+   *  the clipped solid increment, front faces decrement; a plane quad drawn
+   *  where stencil != 0 fills the cut so the part reads as solid. */
+  private makeCapGroup(
+    geometry: THREE.BufferGeometry,
+    color: number,
+    order: number
+  ): THREE.Object3D[] {
+    const stencilBase = () => {
+      const m = new THREE.MeshBasicMaterial();
+      m.depthWrite = false;
+      m.depthTest = false;
+      m.colorWrite = false;
+      m.stencilWrite = true;
+      m.stencilFunc = THREE.AlwaysStencilFunc;
+      m.clippingPlanes = [this.sectionPlane];
+      this.capDisposables.push(m);
+      return m;
+    };
+    const backMat = stencilBase();
+    backMat.side = THREE.BackSide;
+    backMat.stencilFail = THREE.IncrementWrapStencilOp;
+    backMat.stencilZFail = THREE.IncrementWrapStencilOp;
+    backMat.stencilZPass = THREE.IncrementWrapStencilOp;
+    const frontMat = stencilBase();
+    frontMat.side = THREE.FrontSide;
+    frontMat.stencilFail = THREE.DecrementWrapStencilOp;
+    frontMat.stencilZFail = THREE.DecrementWrapStencilOp;
+    frontMat.stencilZPass = THREE.DecrementWrapStencilOp;
+    const back = new THREE.Mesh(geometry, backMat);
+    const front = new THREE.Mesh(geometry, frontMat);
+    back.renderOrder = order;
+    front.renderOrder = order;
+
+    const capGeo = new THREE.PlaneGeometry(this.bboxDiag * 4, this.bboxDiag * 4);
+    const capMat = new THREE.MeshStandardMaterial({
+      color,
+      metalness: 0.05,
+      roughness: 0.8,
+      stencilWrite: true,
+      stencilRef: 0,
+      stencilFunc: THREE.NotEqualStencilFunc,
+      stencilFail: THREE.ReplaceStencilOp,
+      stencilZFail: THREE.ReplaceStencilOp,
+      stencilZPass: THREE.ReplaceStencilOp,
+    });
+    this.capDisposables.push(capGeo, capMat);
+    const cap = new THREE.Mesh(capGeo, capMat);
+    cap.renderOrder = order + 0.1;
+    cap.onAfterRender = (renderer) => renderer.clearStencil();
+    cap.position.copy(this.sectionProxy.position);
+    cap.quaternion.copy(this.sectionProxy.quaternion);
+    const group = [back, front, cap];
+    for (const o of group) this.scene.add(o);
+    return group;
+  }
+
+  /** (Re)create cap groups for the part mesh and the voxel hull. */
+  private rebuildCapGroups() {
+    if (!this.sectionControls) return; // section never enabled yet
+    for (const o of [...this.capPart, ...this.capVoxel]) this.scene.remove(o);
+    for (const d of this.capDisposables) d.dispose();
+    this.capPart = [];
+    this.capVoxel = [];
+    this.capDisposables = [];
+    if (this.geometry) {
+      this.capPart = this.makeCapGroup(this.geometry, 0x76808c, 1);
+    }
+    const hull = this.voxelGroup.children.find((c): c is THREE.Mesh => c instanceof THREE.Mesh);
+    if (hull) {
+      this.capVoxel = this.makeCapGroup(hull.geometry as THREE.BufferGeometry, 0x5f6c7b, 3);
+    }
+    this.updateSectionVisibility();
+  }
+
+  /** Push/remove the clipping plane on every content material. */
+  private refreshClipping() {
+    const planes = this.sectionOn ? [this.sectionPlane] : null;
+    const apply = (mat: THREE.Material | THREE.Material[] | undefined) => {
+      if (!mat) return;
+      for (const m of Array.isArray(mat) ? mat : [mat]) {
+        const had = (m.clippingPlanes?.length ?? 0) > 0;
+        const want = !!planes;
+        if (had !== want) {
+          m.clippingPlanes = planes;
+          m.needsUpdate = true;
+        }
+      }
+    };
+    apply(this.mesh?.material);
+    for (const c of this.voxelGroup.children) apply((c as THREE.Mesh).material);
+    for (const m of this.regionMeshes) apply(m.material);
+    apply(this.optShapeMesh?.material ?? undefined);
+  }
+
+  private updateSectionVisibility() {
+    const gizmoVisible = this.sectionOn;
+    if (this.sectionControls) {
+      this.sectionControls.getHelper().visible = gizmoVisible;
+      this.sectionControls.enabled = gizmoVisible;
+    }
+    if (this.sectionHelper) this.sectionHelper.visible = gizmoVisible;
+    // Caps only where an OPAQUE solid is being cut (ghosted part: see inside).
+    const mat = this.mesh?.material as THREE.MeshStandardMaterial | undefined;
+    const partCap = this.sectionOn && !!this.mesh?.visible && !!mat && !mat.transparent;
+    for (const o of this.capPart) o.visible = partCap;
+    const voxCap = this.sectionOn && this.voxelGroup.visible;
+    for (const o of this.capVoxel) o.visible = voxCap;
   }
 
   /** Re-derive positions, colors, part opacity, and overlay visibility. */
@@ -726,6 +958,7 @@ export class SceneManager {
       m.visible = infill && this.regionVisible[i] !== false;
     });
     this.updateMarkerVisibility();
+    this.updateSectionVisibility();
     this.applyPositions();
     this.applyColors();
   }
@@ -749,6 +982,19 @@ export class SceneManager {
     if (!this.geometry || !this.colors || !this.uvs) return;
     const uvAttr = this.geometry.getAttribute("uv") as THREE.BufferAttribute;
     if (this.viewMode === "deformed" && this.displacements) {
+      const sf = this.scalarField;
+      if (sf && sf.values.length * 2 === this.uvs.length) {
+        // Stress/strain field coloring.
+        const range = sf.max - sf.min;
+        const inv = range > 1e-30 ? 1 / range : 0;
+        for (let i = 0; i < sf.values.length; i++) {
+          this.uvs[2 * i] = (sf.values[i] - sf.min) * inv;
+          this.uvs[2 * i + 1] = 0.5;
+        }
+        uvAttr.needsUpdate = true;
+        this.setSurfaceMaterialMode("jet");
+        return;
+      }
       const d = this.displacements;
       let maxMag = 1e-12;
       const n = d.length / 3;

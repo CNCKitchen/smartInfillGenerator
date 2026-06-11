@@ -113,6 +113,13 @@ interface AppState {
   regionVisible: boolean[];
   /** Density cutaway threshold in %, 0 = off (surface paint only). */
   densityThreshold: number;
+  /** Result field shown in the Deformed view ("u" or a stress/strain kind). */
+  resultField: string;
+  /** Min/max of the active stress/strain field, for the legend. */
+  fieldRange: { min: number; max: number } | null;
+  // Section plane.
+  sectionOn: boolean;
+  sectionMode: "translate" | "rotate";
 
   loadFile(name: string, bytes: ArrayBuffer): Promise<void>;
   setSegAngle(angle: number): Promise<void>;
@@ -141,6 +148,11 @@ interface AppState {
   setNBins(v: number): void;
   setRegionVisible(index: number, on: boolean): void;
   setDensityThreshold(v: number): void;
+  setResultField(kind: string): Promise<void>;
+  toggleSection(): void;
+  setSectionMode(mode: "translate" | "rotate"): void;
+  flipSection(): void;
+  setSectionAxis(axis: "x" | "y" | "z"): void;
   runCheck(): Promise<void>;
   runSolve(): Promise<void>;
   runOptimize(): Promise<void>;
@@ -155,6 +167,8 @@ interface AppState {
 let bcCounter = 0;
 let isoTimer: ReturnType<typeof setTimeout> | null = null;
 let smoothTimer: ReturnType<typeof setTimeout> | null = null;
+/** Per-kind cache of fetched stress/strain fields (cleared on invalidation). */
+const fieldCache = new Map<string, Float32Array>();
 
 /** Events the 3D scene listens to (kept out of React rendering). */
 export interface SceneEvents {
@@ -176,6 +190,13 @@ export interface SceneEvents {
     density?: Float32Array | null
   ) => void;
   onRegionVisibility?: (visible: boolean[]) => void;
+  /** Stress/strain scalars for the deformed view (null = |u| colors). */
+  onScalarField?: (values: Float32Array | null) => void;
+  // Section plane controls.
+  onSectionState?: (on: boolean) => void;
+  onSectionMode?: (mode: "translate" | "rotate") => void;
+  onSectionFlip?: () => void;
+  onSectionAxis?: (axis: "x" | "y" | "z") => void;
 }
 
 export const sceneEvents: SceneEvents = {};
@@ -193,7 +214,11 @@ function invalidateResults(set: (p: Partial<AppState>) => void, get: () => AppSt
     regionInfos: [],
     regionVisible: [],
     densityThreshold: 0,
+    resultField: "u",
+    fieldRange: null,
   });
+  fieldCache.clear();
+  sceneEvents.onScalarField?.(null);
   sceneEvents.onRegions?.(null);
   sceneEvents.onVertexDensity?.(null);
   sceneEvents.onDisplacements?.(null, null);
@@ -261,6 +286,10 @@ export const useStore = create<AppState>((set, get) => ({
   regionInfos: [],
   regionVisible: [],
   densityThreshold: 0,
+  resultField: "u",
+  fieldRange: null,
+  sectionOn: false,
+  sectionMode: "translate",
 
   async loadFile(name, bytes) {
     set({ busy: "Parsing & segmenting…", error: null, notice: null });
@@ -287,6 +316,8 @@ export const useStore = create<AppState>((set, get) => ({
         regionInfos: [],
         regionVisible: [],
         densityThreshold: 0,
+        resultField: "u",
+        fieldRange: null,
         busy: null,
         notice:
           (model as LoadedModel & { meshObjects?: number }).meshObjects &&
@@ -294,8 +325,10 @@ export const useStore = create<AppState>((set, get) => ({
             ? "3MF contained multiple meshes — analyzing the largest body only."
             : null,
       });
+      fieldCache.clear();
       // Clear stale overlays BEFORE the model swap so nothing survives even
       // if a later step fails.
+      sceneEvents.onScalarField?.(null);
       sceneEvents.onBcsChanged?.([], null);
       sceneEvents.onDisplacements?.(null, null);
       sceneEvents.onVertexDensity?.(null);
@@ -546,15 +579,19 @@ export const useStore = create<AppState>((set, get) => ({
         return;
       }
       const { stats, displacements } = await engine.solve();
+      fieldCache.clear(); // stress fields belong to the previous solution
       set({
         stats,
         hasResult: true,
         viewMode: "deformed",
         busy: null,
+        resultField: "u",
+        fieldRange: null,
         notice: stats.converged
           ? null
           : `Solver stopped at the iteration cap (residual ${stats.relResidual.toExponential(1)}) — the shown result is a close approximation. Preview resolution converges faster.`,
       });
+      sceneEvents.onScalarField?.(null);
       sceneEvents.onDisplacements?.(displacements, stats);
       sceneEvents.onViewState?.("deformed", get().deformScale);
     } catch (e) {
@@ -590,7 +627,10 @@ export const useStore = create<AppState>((set, get) => ({
         }
       );
       const vis = out.regions.map(() => true);
+      fieldCache.clear(); // stress fields belong to the previous solution
       set({
+        resultField: "u",
+        fieldRange: null,
         optSummary: out.summary,
         optProgress: null,
         busy: null,
@@ -667,6 +707,53 @@ export const useStore = create<AppState>((set, get) => ({
   setAnimateDeformed(on) {
     set({ animateDeformed: on });
     sceneEvents.onAnimateDeformed?.(on);
+  },
+
+  async setResultField(kind) {
+    set({ resultField: kind });
+    if (kind === "u") {
+      set({ fieldRange: null });
+      sceneEvents.onScalarField?.(null);
+      return;
+    }
+    try {
+      let values = fieldCache.get(kind);
+      if (!values) {
+        values = await engine.resultField(kind);
+        fieldCache.set(kind, values);
+      }
+      if (get().resultField !== kind) return; // user moved on mid-fetch
+      let min = Infinity;
+      let max = -Infinity;
+      for (let i = 0; i < values.length; i++) {
+        min = Math.min(min, values[i]);
+        max = Math.max(max, values[i]);
+      }
+      set({ fieldRange: { min, max } });
+      sceneEvents.onScalarField?.(values);
+    } catch (e) {
+      set({ error: e instanceof Error ? e.message : String(e), resultField: "u", fieldRange: null });
+      sceneEvents.onScalarField?.(null);
+    }
+  },
+
+  toggleSection() {
+    const on = !get().sectionOn;
+    set({ sectionOn: on });
+    sceneEvents.onSectionState?.(on);
+  },
+
+  setSectionMode(mode) {
+    set({ sectionMode: mode });
+    sceneEvents.onSectionMode?.(mode);
+  },
+
+  flipSection() {
+    sceneEvents.onSectionFlip?.();
+  },
+
+  setSectionAxis(axis) {
+    sceneEvents.onSectionAxis?.(axis);
   },
 
   clearError() {

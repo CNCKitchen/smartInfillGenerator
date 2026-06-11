@@ -136,6 +136,11 @@ export class EngineClient {
     return this.call({ op: "resmooth", iters });
   }
 
+  /** Stress/strain scalar per surface vertex (kind: vm|sxx|...|gzx). */
+  resultField(kind: string): Promise<Float32Array> {
+    return this.call({ op: "resultField", kind });
+  }
+
   exportThreeMf(): Promise<Uint8Array> {
     return this.call({ op: "exportThreeMf" });
   }

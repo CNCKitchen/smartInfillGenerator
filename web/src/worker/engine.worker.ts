@@ -34,6 +34,7 @@ type Req =
     }
   | { id: number; op: "densityShape"; threshold: number }
   | { id: number; op: "resmooth"; iters: number }
+  | { id: number; op: "resultField"; kind: string }
   | { id: number; op: "exportThreeMf" }
   | { id: number; op: "exportStls" };
 
@@ -205,6 +206,13 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
           { id: msg.id, ok: true, data: { regions } },
           transfer
         );
+        return;
+      }
+      case "resultField": {
+        const values = requireModel().result_field(msg.kind);
+        (self as unknown as Worker).postMessage({ id: msg.id, ok: true, data: values }, [
+          values.buffer,
+        ]);
         return;
       }
       case "exportThreeMf": {

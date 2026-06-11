@@ -13,6 +13,7 @@ use sig_core::mesh::TriMesh;
 use sig_core::segment::{segment, Segmentation};
 use sig_core::simp::{evaluate, optimize as simp_optimize, OptimizeParams};
 use sig_core::solve::{active_nodes, pad_for_levels, solve_nodes, SolveSettings, Solution};
+use sig_core::stress::{cell_field, FieldKind};
 use sig_core::threemf::{export_orca_3mf, export_stl_zip, import_3mf, weld};
 use sig_core::voxel::VoxelGrid;
 use wasm_bindgen::prelude::*;
@@ -57,6 +58,10 @@ pub struct Model {
     target_cells: u32,
     grid: Option<(VoxelGrid, usize)>, // padded grid + level count
     solution: Option<Solution>,
+    /// Per-cell stiffness factors the CURRENT solution was computed with:
+    /// None = plain solid solve (grid.scale), Some = binned-infill field.
+    /// Stress evaluation must use the same eps as the solve.
+    solution_eps: Option<Vec<f32>>,
     opt: Option<OptOutput>,
 }
 
@@ -111,6 +116,7 @@ impl Model {
             target_cells: 300_000,
             grid: None,
             solution: None,
+            solution_eps: None,
             opt: None,
         })
     }
@@ -294,6 +300,7 @@ impl Model {
         })
         .to_string();
         self.solution = Some(sol);
+        self.solution_eps = None; // plain solid solve: eps = grid.scale
         Ok(out)
     }
 
@@ -501,6 +508,15 @@ impl Model {
             max_disp = max_disp.max(m);
         }
         max_disp = max_disp.sqrt();
+        // Stress evaluation needs the eps the verification solve used.
+        self.solution_eps = Some(sig_core::simp::build_eps(
+            grid,
+            &result.skin_cells,
+            &result.design_cells,
+            &x_binned,
+            exponent,
+            coeff,
+        ));
         self.solution = Some(Solution {
             u: u_binned.iter().map(|&v| v as f32).collect(),
             mx,
@@ -640,6 +656,27 @@ impl Model {
         Ok(self.sample_cell_field(grid, &opt.cell_density))
     }
 
+    /// Stress/strain scalar per soup vertex, from the current solution.
+    /// Kinds: "vm" | "sxx" | "syy" | "szz" | "sxy" | "syz" | "szx" (MPa) and
+    /// "evm" | "exx" | "eyy" | "ezz" | "gxy" | "gyz" | "gzx" (strain).
+    /// Evaluated at cell centers with the eps the solve actually used.
+    pub fn result_field(&self, kind: &str) -> Result<Vec<f32>, JsValue> {
+        let kind = FieldKind::parse(kind).ok_or_else(|| err("unknown result field"))?;
+        let sol =
+            self.solution.as_ref().ok_or_else(|| err("no solution — run Solve or Optimize"))?;
+        let (grid, _) = self.grid.as_ref().ok_or_else(|| err("no grid"))?;
+        let scale_eps;
+        let eps: &[f32] = match &self.solution_eps {
+            Some(e) => e,
+            None => {
+                scale_eps = grid.scale.clone();
+                &scale_eps
+            }
+        };
+        let cells = cell_field(grid, &sol.u, self.settings.e0, self.settings.nu, eps, kind);
+        Ok(sample_cell_values(&self.mesh.tris, grid, &cells))
+    }
+
     /// Orca/Bambu project 3MF with part + nested modifiers. The part mesh is
     /// the ORIGINAL import tessellation (display subdivision stays internal).
     pub fn export_3mf(&self) -> Result<Vec<u8>, JsValue> {
@@ -734,6 +771,50 @@ fn sample_points_static(
             }
         }
         out.push(val as f32);
+    }
+    out
+}
+
+/// Sample a per-cell scalar (dense Vec over the padded grid; valid where
+/// grid.scale > 0) at every soup vertex — nearest solid cell wins.
+fn sample_cell_values(tris: &[[f32; 9]], grid: &VoxelGrid, values: &[f32]) -> Vec<f32> {
+    let (nx, ny, nz) = (grid.nx, grid.ny, grid.nz);
+    let h = grid.h;
+    let cell_at = |p: [f64; 3]| -> Option<usize> {
+        let cx = ((p[0] - grid.origin[0]) / h).floor() as i64;
+        let cy = ((p[1] - grid.origin[1]) / h).floor() as i64;
+        let cz = ((p[2] - grid.origin[2]) / h).floor() as i64;
+        if cx < 0 || cy < 0 || cz < 0 || cx >= nx as i64 || cy >= ny as i64 || cz >= nz as i64 {
+            return None;
+        }
+        Some(((cz as usize) * ny + cy as usize) * nx + cx as usize)
+    };
+    let mut out = Vec::with_capacity(tris.len() * 3);
+    for t in tris {
+        for v in 0..3 {
+            let p = [t[3 * v] as f64, t[3 * v + 1] as f64, t[3 * v + 2] as f64];
+            let mut val = 0.0f32;
+            'search: for r in 0..3i64 {
+                for dz in -r..=r {
+                    for dy in -r..=r {
+                        for dx in -r..=r {
+                            let q = [
+                                p[0] + dx as f64 * h,
+                                p[1] + dy as f64 * h,
+                                p[2] + dz as f64 * h,
+                            ];
+                            if let Some(ci) = cell_at(q) {
+                                if grid.scale[ci] > 0.0 {
+                                    val = values[ci];
+                                    break 'search;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            out.push(val);
+        }
     }
     out
 }
