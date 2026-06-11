@@ -390,6 +390,44 @@ fn subdivision_preserves_area_and_respects_cap() {
 }
 
 #[test]
+fn displacement_sampling_ignores_inactive_nodes() {
+    use sig_core::solve::{active_nodes, Solution};
+    // One solid cell at (1,1,1) in an otherwise empty 4^3 grid.
+    let mut grid = VoxelGrid::solid_box(4, 4, 4, 1.0);
+    grid.scale.iter_mut().for_each(|s| *s = 0.0);
+    let ci = grid.cell_index(1, 1, 1);
+    grid.scale[ci] = 1.0;
+    let active = active_nodes(&grid);
+    let (mx, my, mz) = (5usize, 5usize, 5usize);
+    let mut u = vec![0f32; 3 * mx * my * mz];
+    for n in 0..mx * my * mz {
+        if active[n] {
+            u[3 * n] = 2.0; // uniform x-displacement on the solid cell's nodes
+        }
+    }
+    let sol = Solution {
+        u,
+        mx,
+        my,
+        mz,
+        h: 1.0,
+        origin: [0.0; 3],
+        active,
+        iterations: 1,
+        rel_residual: 0.0,
+        converged: true,
+    };
+    // Inside the solid cell: exact either way.
+    assert!((sol.sample_displacement([1.5, 1.5, 1.5])[0] - 2.0).abs() < 1e-9);
+    // Just OUTSIDE the cell face: plain trilinear would dilute with the
+    // void-side zeros (0.9*2.0 = 1.8); active-aware sampling stays exact.
+    // This is the thin-wall "shredded stripes / stuck vertices" bug.
+    assert!((sol.sample_displacement([1.5, 1.5, 2.1])[0] - 2.0).abs() < 1e-9);
+    // Deep in the void: nearest-active fallback, not a stuck zero.
+    assert!((sol.sample_displacement([3.9, 3.9, 3.9])[0] - 2.0).abs() < 1e-9);
+}
+
+#[test]
 fn voxel_surface_mesh_counts() {
     let grid = VoxelGrid::solid_box(2, 2, 2, 1.0);
     let (tris, edges) = grid.surface_mesh();

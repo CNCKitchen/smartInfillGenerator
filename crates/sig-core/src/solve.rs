@@ -239,7 +239,13 @@ impl Solution {
         best.sqrt()
     }
 
-    /// Trilinear displacement sample at an arbitrary point (clamped to grid).
+    /// Trilinear displacement sample at an arbitrary point (clamped to grid),
+    /// restricted to ACTIVE nodes. Inactive nodes are zero-masked in the
+    /// solve; letting them participate dilutes every sample near a stair-
+    /// stepped surface toward zero — thin walls then display as shredded
+    /// stripes with spike artifacts where stuck vertices neighbor moving
+    /// ones. Weights renormalize over the active corners; if no corner is
+    /// active the nearest active node within a small neighborhood is used.
     pub fn sample_displacement(&self, p: [f64; 3]) -> [f64; 3] {
         let t = [
             ((p[0] - self.origin[0]) / self.h).clamp(0.0, (self.mx - 1) as f64),
@@ -253,20 +259,68 @@ impl Solution {
         ];
         let f = [t[0] - i0[0] as f64, t[1] - i0[1] as f64, t[2] - i0[2] as f64];
         let mut out = [0f64; 3];
+        let mut wsum = 0f64;
         for dz in 0..2 {
             for dy in 0..2 {
                 for dx in 0..2 {
+                    let n = ((i0[2] + dz) * self.my + i0[1] + dy) * self.mx + i0[0] + dx;
+                    if !self.active[n] {
+                        continue;
+                    }
                     let w = (if dx == 1 { f[0] } else { 1.0 - f[0] })
                         * (if dy == 1 { f[1] } else { 1.0 - f[1] })
                         * (if dz == 1 { f[2] } else { 1.0 - f[2] });
-                    let n = ((i0[2] + dz) * self.my + i0[1] + dy) * self.mx + i0[0] + dx;
+                    wsum += w;
                     for d in 0..3 {
                         out[d] += w * self.u[3 * n + d] as f64;
                     }
                 }
             }
         }
-        out
+        if wsum > 1e-9 {
+            return [out[0] / wsum, out[1] / wsum, out[2] / wsum];
+        }
+        // No active corner (vertex in a void pocket of the bounding grid):
+        // take the nearest active node in expanding rings.
+        for r in 1i64..=3 {
+            let mut best: Option<(f64, usize)> = None;
+            for dz in -r..=r {
+                for dy in -r..=r {
+                    for dx in -r..=r {
+                        let x = i0[0] as i64 + dx;
+                        let y = i0[1] as i64 + dy;
+                        let z = i0[2] as i64 + dz;
+                        if x < 0
+                            || y < 0
+                            || z < 0
+                            || x >= self.mx as i64
+                            || y >= self.my as i64
+                            || z >= self.mz as i64
+                        {
+                            continue;
+                        }
+                        let n = (z as usize * self.my + y as usize) * self.mx + x as usize;
+                        if !self.active[n] {
+                            continue;
+                        }
+                        let d2 = (x as f64 - t[0]).powi(2)
+                            + (y as f64 - t[1]).powi(2)
+                            + (z as f64 - t[2]).powi(2);
+                        if best.map_or(true, |(bd, _)| d2 < bd) {
+                            best = Some((d2, n));
+                        }
+                    }
+                }
+            }
+            if let Some((_, n)) = best {
+                return [
+                    self.u[3 * n] as f64,
+                    self.u[3 * n + 1] as f64,
+                    self.u[3 * n + 2] as f64,
+                ];
+            }
+        }
+        [0.0; 3]
     }
 }
 
