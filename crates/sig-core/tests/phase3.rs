@@ -12,7 +12,7 @@ use sig_core::simp::{classify_cells, evaluate, optimize, OptimizeParams};
 use sig_core::solve::SolveSettings;
 use sig_core::threemf::{export_orca_3mf, export_stl_zip, import_3mf, weld, IndexedMesh};
 use sig_core::zip::{read_zip, ZipWriter};
-use sig_core::{pad_for_levels, VoxelGrid};
+use sig_core::{pad_for_levels, solve_static, BoxRegion, StaticProblem, VoxelGrid};
 use std::collections::HashMap;
 
 fn face_tris(face: usize) -> Vec<u32> {
@@ -300,6 +300,55 @@ fn conv_trace() {
     })
     .expect("optimize");
     println!("converged = {}, iterations = {}", result.converged, result.iterations);
+}
+
+/// Diagnostic: MGCG convergence on the 3DBenchy at the app's resolution
+/// presets. Run: cargo test -p sig-core --test phase3 benchy -- --ignored --nocapture
+#[test]
+#[ignore]
+fn benchy_convergence() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../3dbenchy.stl");
+    let bytes = std::fs::read(path).expect("3dbenchy.stl in repo root");
+    let mesh = sig_core::TriMesh::from_stl(&bytes).expect("parse benchy");
+    let (lo, hi) = mesh.bounds().unwrap();
+    let vol = (hi[0] - lo[0]) * (hi[1] - lo[1]) * (hi[2] - lo[2]);
+    println!(
+        "benchy: {} tris, bbox {:.1}x{:.1}x{:.1}",
+        mesh.len(), hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]
+    );
+    for (label, target) in
+        [("preview", 100_000f64), ("normal", 300_000f64), ("fine", 1_000_000f64)]
+    {
+        let h = (vol / target).cbrt();
+        let grid = VoxelGrid::voxelize(&mesh, h);
+        println!(
+            "{label}: h={h:.3} dims {}x{}x{} solid {}",
+            grid.nx, grid.ny, grid.nz, grid.solid_count()
+        );
+        let problem = StaticProblem {
+            grid,
+            fixed: vec![BoxRegion::new(
+                [lo[0] - 1.0, lo[1] - 1.0, lo[2] - 1.0],
+                [hi[0] + 1.0, hi[1] + 1.0, lo[2] + 2.0],
+            )],
+            loads: vec![(
+                BoxRegion::new(
+                    [lo[0] - 1.0, lo[1] - 1.0, hi[2] - 6.0],
+                    [hi[0] + 1.0, hi[1] + 1.0, hi[2] + 1.0],
+                ),
+                [5.0, 0.0, 0.0],
+            )],
+            settings: SolveSettings { max_iter: 600, ..Default::default() },
+        };
+        let t0 = std::time::Instant::now();
+        match solve_static(&problem) {
+            Ok(s) => println!(
+                "  iters {} res {:.2e} maxu {:.4} mm ({:.1}s)",
+                s.iterations, s.rel_residual, s.max_displacement(), t0.elapsed().as_secs_f64()
+            ),
+            Err(e) => println!("  FAILED after {:.1}s: {e}", t0.elapsed().as_secs_f64()),
+        }
+    }
 }
 
 #[test]

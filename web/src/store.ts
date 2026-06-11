@@ -546,7 +546,15 @@ export const useStore = create<AppState>((set, get) => ({
         return;
       }
       const { stats, displacements } = await engine.solve();
-      set({ stats, hasResult: true, viewMode: "deformed", busy: null });
+      set({
+        stats,
+        hasResult: true,
+        viewMode: "deformed",
+        busy: null,
+        notice: stats.converged
+          ? null
+          : `Solver stopped at the iteration cap (residual ${stats.relResidual.toExponential(1)}) — the shown result is a close approximation. Preview resolution converges faster.`,
+      });
       sceneEvents.onDisplacements?.(displacements, stats);
       sceneEvents.onViewState?.("deformed", get().deformScale);
     } catch (e) {
@@ -590,6 +598,7 @@ export const useStore = create<AppState>((set, get) => ({
         stats: {
           iterations: out.summary.iterations,
           relResidual: 0,
+          converged: true,
           maxDisplacement: out.summary.maxDisplacement,
           seconds: out.summary.seconds,
         },

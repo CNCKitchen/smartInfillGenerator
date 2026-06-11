@@ -34,6 +34,8 @@ export interface CheckReport {
 export interface SolveStats {
   iterations: number;
   relResidual: number;
+  /** False when the iteration cap hit first — result is approximate. */
+  converged: boolean;
   maxDisplacement: number;
   /** Wall time measured in the worker, seconds. */
   seconds: number;

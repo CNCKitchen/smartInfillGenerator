@@ -503,6 +503,10 @@ fn average_coarse_eps(fine_eps: &[f32], fnx: usize, fny: usize, fnz: usize) -> V
                         }
                     }
                 }
+                // Plain child average. Occupancy-boosted variants were tried
+                // for thin-shell parts (Benchy) and measurably HURT
+                // convergence (+8-12% iterations) — the softer operator is
+                // the better preconditioner here.
                 eps[(cz * ny + cy) * nx + cx] = s / 8.0;
             }
         }

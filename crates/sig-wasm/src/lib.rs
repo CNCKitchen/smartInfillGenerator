@@ -289,6 +289,7 @@ impl Model {
         let out = serde_json::json!({
             "iterations": sol.iterations,
             "relResidual": sol.rel_residual,
+            "converged": sol.converged,
             "maxDisplacement": sol.max_displacement(),
         })
         .to_string();
@@ -401,7 +402,9 @@ impl Model {
         }
 
         let params = OptimizeParams {
-            budget: (budget_pct / 100.0).clamp(0.05, 1.0),
+            // 1% is allowed: the skin + 10% interior floor dominate down
+            // there, the card reports the effective (raised) budget.
+            budget: (budget_pct / 100.0).clamp(0.01, 1.0),
             exponent,
             coeff,
             wall_mm: wall_mm.clamp(0.2, 5.0),
@@ -508,6 +511,7 @@ impl Model {
             active: active_nodes(grid),
             iterations: result.iterations,
             rel_residual: 0.0,
+            converged: true,
         });
 
         // ---- regions (bins above base) ----

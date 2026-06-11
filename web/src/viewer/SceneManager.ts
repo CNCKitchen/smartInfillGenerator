@@ -9,7 +9,9 @@ import type { Tool, ViewMode } from "../store";
 import type { OptRegion } from "../engine/EngineClient";
 
 const BASE_COLOR = new THREE.Color(0x9aa3ad);
-const HOVER_TINT = new THREE.Color(0xc9d4e0);
+// Hover highlight: saturated amber, unmistakable against the gray part and
+// every BC color (a light gray tint was too close to the base material).
+const HOVER_TINT = new THREE.Color(0xffb224);
 const BC_COLORS: Record<string, THREE.Color> = {
   fixed: new THREE.Color(0x3b82f6),
   frictionless: new THREE.Color(0x22d3ee),
@@ -437,7 +439,7 @@ export class SceneManager {
     for (let t = 0; t < this.triCount; t++) {
       let c = triColor[t] ?? BASE_COLOR;
       if (hoverSet?.has(t)) {
-        c = triColor[t] ? triColor[t]!.clone().lerp(HOVER_TINT, 0.45) : HOVER_TINT;
+        c = triColor[t] ? triColor[t]!.clone().lerp(HOVER_TINT, 0.65) : HOVER_TINT;
       }
       for (let v = 0; v < 3; v++) {
         this.colors[9 * t + 3 * v] = c.r;

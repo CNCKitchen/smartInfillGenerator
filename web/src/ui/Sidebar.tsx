@@ -249,7 +249,7 @@ export function Sidebar() {
             <span>Material budget {s.budget}%</span>
             <input
               type="range"
-              min={20}
+              min={1}
               max={90}
               step={1}
               value={s.budget}

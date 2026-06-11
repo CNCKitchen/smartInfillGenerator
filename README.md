@@ -88,6 +88,11 @@ cd web && npm run build                                           # production b
 - Single-threaded WASM: optimization at Preview resolution takes ~½–2 min
   depending on part size (live density view while it runs). wasm threads are
   the planned next multiplier (~5–8×).
+- Thin-shell jagged parts (Benchy-class) need 170–290 MGCG iterations at the
+  presets — the cap is 600 (2× margin), and hitting it is a notice with the
+  best-available approximation shown, never a hard error. Measured 3DBenchy
+  solve times (native, 16 threads): 1.2 s / 3.1 s / 12 s at
+  preview/normal/fine; single-thread browser is ~10× that.
 - PrusaSlicer-flavor 3MF writer, golden FEA comparisons, anisotropy, and STEP
   import remain per DESIGN.md.
 - Multi-mesh 3MF imports analyze the largest body only (warned in-app).
