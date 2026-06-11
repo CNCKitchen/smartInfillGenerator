@@ -2,8 +2,13 @@
 // Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
 
 //! Density bins and modifier-region extraction (DESIGN.md decisions #10/#3):
-//! - volume-weighted 1-D k-means places bin values where the optimized field
-//!   actually lives,
+//! - level placement: bottom level pinned at the printability floor, upper
+//!   levels by strain-energy-weighted k-means in stiffness space (convex
+//!   E(ρ) makes dense infill more efficient per gram, so load levels land
+//!   high — measured +15.2% vs uniform on the cantilever fixture, vs +13.9%
+//!   for plain density-space k-means),
+//! - assignment: anchored at the optimizer's per-cell choice, with a
+//!   bisected mass multiplier so the binned design still meets the budget,
 //! - regions are NESTED indicators (bin >= k) so exported modifiers overlap
 //!   and the slicer's modifier order (low -> high density) resolves them,
 //! - isosurfacing via marching tetrahedra on a node lattice with a void
@@ -71,6 +76,190 @@ pub fn cluster_densities(values: &[f64], k: usize) -> Vec<f64> {
     }
     centers.dedup_by(|a, b| (*a - *b).abs() < 0.005);
     centers
+}
+
+/// Place `n` discrete infill levels for an optimized continuous field.
+///
+/// Level 0 is PINNED at `floor`: its job is printability (the structurally
+/// idle bulk prints and supports its top surfaces), not load bearing. The
+/// remaining levels minimize the COMPLIANCE error of quantization rather
+/// than the mass error: weighted 1-D k-means in relative-stiffness space
+/// y = coeff·x^exponent, weighted by per-cell strain energy. Because the
+/// infill law is convex (exponent > 1), stiffness per gram grows with
+/// density — the classic argument that makes intermediate densities
+/// inefficient — so the energy weighting pushes the upper levels toward the
+/// cap instead of averaging the structurally idle transition band ("one low
+/// level so it prints, the rest rather high").
+pub fn cluster_levels(
+    x: &[f64],
+    se: &[f64],
+    n: usize,
+    exponent: f64,
+    coeff: f64,
+    floor: f64,
+    cap: f64,
+) -> Vec<f64> {
+    assert_eq!(x.len(), se.len());
+    assert!(n >= 1);
+    let mut levels = vec![floor];
+    if n == 1 {
+        return levels;
+    }
+    // Candidates for the load-bearing levels: cells meaningfully above floor.
+    let mut ys: Vec<f64> = Vec::new();
+    let mut ws: Vec<f64> = Vec::new();
+    let mut w_total = 0.0;
+    for (i, &xi) in x.iter().enumerate() {
+        if xi > floor + 0.02 {
+            ys.push(coeff * xi.powf(exponent));
+            let w = se[i].max(0.0);
+            ws.push(w);
+            w_total += w;
+        }
+    }
+    if ys.is_empty() {
+        return levels; // whole interior sits at the floor — nothing to grade
+    }
+    if w_total <= 0.0 {
+        ws.iter_mut().for_each(|w| *w = 1.0); // degenerate: volume weighting
+    }
+    let k = (n - 1).min(ys.len());
+    for c in weighted_kmeans_1d(&ys, &ws, k) {
+        levels.push((c / coeff).powf(1.0 / exponent).clamp(floor, cap));
+    }
+    levels.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    // Round to whole percent for the slicer; merge near-duplicates.
+    for l in levels.iter_mut() {
+        *l = (*l * 100.0).round() / 100.0;
+    }
+    levels.dedup_by(|a, b| (*a - *b).abs() < 0.015);
+    levels
+}
+
+/// Weighted 1-D k-means (Lloyd), weighted-quantile init, ascending centers.
+fn weighted_kmeans_1d(v: &[f64], w: &[f64], k: usize) -> Vec<f64> {
+    let mut idx: Vec<usize> = (0..v.len()).collect();
+    idx.sort_by(|&a, &b| v[a].partial_cmp(&v[b]).unwrap());
+    let total: f64 = w.iter().sum();
+    let mut centers: Vec<f64> = Vec::with_capacity(k);
+    let mut acc = 0.0;
+    let mut next_target = 0.5 / k as f64 * total;
+    for &i in &idx {
+        acc += w[i];
+        while centers.len() < k && acc >= next_target {
+            centers.push(v[i]);
+            next_target = (centers.len() as f64 + 0.5) / k as f64 * total;
+        }
+    }
+    while centers.len() < k {
+        centers.push(v[idx[idx.len() - 1]]);
+    }
+    let mut assign = vec![0usize; v.len()];
+    for _ in 0..60 {
+        let mut changed = false;
+        for (i, &vi) in v.iter().enumerate() {
+            let mut best = 0usize;
+            let mut bd = f64::INFINITY;
+            for (c, &cv) in centers.iter().enumerate() {
+                let d = (vi - cv).abs();
+                if d < bd {
+                    bd = d;
+                    best = c;
+                }
+            }
+            if assign[i] != best {
+                assign[i] = best;
+                changed = true;
+            }
+        }
+        let mut sum = vec![0f64; k];
+        let mut wsum = vec![0f64; k];
+        for (i, &vi) in v.iter().enumerate() {
+            sum[assign[i]] += w[i] * vi;
+            wsum[assign[i]] += w[i];
+        }
+        for c in 0..k {
+            if wsum[c] > 0.0 {
+                centers[c] = sum[c] / wsum[c];
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    centers.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    centers
+}
+
+/// Assign each cell to a level under a mass constraint, ANCHORED at the
+/// optimizer's own choice: per cell minimize
+///   w_c · (E(l) − E(x_c))² + λ · (l − x_c)
+/// in relative-stiffness space, with the multiplier λ bisected until the
+/// mean assigned density meets `target_mean`. At λ = 0 this is plain
+/// nearest-stiffness quantization — the continuous field already encodes
+/// the optimal mass distribution (at an OC optimum all marginal values are
+/// equal, so re-ranking cells by frozen-u sensitivity only adds noise) —
+/// and λ repairs the quantization mass drift by moving the cells with the
+/// least strain energy first (w_c = se_c + ε keeps dead cells cheap to move
+/// but still anchored).
+pub fn assign_bins_mass(
+    x: &[f64],
+    se: &[f64],
+    levels: &[f64],
+    exponent: f64,
+    coeff: f64,
+    target_mean: f64,
+) -> Vec<u8> {
+    assert_eq!(x.len(), se.len());
+    if levels.len() <= 1 {
+        return vec![0u8; x.len()];
+    }
+    let rel: Vec<f64> = levels.iter().map(|&l| coeff * l.powf(exponent)).collect();
+    let ex: Vec<f64> = x.iter().map(|&xi| coeff * xi.powf(exponent)).collect();
+    let mean_se = se.iter().map(|s| s.max(0.0)).sum::<f64>() / se.len().max(1) as f64;
+    let anchor = (0.01 * mean_se).max(1e-300);
+    let w: Vec<f64> = se.iter().map(|s| s.max(0.0) + anchor).collect();
+    let assign_for = |lambda: f64| -> Vec<u8> {
+        (0..x.len())
+            .map(|i| {
+                let mut best = 0u8;
+                let mut bs = f64::INFINITY;
+                for (c, (&l, &r)) in levels.iter().zip(&rel).enumerate() {
+                    let de = r - ex[i];
+                    let s = w[i] * de * de + lambda * (l - x[i]);
+                    if s < bs {
+                        bs = s;
+                        best = c as u8;
+                    }
+                }
+                best
+            })
+            .collect()
+    };
+    let mean_of = |bins: &[u8]| -> f64 {
+        bins.iter().map(|&b| levels[b as usize]).sum::<f64>() / bins.len().max(1) as f64
+    };
+    let mut bins = assign_for(0.0);
+    if (mean_of(&bins) - target_mean).abs() <= 0.002 {
+        return bins;
+    }
+    // Mean density is monotone decreasing in λ; saturate both ends.
+    let bound = 1e4 * w.iter().cloned().fold(0.0, f64::max).max(1e-300);
+    let (mut lo, mut hi) = (-bound, bound);
+    for _ in 0..80 {
+        let lambda = 0.5 * (lo + hi);
+        bins = assign_for(lambda);
+        let m = mean_of(&bins);
+        if (m - target_mean).abs() <= 0.002 {
+            break;
+        }
+        if m > target_mean {
+            lo = lambda; // too heavy: raise the price of mass
+        } else {
+            hi = lambda;
+        }
+    }
+    bins
 }
 
 /// Assign each value to the nearest center; returns bin index per value.

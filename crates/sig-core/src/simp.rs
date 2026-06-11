@@ -83,6 +83,10 @@ pub struct OptimizeResult {
     pub compliance: f64,
     /// Last displacement field (padded node grid, f64) — warm start / reuse.
     pub u: Vec<f64>,
+    /// Per-design-cell strain energy (unit relative stiffness) of the final
+    /// iterate — the compliance sensitivity used for level placement and
+    /// mass-constrained bin assignment.
+    pub se: Vec<f64>,
 }
 
 #[derive(Debug)]
@@ -558,6 +562,7 @@ pub fn optimize(
         converged,
         compliance,
         u,
+        se,
     })
 }
 

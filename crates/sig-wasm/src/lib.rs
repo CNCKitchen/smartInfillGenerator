@@ -9,7 +9,7 @@
 
 use sig_core::attach::{assemble, check_problem, BcKind, BcSpec};
 use sig_core::bins::{
-    assign_bins, cleanup_small_regions, cluster_densities, extract_iso, extract_region,
+    assign_bins_mass, cleanup_small_regions, cluster_levels, extract_iso, extract_region,
     taubin_smooth, RegionMesh,
 };
 use sig_core::mesh::TriMesh;
@@ -497,8 +497,17 @@ impl Model {
         .map_err(err)?;
 
         // ---- bins ----
-        let centers = cluster_densities(&result.x, n_bins);
-        let mut bins = assign_bins(&result.x, &centers);
+        // Level placement: floor pinned ("just so it prints"), upper levels
+        // from strain-energy-weighted clustering in stiffness space — the
+        // convex infill law makes dense infill more efficient per gram, so
+        // the load-bearing levels land high. Assignment then re-meets the
+        // mass budget via a bisected first-order compliance/mass tradeoff.
+        let centers = cluster_levels(
+            &result.x, &result.se, n_bins, exponent, coeff, params.floor, params.cap,
+        );
+        let target_mean = result.x.iter().sum::<f64>() / result.x.len().max(1) as f64;
+        let mut bins =
+            assign_bins_mass(&result.x, &result.se, &centers, exponent, coeff, target_mean);
         let min_cells = (result.design_cells.len() / 500).max(30);
         cleanup_small_regions(grid, &result.design_cells, &mut bins, centers.len(), min_cells);
         let x_binned: Vec<f64> = bins.iter().map(|&b| centers[b as usize]).collect();

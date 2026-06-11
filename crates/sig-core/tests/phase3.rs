@@ -7,8 +7,8 @@
 
 use sig_core::attach::{assemble, check_problem, BcKind, BcSpec};
 use sig_core::bins::{
-    assign_bins, cleanup_small_regions, cluster_densities, extract_region, taubin_smooth,
-    RegionMesh,
+    assign_bins, assign_bins_mass, cleanup_small_regions, cluster_densities, cluster_levels,
+    extract_region, taubin_smooth, RegionMesh,
 };
 use sig_core::mesh::primitives;
 use sig_core::simp::{classify_cells, evaluate, optimize, OptimizeParams};
@@ -32,6 +32,17 @@ struct OptFixture {
     design: Vec<u32>,
     x: Vec<f64>,
     u: Vec<f64>,
+    se: Vec<f64>,
+}
+
+/// The app's binning pipeline: floor-pinned energy-weighted level placement
+/// plus mass-constrained assignment (see bins.rs).
+fn bin_fixture(f: &OptFixture, n: usize) -> (Vec<f64>, Vec<u8>) {
+    let centers = cluster_levels(&f.x, &f.se, n, 1.5, 1.0, 0.10, 0.70);
+    let target = f.x.iter().sum::<f64>() / f.x.len() as f64;
+    let mut bins = assign_bins_mass(&f.x, &f.se, &centers, 1.5, 1.0, target);
+    cleanup_small_regions(&f.grid, &f.design, &mut bins, centers.len(), 30);
+    (centers, bins)
 }
 
 fn run_cantilever_optimization() -> OptFixture {
@@ -64,6 +75,7 @@ fn run_cantilever_optimization() -> OptFixture {
         design: result.design_cells,
         x: result.x,
         u: result.u,
+        se: result.se,
     }
 }
 
@@ -71,15 +83,24 @@ fn run_cantilever_optimization() -> OptFixture {
 fn optimized_bins_beat_uniform_infill_at_equal_mass() {
     let f = run_cantilever_optimization();
 
-    // Bin the optimized field.
-    let centers = cluster_densities(&f.x, 3);
+    // Bin the optimized field with the app's pipeline.
+    let (centers, bins) = bin_fixture(&f, 3);
     assert!(centers.len() >= 2, "expected at least 2 distinct bins, got {centers:?}");
-    let mut bins = assign_bins(&f.x, &centers);
-    cleanup_small_regions(&f.grid, &f.design, &mut bins, centers.len(), 30);
+    // Level placement follows the convex-law theory: bottom pinned at the
+    // printability floor, top driven toward the cap by the energy weighting.
+    assert!((centers[0] - 0.10).abs() < 1e-9, "bottom level is the floor: {centers:?}");
+    assert!(*centers.last().unwrap() > 0.45, "load level sits high: {centers:?}");
     let x_binned: Vec<f64> = bins.iter().map(|&b| centers[b as usize]).collect();
 
-    // Uniform field at the SAME interior mass.
+    // Mass-constrained assignment lands near the optimizer's mean.
+    let target = f.x.iter().sum::<f64>() / f.x.len() as f64;
     let mean = x_binned.iter().sum::<f64>() / x_binned.len() as f64;
+    assert!(
+        (mean - target).abs() < 0.03,
+        "binned mean {mean:.3} should track the continuous mean {target:.3}"
+    );
+
+    // Uniform field at the SAME interior mass.
     let x_uniform = vec![mean; x_binned.len()];
 
     let (c_binned, maxd_binned, _) = evaluate(
@@ -109,9 +130,7 @@ fn optimized_bins_beat_uniform_infill_at_equal_mass() {
 #[test]
 fn extracted_regions_are_watertight_and_oriented() {
     let f = run_cantilever_optimization();
-    let centers = cluster_densities(&f.x, 3);
-    let mut bins = assign_bins(&f.x, &centers);
-    cleanup_small_regions(&f.grid, &f.design, &mut bins, centers.len(), 30);
+    let (centers, bins) = bin_fixture(&f, 3);
 
     let mut bin_of_cell: HashMap<u32, u8> = HashMap::new();
     for (i, &c) in f.design.iter().enumerate() {
@@ -165,6 +184,65 @@ fn signed_volume(positions: &[f32], indices: &[u32]) -> f64 {
             / 6.0;
     }
     vol
+}
+
+/// Diagnostic: A/B the old binning (mass-error k-means on density, nearest
+/// assignment) against the new one (floor-pinned energy-weighted levels,
+/// mass-constrained assignment) on the cantilever fixture. Run with:
+/// cargo test -p sig-core --test phase3 bin_placement_ab -- --ignored --nocapture
+#[test]
+#[ignore]
+fn bin_placement_ab() {
+    let f = run_cantilever_optimization();
+    let eval_layout = |x_b: &[f64], label: &str, centers: &[f64]| {
+        let (c, _, _) = evaluate(
+            &f.grid, f.levels, &f.problem, &f.settings, &f.skin, &f.design, x_b, 1.5, 1.0,
+            Some(&f.u),
+        )
+        .unwrap();
+        let mean = x_b.iter().sum::<f64>() / x_b.len() as f64;
+        let x_u = vec![mean; x_b.len()];
+        let (cu, _, _) = evaluate(
+            &f.grid, f.levels, &f.problem, &f.settings, &f.skin, &f.design, &x_u, 1.5, 1.0,
+            Some(&f.u),
+        )
+        .unwrap();
+        println!(
+            "{label}: levels {:?} mean infill {:.1}% C {:.5} gain vs uniform {:+.2}%",
+            centers.iter().map(|v| (v * 100.0).round()).collect::<Vec<_>>(),
+            mean * 100.0,
+            c,
+            (cu / c - 1.0) * 100.0
+        );
+    };
+    let target = f.x.iter().sum::<f64>() / f.x.len() as f64;
+    let xb_of = |centers: &[f64], bins: &[u8]| -> Vec<f64> {
+        bins.iter().map(|&b| centers[b as usize]).collect()
+    };
+
+    // A: old pipeline (mass-error k-means on rho, nearest-rho assignment).
+    let centers_a = cluster_densities(&f.x, 3);
+    let mut bins_a = assign_bins(&f.x, &centers_a);
+    cleanup_small_regions(&f.grid, &f.design, &mut bins_a, centers_a.len(), 30);
+    eval_layout(&xb_of(&centers_a, &bins_a), "A old rho-kmeans + nearest    ", &centers_a);
+
+    // B: energy-weighted E-space levels + anchored mass assignment.
+    let centers_b = cluster_levels(&f.x, &f.se, 3, 1.5, 1.0, 0.10, 0.70);
+    let mut bins_b = assign_bins_mass(&f.x, &f.se, &centers_b, 1.5, 1.0, target);
+    cleanup_small_regions(&f.grid, &f.design, &mut bins_b, centers_b.len(), 30);
+    eval_layout(&xb_of(&centers_b, &bins_b), "B se-E levels + anchored mass ", &centers_b);
+
+    // C: volume-weighted E-space levels + anchored mass assignment.
+    let ones = vec![1.0; f.x.len()];
+    let centers_c = cluster_levels(&f.x, &ones, 3, 1.5, 1.0, 0.10, 0.70);
+    let mut bins_c = assign_bins_mass(&f.x, &f.se, &centers_c, 1.5, 1.0, target);
+    cleanup_small_regions(&f.grid, &f.design, &mut bins_c, centers_c.len(), 30);
+    eval_layout(&xb_of(&centers_c, &bins_c), "C vol-E levels + anchored mass", &centers_c);
+
+    // D: old rho-kmeans levels + anchored mass assignment.
+    let mut bins_d = assign_bins_mass(&f.x, &f.se, &centers_a, 1.5, 1.0, target);
+    cleanup_small_regions(&f.grid, &f.design, &mut bins_d, centers_a.len(), 30);
+    eval_layout(&xb_of(&centers_a, &bins_d), "D old levels + anchored mass  ", &centers_a);
 }
 
 #[test]

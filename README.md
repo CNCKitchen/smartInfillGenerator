@@ -52,7 +52,11 @@ Workflow in the app:
    editable in ⚙ Settings), perimeters × line width (the solid skin the
    analysis assumes — the perimeter count is also written into the
    exported 3MF so the print matches; line width stays profile-controlled),
-   region smoothing, and number of density levels. The evolving dense-core
+   region smoothing, and number of density levels. Levels are auto-placed
+   from the optimized field: the bottom one is pinned at the 10% printability
+   floor ("just so it prints"), the load-bearing ones land high (the convex
+   E(ρ) law makes dense infill stiffer per gram), and the assignment re-meets
+   your mass budget after quantization. The evolving dense-core
    shape is shown live each iteration; the loop stops on a design-stationarity
    criterion (iteration cap is only a safety net). The card reports the
    headline comparison — **"vs X% uniform infill at the same weight: +Y%
