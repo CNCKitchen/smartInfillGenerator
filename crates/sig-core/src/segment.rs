@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
+
 //! Surface segmentation: weld the triangle soup, build edge adjacency, and
 //! region-grow patches across edges whose dihedral angle is below a threshold.
 //! CAD-derived STLs decompose into face-like patches; organic meshes fall back

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
+
 //! Attach user boundary conditions (defined as triangle selections on the
 //! input mesh) to voxel-grid nodes, assemble the node-level problem, and run
 //! the pre-solve constraint check (islands + rigid-body modes).

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
+
 import { create } from "zustand";
 import { engine, type OptRegion, type OptSummary } from "./engine/EngineClient";
 import type {

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
+
 //! WASM API for the Smart Infill Generator web app.
 //!
 //! One `Model` instance lives in a web worker and owns mesh, segmentation,

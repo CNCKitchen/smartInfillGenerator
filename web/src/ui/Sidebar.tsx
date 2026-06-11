@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
+
 import { useEffect, useRef } from "react";
 import { useStore, type ViewMode } from "../store";
 import { RESULT_FIELDS } from "../types";

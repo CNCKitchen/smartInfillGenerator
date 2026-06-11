@@ -102,3 +102,17 @@ cd web && npm run build                                           # production b
 - PrusaSlicer-flavor 3MF writer, golden FEA comparisons, anisotropy, and STEP
   import remain per DESIGN.md.
 - Multi-mesh 3MF imports analyze the largest body only (warned in-app).
+
+## License
+
+**AGPL-3.0-only** — see [LICENSE](LICENSE). Free to use, modify, self-host,
+and redistribute; if you distribute it or offer it over a network, your
+version's complete source must be available under the same terms.
+
+Want it inside closed-source software? **Commercial exceptions are
+available** — see [COMMERCIAL.md](COMMERCIAL.md). Contributions require the
+CLA in [CONTRIBUTING.md](CONTRIBUTING.md), which also documents the strict
+dependency license policy (no third-party copyleft in the core — it would
+break the dual-licensing model; enforced via [deny.toml](deny.toml)).
+
+The project name/logo are trademarks and not covered by the code license.

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
+
 //! Phase-1 exit-criterion benchmark:
 //!   1. Winding-number voxelization of a ~16k-triangle sphere at fine resolution.
 //!   2. Cantilever MGCG solves at 131k and ~1.05M cells, with the

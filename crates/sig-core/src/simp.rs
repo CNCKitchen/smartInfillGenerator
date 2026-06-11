@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
+
 //! Variable-density infill optimization (DESIGN.md decision #8):
 //! compliance minimization under a mass budget, using the PHYSICAL infill
 //! stiffness law E(x) = E0 * x^n — intermediate densities are printable as

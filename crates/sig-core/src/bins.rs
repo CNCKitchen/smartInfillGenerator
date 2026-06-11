@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
+
 //! Density bins and modifier-region extraction (DESIGN.md decisions #10/#3):
 //! - volume-weighted 1-D k-means places bin values where the optimized field
 //!   actually lives,

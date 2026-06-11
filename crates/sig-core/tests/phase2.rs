@@ -1,4 +1,7 @@
-﻿//! Phase-2 engine tests: segmentation, closest-point queries, island and
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
+
+//! Phase-2 engine tests: segmentation, closest-point queries, island and
 //! rigid-body-mode checks, triangle-selection BC attachment, frictionless
 //! penalty springs, gravity.
 

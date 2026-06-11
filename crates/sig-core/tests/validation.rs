@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
+
 //! Correctness anchors for the Phase-1 engine:
 //! 1. Element matrix sanity (symmetry, rigid-body null space).
 //! 2. Matrix-free apply == dense assembly on a small mixed void/solid grid.

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
+
 //! Triangle BVH with aggregated dipole data for fast winding numbers
 //! (Barill et al. 2018, first-order approximation). Inside/outside queries are
 //! robust to holes, self-intersections, duplicate and non-manifold geometry —

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
+
 //! Thin parallelism layer: rayon when the `parallel` feature is on, sequential
 //! fallback otherwise (wasm32 without threads). All hot loops in the solver go
 //! through these helpers so the two builds share one code path.

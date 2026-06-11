@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
+
 // Imperative three.js layer: mesh display, patch hover/select, brush,
 // BC coloring + support glyphs, axis gizmo, rigid-body-mode animation,
 // deformed-shape overlay (with looping animation), density/region/voxel views.

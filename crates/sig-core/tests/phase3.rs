@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
+
 //! Phase-3/4 tests: SIMP optimization quality, bin clustering, watertight
 //! region extraction, 3MF export/import roundtrips (incl. the reference
 //! Cube.3mf sample from OrcaSlicer/Bambu Studio).

@@ -34,7 +34,7 @@ Reference points:
 | 11 | Slicer output | **OrcaSlicer project 3MF + Bambu Studio** (shared dialect, pinned from sample — see §5) and **PrusaSlicer flavor** (`Slic3r_PE_model_config`). **Per-bin STL export always available** as universal fallback. Cura deferred. |
 | 12 | Infill patterns | Calibrated E(ρ) for **gyroid (default), cubic, grid**. All other patterns: generic Gibson-Ashby fallback + warning. Grid's anisotropy documented as limitation. |
 | 13 | Validation bar | **Solver unit tests vs analytic solutions (CI) + golden comparisons vs established FEA (CalculiX/Fusion) on ~5 representative parts.** Physical testing is post-launch content, not a release gate. |
-| 14 | Source posture | **Closed source, private repo, free beta.** All dependencies permissive (MIT/Apache/BSD/MPL); keeps commercial options open (Pro tier, vendor licensing, or open-sourcing later). |
+| 14 | Source posture | **REVISED 2026-06: Open source, AGPL-3.0-only, dual-licensed.** Code: AGPL (network copyleft closes the hosted-fork hole; GPL alone would not). Copyright stays with Stefan via CLA (CONTRIBUTING.md) → commercial exceptions sellable to slicer/printer/CAD vendors (COMMERCIAL.md). Name/logo trademarked, NOT AGPL. Measured calibration data licensed separately (the verified-materials business must stay unforkable). **Standing rule: no third-party (A)GPL/LGPL/SSPL/BSL/NC code in the core, ever** — it would legally break the commercial-exception model; allowed: MIT/Apache/BSD/ISC/Zlib/CC0/MPL-2.0 (enforced via deny.toml + CONTRIBUTING.md). |
 
 ## 3. Engineering decisions (made during design, not interview-blocking)
 

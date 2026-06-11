@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
+
 //! 3MF input/output.
 //!
 //! Export targets the Bambu/Orca project flavor reverse-engineered from the

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
+
 // Functional smoke test of the wasm-bindgen Model API (the same calls the web
 // worker makes). Run: node smoke-wasm.mjs
 import { readFileSync } from "node:fs";

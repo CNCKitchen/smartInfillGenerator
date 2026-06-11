@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
+
 //! 8-node hexahedral element for linear elasticity on a regular voxel grid.
 //! One reference stiffness matrix KE per grid level (unit cube scaled by h and
 //! E), scaled per cell by a relative stiffness factor — the standard

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
+
 //! Per-cell stress/strain evaluation from a displacement field.
 //!
 //! Strains are evaluated at cell centers (the superconvergent point of the

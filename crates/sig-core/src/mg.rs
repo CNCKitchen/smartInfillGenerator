@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
+
 //! Geometric multigrid preconditioned CG (MGCG) for voxel-grid elasticity.
 //!
 //! - Matrix-free: one reference KE per level, scaled per cell by a stiffness
