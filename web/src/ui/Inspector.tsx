@@ -1,17 +1,104 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
 
-// Results dock: DRO-style readout windows for the optimization outcome.
-// Rendered only when a result exists — an empty instrument shows nothing.
+// Results dock: DRO-style readout windows. Optimization results take
+// precedence; an as-printed verify solve gets its own readouts (mass at the
+// print settings, deflection, min safety factor). Empty instrument = hidden.
 
 import { useStore } from "../store";
 import { fmtDispParts } from "./fmt";
 
 export function Inspector() {
   const s = useStore();
-  const o = s.optSummary;
-  if (!o) return null;
+  if (s.optSummary) return <OptResults />;
+  if (s.printedStats && s.stats && s.hasResult) return <PrintedResults />;
+  return null;
+}
 
+/** Dock after "Solve once · As printed": the part at today's print settings. */
+function PrintedResults() {
+  const s = useStore();
+  const p = s.printedStats!;
+  const stats = s.stats!;
+  const [defl, deflUnit] = fmtDispParts(stats.maxDisplacement);
+  return (
+    <aside className="inspector" aria-label="Results">
+      <div className="i-head">
+        <span>Results</span>
+        <span>as printed</span>
+      </div>
+
+      <div className="dro">
+        <div className="dro-label">
+          <span>Mass</span>
+          <span>
+            of {p.massSolidGrams.toFixed(1)} g solid ·{" "}
+            {Math.round((100 * p.massGrams) / Math.max(p.massSolidGrams, 1e-9))} %
+          </span>
+        </div>
+        <div className="dro-window">
+          <b>{p.massGrams.toFixed(1)}</b>
+          <span>g</span>
+        </div>
+      </div>
+
+      <div className="dro">
+        <div className="dro-label">
+          <span>Max deflection</span>
+        </div>
+        <div className="dro-window">
+          <b>{defl}</b>
+          <span>{deflUnit}</span>
+        </div>
+      </div>
+
+      <div className="dro hero">
+        <div className="dro-label">
+          <span>Min safety factor</span>
+          <span>σₜ {s.material.strength} MPa</span>
+        </div>
+        <div className="dro-window">
+          <b>{p.minSf !== null ? p.minSf.toFixed(2) : "—"}</b>
+          <span>×</span>
+        </div>
+      </div>
+
+      <div className="divider" />
+      <div className="kv">
+        <span>Print settings</span>
+        <b>
+          {p.perimeters} × {p.lineWidth} mm · {p.infillPct}% {p.pattern}
+        </b>
+      </div>
+      <div className="kv">
+        <span>Skin resolution</span>
+        <b>
+          {p.skinLayers} cell layer{p.skinLayers === 1 ? "" : "s"}
+        </b>
+      </div>
+      <div className="kv">
+        <span>{stats.converged ? "Solved" : "Stopped at cap"}</span>
+        <b>
+          {stats.iterations} it · {stats.seconds.toFixed(1)} s
+        </b>
+      </div>
+      <div className="kv">
+        <span>Advisory</span>
+        <b>isotropic · no layer adhesion</b>
+      </div>
+      {p.skinLayers === 1 && (
+        <div className="warnrow">
+          The wall is one voxel layer at this resolution — coarse. Raise the resolution in
+          Properties for a trustworthy printed-mode result.
+        </div>
+      )}
+    </aside>
+  );
+}
+
+function OptResults() {
+  const s = useStore();
+  const o = s.optSummary!;
   const stiff = Math.round(o.stiffnessVsSolid * 100);
   const gain = (o.gainVsUniform * 100).toFixed(1);
   const uniformPct = Math.round(o.meanInfill * 100);

@@ -69,6 +69,19 @@ Reference points:
 - **Performance budget:** default grid auto-sized to ~1–2 M active cells (device-memory
   aware); resolution presets Preview / Normal / Fine. Target: full optimize < ~60 s on a
   mid desktop at Normal. Warn when thin features span < 3 cells at chosen resolution.
+- **As-printed analysis (2026-06):** Verify can solve the part AS PRINTED — skin
+  (perimeters × line width) at 100%, interior at a uniform infill ratio through the
+  calibrated pattern law: the same `evaluate` path the optimizer's baselines use, exposed
+  as `solve_printed` with stress/SF on the homogenized eps (min SF, mass at the print
+  settings and deflection feed the results dock). This makes the tool a general FDM-FEA
+  whose accuracy IS the accuracy of the measured E(ρ) calibration. Voxel size optionally
+  snaps to wall/k (`pick_voxel_size`) so the skin is an exact integer number of cell
+  layers (`classify_cells` uses layers = round(wall/h)); hard 4M-cell cap, snap abandoned
+  when even k = 1 would exceed it. Stated approximations: nominal skin thickness exact
+  only on flat faces (voxel staircase on curves), ONE isotropic skin thickness (real
+  top/bottom shells are layers × layer height — not modeled separately yet), homogenized
+  infill, no FDM anisotropy. Print properties (perimeters, line width, pattern, infill %)
+  live in step 3 "Properties", shared by verify, optimizer and export — no duplicates.
 - **Materials:** presets PLA, PETG, ABS, ASA (E₀, ν, density, tensile strength σₜ),
   user-editable. The safety-factor plot (2026-06: σₜ·rel(ρ)/σᵥM per cell, graded infill's
   allowable scaled with the same Gibson-Ashby factor as its stiffness, inverted colormap

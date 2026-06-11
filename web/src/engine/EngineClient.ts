@@ -73,6 +73,11 @@ export class EngineClient {
     return this.call({ op: "setResolution", cells });
   }
 
+  /** Snap the voxel size to wall/k so the skin is k cell layers (0 = off). */
+  setSnapWall(wall: number): Promise<void> {
+    return this.call({ op: "setSnapWall", wall });
+  }
+
   setBcs(bcs: Bc[]): Promise<void> {
     // Copy tri arrays: the originals stay with the UI.
     const payload = bcs.map((bc) => ({
@@ -98,6 +103,14 @@ export class EngineClient {
 
   solve(): Promise<{ stats: SolveStats; displacements: Float32Array }> {
     return this.call({ op: "solve" });
+  }
+
+  /** Analyze the part AS PRINTED: solid skin + uniform infill through the
+   *  calibrated pattern law. Same fields as solve() plus print-mass stats. */
+  solvePrinted(
+    opts: PrintedOptions
+  ): Promise<{ stats: PrintedStats; displacements: Float32Array }> {
+    return this.call({ op: "solvePrinted", opts: opts as unknown as Record<string, unknown> });
   }
 
   optimize(
@@ -142,6 +155,29 @@ export class EngineClient {
   exportStls(): Promise<Uint8Array> {
     return this.call({ op: "exportStls" });
   }
+}
+
+/** Mirrors the wasm PrintedOpts (serialized to JSON in the worker). */
+export interface PrintedOptions {
+  /** Uniform interior infill in percent — the slicer setting. */
+  infillPct: number;
+  /** Calibrated pattern law E/E₀ = coeff·ρ^exponent. */
+  exponent: number;
+  coeff: number;
+  perimeters: number;
+  lineWidth: number;
+}
+
+/** solve() stats plus the as-printed extras. */
+export interface PrintedStats extends SolveStats {
+  /** Part mass at these print settings (solid skin + infill interior). */
+  massGrams: number;
+  /** Mass if the part printed fully dense. */
+  massSolidGrams: number;
+  skinCells: number;
+  interiorCells: number;
+  /** Cell layers the grid resolves the skin with (k after snapping). */
+  skinLayers: number;
 }
 
 /** Mirrors the wasm OptimizeOpts (serialized to JSON in the worker). */

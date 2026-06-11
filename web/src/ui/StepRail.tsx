@@ -10,7 +10,7 @@ import { useStore } from "../store";
 const STEPS: { n: number; label: string; title: string }[] = [
   { n: 1, label: "Model", title: "1 · Model" },
   { n: 2, label: "Loads", title: "2 · Boundary conditions" },
-  { n: 3, label: "Material", title: "3 · Material & analysis" },
+  { n: 3, label: "Properties", title: "3 · Properties — material, print settings, analysis grid" },
   { n: 4, label: "Verify", title: "4 · Verify setup" },
   { n: 5, label: "Optimize", title: "5 · Optimize infill" },
   { n: 6, label: "Export", title: "6 · View & export" },

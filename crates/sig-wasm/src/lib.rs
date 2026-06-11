@@ -95,6 +95,25 @@ impl Default for OptimizeOpts {
     }
 }
 
+/// Options for `Model::solve_printed` — analyze the part AS PRINTED:
+/// skin (perimeters × line width) solid, interior at a uniform infill
+/// ratio through the calibrated pattern law.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct PrintedOpts {
+    infill_pct: f64,
+    exponent: f64,
+    coeff: f64,
+    perimeters: u32,
+    line_width: f64,
+}
+
+impl Default for PrintedOpts {
+    fn default() -> Self {
+        Self { infill_pct: 25.0, exponent: 1.5, coeff: 1.0, perimeters: 2, line_width: 0.45 }
+    }
+}
+
 #[wasm_bindgen]
 pub struct Model {
     /// Working mesh: display + segmentation + BC attachment + voxelization.
@@ -119,6 +138,9 @@ pub struct Model {
     strength: f64,
     gravity_on: bool,
     target_cells: u32,
+    /// Snap the voxel size to wall/k (0 = off) so the printed skin is
+    /// resolved by an integer number of cell layers.
+    snap_wall: f64,
     grid: Option<(VoxelGrid, usize)>, // padded grid + level count
     solution: Option<Solution>,
     /// Per-cell stiffness factors the CURRENT solution was computed with:
@@ -178,6 +200,7 @@ impl Model {
             strength: 50.0,   // PLA tensile, MPa
             gravity_on: false,
             target_cells: 300_000,
+            snap_wall: 0.0,
             grid: None,
             solution: None,
             solution_eps: None,
@@ -251,6 +274,20 @@ impl Model {
         }
     }
 
+    /// Snap the voxel size to an integer fraction of the wall thickness
+    /// (h = wall/k) so the printed skin is exactly k cell layers on flat
+    /// faces. 0 disables. Changing the value invalidates grid and results.
+    pub fn set_snap_wall(&mut self, wall_mm: f64) {
+        let w = if wall_mm > 0.0 { wall_mm.clamp(0.2, 5.0) } else { 0.0 };
+        if (w - self.snap_wall).abs() > 1e-9 {
+            self.snap_wall = w;
+            self.grid = None;
+            self.solution = None;
+            self.solution_eps = None;
+            self.opt = None;
+        }
+    }
+
     pub fn clear_bcs(&mut self) {
         self.bcs.clear();
         self.solution = None;
@@ -295,7 +332,7 @@ impl Model {
         }
         let (lo, hi) = self.mesh.bounds().ok_or_else(|| err("empty mesh"))?;
         let vol = (hi[0] - lo[0]).max(1e-6) * (hi[1] - lo[1]).max(1e-6) * (hi[2] - lo[2]).max(1e-6);
-        let h = (vol / self.target_cells as f64).cbrt().max(1e-3);
+        let h = sig_core::voxel::pick_voxel_size(vol, self.target_cells as f64, self.snap_wall);
         let grid = VoxelGrid::voxelize(&self.mesh, h);
         if grid.solid_count() == 0 {
             return Err(err("voxelization produced no solid cells — model too thin for this resolution"));
@@ -377,6 +414,61 @@ impl Model {
         .to_string();
         self.solution = Some(sol);
         self.solution_eps = None; // plain solid solve: eps = grid.scale
+        Ok(out)
+    }
+
+    /// Analyze the part AS PRINTED: skin (perimeters × line width) at 100%,
+    /// interior at a uniform infill ratio through the calibrated pattern law.
+    /// Same machinery as the optimizer's verification solves — the accuracy
+    /// is the accuracy of the calibrated E(ρ) curve. Stress/SF fields use
+    /// the stored eps, so the safety factor of the printed part falls out.
+    /// JSON: solve() fields + massGrams/massSolidGrams/skinCells/
+    /// interiorCells/skinLayers for the results dock.
+    pub fn solve_printed(&mut self, opts_json: &str) -> Result<String, JsValue> {
+        let opts: PrintedOpts = serde_json::from_str(opts_json).map_err(err)?;
+        self.ensure_grid()?;
+        let (grid, levels) = self.grid.as_ref().unwrap();
+        let asm = assemble(&self.mesh, grid, &self.bcs, self.gravity_arg(), &self.settings)
+            .map_err(err)?;
+        let report = check_problem(grid, &asm);
+        if !report.ok {
+            return Err(err("model is under-constrained — run check() for details"));
+        }
+        let eval_exp = opts.exponent.clamp(1.0, 3.5);
+        let eval_coeff = opts.coeff.clamp(0.05, 2.0);
+        let perimeters = opts.perimeters.clamp(1, 8);
+        let wall_mm = (perimeters as f64 * opts.line_width.clamp(0.1, 1.5)).clamp(0.2, 5.0);
+        let infill = (opts.infill_pct / 100.0).clamp(0.01, 1.0);
+        // A part thinner than the wall everywhere simply prints solid —
+        // design is empty and the solve degenerates to the solid case.
+        let (skin, design) = sig_core::simp::classify_cells(grid, wall_mm);
+        let x = vec![infill; design.len()];
+        let eps = sig_core::simp::build_eps(grid, &skin, &design, &x, eval_exp, eval_coeff);
+        let (sol, _compliance) =
+            sig_core::simp::solve_with_eps(grid, *levels, &asm.problem, &self.settings, eps.clone())
+                .map_err(err)?;
+        // Mass at these print settings: solid skin + interior at the ratio.
+        let cell_vol = grid.h * grid.h * grid.h;
+        let n_skin = skin.len() as f64;
+        let n_design = design.len() as f64;
+        let mass = (n_skin + infill * n_design) * cell_vol * self.density * 1e6;
+        let mass_solid = (n_skin + n_design) * cell_vol * self.density * 1e6;
+        let out = serde_json::json!({
+            "iterations": sol.iterations,
+            "relResidual": sol.rel_residual,
+            "converged": sol.converged,
+            "maxDisplacement": sol.max_displacement(),
+            "residuals": sol.residuals.clone(),
+            "massGrams": mass,
+            "massSolidGrams": mass_solid,
+            "skinCells": skin.len(),
+            "interiorCells": design.len(),
+            // Cell layers the grid resolves the skin with (k after snapping).
+            "skinLayers": (wall_mm / grid.h).round().max(1.0) as u32,
+        })
+        .to_string();
+        self.solution = Some(sol);
+        self.solution_eps = Some(eps);
         Ok(out)
     }
 

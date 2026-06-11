@@ -173,6 +173,48 @@ assert(report.ok === true, "elastic springs alone constrain the part");
 }
 console.log("ok: elastic foundation path solves");
 
+// ---- as-printed verify: voxel snap + skin/infill solve ----
+model.clear_bcs();
+model.add_fixed(sel(0, "min"));
+model.add_force(sel(0, "max"), 0, 0, -5);
+{
+  const sSolid = JSON.parse(model.solve());
+  const sfSolidMin = fmin(model.result_field("sf"));
+
+  // Snap the voxel size: 2 x 0.45 mm wall -> h = wall/k exactly.
+  model.set_snap_wall(0.9);
+  const infoSnap = JSON.parse(model.voxel_info());
+  const k = Math.round(0.9 / infoSnap.h);
+  assert(k >= 1 && Math.abs(k * infoSnap.h - 0.9) < 1e-9,
+    `voxel size snapped to wall/${k} (h=${infoSnap.h.toFixed(3)} mm)`);
+
+  const t2 = performance.now();
+  const ps = JSON.parse(model.solve_printed(JSON.stringify({
+    infillPct: 25, exponent: 1.5, coeff: 1.0, perimeters: 2, lineWidth: 0.45,
+  })));
+  console.log(
+    `   printed solve: ${ps.iterations} iters in ${((performance.now() - t2) / 1000).toFixed(1)} s, ` +
+    `max |u| ${ps.maxDisplacement.toFixed(4)} mm, mass ${ps.massGrams.toFixed(1)} g of ${ps.massSolidGrams.toFixed(1)} g solid`);
+  assert(ps.converged && ps.maxDisplacement > 0, "printed solve converges");
+  assert(ps.skinLayers === k, `skin resolved by exactly ${k} cell layers (got ${ps.skinLayers})`);
+  assert(ps.interiorCells > 0 && ps.skinCells > 0, "skin and interior both present");
+  assert(ps.massGrams < ps.massSolidGrams, "printed part lighter than solid");
+  assert(ps.maxDisplacement > sSolid.maxDisplacement * 1.05,
+    `25% infill bends more than solid (${ps.maxDisplacement.toFixed(4)} vs ${sSolid.maxDisplacement.toFixed(4)} mm)`);
+  assert(Array.isArray(ps.residuals) && ps.residuals.length === ps.iterations + 1,
+    "printed solve carries the residual trace");
+
+  // Stress/SF on the printed solution use the homogenized eps.
+  const sfPrinted = model.result_field("sf");
+  const sfPrintedMin = fmin(sfPrinted);
+  assert(sfPrinted.every((v) => Number.isFinite(v) && v > 0 && v <= 99), "printed SF field sane");
+  assert(sfPrintedMin < sfSolidMin,
+    `printed min SF below solid's (${sfPrintedMin.toFixed(1)} < ${sfSolidMin.toFixed(1)})`);
+
+  model.set_snap_wall(0); // back to nominal sizing for the remaining sections
+}
+console.log("ok: as-printed verify (snap + skin/infill solve + SF)");
+
 // Resegmentation.
 model.resegment(60);
 assert(model.patch_count() === 6, "resegment at 60 deg still 6 patches");

@@ -155,11 +155,21 @@ interface AppState {
   materials: Material[];
   curves: Record<PatternKey, PatternCurve>;
   resolution: ResolutionKey;
-  // optimization inputs
-  budget: number; // infill budget: target mean interior density in %
+  // print properties (step 3 · Properties) — shared by the as-printed
+  // verify solve, the optimizer's skin model, and the 3MF export
   pattern: PatternKey;
   perimeters: number;
   lineWidth: number; // mm
+  /** Uniform interior infill % "as printed" — the slicer setting. */
+  printInfill: number;
+  /** Snap the voxel size to wall/k so the skin is k exact cell layers. */
+  snapVoxel: boolean;
+  /** What "Solve once" analyzes: the print or the CAD-ideal solid. */
+  analyzeMode: "printed" | "solid";
+  /** Extras of the last as-printed solve (results dock); null = solid run. */
+  printedStats: PrintedSummary | null;
+  // optimization inputs
+  budget: number; // infill budget: target mean interior density in %
   smoothIters: number; // Taubin passes on modifier regions
   nBins: number;
   /** Optimization goal: stiffest at a mass budget, or lightest at a
@@ -236,6 +246,9 @@ interface AppState {
   setPattern(p: PatternKey): void;
   setPerimeters(v: number): void;
   setLineWidth(v: number): void;
+  setPrintInfill(v: number): void;
+  setSnapVoxel(on: boolean): void;
+  setAnalyzeMode(m: "printed" | "solid"): void;
   setSmoothIters(v: number): void;
   setNBins(v: number): void;
   setGoal(g: "budget" | "match"): void;
@@ -266,6 +279,21 @@ interface AppState {
 export interface LogLine {
   t: string;
   msg: string;
+}
+
+/** Dock data of the last as-printed verify solve. */
+export interface PrintedSummary {
+  massGrams: number;
+  massSolidGrams: number;
+  /** Cell layers resolving the skin (k after voxel snapping). */
+  skinLayers: number;
+  /** Print settings the solve used (the dock labels them honestly). */
+  infillPct: number;
+  pattern: PatternKey;
+  perimeters: number;
+  lineWidth: number;
+  /** Minimum safety factor over the part; null if the field fetch failed. */
+  minSf: number | null;
 }
 
 /** One optimizer iteration for the nerd-log convergence charts. */
@@ -368,12 +396,20 @@ async function pushBcs(get: () => AppState) {
   await engine.setBcs(get().bcs);
 }
 
+/** Push the voxel-snap wall to the engine from the current print settings. */
+async function pushSnap(get: () => AppState) {
+  const s = get();
+  if (!s.model) return; // nothing loaded yet — loadFile pushes the snap
+  await engine.setSnapWall(s.snapVoxel ? s.perimeters * s.lineWidth : 0);
+}
+
 function invalidateResults(set: (p: Partial<AppState>) => void, get: () => AppState) {
   set({
     check: null,
     stats: null,
     hasResult: false,
     optSummary: null,
+    printedStats: null,
     regionInfos: [],
     regionVisible: [],
     densityThreshold: 0,
@@ -433,6 +469,10 @@ export const useStore = create<AppState>((set, get) => ({
   pattern: "gyroid",
   perimeters: 2,
   lineWidth: 0.45,
+  printInfill: 25,
+  snapVoxel: true,
+  analyzeMode: "printed",
+  printedStats: null,
   smoothIters: 15,
   nBins: 3,
   goal: "budget",
@@ -479,6 +519,11 @@ export const useStore = create<AppState>((set, get) => ({
       const m = get().material;
       await engine.setMaterial(m.e0, m.nu, m.density, m.strength);
       await engine.setResolution(RESOLUTIONS[get().resolution]);
+      // A fresh wasm Model defaults to snap off; push the current setting.
+      // (Inline, not pushSnap: the store's `model` isn't set yet.)
+      await engine.setSnapWall(
+        get().snapVoxel ? get().perimeters * get().lineWidth : 0
+      );
       set({
         fileName: name,
         model,
@@ -686,13 +731,43 @@ export const useStore = create<AppState>((set, get) => ({
     set({ budget: Math.min(hi, Math.max(lo, Math.round(v))) });
   },
   setPattern(p) {
-    set({ pattern: p });
+    // The pattern law feeds the next solve/optimize; a shown printed result
+    // would no longer match it.
+    set({ pattern: p, printedStats: null });
   },
   setPerimeters(v) {
-    set({ perimeters: Math.min(8, Math.max(1, Math.round(v))) });
+    set({ perimeters: Math.min(8, Math.max(1, Math.round(v))), printedStats: null });
+    if (get().snapVoxel) {
+      // The wall changed: with snapping on the engine rebuilds the grid.
+      invalidateResults(set, get);
+      invalidateGrid(set, get);
+    }
+    void pushSnap(get);
   },
   setLineWidth(v) {
-    set({ lineWidth: Math.min(1.5, Math.max(0.1, v)) });
+    set({ lineWidth: Math.min(1.5, Math.max(0.1, v)), printedStats: null });
+    if (get().snapVoxel) {
+      invalidateResults(set, get);
+      invalidateGrid(set, get);
+    }
+    void pushSnap(get);
+  },
+  setPrintInfill(v) {
+    const pct = Math.min(100, Math.max(5, Math.round(v)));
+    set({ printInfill: pct, printedStats: null });
+    // "Here's your print today — now beat it": the optimizer's budget
+    // follows the print setting (still clamped to its own band).
+    get().setBudget(pct);
+  },
+  setSnapVoxel(on) {
+    set({ snapVoxel: on });
+    // The engine drops grid + results when the snap value actually changes.
+    invalidateResults(set, get);
+    invalidateGrid(set, get);
+    void pushSnap(get);
+  },
+  setAnalyzeMode(m) {
+    set({ analyzeMode: m });
   },
   setSmoothIters(v) {
     const iters = Math.min(40, Math.max(0, Math.round(v)));
@@ -825,9 +900,49 @@ export const useStore = create<AppState>((set, get) => ({
         });
         return;
       }
-      const m = get().material;
-      appendLog(set, `Solve: ${m.name} (E₀ ${m.e0} MPa, ν ${m.nu}) …`);
-      const { stats, displacements } = await engine.solve();
+      const st0 = get();
+      const m = st0.material;
+      const printed = st0.analyzeMode === "printed";
+      const curve = st0.curves[st0.pattern];
+      let printedSummary: PrintedSummary | null = null;
+      let stats: SolveStats;
+      let displacements: Float32Array;
+      if (printed) {
+        appendLog(
+          set,
+          `Solve as printed: ${m.name}, skin ${st0.perimeters}×${st0.lineWidth} mm solid, ` +
+            `interior ${st0.printInfill}% ${st0.pattern} (E/E₀ = ${curve.coeff}·ρ^${curve.exponent}) …`
+        );
+        const out = await engine.solvePrinted({
+          infillPct: st0.printInfill,
+          exponent: curve.exponent,
+          coeff: curve.coeff,
+          perimeters: st0.perimeters,
+          lineWidth: st0.lineWidth,
+        });
+        stats = out.stats;
+        displacements = out.displacements;
+        printedSummary = {
+          massGrams: out.stats.massGrams,
+          massSolidGrams: out.stats.massSolidGrams,
+          skinLayers: out.stats.skinLayers,
+          infillPct: st0.printInfill,
+          pattern: st0.pattern,
+          perimeters: st0.perimeters,
+          lineWidth: st0.lineWidth,
+          minSf: null,
+        };
+        appendLog(
+          set,
+          `  as printed: mass ${out.stats.massGrams.toFixed(1)} g of ${out.stats.massSolidGrams.toFixed(1)} g solid · ` +
+            `skin resolved by ${out.stats.skinLayers} cell layer${out.stats.skinLayers === 1 ? "" : "s"}`
+        );
+      } else {
+        appendLog(set, `Solve solid: ${m.name} (E₀ ${m.e0} MPa, ν ${m.nu}) …`);
+        const out = await engine.solve();
+        stats = out.stats;
+        displacements = out.displacements;
+      }
       fieldCache.clear(); // stress fields belong to the previous solution
       sceneEvents.onLegendRange?.(null, null);
       appendLog(
@@ -838,6 +953,7 @@ export const useStore = create<AppState>((set, get) => ({
       );
       set({
         stats,
+        printedStats: printedSummary,
         solveResiduals: stats.residuals ?? [],
         hasResult: true,
         viewMode: "deformed",
@@ -847,12 +963,33 @@ export const useStore = create<AppState>((set, get) => ({
         legendMin: null,
         legendMax: null,
         notice: stats.converged
-          ? null
+          ? printedSummary && printedSummary.skinLayers === 1
+            ? "The wall is only one voxel layer thick at this resolution — printed-mode results are coarse. Raise the resolution in Properties."
+            : null
           : `Solver stopped at the iteration cap (residual ${stats.relResidual.toExponential(1)}) — the shown result is a close approximation. Preview resolution converges faster.`,
       });
       sceneEvents.onScalarField?.(null);
       sceneEvents.onDisplacements?.(displacements, stats);
       sceneEvents.onViewState?.("deformed", get().deformScale);
+      if (printedSummary) {
+        // Min safety factor for the dock — the field is cached, so picking
+        // "Safety factor" in the viewer afterwards is instant.
+        try {
+          const sf = await engine.resultField("sf");
+          fieldCache.set("sf", sf);
+          let minSf = Infinity;
+          for (let i = 0; i < sf.length; i++) minSf = Math.min(minSf, sf[i]);
+          if (Number.isFinite(minSf) && get().printedStats) {
+            set({ printedStats: { ...get().printedStats!, minSf } });
+            appendLog(
+              set,
+              `  min safety factor ${minSf.toFixed(2)}× (σₜ ${m.strength} MPa, infill allowable scaled by E(ρ))`
+            );
+          }
+        } catch {
+          // result vanished mid-fetch: the dock shows mass/deflection only
+        }
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       set({ busy: null, error: msg });
@@ -868,6 +1005,7 @@ export const useStore = create<AppState>((set, get) => ({
       error: null,
       optProgress: null,
       optSummary: null,
+      printedStats: null,
       optSeries: [],
     });
     sceneEvents.onAnimateMode?.(null);

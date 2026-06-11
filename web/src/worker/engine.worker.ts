@@ -30,6 +30,13 @@ type Req =
   | { id: number; op: "voxelMesh" }
   | { id: number; op: "check" }
   | { id: number; op: "solve" }
+  | { id: number; op: "setSnapWall"; wall: number }
+  | {
+      id: number;
+      op: "solvePrinted";
+      /** PrintedOpts object — serialized to JSON for the wasm API. */
+      opts: Record<string, unknown>;
+    }
   | {
       id: number;
       op: "optimize";
@@ -100,6 +107,9 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
       case "setResolution":
         requireModel().set_resolution(msg.cells);
         break;
+      case "setSnapWall":
+        requireModel().set_snap_wall(msg.wall);
+        break;
       case "setBcs": {
         const m = requireModel();
         m.clear_bcs();
@@ -138,6 +148,17 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
       case "solve": {
         const t0 = performance.now();
         const stats = JSON.parse(requireModel().solve());
+        const displacements = requireModel().vertex_displacements();
+        stats.seconds = (performance.now() - t0) / 1000;
+        (self as unknown as Worker).postMessage(
+          { id: msg.id, ok: true, data: { stats, displacements } },
+          [displacements.buffer]
+        );
+        return;
+      }
+      case "solvePrinted": {
+        const t0 = performance.now();
+        const stats = JSON.parse(requireModel().solve_printed(JSON.stringify(msg.opts)));
         const displacements = requireModel().vertex_displacements();
         stats.seconds = (performance.now() - t0) / 1000;
         (self as unknown as Worker).postMessage(

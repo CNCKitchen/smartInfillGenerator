@@ -615,3 +615,62 @@ pub fn evaluate(
     }
     Ok((compliance, max2.sqrt(), u))
 }
+
+/// Solve with an explicit per-cell stiffness field and return a full
+/// `Solution` (iteration count, residual trace) plus the compliance b·u.
+/// This is the "as printed" verify solve: build eps from skin at 100% and a
+/// uniform interior ratio via `build_eps`, then call this.
+pub fn solve_with_eps(
+    grid: &VoxelGrid,
+    levels: usize,
+    problem: &NodeProblem,
+    settings: &SolveSettings,
+    eps: Vec<f32>,
+) -> Result<(crate::solve::Solution, f64), crate::solve::SolveError> {
+    if grid.solid_count() == 0 {
+        return Err(crate::solve::SolveError::NoSolidCells);
+    }
+    if problem.fixed.is_empty() && problem.springs.is_empty() {
+        return Err(crate::solve::SolveError::NoFixedNodes);
+    }
+    let (nx, ny, nz) = (grid.nx, grid.ny, grid.nz);
+    let (mx, my, mz) = (nx + 1, ny + 1, nz + 1);
+    let ndof = 3 * mx * my * mz;
+    let mut fixed = vec![false; ndof];
+    for &n in &problem.fixed {
+        for d in 0..3 {
+            fixed[3 * n as usize + d] = true;
+        }
+    }
+    let mut b = build_rhs(grid, problem);
+    let ke64 = ke_hex(settings.e0, settings.nu, grid.h);
+    let finest = Level::new(nx, ny, nz, grid.h, eps, ke64, &fixed, problem.springs.clone());
+    for (i, c) in finest.constrained.iter().enumerate() {
+        if *c {
+            b[i] = 0.0;
+        }
+    }
+    let mut solver = MgSolver::new(finest, levels);
+    let mut u = vec![0f64; ndof];
+    let stats = solver.solve(&b, &mut u, settings.tol, settings.max_iter);
+    let mut compliance = 0f64;
+    for i in 0..ndof {
+        compliance += b[i] * u[i];
+    }
+    Ok((
+        crate::solve::Solution {
+            u: u.iter().map(|&v| v as f32).collect(),
+            mx,
+            my,
+            mz,
+            h: grid.h,
+            origin: grid.origin,
+            active: crate::solve::active_nodes(grid),
+            iterations: stats.iterations,
+            rel_residual: stats.rel_residual,
+            converged: stats.converged,
+            residuals: std::mem::take(&mut solver.last_trace),
+        },
+        compliance,
+    ))
+}

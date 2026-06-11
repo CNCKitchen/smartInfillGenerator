@@ -41,11 +41,23 @@ Workflow in the app:
    Fixed patch artificially stiffens the part and concentrates stress at
    the patch edges. (Self-weight exists in the engine but is hidden in
    the UI — negligible for desktop plastic prints.)
-3. **Material & analysis** — material presets (editable in ⚙ Settings,
-   persisted per browser), resolution (Preview recommended for the first
-   pass). The `Mesh` view shows the actual voxel mesh the solver runs on.
-4. **Verify** — `Check setup` animates any remaining rigid-body freedom;
-   `Solve once` lands in the **Results** view, where review happens on the
+3. **Properties** — material presets (editable in ⚙ Settings, persisted per
+   browser) plus the print settings the WHOLE analysis shares: perimeters ×
+   line width (the solid skin; the perimeter count is also written into the
+   exported 3MF as `wall_loops`), infill pattern, and the uniform infill %
+   "as printed". Analysis resolution lives here too, with **voxel snapping**:
+   the cell size snaps to wall/k so the printed skin is resolved by an exact
+   integer number of cell layers (the panel shows the resulting h and k, and
+   warns when the skin is only one cell). The `Mesh` view shows the actual
+   voxel grid the solver runs on.
+4. **Verify** — `Check setup` animates any remaining rigid-body freedom.
+   `Solve once` analyzes either **As printed** — skin solid, interior at the
+   uniform infill through the calibrated E(ρ) curve; this turns the tool
+   into a general FDM-FEA: mass at the print settings, max deflection and
+   the **min safety factor** land in the results dock — or **Solid
+   material** (fully dense E₀, the CAD-ideal reference: run both to see
+   what printing costs you). Either way the run lands in the **Results**
+   view, where review happens on the
    viewport itself: the **result field** picker sits right under the view
    tabs (displacement, a **safety factor** σₜ/σᵥM — graded infill's
    allowable scales with the same E(ρ) law as its stiffness, inverted
@@ -69,11 +81,10 @@ Workflow in the app:
    concentric via object-level `internal_solid_infill_pattern`), and the
    comparison still uses the calibrated pattern curve. Then pick an infill
    budget (the target MEAN interior density — same scale as your slicer's
-   uniform infill setting; walls/shells come on top), pattern
-   (gyroid/cubic/grid — E(ρ) curves editable in ⚙ Settings), perimeters ×
-   line width (the solid skin the analysis assumes — the perimeter count is
-   also written into the exported 3MF so the print matches; line width stays
-   profile-controlled), region smoothing, and number of density levels.
+   uniform infill setting; walls/shells come on top — initialized from the
+   Properties infill so the flow reads "here's your print, now beat it"),
+   region smoothing, and number of density levels; skin and pattern come
+   from Properties (step 3).
    Levels are auto-placed from the optimized field: the bottom one is pinned
    at the printability floor ("just so it prints"), the load-bearing ones
    land high (the convex E(ρ) law makes dense infill stiffer per gram), and

@@ -30,8 +30,8 @@ const KIND_DOT: Record<BcKind, string> = {
 const HEAD: Record<number, { title: string; sub: string }> = {
   1: { title: "Model", sub: "Drop an STL or 3MF — units are mm." },
   2: { title: "Boundary conditions", sub: "Where the part is held, how it is loaded." },
-  3: { title: "Material & analysis", sub: "What it's made of, how fine the solver runs." },
-  4: { title: "Verify setup", sub: "Check constraints, then run a single solve." },
+  3: { title: "Properties", sub: "Material, print settings, analysis grid." },
+  4: { title: "Verify setup", sub: "Check constraints, then analyze the print or the solid." },
   5: { title: "Optimize infill", sub: "Distribute density where the loads need it." },
   6: { title: "View & export", sub: "Inspect the result, hand off to the slicer." },
 };
@@ -77,7 +77,7 @@ export function StepPanel() {
       </div>
       {step === 1 && <StepModel />}
       {step === 2 && <StepBcs />}
-      {step === 3 && <StepMaterial />}
+      {step === 3 && <StepProperties />}
       {step === 4 && <StepVerify />}
       {step === 5 && <StepOptimize />}
       {step === 6 && <StepExport />}
@@ -310,10 +310,12 @@ function BcRow({ bc }: { bc: Bc }) {
   );
 }
 
-// ---------------- 3 · Material & analysis ----------------
+// ---------------- 3 · Properties ----------------
 
-function StepMaterial() {
+function StepProperties() {
   const s = useStore();
+  const wall = s.perimeters * s.lineWidth;
+  const k = s.voxelInfo ? Math.max(1, Math.round(wall / s.voxelInfo.h)) : null;
   return (
     <>
       <div className="group">
@@ -339,9 +341,67 @@ function StepMaterial() {
           </a>
         </div>
       </div>
+
+      <div className="duo">
+        <div className="group">
+          <div className="g-label">
+            <span>Perimeters</span>
+          </div>
+          <NumInput value={s.perimeters} step={1} min={1} max={8} onCommit={(v) => s.setPerimeters(v)} />
+        </div>
+        <div className="group">
+          <div className="g-label">
+            <span>Line width</span>
+            <b>mm</b>
+          </div>
+          <NumInput
+            value={s.lineWidth}
+            step={0.05}
+            min={0.1}
+            max={1.5}
+            onCommit={(v) => s.setLineWidth(v)}
+          />
+        </div>
+      </div>
+      <div className="dim small">
+        ≈ {wall.toFixed(2)} mm solid skin — what the analysis assumes and what the 3MF's
+        wall_loops will print. Match the line width to your profile.
+      </div>
+
+      <div className="duo">
+        <div className="group">
+          <div className="g-label">
+            <span>Infill pattern</span>
+          </div>
+          <select value={s.pattern} onChange={(e) => s.setPattern(e.target.value as PatternKey)}>
+            <option value="gyroid">Gyroid</option>
+            <option value="cubic">Cubic</option>
+            <option value="grid">Grid</option>
+          </select>
+        </div>
+        <div className="group">
+          <div className="g-label">
+            <span>Infill</span>
+            <b>{s.printInfill} %</b>
+          </div>
+          <input
+            type="range"
+            min={5}
+            max={100}
+            step={1}
+            value={s.printInfill}
+            onChange={(e) => s.setPrintInfill(Number(e.target.value))}
+          />
+        </div>
+      </div>
+      <div className="dim small">
+        The uniform ratio "Solve as printed" analyzes (the optimizer's budget follows it as a
+        starting point). The pattern's E(ρ) curve is editable in ⚙ Settings.
+      </div>
+
       <div className="group">
         <div className="g-label">
-          <span>Resolution</span>
+          <span>Analysis resolution</span>
         </div>
         <select
           value={s.resolution}
@@ -351,9 +411,21 @@ function StepMaterial() {
           <option value="normal">Normal</option>
           <option value="fine">Fine</option>
         </select>
+        <label className="rowcheck">
+          <input
+            type="checkbox"
+            checked={s.snapVoxel}
+            onChange={(e) => s.setSnapVoxel(e.target.checked)}
+          />
+          <span>Snap voxel size to the wall (h = wall/k)</span>
+        </label>
         <div className="dim small">
-          Preview is right for the first pass — the Mesh view (top of the viewport) shows the
-          actual voxel grid the solver runs on.
+          {s.voxelInfo
+            ? `Grid h = ${s.voxelInfo.h.toFixed(2)} mm — the ${wall.toFixed(2)} mm skin is ${k} cell layer${k === 1 ? "" : "s"} thick.`
+            : "Grid size is computed at the next check/solve/optimize."}
+          {s.snapVoxel && k === 1 && (
+            <> Single-layer skin is coarse — raise the resolution for printed-mode accuracy.</>
+          )}
         </div>
       </div>
     </>
@@ -366,6 +438,32 @@ function StepVerify() {
   const s = useStore();
   return (
     <>
+      <div className="group">
+        <div className="g-label">
+          <span>Analyze</span>
+        </div>
+        <div className="seg">
+          <button
+            className={s.analyzeMode === "printed" ? "on" : ""}
+            onClick={() => s.setAnalyzeMode("printed")}
+            title="Skin solid, interior at the uniform infill from Properties — through your calibrated E(ρ) curve"
+          >
+            As printed
+          </button>
+          <button
+            className={s.analyzeMode === "solid" ? "on" : ""}
+            onClick={() => s.setAnalyzeMode("solid")}
+            title="Fully dense E₀ everywhere — the CAD-ideal reference"
+          >
+            Solid material
+          </button>
+        </div>
+        <div className="dim small">
+          {s.analyzeMode === "printed"
+            ? `Skin ${s.perimeters} × ${s.lineWidth} mm at 100%, interior ${s.printInfill}% ${s.pattern} — accuracy is the accuracy of the calibrated E(ρ) curve.`
+            : "Fully dense E₀ everywhere — answers \"how much stiffness does printing cost me?\" next to an as-printed run."}
+        </div>
+      </div>
       <div className="toolrow">
         <button onClick={() => void s.runCheck()} disabled={!!s.busy}>
           Check setup
@@ -385,14 +483,16 @@ function StepVerify() {
       )}
       {s.stats && s.hasResult && !s.optSummary && (
         <div className="status ok">
-          Max deflection <b>{fmtDisp(s.stats.maxDisplacement)}</b> · {s.stats.iterations} iters ·{" "}
-          {s.stats.seconds.toFixed(1)} s
+          Max deflection <b>{fmtDisp(s.stats.maxDisplacement)}</b> ·{" "}
+          {s.printedStats ? `as printed (${s.printedStats.infillPct}% ${s.printedStats.pattern})` : "solid"} ·{" "}
+          {s.stats.iterations} iters · {s.stats.seconds.toFixed(1)} s
         </div>
       )}
       <div className="hint">
         Check animates any remaining rigid-body freedom. Solve lands in the <b>Results</b> view —
         the field picker sits under the view tabs, playback at the bottom, min/max markers and
-        click-to-edit scale & exaggeration in the legend.
+        click-to-edit scale & exaggeration in the legend. As-printed results land in the dock on
+        the right (mass, deflection, min safety factor).
       </div>
     </>
   );
@@ -448,37 +548,25 @@ function StepOptimize() {
         </div>
       </div>
 
-      <div className="duo">
-        <div className="group">
-          <div className="g-label">
-            <span>Pattern</span>
-          </div>
-          <select value={s.pattern} onChange={(e) => s.setPattern(e.target.value as PatternKey)}>
-            <option value="gyroid">Gyroid</option>
-            <option value="cubic">Cubic</option>
-            <option value="grid">Grid</option>
-          </select>
+      <div className="group">
+        <div className="g-label">
+          <span>Mode</span>
         </div>
-        <div className="group">
-          <div className="g-label">
-            <span>Mode</span>
-          </div>
-          <div className="seg">
-            <button
-              className={s.optMode === "graded" ? "on" : ""}
-              onClick={() => s.setOptMode("graded")}
-              title="Several discrete infill densities, placed from the optimized field"
-            >
-              Graded
-            </button>
-            <button
-              className={s.optMode === "binary" ? "on" : ""}
-              onClick={() => s.setOptMode("binary")}
-              title="Hollow or solid: interior is either the printability floor or 100% dense"
-            >
-              Binary
-            </button>
-          </div>
+        <div className="seg">
+          <button
+            className={s.optMode === "graded" ? "on" : ""}
+            onClick={() => s.setOptMode("graded")}
+            title="Several discrete infill densities, placed from the optimized field"
+          >
+            Graded
+          </button>
+          <button
+            className={s.optMode === "binary" ? "on" : ""}
+            onClick={() => s.setOptMode("binary")}
+            title="Hollow or solid: interior is either the printability floor or 100% dense"
+          >
+            Binary (hollow/solid)
+          </button>
         </div>
       </div>
 
@@ -500,31 +588,12 @@ function StepOptimize() {
         </div>
       )}
 
-      <div className="duo">
-        <div className="group">
-          <div className="g-label">
-            <span>Perimeters</span>
-          </div>
-          <NumInput value={s.perimeters} step={1} min={1} max={8} onCommit={(v) => s.setPerimeters(v)} />
-        </div>
-        <div className="group">
-          <div className="g-label">
-            <span>Line width</span>
-            <b>mm</b>
-          </div>
-          <NumInput
-            value={s.lineWidth}
-            step={0.05}
-            min={0.1}
-            max={1.5}
-            onCommit={(v) => s.setLineWidth(v)}
-          />
-        </div>
-      </div>
       <div className="row">
         <div className="dim small" style={{ flex: 1 }}>
-          ≈ {(s.perimeters * s.lineWidth).toFixed(2)} mm solid skin — perimeters go into the 3MF;
-          match the line width to your profile
+          Skin {s.perimeters} × {s.lineWidth} mm · {s.pattern} —{" "}
+          <a className="link" onClick={() => s.setActiveStep(3)}>
+            edit in Properties
+          </a>
         </div>
         {s.optMode === "binary" ? (
           <span className="dim small">2 levels (hollow/solid)</span>
