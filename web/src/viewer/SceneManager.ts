@@ -16,12 +16,13 @@ const BASE_COLOR = new THREE.Color(0x9aa3ad);
 // Hover highlight: saturated amber, unmistakable against the gray part and
 // every BC color (a light gray tint was too close to the base material).
 const HOVER_TINT = new THREE.Color(0xffb224);
+// Deepened for the light Werkbank stage; KIND_DOT in StepPanel.tsx must match.
 const BC_COLORS: Record<string, THREE.Color> = {
-  fixed: new THREE.Color(0x3b82f6),
-  frictionless: new THREE.Color(0x22d3ee),
-  elastic: new THREE.Color(0x34d399),
-  force: new THREE.Color(0xef4444),
-  pressure: new THREE.Color(0xf59e0b),
+  fixed: new THREE.Color(0x2563eb),
+  frictionless: new THREE.Color(0x0e9cbf),
+  elastic: new THREE.Color(0x1f9d6b),
+  force: new THREE.Color(0xd93025),
+  pressure: new THREE.Color(0xc97b10),
 };
 
 export interface SceneCallbacks {
@@ -146,7 +147,8 @@ export class SceneManager {
     this.renderer.setPixelRatio(window.devicePixelRatio);
     this.renderer.autoClear = false;
     this.renderer.localClippingEnabled = true;
-    this.scene.background = new THREE.Color(0x14181d);
+    // Werkbank stage: light studio gray (matches .stage in styles.css).
+    this.scene.background = new THREE.Color(0xdedcd6);
 
     this.camera = new THREE.OrthographicCamera(-120, 120, 120, -120, 0.1, 10000);
     this.camera.position.set(120, -160, 110);
@@ -156,16 +158,16 @@ export class SceneManager {
     this.controls.enableDamping = true;
     this.controls.dampingFactor = 0.12;
 
-    const hemi = new THREE.HemisphereLight(0xffffff, 0x30363d, 1.0);
+    const hemi = new THREE.HemisphereLight(0xffffff, 0xb9b6ae, 1.0);
     this.scene.add(hemi);
     const key = new THREE.DirectionalLight(0xffffff, 1.6);
     key.position.set(1, -1.2, 1.8);
     this.scene.add(key);
-    const fill = new THREE.DirectionalLight(0xa0b4ff, 0.5);
+    const fill = new THREE.DirectionalLight(0xc8d2e0, 0.4);
     fill.position.set(-1.5, 1, -0.5);
     this.scene.add(fill);
 
-    const grid = new THREE.GridHelper(400, 40, 0x39414b, 0x232a32);
+    const grid = new THREE.GridHelper(400, 40, 0xafada6, 0xc8c6bf);
     grid.rotation.x = Math.PI / 2; // Z-up
     this.scene.add(grid);
 
@@ -234,7 +236,7 @@ export class SceneManager {
     }
     const origin = new THREE.Mesh(
       new THREE.SphereGeometry(0.09, 12, 8),
-      new THREE.MeshBasicMaterial({ color: 0x8fa0b3 })
+      new THREE.MeshBasicMaterial({ color: 0x6e7173 })
     );
     this.gizmoScene.add(origin);
   }
@@ -678,7 +680,7 @@ export class SceneManager {
     if (edges && edges.length) {
       const geo = new THREE.BufferGeometry();
       geo.setAttribute("position", new THREE.BufferAttribute(edges, 3));
-      const mat = new THREE.LineBasicMaterial({ color: 0x12161b, transparent: true, opacity: 0.6 });
+      const mat = new THREE.LineBasicMaterial({ color: 0x2a2d30, transparent: true, opacity: 0.45 });
       this.voxelDisposables.push(geo, mat);
       this.voxelGroup.add(new THREE.LineSegments(geo, mat));
     }
@@ -889,14 +891,14 @@ export class SceneManager {
     const group = new THREE.Group();
     const quadGeo = new THREE.PlaneGeometry(d, d);
     const quadMat = new THREE.MeshBasicMaterial({
-      color: 0x4f9cf9,
+      color: 0x2e6fd0,
       transparent: true,
       opacity: 0.08,
       side: THREE.DoubleSide,
       depthWrite: false,
     });
     const edgeGeo = new THREE.EdgesGeometry(quadGeo);
-    const edgeMat = new THREE.LineBasicMaterial({ color: 0x4f9cf9, transparent: true, opacity: 0.7 });
+    const edgeMat = new THREE.LineBasicMaterial({ color: 0x2e6fd0, transparent: true, opacity: 0.7 });
     this.sectionQuadDisposables.push(quadGeo, quadMat, edgeGeo, edgeMat);
     group.add(new THREE.Mesh(quadGeo, quadMat));
     group.add(new THREE.LineSegments(edgeGeo, edgeMat));
@@ -1181,13 +1183,13 @@ export class SceneManager {
     }
     const canvas = document.createElement("canvas");
     const ctx = canvas.getContext("2d")!;
-    const font = "bold 28px 'Segoe UI', system-ui, sans-serif";
+    const font = "bold 28px 'B612 Mono', 'Barlow', system-ui, sans-serif";
     ctx.font = font;
     const w = Math.ceil(ctx.measureText(text).width) + 18;
     canvas.width = w;
     canvas.height = 40;
     ctx.font = font;
-    ctx.fillStyle = "#14181dcc";
+    ctx.fillStyle = "#fcfcfae8";
     ctx.fillRect(0, 0, w, 40);
     ctx.fillStyle = `#${color.toString(16).padStart(6, "0")}`;
     ctx.textBaseline = "middle";
@@ -1224,8 +1226,8 @@ export class SceneManager {
     this.markerMin.position.set(pos[3 * d.minIdx], pos[3 * d.minIdx + 1], pos[3 * d.minIdx + 2]);
     this.markerMax!.position.set(pos[3 * d.maxIdx], pos[3 * d.maxIdx + 1], pos[3 * d.maxIdx + 2]);
     if (!positionsOnly) {
-      this.setMarkerLabel(this.markerMin, `min ${this.fmtExtreme(d.minVal)}`, 0x9cc4f7);
-      this.setMarkerLabel(this.markerMax!, `max ${this.fmtExtreme(d.maxVal)}`, 0xffb3b3);
+      this.setMarkerLabel(this.markerMin, `min ${this.fmtExtreme(d.minVal)}`, 0x1d5fc4);
+      this.setMarkerLabel(this.markerMax!, `max ${this.fmtExtreme(d.maxVal)}`, 0xc2330e);
     }
   }
 
@@ -1298,7 +1300,7 @@ function makeTextSprite(text: string, color: number): THREE.Sprite {
   canvas.width = 64;
   canvas.height = 64;
   const ctx = canvas.getContext("2d")!;
-  ctx.font = "bold 44px 'Segoe UI', system-ui, sans-serif";
+  ctx.font = "bold 44px 'Barlow', 'Segoe UI', system-ui, sans-serif";
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
   ctx.fillStyle = `#${color.toString(16).padStart(6, "0")}`;

@@ -1,0 +1,442 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com> -->
+<!--
+  DESIGN DRAFT 2 · "WERKBANK" (light)
+  Software as a measuring instrument: warm-gray chassis, recessed wells,
+  a caliper-style step rail with an orange carriage, DRO-style readouts
+  for results, machine status strip. Accent: CNC Kitchen orange.
+  Type: Barlow (DIN heritage) + B612 Mono (the Airbus cockpit face) for data.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=1380">
+<title>Draft 2 · Werkbank — Smart Infill Generator</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600;700&family=Barlow+Semi+Condensed:wght@500;600&family=B612+Mono:wght@400;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --chassis:  #E7E6E1;  /* instrument housing */
+    --panel:    #FCFCFA;  /* faceplates */
+    --well:     #EFEEE9;  /* recessed inputs */
+    --line:     #CFCEC7;  /* panel seams */
+    --ink:      #26282A;
+    --dim:      #75787B;
+    --orange:   #E06A13;  /* anodized accent */
+    --orange-d: #C25709;
+    --green:    #2E7D46;  /* status lamp */
+    --lcd-bg:   #20241F;  /* readout windows */
+    --lcd:      #C9E89B;  /* readout digits */
+    --ui: "Barlow", system-ui, sans-serif;
+    --cond: "Barlow Semi Condensed", var(--ui);
+    --mono: "B612 Mono", Consolas, monospace;
+    --r: 3px;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { font-family: var(--ui); font-size: 13px; color: var(--ink); background: var(--chassis); }
+  button { font: inherit; color: inherit; background: none; border: none; cursor: pointer; }
+  :focus-visible { outline: 2px solid var(--orange); outline-offset: 1px; }
+
+  .app { height: 100%; min-width: 1340px; display: flex; flex-direction: column; }
+
+  /* ---- top bar ---- */
+  .top {
+    height: 54px; display: flex; align-items: center; gap: 14px; padding: 0 14px 0 12px;
+    background: var(--chassis); border-bottom: 1px solid var(--line);
+  }
+  .brandmark {
+    width: 30px; height: 30px; border-radius: var(--r); background: var(--orange);
+    display: grid; place-items: center; color: #fff; font-weight: 700; font-size: 13px;
+    font-family: var(--cond); letter-spacing: 0.02em;
+  }
+  .brand { line-height: 1.15; }
+  .brand b { font-size: 14.5px; font-weight: 700; letter-spacing: 0.01em; display: block; }
+  .brand span { font-size: 10px; color: var(--dim); letter-spacing: 0.14em; text-transform: uppercase; font-weight: 600; }
+  .partchip {
+    margin-left: 18px; display: flex; align-items: baseline; gap: 10px;
+    background: var(--well); border: 1px solid var(--line); border-radius: var(--r);
+    padding: 6px 12px; box-shadow: inset 0 1px 2px rgba(0,0,0,0.05);
+  }
+  .partchip b { font-weight: 600; font-size: 13px; }
+  .partchip span { font-family: var(--mono); font-size: 10.5px; color: var(--dim); }
+  .top .grow { flex: 1; }
+  .ghost {
+    height: 34px; padding: 0 13px; border: 1px solid var(--line); border-radius: var(--r);
+    background: var(--panel); font-weight: 500;
+  }
+  .ghost:hover { border-color: #B5B4AD; }
+  .primary {
+    height: 34px; padding: 0 18px; border-radius: var(--r); background: var(--orange);
+    color: #fff; font-weight: 600; box-shadow: 0 1px 0 rgba(0,0,0,0.18);
+  }
+  .primary:hover { background: var(--orange-d); }
+
+  /* ---- main ---- */
+  .main { flex: 1; display: flex; min-height: 0; }
+
+  /* caliper rail */
+  .rail {
+    width: 92px; min-width: 92px; background: var(--chassis);
+    border-right: 1px solid var(--line); position: relative;
+    display: flex; flex-direction: column; padding: 10px 0 10px;
+  }
+  .rail::before { /* the measuring scale */
+    content: ""; position: absolute; top: 0; bottom: 0; right: 12px; width: 9px;
+    background:
+      repeating-linear-gradient(to bottom, #918F88 0 1px, transparent 1px 7px),
+      linear-gradient(#AAA9A2, #AAA9A2);
+    background-size: 5px 100%, 1px 100%;
+    background-position: right top, right top; background-repeat: no-repeat;
+  }
+  .station {
+    position: relative; height: 64px; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 3px; width: 100%;
+  }
+  .st-no { font-family: var(--mono); font-size: 13px; color: var(--dim); }
+  .st-name { font-family: var(--cond); font-size: 9px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; color: var(--dim); }
+  .station.done .st-no { color: var(--ink); }
+  .station.done .st-no::after { content: " ✓"; color: var(--green); font-size: 10px; }
+  .station.active {
+    background: var(--orange); border-radius: var(--r); margin: 0 8px; width: auto;
+    align-self: stretch; box-shadow: 0 1px 3px rgba(0,0,0,0.25);
+  }
+  .station.active::after { /* caliper jaw gripping the scale */
+    content: ""; position: absolute; right: -9px; top: 50%; margin-top: -7px;
+    border: 7px solid transparent; border-left-color: var(--orange);
+  }
+  .station.active .st-no, .station.active .st-name { color: #fff; }
+
+  /* control panel */
+  .panel {
+    width: 330px; min-width: 330px; background: var(--panel);
+    border-right: 1px solid var(--line); overflow-y: auto;
+    padding: 16px 16px 22px; display: flex; flex-direction: column; gap: 15px;
+  }
+  .p-head b { font-size: 15px; font-weight: 700; display: block; }
+  .p-head span { font-size: 12px; color: var(--dim); }
+  .group { display: flex; flex-direction: column; gap: 6px; }
+  .g-label {
+    font-family: var(--cond); font-size: 10px; font-weight: 600; letter-spacing: 0.12em;
+    text-transform: uppercase; color: var(--dim);
+    display: flex; justify-content: space-between; align-items: baseline;
+  }
+  .g-label b { font-family: var(--mono); font-size: 12px; color: var(--ink); letter-spacing: 0; }
+
+  .seg {
+    display: flex; background: var(--well); border: 1px solid var(--line);
+    border-radius: var(--r); padding: 2px; gap: 2px;
+    box-shadow: inset 0 1px 2px rgba(0,0,0,0.05);
+  }
+  .seg button { flex: 1; padding: 6px 4px; font-size: 12px; font-weight: 500; border-radius: 2px; color: var(--dim); }
+  .seg button.on { background: #fff; color: var(--ink); font-weight: 600; box-shadow: 0 1px 2px rgba(0,0,0,0.12); }
+
+  input[type="range"] { -webkit-appearance: none; width: 100%; height: 24px; background: transparent; margin: 0; }
+  input[type="range"]::-webkit-slider-runnable-track {
+    height: 6px; border-radius: 3px; background:
+      linear-gradient(to right, var(--orange) 0 33%, #D8D7D0 33%);
+    box-shadow: inset 0 1px 2px rgba(0,0,0,0.15);
+  }
+  input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none; width: 16px; height: 16px; margin-top: -5px; border-radius: 50%;
+    background: #fff; border: 2px solid var(--orange); box-shadow: 0 1px 2px rgba(0,0,0,0.25);
+  }
+  .ticks { display: flex; justify-content: space-between; font-family: var(--mono); font-size: 9px; color: var(--dim); }
+
+  select, .numfield {
+    font-family: inherit; font-size: 13px; color: var(--ink); width: 100%;
+    background: var(--well); border: 1px solid var(--line); border-radius: var(--r);
+    padding: 7px 9px; box-shadow: inset 0 1px 2px rgba(0,0,0,0.05);
+  }
+  .numfield { font-family: var(--mono); font-size: 12px; }
+  .duo { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .chips { display: flex; gap: 6px; }
+  .chip {
+    font-family: var(--mono); font-size: 11px; padding: 4px 9px; border-radius: var(--r);
+    background: var(--well); border: 1px solid var(--line); color: var(--dim);
+  }
+  .chip.hot { color: var(--ink); border-color: #B5B4AD; background: #fff; }
+
+  .run {
+    margin-top: 2px; height: 40px; border-radius: var(--r); background: var(--orange);
+    color: #fff; font-size: 14px; font-weight: 600; letter-spacing: 0.02em;
+    box-shadow: 0 1px 0 rgba(0,0,0,0.18);
+  }
+  .run:hover { background: var(--orange-d); }
+  .runnote { font-size: 11.5px; color: var(--dim); text-align: center; }
+
+  /* ---- viewport ---- */
+  .stage {
+    flex: 1; position: relative; overflow: hidden;
+    background: radial-gradient(120% 90% at 50% 30%, #F1F0EB 0%, #E0DFD9 70%, #D4D3CC 100%);
+  }
+  .scene { position: absolute; inset: 0; width: 100%; height: 100%; }
+  .viewmodes {
+    position: absolute; top: 12px; left: 50%; transform: translateX(-50%);
+    display: flex; gap: 2px; background: rgba(252,252,250,0.92); padding: 3px;
+    border: 1px solid var(--line); border-radius: var(--r); box-shadow: 0 1px 4px rgba(0,0,0,0.10);
+  }
+  .viewmodes button { padding: 5px 13px; font-size: 12px; font-weight: 500; border-radius: 2px; color: var(--dim); }
+  .viewmodes button.on { background: var(--ink); color: #fff; }
+  .legend {
+    position: absolute; top: 12px; right: 12px; width: 150px;
+    background: rgba(252,252,250,0.95); border: 1px solid var(--line); border-radius: var(--r);
+    box-shadow: 0 1px 4px rgba(0,0,0,0.10); padding: 9px 11px;
+  }
+  .legend h4 { margin: 0 0 7px; font-family: var(--cond); font-size: 10px; font-weight: 600; letter-spacing: 0.12em; text-transform: uppercase; color: var(--dim); }
+  .lrow { display: flex; align-items: center; gap: 8px; font-size: 12px; padding: 2.5px 0; }
+  .lrow i { width: 14px; height: 14px; border-radius: 2px; border: 1px solid rgba(0,0,0,0.15); }
+  .lrow .pct { margin-left: auto; font-family: var(--mono); font-size: 10.5px; color: var(--dim); }
+  .gizmo { position: absolute; bottom: 38px; right: 14px; font-family: var(--mono); font-size: 10px; color: var(--dim); }
+  .sectionchip {
+    position: absolute; bottom: 38px; left: 12px; display: flex; gap: 2px; align-items: center;
+    background: rgba(252,252,250,0.92); padding: 3px; border: 1px solid var(--line);
+    border-radius: var(--r); font-size: 11.5px;
+  }
+  .sectionchip button { padding: 4px 9px; border-radius: 2px; color: var(--dim); font-weight: 500; }
+  .sectionchip button.on { background: var(--ink); color: #fff; }
+
+  /* inspector */
+  .inspector {
+    width: 296px; min-width: 296px; background: var(--chassis); border-left: 1px solid var(--line);
+    overflow-y: auto; padding: 14px; display: flex; flex-direction: column; gap: 10px;
+  }
+  .i-head { font-family: var(--cond); font-size: 10px; font-weight: 600; letter-spacing: 0.12em; text-transform: uppercase; color: var(--dim); display: flex; justify-content: space-between; }
+  .dro {
+    background: var(--panel); border: 1px solid var(--line); border-radius: var(--r);
+    padding: 10px 12px 11px; box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+  }
+  .dro-label { font-size: 11.5px; color: var(--dim); margin-bottom: 6px; display: flex; justify-content: space-between; }
+  .dro-window {
+    background: var(--lcd-bg); border-radius: 2px; padding: 7px 10px;
+    box-shadow: inset 0 2px 4px rgba(0,0,0,0.55);
+    display: flex; align-items: baseline; justify-content: space-between;
+  }
+  .dro-window b { font-family: var(--mono); font-size: 19px; font-weight: 700; color: var(--lcd); letter-spacing: 0.02em; }
+  .dro-window span { font-family: var(--mono); font-size: 10px; color: #7E8F66; }
+  .dro.hero .dro-window b { color: #B7E37E; }
+  .kv { display: flex; justify-content: space-between; font-size: 12px; padding: 3px 1px; color: var(--dim); }
+  .kv b { font-family: var(--mono); font-size: 11.5px; color: var(--ink); font-weight: 400; }
+  .divider { border-top: 1px solid var(--line); margin: 2px 0; }
+
+  /* ---- status strip ---- */
+  .status {
+    height: 30px; background: var(--ink); color: #B9BCBE; display: flex; align-items: center;
+    font-family: var(--mono); font-size: 10px; gap: 0;
+  }
+  .status > div { padding: 0 14px; display: flex; align-items: center; gap: 7px; height: 100%; border-right: 1px solid #3A3C3E; white-space: nowrap; }
+  .status .lamp { width: 8px; height: 8px; border-radius: 50%; background: var(--green); box-shadow: 0 0 5px #2E7D46AA; }
+  .status b { color: #ECEEEF; font-weight: 400; }
+  .status .grow { flex: 1; border-right: none; }
+  .status button { color: #B9BCBE; font-family: var(--mono); font-size: 10px; height: 100%; padding: 0 14px; border-left: 1px solid #3A3C3E; }
+  .status button:hover { color: #fff; background: #313335; }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <header class="top">
+    <div class="brandmark">SI</div>
+    <div class="brand">
+      <b>Smart Infill Generator</b>
+      <span>CNC Kitchen · browser FEA</span>
+    </div>
+    <div class="partchip">
+      <b>bracket_v3.stl</b>
+      <span>84 × 38 × 12 mm</span>
+      <span>24 612 facets</span>
+    </div>
+    <div class="grow"></div>
+    <button class="ghost">⚙ Settings</button>
+    <button class="primary">Export 3MF</button>
+  </header>
+
+  <div class="main">
+    <nav class="rail" aria-label="Workflow">
+      <button class="station done"><span class="st-no">1</span><span class="st-name">Model</span></button>
+      <button class="station done"><span class="st-no">2</span><span class="st-name">Loads</span></button>
+      <button class="station done"><span class="st-no">3</span><span class="st-name">Material</span></button>
+      <button class="station done"><span class="st-no">4</span><span class="st-name">Verify</span></button>
+      <button class="station active"><span class="st-no">5</span><span class="st-name">Optimize</span></button>
+      <button class="station"><span class="st-no">6</span><span class="st-name">Export</span></button>
+    </nav>
+
+    <section class="panel">
+      <div class="p-head">
+        <b>Optimize infill</b>
+        <span>Distribute density where the loads need it.</span>
+      </div>
+
+      <div class="group">
+        <div class="g-label"><span>Goal</span></div>
+        <div class="seg">
+          <button class="on">Stiffest at budget</button>
+          <button>Match uniform stiffness</button>
+        </div>
+      </div>
+
+      <div class="group">
+        <div class="g-label"><span>Infill budget</span><b>30.0 %</b></div>
+        <input type="range" min="10" max="70" value="30">
+        <div class="ticks"><span>10</span><span>30</span><span>50</span><span>70</span></div>
+      </div>
+
+      <div class="duo">
+        <div class="group">
+          <div class="g-label"><span>Pattern</span></div>
+          <select><option>Gyroid</option><option>Cubic</option><option>Grid</option></select>
+        </div>
+        <div class="group">
+          <div class="g-label"><span>Mode</span></div>
+          <div class="seg">
+            <button class="on">Graded</button>
+            <button>Binary</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="duo">
+        <div class="group">
+          <div class="g-label"><span>Perimeters</span></div>
+          <div class="numfield">2 × 0.45 mm</div>
+        </div>
+        <div class="group">
+          <div class="g-label"><span>Region smoothing</span></div>
+          <div class="numfield">2×</div>
+        </div>
+      </div>
+
+      <div class="group">
+        <div class="g-label"><span>Density levels</span><b>auto</b></div>
+        <div class="chips"><span class="chip">10</span><span class="chip">45</span><span class="chip hot">70 %</span></div>
+      </div>
+
+      <button class="run">Optimize infill</button>
+      <div class="runnote">Converged after 18 iterations · 41 s</div>
+    </section>
+
+    <main class="stage">
+      <svg class="scene" viewBox="0 0 980 560" preserveAspectRatio="xMidYMid meet" font-family="B612 Mono, monospace">
+        <defs>
+          <pattern id="vox" width="10" height="10" patternUnits="userSpaceOnUse">
+            <path d="M10,0 H0 V10" fill="none" stroke="rgba(255,255,255,0.16)" stroke-width="1"/>
+          </pattern>
+          <pattern id="wall2" width="11" height="11" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+            <line x1="0" y1="0" x2="0" y2="11" stroke="#9C9B94" stroke-width="1.4"/>
+          </pattern>
+          <marker id="arr2" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+            <path d="M0,0 L9,4.5 L0,9 Z" fill="#C2330E"/>
+          </marker>
+          <filter id="soft" x="-40%" y="-40%" width="180%" height="180%">
+            <feGaussianBlur stdDeviation="7"/>
+          </filter>
+          <clipPath id="bodyclip2">
+            <path d="M48,128 L524,156 A52,52 0 1 1 524,248 L260,246 L48,338 Z"/>
+          </clipPath>
+        </defs>
+
+        <g transform="translate(80,42)">
+          <ellipse cx="300" cy="420" rx="330" ry="22" fill="#000" opacity="0.13" filter="url(#soft)"/>
+
+          <!-- fixed wall -->
+          <rect x="-38" y="50" width="38" height="356" fill="url(#wall2)"/>
+          <line x1="0" y1="50" x2="0" y2="406" stroke="#6E6D67" stroke-width="2.4"/>
+          <g fill="none" stroke="#6E6D67" stroke-width="1.4">
+            <path d="M0,86 l-15,-9 l0,18 Z"/><path d="M0,156 l-15,-9 l0,18 Z"/>
+            <path d="M0,228 l-15,-9 l0,18 Z"/><path d="M0,300 l-15,-9 l0,18 Z"/>
+            <path d="M0,372 l-15,-9 l0,18 Z"/>
+          </g>
+
+          <!-- mounting plate -->
+          <rect x="0" y="58" width="48" height="340" fill="#C8CCCE" stroke="#8E9294" stroke-width="1.2"/>
+          <circle cx="24" cy="104" r="10" fill="#E4E3DD" stroke="#8E9294" stroke-width="1.2"/>
+          <circle cx="24" cy="352" r="10" fill="#E4E3DD" stroke="#8E9294" stroke-width="1.2"/>
+
+          <!-- part body, floor density -->
+          <path d="M48,128 L524,156 A52,52 0 1 1 524,248 L260,246 L48,338 Z" fill="#6B89A4"/>
+
+          <!-- 45 % -->
+          <g clip-path="url(#bodyclip2)">
+            <path d="M50,166 L330,170 L410,156 L490,158 L400,186 L50,196 Z" fill="#D89E33"/>
+            <path d="M40,296 L238,234 L202,222 L40,250 Z" fill="#D89E33"/>
+            <!-- 70 % -->
+            <path d="M44,126 L416,154 L330,168 L44,164 Z" fill="#CE4A22"/>
+            <path d="M40,346 L272,246 L238,234 L40,296 Z" fill="#CE4A22"/>
+            <path d="M548,202 m-46,0 a46,46 0 1 0 92,0 a46,46 0 1 0 -92,0 M548,202 m-25,0 a25,25 0 1 1 50,0 a25,25 0 1 1 -50,0" fill="#CE4A22" fill-rule="evenodd"/>
+            <!-- voxel hint -->
+            <rect x="40" y="120" width="600" height="240" fill="url(#vox)"/>
+          </g>
+
+          <!-- region boundaries + outline -->
+          <g clip-path="url(#bodyclip2)" fill="none" stroke="rgba(255,255,255,0.55)" stroke-width="1">
+            <path d="M330,168 L416,154 M50,164 L330,168 M400,186 L50,196 M490,158 L400,186"/>
+            <circle cx="548" cy="202" r="46"/><circle cx="548" cy="202" r="25"/>
+          </g>
+          <path d="M48,128 L524,156 A52,52 0 1 1 524,248 L260,246 L48,338 Z" fill="none" stroke="#3D454C" stroke-width="2"/>
+          <circle cx="548" cy="202" r="22" fill="#E4E3DD" stroke="#3D454C" stroke-width="2"/>
+
+          <!-- load -->
+          <line x1="548" y1="232" x2="548" y2="318" stroke="#C2330E" stroke-width="2.4" marker-end="url(#arr2)"/>
+          <text x="562" y="296" font-size="13" fill="#C2330E" font-weight="700">F = 120 N</text>
+        </g>
+      </svg>
+
+      <div class="viewmodes">
+        <button>Solid</button><button>Mesh</button><button>Density</button><button class="on">Regions</button>
+      </div>
+
+      <div class="legend">
+        <h4>Density</h4>
+        <div class="lrow"><i style="background:#CE4A22"></i> dense <span class="pct">70 %</span></div>
+        <div class="lrow"><i style="background:#D89E33"></i> medium <span class="pct">45 %</span></div>
+        <div class="lrow"><i style="background:#6B89A4"></i> floor <span class="pct">10 %</span></div>
+      </div>
+
+      <div class="sectionchip">
+        <button class="on">Section</button><button>Flip</button><button>X</button><button>Y</button><button>Z</button>
+      </div>
+      <div class="gizmo">Z↑ X→ Y⊙</div>
+    </main>
+
+    <aside class="inspector">
+      <div class="i-head"><span>Results</span><span>run 1</span></div>
+
+      <div class="dro hero">
+        <div class="dro-label"><span>vs 30 % uniform, same weight</span></div>
+        <div class="dro-window"><b>+16.8</b><span>% STIFFER</span></div>
+      </div>
+      <div class="dro">
+        <div class="dro-label"><span>Mass</span></div>
+        <div class="dro-window"><b>38.4</b><span>g</span></div>
+      </div>
+      <div class="dro">
+        <div class="dro-label"><span>Max deflection</span></div>
+        <div class="dro-window"><b>0.42</b><span>mm</span></div>
+      </div>
+      <div class="dro">
+        <div class="dro-label"><span>Min safety factor</span><span>σₜ 50 MPa</span></div>
+        <div class="dro-window"><b>3.21</b><span>×</span></div>
+      </div>
+
+      <div class="divider"></div>
+      <div class="kv"><span>Stiffness vs 100 % solid</span><b>71 %</b></div>
+      <div class="kv"><span>Levels used</span><b>10 · 45 · 70 %</b></div>
+      <div class="kv"><span>Pattern</span><b>Gyroid</b></div>
+      <div class="kv"><span>Perimeters in 3MF</span><b>2 · wall_loops</b></div>
+    </aside>
+  </div>
+
+  <footer class="status">
+    <div><span class="lamp"></span> READY</div>
+    <div>GRID <b>188×84×46</b> · <b>412k</b> cells · h <b>0.45 mm</b></div>
+    <div>MGCG <b>92 it</b> · res <b>8.4e-7</b> · <b>6.2 s</b></div>
+    <div>OPT <b>18 it</b> · Δρ̄ <b>0.0041</b> · converged</div>
+    <div class="grow"></div>
+    <div>mm · MPa</div>
+    <button>▤ Log for nerds</button>
+  </footer>
+</div>
+</body>
+</html>

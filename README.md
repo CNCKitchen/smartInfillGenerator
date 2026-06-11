@@ -16,6 +16,12 @@ npm install     # first time only
 npm run dev     # opens on http://localhost:5173
 ```
 
+The app is laid out like an instrument ("Werkbank" design): a top bar with the
+part and the Export action, a numbered **step rail** (the orange carriage marks
+where you are), a panel showing only the active step, the viewport (view modes
+top-center, section plane bottom-left), a **results dock** on the right after
+an optimization, and a **status strip** with live solver telemetry.
+
 Workflow in the app:
 
 1. **Model** — drop an STL or 3MF (units mm). Coarse tessellations are
@@ -85,7 +91,7 @@ Workflow in the app:
    so walls inherit cleanly) for OrcaSlicer/Bambu Studio, or a `.zip` of
    modifier STLs for any slicer.
 
-A **"Log for nerds"** drawer (bottom-left of the viewer) streams the raw
+A **"Log for nerds"** drawer (toggle in the status strip) streams the raw
 telemetry: voxel grid stats, RBM check results, MGCG iterations/residuals,
 and one line per optimizer iteration (compliance, mean infill, design change,
 inner CG effort) — with live convergence charts for compliance, design

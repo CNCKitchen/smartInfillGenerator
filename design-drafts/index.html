@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com> -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Smart Infill Generator — design drafts</title>
+<style>
+  body {
+    font-family: system-ui, sans-serif; max-width: 880px; margin: 48px auto;
+    padding: 0 24px; color: #1c1e21; line-height: 1.55; background: #fafaf8;
+  }
+  h1 { font-size: 22px; }
+  p.lead { color: #5a5f66; }
+  .card {
+    border: 1px solid #d8d8d2; background: #fff; border-radius: 6px;
+    padding: 18px 22px; margin: 14px 0;
+  }
+  .card h2 { font-size: 16px; margin: 0 0 4px; }
+  .card h2 a { color: #1c4fd6; }
+  .tag { font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase;
+    padding: 2px 8px; border-radius: 3px; margin-left: 8px; vertical-align: 2px; }
+  .light { background: #eef3e6; color: #3e6b22; }
+  .dark  { background: #2b2b2a; color: #efa73c; }
+  ul { margin: 8px 0 0; padding-left: 20px; color: #44484e; }
+  .note { font-size: 13px; color: #777b80; margin-top: 28px; }
+</style>
+</head>
+<body>
+  <h1>Smart Infill Generator — three design drafts</h1>
+  <p class="lead">
+    Static mockups, all showing the same state (step 5 just converged on
+    <code>bracket_v3.stl</code>) so the comparison is fair. All three share the
+    reorganized layout: top app bar, numbered step rail, one active-step panel,
+    dominant viewport, status bar with telemetry. Open at ≥ 1280 px width.
+  </p>
+
+  <div class="card">
+    <h2><a href="draft-1-drawing-office.html">Draft 1 · Drawing Office</a><span class="tag light">light</span></h2>
+    The engineering drawing as interface: sheet frame around the whole app, a real
+    title block as the header, density regions rendered as section hatching with
+    dimension-style leader annotations, line-weight hierarchy instead of shadows.
+    <ul>
+      <li>Accent: checker's red — spent only on the active step, primary actions, loads</li>
+      <li>Type: Archivo + IBM Plex Mono (every number is mono)</li>
+      <li>Signature: title block + hatched regions + leader-line callouts</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h2><a href="draft-2-werkbank.html">Draft 2 · Werkbank</a><span class="tag light">light</span></h2>
+    Software as a measuring instrument: warm-gray chassis with recessed input wells,
+    a caliper-scale step rail with an orange carriage, results as DRO-style readout
+    windows, machine status strip with a green ready-lamp. CNC Kitchen orange as the accent.
+    <ul>
+      <li>Accent: anodized orange (brand) + LCD-green readouts</li>
+      <li>Type: Barlow (DIN heritage) + B612 Mono (the Airbus cockpit face)</li>
+      <li>Signature: caliper rail + digital-readout result cards</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h2><a href="draft-3-operator-dark.html">Draft 3 · Operator</a><span class="tag dark">dark</span></h2>
+    Viewport-first operator console in warm graphite (deliberately not blue-black):
+    the "log for nerds" promoted to a first-class telemetry dock with scope-style
+    amber traces, floating instrument readouts over the stage, minimal chrome.
+    <ul>
+      <li>Accent: instrument amber on layered graphite — no neon, no gradients</li>
+      <li>Type: Chivo + Fragment Mono</li>
+      <li>Signature: the telemetry dock (charts + live log) under the viewport</li>
+    </ul>
+  </div>
+
+  <p class="note">
+    Drafts only — controls are not wired. Fonts load from Google Fonts (OFL-licensed;
+    they would be self-hosted in the real app). Pick a direction and it gets implemented
+    as the actual React/CSS theme.
+  </p>
+</body>
+</html>

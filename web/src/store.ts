@@ -137,6 +137,8 @@ function saveSettings(
 const initialSettings = loadSettings();
 
 interface AppState {
+  // workflow navigation (step rail): 1 Model … 6 View & export
+  activeStep: number;
   // model
   fileName: string | null;
   model: LoadedModel | null;
@@ -210,6 +212,7 @@ interface AppState {
   /** MGCG residual history of the last plain solve (log-scale plot). */
   solveResiduals: number[];
 
+  setActiveStep(n: number): void;
   loadFile(name: string, bytes: ArrayBuffer): Promise<void>;
   setSegAngle(angle: number): Promise<void>;
   setTool(tool: Tool): void;
@@ -413,6 +416,7 @@ function download(bytes: Uint8Array, filename: string, mime: string) {
 }
 
 export const useStore = create<AppState>((set, get) => ({
+  activeStep: 1,
   fileName: null,
   model: null,
   segAngle: 30,
@@ -464,6 +468,10 @@ export const useStore = create<AppState>((set, get) => ({
   optSeries: [],
   solveResiduals: [],
 
+  setActiveStep(n) {
+    set({ activeStep: Math.min(6, Math.max(1, Math.round(n))) });
+  },
+
   async loadFile(name, bytes) {
     set({ busy: "Parsing & segmenting…", error: null, notice: null });
     try {
@@ -474,6 +482,8 @@ export const useStore = create<AppState>((set, get) => ({
       set({
         fileName: name,
         model,
+        // a fresh model means fresh supports & loads — jump there
+        activeStep: 2,
         bcs: [],
         activeBcId: null,
         tool: "orbit",

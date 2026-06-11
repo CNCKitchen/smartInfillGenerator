@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com> -->
+<!--
+  DESIGN DRAFT 1 · "DRAWING OFFICE" (light)
+  The engineering drawing as interface: sheet frame, title block, line-weight
+  hierarchy, section hatching for density regions, dimension-style annotations.
+  Accent: checker's red, spent only on the active step, primary actions and loads.
+  Type: Archivo (UI) + IBM Plex Mono (all data).
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=1380">
+<title>Draft 1 · Drawing Office — Smart Infill Generator</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --paper:   #F7F6F1;  /* technical paper */
+    --field:   #FFFFFF;  /* viewport sheet */
+    --ink:     #1B1E21;  /* 0.7 mm pen */
+    --rule:    #C9C8C0;  /* 0.35 mm pen */
+    --dim:     #6E7378;  /* secondary text */
+    --red:     #C23B17;  /* checker's red — active, primary, loads */
+    --hatch:   #5A5F64;  /* hatching strokes */
+    --ui: "Archivo", system-ui, sans-serif;
+    --mono: "IBM Plex Mono", Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    font-family: var(--ui); font-size: 13px; color: var(--ink);
+    background: #E6E5DF; padding: 12px;
+  }
+  button { font: inherit; color: inherit; background: none; cursor: pointer; }
+  :focus-visible { outline: 2px solid var(--red); outline-offset: 1px; }
+
+  /* ---- the sheet: everything lives inside a drawing frame ---- */
+  .sheet {
+    height: 100%; min-width: 1320px; display: flex; flex-direction: column;
+    background: var(--paper); border: 2px solid var(--ink);
+  }
+
+  /* ---- title block ---- */
+  .titleblock {
+    display: grid; grid-template-columns: 290px 1fr 170px 130px 130px 110px auto;
+    border-bottom: 2px solid var(--ink); background: var(--paper);
+  }
+  .tb-cell { padding: 9px 14px 8px; border-right: 1px solid var(--rule); min-width: 0; }
+  .tb-cell:last-child { border-right: none; display: flex; align-items: center; gap: 8px; padding-right: 10px; }
+  .tb-label {
+    font-size: 9.5px; font-weight: 600; letter-spacing: 0.12em; color: var(--dim);
+    text-transform: uppercase; margin-bottom: 3px;
+  }
+  .tb-value { font-family: var(--mono); font-size: 13px; font-weight: 500; white-space: nowrap; }
+  .tb-value .sub { color: var(--dim); font-size: 11.5px; margin-left: 8px; }
+  .brand .tb-label { color: var(--red); }
+  .brand-name { font-size: 16px; font-weight: 700; letter-spacing: 0.02em; }
+  .brand-name em { font-style: normal; color: var(--dim); font-weight: 500; }
+  .gearbtn {
+    border: 1px solid var(--ink); width: 34px; height: 34px; font-size: 15px;
+    background: var(--paper);
+  }
+  .gearbtn:hover { background: #ECEBE4; }
+  .export {
+    border: 1px solid var(--red); background: var(--red); color: #fff;
+    font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase;
+    font-size: 12px; padding: 9px 18px;
+  }
+  .export:hover { background: #A93212; }
+
+  /* ---- work area ---- */
+  .work { flex: 1; display: flex; min-height: 0; }
+  .rail {
+    width: 384px; min-width: 384px; border-right: 1px solid var(--ink);
+    display: flex; flex-direction: column; min-height: 0;
+  }
+
+  /* step index — like a drawing's revision table */
+  .steps { border-bottom: 1px solid var(--ink); }
+  .step {
+    display: grid; grid-template-columns: 44px 1fr auto; align-items: center;
+    border-bottom: 1px solid var(--rule); padding: 0 14px 0 0; height: 38px;
+    width: 100%; text-align: left;
+  }
+  .step:last-child { border-bottom: none; }
+  .step-no {
+    font-family: var(--mono); font-size: 13px; font-weight: 600; height: 100%;
+    display: flex; align-items: center; justify-content: center;
+    border-right: 1px solid var(--rule); position: relative;
+  }
+  .step.done .step-no { background: url('data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="7" height="7"><path d="M-1,8 L8,-1" stroke="%23B9B8B0" stroke-width="1"/></svg>'); }
+  .step.done .step-no span { background: var(--paper); padding: 1px 4px; }
+  .step-name { padding-left: 12px; font-weight: 600; font-size: 12.5px; letter-spacing: 0.02em; }
+  .step-meta { font-family: var(--mono); font-size: 11px; color: var(--dim); }
+  .step.todo .step-name, .step.todo .step-no { color: #A6AAAE; }
+  .step.active { background: #fff; box-shadow: inset 4px 0 0 var(--red); }
+  .step.active .step-no { color: var(--red); }
+  .step:hover:not(.active) { background: #F0EFE9; }
+
+  /* ---- active step panel ---- */
+  .panel { flex: 1; overflow-y: auto; padding: 16px 16px 20px; display: flex; flex-direction: column; gap: 16px; }
+  .panel-title { font-size: 11px; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase; }
+  .panel-title small { color: var(--dim); font-weight: 500; letter-spacing: 0.05em; text-transform: none; font-size: 11.5px; display: block; margin-top: 3px; }
+  .ctl { display: flex; flex-direction: column; gap: 6px; }
+  .ctl-label { font-size: 9.5px; font-weight: 600; letter-spacing: 0.12em; text-transform: uppercase; color: var(--dim); display: flex; justify-content: space-between; }
+  .ctl-label b { font-family: var(--mono); color: var(--ink); font-weight: 600; letter-spacing: 0; }
+
+  .seg { display: flex; border: 1px solid var(--ink); }
+  .seg button {
+    flex: 1; padding: 7px 6px; font-size: 12px; font-weight: 500;
+    border: none; border-right: 1px solid var(--rule); background: #fff;
+  }
+  .seg button:last-child { border-right: none; }
+  .seg button.on { background: var(--ink); color: #fff; font-weight: 600; }
+  .seg button:not(.on):hover { background: #F0EFE9; }
+
+  input[type="range"] { -webkit-appearance: none; width: 100%; height: 22px; background: transparent; margin: 0; }
+  input[type="range"]::-webkit-slider-runnable-track { height: 2px; background: var(--ink); }
+  input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none; width: 11px; height: 11px; margin-top: -4.5px;
+    background: var(--red); border: 1px solid var(--ink);
+  }
+  .ticks { display: flex; justify-content: space-between; font-family: var(--mono); font-size: 9.5px; color: var(--dim); margin-top: -2px; }
+
+  select, .numfield {
+    font-family: var(--mono); font-size: 12.5px; color: var(--ink);
+    background: #fff; border: 1px solid var(--ink); padding: 6px 8px; width: 100%;
+  }
+  .duo { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .chips { display: flex; gap: 6px; }
+  .chip { border: 1px solid var(--rule); background: #fff; font-family: var(--mono); font-size: 11.5px; padding: 4px 9px; }
+  .chip.hot { border-color: var(--ink); font-weight: 600; }
+
+  .run {
+    border: 1px solid var(--red); background: var(--red); color: #fff;
+    padding: 10px; font-weight: 600; font-size: 13px; letter-spacing: 0.04em;
+  }
+  .run:hover { background: #A93212; }
+
+  /* results — a ruled table, like a parts list */
+  .results { border: 1px solid var(--ink); background: #fff; }
+  .results-head {
+    display: flex; justify-content: space-between; padding: 7px 12px;
+    border-bottom: 1px solid var(--ink); font-size: 9.5px; font-weight: 700;
+    letter-spacing: 0.14em; text-transform: uppercase;
+  }
+  .results-head span:last-child { color: var(--dim); font-weight: 500; }
+  .headline { padding: 12px; border-bottom: 1px solid var(--rule); }
+  .headline b { font-family: var(--mono); font-size: 19px; font-weight: 600; display: block; }
+  .headline small { color: var(--dim); font-size: 11.5px; }
+  .rrow {
+    display: flex; justify-content: space-between; padding: 6px 12px;
+    border-bottom: 1px solid var(--rule); font-size: 12px; color: var(--dim);
+  }
+  .rrow:last-child { border-bottom: none; }
+  .rrow b { font-family: var(--mono); color: var(--ink); font-weight: 500; }
+
+  /* ---- viewport ---- */
+  .viewport {
+    flex: 1; position: relative; overflow: hidden; background: var(--field);
+    /* millimetre paper, faint red-ruled */
+    background-image:
+      linear-gradient(rgba(194,59,23,0.10) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(194,59,23,0.10) 1px, transparent 1px),
+      linear-gradient(rgba(194,59,23,0.045) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(194,59,23,0.045) 1px, transparent 1px);
+    background-size: 45px 45px, 45px 45px, 9px 9px, 9px 9px;
+  }
+  .scene { position: absolute; inset: 0; width: 100%; height: 100%; }
+
+  .viewmodes {
+    position: absolute; top: 14px; left: 14px; display: flex;
+    border: 1px solid var(--ink); background: var(--paper);
+  }
+  .viewmodes button {
+    padding: 6px 12px; font-size: 10px; font-weight: 600; letter-spacing: 0.1em;
+    border: none; border-right: 1px solid var(--rule);
+  }
+  .viewmodes button:last-child { border-right: none; }
+  .viewmodes button.on { background: var(--ink); color: #fff; }
+
+  .legend {
+    position: absolute; top: 14px; right: 14px; width: 168px;
+    border: 1px solid var(--ink); background: var(--paper);
+  }
+  .legend-title { padding: 6px 10px; border-bottom: 1px solid var(--ink); font-size: 9.5px; font-weight: 700; letter-spacing: 0.14em; }
+  .lrow { display: flex; align-items: center; gap: 9px; padding: 5px 10px; border-bottom: 1px solid var(--rule); }
+  .lrow:last-child { border-bottom: none; }
+  .lrow svg { border: 1px solid var(--ink); background: #fff; }
+  .lrow span { font-family: var(--mono); font-size: 11px; }
+  .lrow .pct { margin-left: auto; color: var(--dim); }
+
+  .scalebar { position: absolute; bottom: 16px; left: 16px; font-family: var(--mono); font-size: 10px; color: var(--ink); }
+  .scalebar .bar { width: 90px; height: 5px; border: 1px solid var(--ink); border-top: none; display: flex; margin-top: 2px; }
+  .scalebar .bar i { flex: 1; } .scalebar .bar i:nth-child(odd) { background: var(--ink); }
+  .gizmo { position: absolute; bottom: 12px; right: 14px; font-family: var(--mono); font-size: 10px; }
+  .nerdtab {
+    position: absolute; bottom: 16px; left: 50%; transform: translateX(-50%);
+    border: 1px solid var(--ink); background: var(--paper); font-size: 10px;
+    font-weight: 600; letter-spacing: 0.12em; padding: 5px 14px;
+  }
+  .nerdtab:hover { background: #ECEBE4; }
+
+  /* ---- status bar ---- */
+  .status {
+    border-top: 2px solid var(--ink); display: flex; align-items: center;
+    font-family: var(--mono); font-size: 10.5px; color: var(--dim);
+    background: var(--paper);
+  }
+  .status > div { padding: 6px 14px; border-right: 1px solid var(--rule); white-space: nowrap; }
+  .status b { color: var(--ink); font-weight: 500; }
+  .status .grow { flex: 1; border-right: none; }
+  .status .lic { border-right: none; }
+</style>
+</head>
+<body>
+<div class="sheet">
+
+  <header class="titleblock">
+    <div class="tb-cell brand">
+      <div class="tb-label">CNC Kitchen · Browser FEA</div>
+      <div class="brand-name">Smart Infill <em>Generator</em></div>
+    </div>
+    <div class="tb-cell">
+      <div class="tb-label">Part</div>
+      <div class="tb-value">bracket_v3.stl<span class="sub">84 × 38 × 12 mm · 24 612 facets</span></div>
+    </div>
+    <div class="tb-cell">
+      <div class="tb-label">Material</div>
+      <div class="tb-value">PLA<span class="sub">E 3600</span></div>
+    </div>
+    <div class="tb-cell">
+      <div class="tb-label">Mass</div>
+      <div class="tb-value">38.4 g</div>
+    </div>
+    <div class="tb-cell">
+      <div class="tb-label">Min safety</div>
+      <div class="tb-value">3.21 ×</div>
+    </div>
+    <div class="tb-cell">
+      <div class="tb-label">Units</div>
+      <div class="tb-value">mm · MPa</div>
+    </div>
+    <div class="tb-cell">
+      <button class="gearbtn" title="Settings">⚙</button>
+      <button class="export">Export 3MF</button>
+    </div>
+  </header>
+
+  <div class="work">
+    <aside class="rail">
+      <nav class="steps">
+        <button class="step done"><span class="step-no"><span>1</span></span><span class="step-name">Model</span><span class="step-meta">412k cells</span></button>
+        <button class="step done"><span class="step-no"><span>2</span></span><span class="step-name">Boundary conditions</span><span class="step-meta">fixed + 120 N</span></button>
+        <button class="step done"><span class="step-no"><span>3</span></span><span class="step-name">Material &amp; analysis</span><span class="step-meta">PLA · preview</span></button>
+        <button class="step done"><span class="step-no"><span>4</span></span><span class="step-name">Verify setup</span><span class="step-meta">δ 0.42 mm</span></button>
+        <button class="step active"><span class="step-no">5</span><span class="step-name">Optimize infill</span><span class="step-meta">converged · 18 it</span></button>
+        <button class="step todo"><span class="step-no">6</span><span class="step-name">View &amp; export</span><span class="step-meta">—</span></button>
+      </nav>
+
+      <section class="panel">
+        <div class="panel-title">5 · Optimize infill
+          <small>Distribute density where the loads need it.</small>
+        </div>
+
+        <div class="ctl">
+          <div class="ctl-label"><span>Goal</span></div>
+          <div class="seg">
+            <button class="on">Stiffest at budget</button>
+            <button>Match uniform stiffness</button>
+          </div>
+        </div>
+
+        <div class="ctl">
+          <div class="ctl-label"><span>Infill budget</span><b>30 %</b></div>
+          <input type="range" min="10" max="70" value="30">
+          <div class="ticks"><span>10</span><span>30</span><span>50</span><span>70</span></div>
+        </div>
+
+        <div class="duo">
+          <div class="ctl">
+            <div class="ctl-label"><span>Pattern</span></div>
+            <select><option>Gyroid</option><option>Cubic</option><option>Grid</option></select>
+          </div>
+          <div class="ctl">
+            <div class="ctl-label"><span>Mode</span></div>
+            <div class="seg">
+              <button class="on">Graded</button>
+              <button>Binary</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="duo">
+          <div class="ctl">
+            <div class="ctl-label"><span>Perimeters</span></div>
+            <div class="numfield">2 × 0.45 mm</div>
+          </div>
+          <div class="ctl">
+            <div class="ctl-label"><span>Levels</span></div>
+            <div class="chips"><span class="chip">10</span><span class="chip">45</span><span class="chip hot">70 %</span></div>
+          </div>
+        </div>
+
+        <button class="run">Optimize infill</button>
+
+        <div class="results">
+          <div class="results-head"><span>Results</span><span>run 1 · 18 iterations</span></div>
+          <div class="headline">
+            <b>+16.8 % stiffer</b>
+            <small>than 30 % uniform infill at the same weight</small>
+          </div>
+          <div class="rrow"><span>Mass</span><b>38.4 g</b></div>
+          <div class="rrow"><span>Stiffness vs 100 % solid</span><b>71 %</b></div>
+          <div class="rrow"><span>Max deflection</span><b>0.42 mm</b></div>
+          <div class="rrow"><span>Min safety factor</span><b>3.21 ×</b></div>
+          <div class="rrow"><span>Levels used</span><b>10 · 45 · 70 %</b></div>
+        </div>
+      </section>
+    </aside>
+
+    <main class="viewport">
+      <svg class="scene" viewBox="0 0 980 560" preserveAspectRatio="xMidYMid meet" font-family="IBM Plex Mono, monospace">
+        <defs>
+          <pattern id="h10" width="9" height="9" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+            <line x1="0" y1="0" x2="0" y2="9" stroke="#9A9FA4" stroke-width="1"/>
+          </pattern>
+          <pattern id="h45" width="4.5" height="4.5" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+            <line x1="0" y1="0" x2="0" y2="4.5" stroke="#7E8388" stroke-width="1"/>
+          </pattern>
+          <pattern id="h70" width="5" height="5" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+            <line x1="0" y1="0" x2="0" y2="5" stroke="#5A5F64" stroke-width="1"/>
+            <line x1="0" y1="2.5" x2="5" y2="2.5" stroke="#5A5F64" stroke-width="1"/>
+          </pattern>
+          <pattern id="wall" width="11" height="11" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+            <line x1="0" y1="0" x2="0" y2="11" stroke="#5A5F64" stroke-width="1.4"/>
+          </pattern>
+          <marker id="arr" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+            <path d="M0,0 L9,4.5 L0,9 Z" fill="#C23B17"/>
+          </marker>
+          <marker id="dimarr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+            <path d="M0,1 L8,4 L0,7 Z" fill="#1B1E21"/>
+          </marker>
+          <clipPath id="bodyclip1">
+            <path d="M48,128 L524,156 A52,52 0 1 1 524,248 L260,246 L48,338 Z"/>
+          </clipPath>
+        </defs>
+
+        <g transform="translate(70,40)">
+          <!-- fixed wall -->
+          <rect x="-38" y="50" width="38" height="356" fill="url(#wall)"/>
+          <line x1="0" y1="50" x2="0" y2="406" stroke="#1B1E21" stroke-width="2.4"/>
+          <!-- support triangles -->
+          <g fill="none" stroke="#1B1E21" stroke-width="1.4">
+            <path d="M0,86 l-15,-9 l0,18 Z"/><path d="M0,156 l-15,-9 l0,18 Z"/>
+            <path d="M0,228 l-15,-9 l0,18 Z"/><path d="M0,300 l-15,-9 l0,18 Z"/>
+            <path d="M0,372 l-15,-9 l0,18 Z"/>
+          </g>
+
+          <!-- mounting plate -->
+          <rect x="0" y="58" width="48" height="340" fill="#fff" stroke="#1B1E21" stroke-width="2"/>
+          <circle cx="24" cy="104" r="10" fill="#F7F6F1" stroke="#1B1E21" stroke-width="1.4"/>
+          <circle cx="24" cy="352" r="10" fill="#F7F6F1" stroke="#1B1E21" stroke-width="1.4"/>
+
+          <!-- part body: floor density base -->
+          <path d="M48,128 L524,156 A52,52 0 1 1 524,248 L260,246 L48,338 Z" fill="url(#h10)" stroke="none"/>
+
+          <g clip-path="url(#bodyclip1)">
+            <!-- 45 % regions -->
+            <path d="M50,166 L330,170 L410,156 L490,158 L400,186 L50,196 Z" fill="url(#h45)"/>
+            <path d="M40,296 L238,234 L202,222 L40,250 Z" fill="url(#h45)"/>
+            <!-- 70 % regions -->
+            <path d="M44,128 L410,154 L330,168 L44,164 Z" fill="url(#h70)"/>
+            <path d="M40,346 L272,246 L238,234 L40,296 Z" fill="url(#h70)"/>
+            <path d="M548,202 m-44,0 a44,44 0 1 0 88,0 a44,44 0 1 0 -88,0 M548,202 m-23,0 a23,23 0 1 1 46,0 a23,23 0 1 1 -46,0" fill="url(#h70)" fill-rule="evenodd"/>
+          </g>
+
+          <!-- outline over hatches -->
+          <path d="M48,128 L524,156 A52,52 0 1 1 524,248 L260,246 L48,338 Z" fill="none" stroke="#1B1E21" stroke-width="2"/>
+          <circle cx="548" cy="202" r="22" fill="#fff" stroke="#1B1E21" stroke-width="2"/>
+
+          <!-- load -->
+          <line x1="548" y1="232" x2="548" y2="318" stroke="#C23B17" stroke-width="2" marker-end="url(#arr)"/>
+          <text x="562" y="296" font-size="13" fill="#C23B17" font-weight="600">F = 120 N</text>
+
+          <!-- leader annotations -->
+          <g stroke="#1B1E21" stroke-width="1" fill="none">
+            <path d="M210,150 L268,96 L330,96"/><circle cx="210" cy="150" r="1.8" fill="#1B1E21"/>
+            <path d="M180,182 L120,60 L182,60"/><circle cx="180" cy="182" r="1.8" fill="#1B1E21"/>
+            <path d="M350,216 L420,330 L482,330"/><circle cx="350" cy="216" r="1.8" fill="#1B1E21"/>
+          </g>
+          <g font-size="12">
+            <rect x="330" y="84" width="56" height="22" fill="#fff" stroke="#1B1E21"/>
+            <text x="358" y="99" text-anchor="middle">70 %</text>
+            <rect x="182" y="48" width="56" height="22" fill="#fff" stroke="#1B1E21"/>
+            <text x="210" y="63" text-anchor="middle">45 %</text>
+            <rect x="482" y="318" width="56" height="22" fill="#fff" stroke="#1B1E21"/>
+            <text x="510" y="333" text-anchor="middle">10 %</text>
+          </g>
+
+          <!-- overall dimension -->
+          <g stroke="#1B1E21" stroke-width="1">
+            <line x1="0" y1="412" x2="0" y2="452"/>
+            <line x1="600" y1="262" x2="600" y2="452"/>
+            <line x1="0" y1="444" x2="600" y2="444" marker-start="url(#dimarr)" marker-end="url(#dimarr)"/>
+          </g>
+          <rect x="268" y="432" width="64" height="22" fill="#F7F6F1"/>
+          <text x="300" y="448" text-anchor="middle" font-size="12">84 mm</text>
+        </g>
+      </svg>
+
+      <div class="viewmodes">
+        <button>Solid</button><button>Mesh</button><button>Density</button><button class="on">Regions</button>
+      </div>
+
+      <div class="legend">
+        <div class="legend-title">Density regions</div>
+        <div class="lrow">
+          <svg width="26" height="16"><rect width="26" height="16" fill="url(#h70l)"/><defs><pattern id="h70l" width="5" height="5" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="5" stroke="#5A5F64" stroke-width="1"/><line x1="0" y1="2.5" x2="5" y2="2.5" stroke="#5A5F64" stroke-width="1"/></pattern></defs></svg>
+          <span>dense</span><span class="pct">70 %</span>
+        </div>
+        <div class="lrow">
+          <svg width="26" height="16"><rect width="26" height="16" fill="url(#h45l)"/><defs><pattern id="h45l" width="4.5" height="4.5" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="4.5" stroke="#7E8388" stroke-width="1"/></pattern></defs></svg>
+          <span>medium</span><span class="pct">45 %</span>
+        </div>
+        <div class="lrow">
+          <svg width="26" height="16"><rect width="26" height="16" fill="url(#h10l)"/><defs><pattern id="h10l" width="9" height="9" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="9" stroke="#9A9FA4" stroke-width="1"/></pattern></defs></svg>
+          <span>floor</span><span class="pct">10 %</span>
+        </div>
+      </div>
+
+      <div class="scalebar">
+        0&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;10&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;20 mm
+        <div class="bar"><i></i><i></i><i></i><i></i></div>
+      </div>
+      <button class="nerdtab">Log for nerds</button>
+      <div class="gizmo">Z↑ · X→</div>
+    </main>
+  </div>
+
+  <footer class="status">
+    <div>VOXELS <b>188 × 84 × 46</b> · <b>412 252</b> CELLS · h <b>0.45 mm</b></div>
+    <div>SOLVE <b>MGCG 92 it</b> · res <b>8.4e-7</b> · <b>6.2 s</b></div>
+    <div>OPTIMIZE <b>18 it</b> · Δρ̄ <b>0.0041</b> · CONVERGED</div>
+    <div class="grow"></div>
+    <div class="lic">SHEET 1/1 · AGPL-3.0-only</div>
+  </footer>
+</div>
+</body>
+</html>

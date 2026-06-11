@@ -44,6 +44,15 @@ Reference points:
   (one crate: STL/3MF parse, winding-number voxelization, segmentation, FEA, SIMP,
   marching cubes, 3MF writers). WASM threads (SharedArrayBuffer → site needs COOP/COEP
   headers) + SIMD. Zip/unzip via `fflate` (MIT) or Rust `zip` crate. No GPL anywhere.
+- **Visual design (2026-06, "Werkbank"):** software styled as a measuring instrument —
+  light warm-gray chassis, recessed input wells, CNC-Kitchen-orange accent, DRO-style
+  result readouts, machine status strip. Layout: top bar (part + Export), caliper-scale
+  step rail (1 Model … 6 Export, orange carriage on the active station), one panel
+  showing only the active step, dominant viewport (view modes top-center, section plane
+  bottom-left), results dock right, telemetry strip bottom. Type: Barlow / Barlow Semi
+  Condensed / B612 Mono — all SIL OFL 1.1, self-hosted under `web/public/fonts/` with
+  their licenses. Rejected drafts (drawing-office light, operator dark) kept in
+  `design-drafts/` for reference.
 - **Solver:** 8-node hex elements, matrix-free CG preconditioned by geometric multigrid;
   identical-element stiffness scaled per-voxel by E(ρ) — the standard topology-optimization
   formulation (cf. the 88-line/PolyTop lineage, all permissively published math).

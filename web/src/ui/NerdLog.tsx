@@ -119,17 +119,8 @@ export function NerdLog() {
     if (el) el.scrollTop = el.scrollHeight;
   }, [lines.length, open]);
 
-  if (!open) {
-    return (
-      <button
-        className="nerdlog-toggle"
-        onClick={() => setLogOpen(true)}
-        title="Solver & optimizer telemetry with convergence charts"
-      >
-        ⌁ Log for nerds
-      </button>
-    );
-  }
+  // The toggle lives in the status strip; closed means invisible.
+  if (!open) return null;
 
   const its = optSeries.map((p) => p.it);
   return (
@@ -148,7 +139,7 @@ export function NerdLog() {
           title="Compliance C [N·mm]"
           xs={its}
           logY
-          series={[{ ys: optSeries.map((p) => p.compliance), color: "#6fc3ff" }]}
+          series={[{ ys: optSeries.map((p) => p.compliance), color: "#e06a13" }]}
           yFmt={(v) => v.toExponential(2)}
         />
         <MiniChart
@@ -157,20 +148,20 @@ export function NerdLog() {
           logY
           threshold={0.005}
           series={[
-            { ys: optSeries.map((p) => p.meanChange), color: "#ffd166", label: "mean" },
-            { ys: optSeries.map((p) => p.change), color: "#8a93a6", label: "max" },
+            { ys: optSeries.map((p) => p.meanChange), color: "#e06a13", label: "mean" },
+            { ys: optSeries.map((p) => p.change), color: "#aba8a0", label: "max" },
           ]}
         />
         <MiniChart
           title="Inner CG iterations / step"
           xs={its}
-          series={[{ ys: optSeries.map((p) => p.innerIters), color: "#9be28c" }]}
+          series={[{ ys: optSeries.map((p) => p.innerIters), color: "#e06a13" }]}
           yFmt={(v) => v.toFixed(0)}
         />
         <MiniChart
           title="MGCG residual — last solve"
           logY
-          series={[{ ys: solveResiduals, color: "#ff9e7a" }]}
+          series={[{ ys: solveResiduals, color: "#e06a13" }]}
           yFmt={(v) => v.toExponential(0)}
         />
       </div>

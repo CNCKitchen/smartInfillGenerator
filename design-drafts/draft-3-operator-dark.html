@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com> -->
+<!--
+  DESIGN DRAFT 3 · "OPERATOR" (dark, non-template)
+  Viewport-first operator console: warm graphite chrome (not blue-black),
+  amber instrument accent, telemetry dock with scope traces promoted to a
+  first-class citizen. Type: Chivo (UI) + Fragment Mono (data).
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=1380">
+<title>Draft 3 · Operator — Smart Infill Generator</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Chivo:wght@400;500;700&family=Fragment+Mono&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --chrome:   #2B2B2A;  /* panels — warm graphite */
+    --chrome-2: #323231;  /* raised */
+    --recess:   #242423;  /* wells */
+    --stage:    #1D1D1C;  /* viewport */
+    --seam:     #3D3D3B;  /* hairlines */
+    --text:     #E9E7E2;  /* warm white */
+    --dim:      #98968F;
+    --faint:    #6C6A64;
+    --amber:    #EFA73C;  /* instrument accent */
+    --amber-d:  #D18C21;
+    --ok:       #7FB069;
+    --ui: "Chivo", system-ui, sans-serif;
+    --mono: "Fragment Mono", Consolas, monospace;
+    --r: 5px;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { font-family: var(--ui); font-size: 13px; color: var(--text); background: var(--chrome); }
+  button { font: inherit; color: inherit; background: none; border: none; cursor: pointer; }
+  :focus-visible { outline: 2px solid var(--amber); outline-offset: 1px; }
+
+  .app { height: 100%; min-width: 1340px; display: flex; flex-direction: column; }
+
+  /* ---- top bar ---- */
+  .top {
+    height: 46px; display: flex; align-items: center; gap: 12px; padding: 0 12px;
+    border-bottom: 1px solid #161615; background: var(--chrome);
+  }
+  .brand { display: flex; align-items: center; gap: 9px; }
+  .brand i {
+    width: 22px; height: 22px; border-radius: 4px; background: var(--amber);
+    display: grid; place-items: center; font-style: normal; color: #1D1D1C;
+    font-weight: 700; font-size: 11px;
+  }
+  .brand b { font-size: 13.5px; font-weight: 700; letter-spacing: 0.01em; }
+  .brand span { font-size: 10px; color: var(--faint); letter-spacing: 0.12em; text-transform: uppercase; }
+  .doc { margin-left: 14px; font-family: var(--mono); font-size: 11.5px; color: var(--dim); }
+  .doc b { color: var(--text); font-weight: 400; }
+  .top .grow { flex: 1; }
+  .ghost { height: 30px; padding: 0 12px; border: 1px solid var(--seam); border-radius: var(--r); color: var(--dim); }
+  .ghost:hover { color: var(--text); border-color: #55534E; }
+  .primary {
+    height: 30px; padding: 0 16px; border-radius: var(--r); background: var(--amber);
+    color: #1D1D1C; font-weight: 700;
+  }
+  .primary:hover { background: var(--amber-d); }
+
+  /* ---- body ---- */
+  .main { flex: 1; display: flex; min-height: 0; }
+
+  .rail {
+    width: 52px; min-width: 52px; border-right: 1px solid #161615; background: var(--chrome);
+    display: flex; flex-direction: column; align-items: stretch; padding-top: 6px;
+  }
+  .st {
+    height: 48px; position: relative; display: grid; place-items: center;
+    font-family: var(--mono); font-size: 13px; color: var(--faint);
+  }
+  .st.done { color: var(--dim); }
+  .st.done::after { content: ""; position: absolute; right: 9px; bottom: 11px; width: 4px; height: 4px; border-radius: 50%; background: var(--ok); }
+  .st.active { color: var(--amber); }
+  .st.active::before { content: ""; position: absolute; left: 0; top: 9px; bottom: 9px; width: 3px; background: var(--amber); border-radius: 0 2px 2px 0; }
+  .st:hover { color: var(--text); }
+
+  .panel {
+    width: 312px; min-width: 312px; border-right: 1px solid #161615; background: var(--chrome);
+    overflow-y: auto; padding: 14px 14px 20px; display: flex; flex-direction: column; gap: 14px;
+  }
+  .p-head b { font-size: 14px; font-weight: 700; display: block; }
+  .p-head span { font-size: 11.5px; color: var(--dim); }
+  .group { display: flex; flex-direction: column; gap: 6px; }
+  .g-label {
+    font-size: 9.5px; font-weight: 500; letter-spacing: 0.14em; text-transform: uppercase;
+    color: var(--faint); display: flex; justify-content: space-between; align-items: baseline;
+  }
+  .g-label b { font-family: var(--mono); font-size: 12px; color: var(--amber); letter-spacing: 0; font-weight: 400; }
+
+  .seg { display: flex; background: var(--recess); border: 1px solid var(--seam); border-radius: var(--r); padding: 2px; gap: 2px; }
+  .seg button { flex: 1; padding: 6px 4px; font-size: 12px; color: var(--dim); border-radius: 3px; }
+  .seg button.on { background: var(--chrome-2); color: var(--text); font-weight: 500; box-shadow: inset 0 0 0 1px #4A4845; }
+
+  input[type="range"] { -webkit-appearance: none; width: 100%; height: 22px; background: transparent; margin: 0; }
+  input[type="range"]::-webkit-slider-runnable-track {
+    height: 4px; border-radius: 2px;
+    background: linear-gradient(to right, var(--amber) 0 33%, #454442 33%);
+  }
+  input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none; width: 13px; height: 13px; margin-top: -4.5px; border-radius: 50%;
+    background: var(--amber); border: 2px solid #1D1D1C; box-shadow: 0 0 0 1px var(--amber);
+  }
+  .ticks { display: flex; justify-content: space-between; font-family: var(--mono); font-size: 9px; color: var(--faint); }
+
+  select, .numfield {
+    font-family: var(--mono); font-size: 12px; color: var(--text); width: 100%;
+    background: var(--recess); border: 1px solid var(--seam); border-radius: var(--r); padding: 7px 9px;
+  }
+  .duo { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
+  .chips { display: flex; gap: 5px; }
+  .chip { font-family: var(--mono); font-size: 11px; padding: 4px 9px; border-radius: 3px; background: var(--recess); border: 1px solid var(--seam); color: var(--dim); }
+  .chip.hot { color: var(--amber); border-color: #6B5526; }
+
+  .run { height: 38px; border-radius: var(--r); background: var(--amber); color: #1D1D1C; font-size: 13.5px; font-weight: 700; }
+  .run:hover { background: var(--amber-d); }
+  .runnote { font-size: 11px; color: var(--dim); text-align: center; }
+
+  /* ---- center: stage + dock ---- */
+  .center { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  .stage {
+    flex: 1; position: relative; overflow: hidden;
+    background: radial-gradient(110% 110% at 50% 28%, #232322 0%, var(--stage) 58%, #181817 100%);
+  }
+  .scene { position: absolute; inset: 0; width: 100%; height: 100%; }
+  .viewmodes {
+    position: absolute; top: 10px; left: 12px; display: flex; gap: 2px;
+    background: rgba(36,36,35,0.9); padding: 3px; border: 1px solid var(--seam); border-radius: var(--r);
+  }
+  .viewmodes button { padding: 4px 11px; font-size: 11.5px; color: var(--dim); border-radius: 3px; }
+  .viewmodes button.on { background: var(--amber); color: #1D1D1C; font-weight: 700; }
+
+  .legend {
+    position: absolute; top: 10px; right: 12px; width: 142px;
+    background: rgba(36,36,35,0.92); border: 1px solid var(--seam); border-radius: var(--r); padding: 9px 11px;
+  }
+  .legend h4 { margin: 0 0 6px; font-size: 9.5px; font-weight: 500; letter-spacing: 0.14em; text-transform: uppercase; color: var(--faint); }
+  .lrow { display: flex; align-items: center; gap: 8px; font-size: 11.5px; padding: 2.5px 0; color: var(--dim); }
+  .lrow i { width: 13px; height: 13px; border-radius: 2px; }
+  .lrow .pct { margin-left: auto; font-family: var(--mono); font-size: 10px; }
+
+  /* floating readouts */
+  .readouts { position: absolute; right: 12px; bottom: 12px; display: flex; flex-direction: column; gap: 6px; width: 196px; }
+  .ro {
+    background: rgba(36,36,35,0.92); border: 1px solid var(--seam); border-radius: var(--r);
+    padding: 7px 11px; display: flex; justify-content: space-between; align-items: baseline;
+  }
+  .ro span { font-size: 10.5px; color: var(--dim); }
+  .ro b { font-family: var(--mono); font-size: 14px; font-weight: 400; color: var(--text); }
+  .ro.hero b { color: var(--amber); font-size: 16px; }
+  .gizmo { position: absolute; bottom: 14px; left: 14px; font-family: var(--mono); font-size: 10px; color: var(--faint); }
+
+  /* telemetry dock — the signature */
+  .dock { height: 188px; border-top: 1px solid #161615; background: var(--chrome); display: flex; flex-direction: column; }
+  .dock-head {
+    height: 30px; display: flex; align-items: center; gap: 14px; padding: 0 12px;
+    border-bottom: 1px solid var(--seam); font-size: 10px; letter-spacing: 0.12em;
+    text-transform: uppercase; color: var(--faint);
+  }
+  .dock-head b { color: var(--dim); font-weight: 500; }
+  .dock-head .grow { flex: 1; }
+  .dock-head button { font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--faint); padding: 3px 9px; border-radius: 3px; }
+  .dock-head button.on { background: var(--recess); color: var(--text); }
+  .dock-body { flex: 1; display: flex; gap: 10px; padding: 10px 12px; min-height: 0; }
+  .chart { flex: 1; min-width: 0; background: var(--recess); border: 1px solid var(--seam); border-radius: var(--r); position: relative; }
+  .chart svg { position: absolute; inset: 0; width: 100%; height: 100%; }
+  .chart .t { position: absolute; top: 6px; left: 9px; font-size: 9px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--faint); }
+  .chart .v { position: absolute; top: 5px; right: 9px; font-family: var(--mono); font-size: 10px; color: var(--amber); }
+  .loglines {
+    flex: 1.25; min-width: 0; background: var(--recess); border: 1px solid var(--seam); border-radius: var(--r);
+    font-family: var(--mono); font-size: 10.5px; line-height: 1.65; color: var(--dim);
+    padding: 7px 11px; overflow: hidden;
+  }
+  .loglines em { font-style: normal; color: var(--faint); margin-right: 9px; }
+  .loglines b { font-weight: 400; color: var(--text); }
+  .loglines .ok { color: var(--ok); }
+
+  /* status bar */
+  .status {
+    height: 26px; background: #1F1F1E; border-top: 1px solid #161615; display: flex; align-items: center;
+    font-family: var(--mono); font-size: 10px; color: var(--faint);
+  }
+  .status > div { padding: 0 13px; border-right: 1px solid #2C2C2B; white-space: nowrap; }
+  .status b { color: var(--dim); font-weight: 400; }
+  .status .grow { flex: 1; border-right: none; }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <header class="top">
+    <div class="brand">
+      <i>SI</i>
+      <b>Smart Infill</b>
+      <span>CNC Kitchen</span>
+    </div>
+    <div class="doc"><b>bracket_v3.stl</b> · 84×38×12 mm · PLA</div>
+    <div class="grow"></div>
+    <button class="ghost">Settings</button>
+    <button class="primary">Export 3MF</button>
+  </header>
+
+  <div class="main">
+    <nav class="rail" aria-label="Workflow">
+      <button class="st done" title="1 · Model">1</button>
+      <button class="st done" title="2 · Boundary conditions">2</button>
+      <button class="st done" title="3 · Material & analysis">3</button>
+      <button class="st done" title="4 · Verify setup">4</button>
+      <button class="st active" title="5 · Optimize infill">5</button>
+      <button class="st" title="6 · View & export">6</button>
+    </nav>
+
+    <section class="panel">
+      <div class="p-head">
+        <b>5 · Optimize infill</b>
+        <span>Distribute density where the loads need it.</span>
+      </div>
+
+      <div class="group">
+        <div class="g-label"><span>Goal</span></div>
+        <div class="seg">
+          <button class="on">Stiffest at budget</button>
+          <button>Match uniform</button>
+        </div>
+      </div>
+
+      <div class="group">
+        <div class="g-label"><span>Infill budget</span><b>30 %</b></div>
+        <input type="range" min="10" max="70" value="30">
+        <div class="ticks"><span>10</span><span>30</span><span>50</span><span>70</span></div>
+      </div>
+
+      <div class="duo">
+        <div class="group">
+          <div class="g-label"><span>Pattern</span></div>
+          <select><option>Gyroid</option><option>Cubic</option><option>Grid</option></select>
+        </div>
+        <div class="group">
+          <div class="g-label"><span>Mode</span></div>
+          <div class="seg"><button class="on">Graded</button><button>Binary</button></div>
+        </div>
+      </div>
+
+      <div class="duo">
+        <div class="group">
+          <div class="g-label"><span>Perimeters</span></div>
+          <div class="numfield">2 × 0.45 mm</div>
+        </div>
+        <div class="group">
+          <div class="g-label"><span>Levels</span></div>
+          <div class="chips"><span class="chip">10</span><span class="chip">45</span><span class="chip hot">70</span></div>
+        </div>
+      </div>
+
+      <button class="run">Optimize infill</button>
+      <div class="runnote">Converged after 18 iterations · 41 s</div>
+    </section>
+
+    <div class="center">
+      <main class="stage">
+        <svg class="scene" viewBox="0 0 980 540" preserveAspectRatio="xMidYMid meet" font-family="Fragment Mono, monospace">
+          <defs>
+            <pattern id="vox3" width="10" height="10" patternUnits="userSpaceOnUse">
+              <path d="M10,0 H0 V10" fill="none" stroke="rgba(255,255,255,0.07)" stroke-width="1"/>
+            </pattern>
+            <pattern id="wall3" width="11" height="11" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+              <line x1="0" y1="0" x2="0" y2="11" stroke="#55534E" stroke-width="1.4"/>
+            </pattern>
+            <marker id="arr3" markerWidth="9" markerHeight="9" refX="7" refY="4.5" orient="auto">
+              <path d="M0,0 L9,4.5 L0,9 Z" fill="#EFA73C"/>
+            </marker>
+            <clipPath id="bodyclip3">
+              <path d="M48,128 L524,156 A52,52 0 1 1 524,248 L260,246 L48,338 Z"/>
+            </clipPath>
+          </defs>
+
+          <g transform="translate(90,30)">
+            <!-- fixed wall -->
+            <rect x="-38" y="50" width="38" height="356" fill="url(#wall3)"/>
+            <line x1="0" y1="50" x2="0" y2="406" stroke="#7C7A74" stroke-width="2.2"/>
+            <g fill="none" stroke="#7C7A74" stroke-width="1.3">
+              <path d="M0,86 l-15,-9 l0,18 Z"/><path d="M0,156 l-15,-9 l0,18 Z"/>
+              <path d="M0,228 l-15,-9 l0,18 Z"/><path d="M0,300 l-15,-9 l0,18 Z"/>
+              <path d="M0,372 l-15,-9 l0,18 Z"/>
+            </g>
+
+            <!-- mounting plate -->
+            <rect x="0" y="58" width="48" height="340" fill="#4A4C4E" stroke="#67696B" stroke-width="1.2"/>
+            <circle cx="24" cy="104" r="10" fill="#1D1D1C" stroke="#67696B" stroke-width="1.2"/>
+            <circle cx="24" cy="352" r="10" fill="#1D1D1C" stroke="#67696B" stroke-width="1.2"/>
+
+            <!-- body: floor density -->
+            <path d="M48,128 L524,156 A52,52 0 1 1 524,248 L260,246 L48,338 Z" fill="#3F6594"/>
+            <g clip-path="url(#bodyclip3)">
+              <path d="M50,166 L330,170 L410,156 L490,158 L400,186 L50,196 Z" fill="#C7913A"/>
+              <path d="M40,296 L238,234 L202,222 L40,250 Z" fill="#C7913A"/>
+              <path d="M44,126 L416,154 L330,168 L44,164 Z" fill="#CC4B2E"/>
+              <path d="M40,346 L272,246 L238,234 L40,296 Z" fill="#CC4B2E"/>
+              <path d="M548,202 m-46,0 a46,46 0 1 0 92,0 a46,46 0 1 0 -92,0 M548,202 m-25,0 a25,25 0 1 1 50,0 a25,25 0 1 1 -50,0" fill="#CC4B2E" fill-rule="evenodd"/>
+              <rect x="40" y="120" width="600" height="240" fill="url(#vox3)"/>
+            </g>
+            <g clip-path="url(#bodyclip3)" fill="none" stroke="rgba(0,0,0,0.35)" stroke-width="1">
+              <path d="M330,168 L416,154 M50,164 L330,168 M400,186 L50,196 M490,158 L400,186"/>
+              <circle cx="548" cy="202" r="46"/><circle cx="548" cy="202" r="25"/>
+            </g>
+            <path d="M48,128 L524,156 A52,52 0 1 1 524,248 L260,246 L48,338 Z" fill="none" stroke="#9C9A94" stroke-width="1.6"/>
+            <circle cx="548" cy="202" r="22" fill="#1D1D1C" stroke="#9C9A94" stroke-width="1.6"/>
+
+            <!-- load -->
+            <line x1="548" y1="232" x2="548" y2="318" stroke="#EFA73C" stroke-width="2.2" marker-end="url(#arr3)"/>
+            <text x="562" y="296" font-size="12.5" fill="#EFA73C">F = 120 N</text>
+          </g>
+        </svg>
+
+        <div class="viewmodes">
+          <button>Solid</button><button>Mesh</button><button>Density</button><button class="on">Regions</button>
+        </div>
+
+        <div class="legend">
+          <h4>Density</h4>
+          <div class="lrow"><i style="background:#CC4B2E"></i> dense <span class="pct">70 %</span></div>
+          <div class="lrow"><i style="background:#C7913A"></i> medium <span class="pct">45 %</span></div>
+          <div class="lrow"><i style="background:#3F6594"></i> floor <span class="pct">10 %</span></div>
+        </div>
+
+        <div class="readouts">
+          <div class="ro hero"><span>vs 30 % uniform</span><b>+16.8 %</b></div>
+          <div class="ro"><span>Mass</span><b>38.4 g</b></div>
+          <div class="ro"><span>Max deflection</span><b>0.42 mm</b></div>
+          <div class="ro"><span>Min safety factor</span><b>3.21 ×</b></div>
+        </div>
+        <div class="gizmo">Z↑ X→ Y⊙</div>
+      </main>
+
+      <section class="dock" aria-label="Telemetry">
+        <div class="dock-head">
+          <b>Telemetry</b>
+          <span>RUN 1 · 18 ITERATIONS · CONVERGED Δρ̄ &lt; 0.005</span>
+          <div class="grow"></div>
+          <button class="on">Charts + log</button>
+          <button>Log only</button>
+          <button>Hide</button>
+        </div>
+        <div class="dock-body">
+          <div class="chart">
+            <span class="t">Compliance (log)</span><span class="v">1.84e2</span>
+            <svg viewBox="0 0 220 120" preserveAspectRatio="none">
+              <g stroke="#3A3A38" stroke-width="1">
+                <line x1="0" y1="40" x2="220" y2="40"/><line x1="0" y1="70" x2="220" y2="70"/><line x1="0" y1="100" x2="220" y2="100"/>
+              </g>
+              <polyline fill="none" stroke="#EFA73C" stroke-width="1.6"
+                points="8,26 20,42 32,58 44,70 56,79 68,86 80,91 96,96 112,99 128,101 144,103 160,104 176,105 192,105.5 212,106"/>
+            </svg>
+          </div>
+          <div class="chart">
+            <span class="t">Design change</span><span class="v">0.0041</span>
+            <svg viewBox="0 0 220 120" preserveAspectRatio="none">
+              <line x1="0" y1="92" x2="220" y2="92" stroke="#B0543F" stroke-width="1" stroke-dasharray="4 3"/>
+              <polyline fill="none" stroke="#EFA73C" stroke-width="1.6"
+                points="8,22 20,30 32,44 44,40 56,54 68,62 80,60 96,70 112,76 128,82 144,86 160,88 176,90 192,93 212,95"/>
+            </svg>
+          </div>
+          <div class="chart">
+            <span class="t">MGCG residual</span><span class="v">8.4e-7</span>
+            <svg viewBox="0 0 220 120" preserveAspectRatio="none">
+              <g stroke="#3A3A38" stroke-width="1">
+                <line x1="0" y1="35" x2="220" y2="35"/><line x1="0" y1="65" x2="220" y2="65"/><line x1="0" y1="95" x2="220" y2="95"/>
+              </g>
+              <polyline fill="none" stroke="#EFA73C" stroke-width="1.6"
+                points="8,14 24,30 40,26 56,44 72,40 88,58 104,54 120,70 136,68 152,82 168,80 184,94 200,92 212,102"/>
+            </svg>
+          </div>
+          <div class="loglines">
+            <div><em>41.2s</em>it 15 · C <b>1.88e2</b> · ρ̄ 0.300 · Δρ̄ 0.0066 · CG 38</div>
+            <div><em>43.9s</em>it 16 · C <b>1.86e2</b> · ρ̄ 0.300 · Δρ̄ 0.0054 · CG 34</div>
+            <div><em>46.5s</em>it 17 · C <b>1.85e2</b> · ρ̄ 0.300 · Δρ̄ 0.0047 · CG 31</div>
+            <div><em>49.0s</em>it 18 · C <b>1.84e2</b> · ρ̄ 0.300 · Δρ̄ 0.0041 · CG 29</div>
+            <div><em>49.3s</em><span class="ok">converged — design stationary (Δρ̄ &lt; 0.005 × 2)</span></div>
+            <div><em>50.1s</em>bins → <b>10 / 45 / 70 %</b> · verified C 1.79e2 · <span class="ok">+16.8 % vs uniform</span></div>
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <footer class="status">
+    <div>GRID <b>188×84×46</b> · <b>412k</b> cells</div>
+    <div>h <b>0.45 mm</b></div>
+    <div>SOLVE <b>6.2 s</b></div>
+    <div class="grow"></div>
+    <div>mm · MPa</div>
+    <div>AGPL-3.0-only</div>
+  </footer>
+</div>
+</body>
+</html>
