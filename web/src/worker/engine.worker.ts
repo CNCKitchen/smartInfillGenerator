@@ -33,8 +33,25 @@ type Req =
       nBins: number;
     }
   | { id: number; op: "densityShape"; threshold: number }
+  | { id: number; op: "resmooth"; iters: number }
   | { id: number; op: "exportThreeMf" }
   | { id: number; op: "exportStls" };
+
+/** Collect region meshes + transfer list (shared by optimize + resmooth). */
+function collectRegions(m: Model): {
+  regions: { density: number; positions: Float32Array; indices: Uint32Array }[];
+  transfer: Transferable[];
+} {
+  const regions: { density: number; positions: Float32Array; indices: Uint32Array }[] = [];
+  const transfer: Transferable[] = [];
+  for (let i = 0; i < m.region_count(); i++) {
+    const positions = m.region_positions(i);
+    const indices = m.region_indices(i);
+    regions.push({ density: m.region_density(i), positions, indices });
+    transfer.push(positions.buffer, indices.buffer);
+  }
+  return { regions, transfer };
+}
 
 self.onmessage = async (ev: MessageEvent<Req>) => {
   const msg = ev.data;
@@ -139,25 +156,27 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
               json: string,
               density: Float32Array,
               skelPositions: Float32Array,
-              skelIndices: Uint32Array
+              skelIndices: Uint32Array,
+              skelDensity: Float32Array
             ) => {
               (self as unknown as Worker).postMessage(
-                { id: msg.id, progress: true, data: JSON.parse(json), density, skelPositions, skelIndices },
-                [density.buffer, skelPositions.buffer, skelIndices.buffer]
+                {
+                  id: msg.id,
+                  progress: true,
+                  data: JSON.parse(json),
+                  density,
+                  skelPositions,
+                  skelIndices,
+                  skelDensity,
+                },
+                [density.buffer, skelPositions.buffer, skelIndices.buffer, skelDensity.buffer]
               );
             }
           )
         );
         summary.seconds = (performance.now() - t0) / 1000;
         // Collect region meshes + final fields in one payload.
-        const regions: { density: number; positions: Float32Array; indices: Uint32Array }[] = [];
-        const transfer: Transferable[] = [];
-        for (let i = 0; i < m.region_count(); i++) {
-          const positions = m.region_positions(i);
-          const indices = m.region_indices(i);
-          regions.push({ density: m.region_density(i), positions, indices });
-          transfer.push(positions.buffer, indices.buffer);
-        }
+        const { regions, transfer } = collectRegions(m);
         const vertexDensity = m.vertex_density();
         const displacements = m.vertex_displacements();
         transfer.push(vertexDensity.buffer, displacements.buffer);
@@ -171,9 +190,20 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
         const arr = requireModel().density_isosurface(msg.threshold);
         const positions = arr[0] as Float32Array;
         const indices = arr[1] as Uint32Array;
+        const density = arr[2] as Float32Array;
         (self as unknown as Worker).postMessage(
-          { id: msg.id, ok: true, data: { positions, indices } },
-          [positions.buffer, indices.buffer]
+          { id: msg.id, ok: true, data: { positions, indices, density } },
+          [positions.buffer, indices.buffer, density.buffer]
+        );
+        return;
+      }
+      case "resmooth": {
+        const m = requireModel();
+        m.resmooth_regions(msg.iters);
+        const { regions, transfer } = collectRegions(m);
+        (self as unknown as Worker).postMessage(
+          { id: msg.id, ok: true, data: { regions } },
+          transfer
         );
         return;
       }

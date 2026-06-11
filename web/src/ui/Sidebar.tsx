@@ -174,10 +174,6 @@ export function Sidebar() {
               edit
             </a>
           </div>
-          <label className="rowcheck">
-            <input type="checkbox" checked={s.gravity} onChange={(e) => s.setGravity(e.target.checked)} />
-            <span>Include self-weight (gravity −Z)</span>
-          </label>
           <label className="row">
             <span>Resolution</span>
             <select
@@ -294,6 +290,12 @@ export function Sidebar() {
               onChange={(e) => s.setSmoothIters(Number(e.target.value))}
             />
           </label>
+          {s.optSummary && (
+            <div className="dim small">
+              Smoothing updates the regions live — check the Regions view; exports use what you
+              see.
+            </div>
+          )}
           <button className="primary" onClick={() => void s.runOptimize()} disabled={!!s.busy}>
             Optimize infill
           </button>

@@ -18,12 +18,16 @@ npm run dev     # opens on http://localhost:5173
 
 Workflow in the app:
 
-1. **Model** — drop an STL or 3MF (units mm). Adjust the surface-detection
-   angle if patches come out too coarse/fine. An axis gizmo (bottom-right)
-   shows the orientation; supports are marked with classic FEA triangles.
+1. **Model** — drop an STL or 3MF (units mm). Coarse tessellations are
+   subdivided internally (~1/60 of the diagonal, 160k-triangle budget) so
+   deformed shapes can actually show curvature; exports always carry the
+   original mesh. Adjust the surface-detection angle if patches come out too
+   coarse/fine. An axis gizmo (bottom-right) shows the orientation; supports
+   are marked with classic FEA triangles. Parallel projection throughout.
 2. **Supports & loads** — add Fixed / Slide / Force / Pressure conditions and
-   click surfaces (or brush) to assign them. Optional self-weight. Clicking
-   anywhere outside this section snaps the tool back to Orbit.
+   click surfaces (or brush) to assign them. Clicking anywhere outside this
+   section snaps the tool back to Orbit. (Self-weight exists in the engine
+   but is hidden in the UI — negligible for desktop plastic prints.)
 3. **Material & analysis** — material presets (editable in ⚙ Settings,
    persisted per browser), resolution (Preview recommended for the first
    pass). The `Mesh` view shows the actual voxel mesh the solver runs on.

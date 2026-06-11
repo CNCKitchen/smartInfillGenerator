@@ -604,8 +604,14 @@ export class SceneManager {
     this.refreshView();
   }
 
-  /** Live optimization skeleton or density-threshold cutaway mesh. */
-  setOptShape(positions: Float32Array | null, indices: Uint32Array | null) {
+  /** Live optimization skeleton or density-threshold cutaway mesh. When a
+   *  per-vertex density scalar is provided, it is colored through the same
+   *  ramp LUT as the density legend. */
+  setOptShape(
+    positions: Float32Array | null,
+    indices: Uint32Array | null,
+    density?: Float32Array | null
+  ) {
     if (this.optShapeMesh) {
       this.scene.remove(this.optShapeMesh);
       this.optShapeMesh.geometry.dispose();
@@ -617,12 +623,28 @@ export class SceneManager {
       geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
       geo.setIndex(new THREE.BufferAttribute(indices, 1));
       geo.computeVertexNormals();
-      const mat = new THREE.MeshStandardMaterial({
-        color: 0xd9974f,
-        roughness: 0.55,
-        metalness: 0.05,
-        side: THREE.DoubleSide,
-      });
+      let mat: THREE.MeshStandardMaterial;
+      if (density && density.length * 3 === positions.length) {
+        const uv = new Float32Array(density.length * 2);
+        for (let i = 0; i < density.length; i++) {
+          uv[2 * i] = Math.min(1, density[i] / 0.8);
+          uv[2 * i + 1] = 0.5;
+        }
+        geo.setAttribute("uv", new THREE.BufferAttribute(uv, 2));
+        mat = new THREE.MeshStandardMaterial({
+          map: this.lutRamp,
+          roughness: 0.55,
+          metalness: 0.05,
+          side: THREE.DoubleSide,
+        });
+      } else {
+        mat = new THREE.MeshStandardMaterial({
+          color: 0xd9974f,
+          roughness: 0.55,
+          metalness: 0.05,
+          side: THREE.DoubleSide,
+        });
+      }
       this.optShapeMesh = new THREE.Mesh(geo, mat);
       this.scene.add(this.optShapeMesh);
     }

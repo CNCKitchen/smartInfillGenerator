@@ -32,6 +32,71 @@ impl TriMesh {
         Self { tris }
     }
 
+    /// Uniformly subdivide so no triangle edge exceeds `target_edge`
+    /// (each triangle becomes an n² barycentric grid). Coarse STLs (a box
+    /// face = 2 triangles) can otherwise only display LINEAR deformation
+    /// between their corner vertices — the bending curve needs vertices to
+    /// exist. Total output is capped near `max_tris` by scaling n down, so
+    /// already-dense meshes pass through unchanged.
+    pub fn subdivided(&self, target_edge: f64, max_tris: usize) -> TriMesh {
+        let target = target_edge.max(1e-9);
+        let mut ns: Vec<usize> = Vec::with_capacity(self.tris.len());
+        let mut total: usize = 0;
+        for t in &self.tris {
+            let mut max_e2 = 0f64;
+            for (u, v) in [(0, 1), (1, 2), (2, 0)] {
+                let mut e2 = 0f64;
+                for d in 0..3 {
+                    let diff = t[3 * u + d] as f64 - t[3 * v + d] as f64;
+                    e2 += diff * diff;
+                }
+                max_e2 = max_e2.max(e2);
+            }
+            let n = ((max_e2.sqrt() / target).ceil() as usize).clamp(1, 64);
+            ns.push(n);
+            total += n * n;
+        }
+        if total > max_tris {
+            let s = (max_tris as f64 / total as f64).sqrt();
+            for n in ns.iter_mut() {
+                *n = ((*n as f64 * s).floor() as usize).max(1);
+            }
+        }
+        let mut out: Vec<[f32; 9]> = Vec::new();
+        for (t, &n) in self.tris.iter().zip(&ns) {
+            if n <= 1 {
+                out.push(*t);
+                continue;
+            }
+            let p = |k: usize| [t[3 * k] as f64, t[3 * k + 1] as f64, t[3 * k + 2] as f64];
+            let (a, b, c) = (p(0), p(1), p(2));
+            let v = |i: usize, j: usize| -> [f64; 3] {
+                let (fi, fj) = (i as f64 / n as f64, j as f64 / n as f64);
+                [
+                    a[0] + (b[0] - a[0]) * fi + (c[0] - a[0]) * fj,
+                    a[1] + (b[1] - a[1]) * fi + (c[1] - a[1]) * fj,
+                    a[2] + (b[2] - a[2]) * fi + (c[2] - a[2]) * fj,
+                ]
+            };
+            let mut push = |p0: [f64; 3], p1: [f64; 3], p2: [f64; 3]| {
+                out.push([
+                    p0[0] as f32, p0[1] as f32, p0[2] as f32,
+                    p1[0] as f32, p1[1] as f32, p1[2] as f32,
+                    p2[0] as f32, p2[1] as f32, p2[2] as f32,
+                ]);
+            };
+            for i in 0..n {
+                for j in 0..n - i {
+                    push(v(i, j), v(i + 1, j), v(i, j + 1));
+                    if i + j < n - 1 {
+                        push(v(i + 1, j), v(i + 1, j + 1), v(i, j + 1));
+                    }
+                }
+            }
+        }
+        TriMesh::from_triangles(out)
+    }
+
     pub fn len(&self) -> usize {
         self.tris.len()
     }

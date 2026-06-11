@@ -9,7 +9,8 @@ interface Pending {
     data: unknown,
     density: Float32Array,
     skelPositions?: Float32Array,
-    skelIndices?: Uint32Array
+    skelIndices?: Uint32Array,
+    skelDensity?: Float32Array
   ) => void;
 }
 
@@ -23,11 +24,12 @@ export class EngineClient {
       type: "module",
     });
     this.worker.onmessage = (ev) => {
-      const { id, ok, data, error, progress, density, skelPositions, skelIndices } = ev.data;
+      const { id, ok, data, error, progress, density, skelPositions, skelIndices, skelDensity } =
+        ev.data;
       const p = this.pending.get(id);
       if (!p) return;
       if (progress) {
-        p.onProgress?.(data, density, skelPositions, skelIndices);
+        p.onProgress?.(data, density, skelPositions, skelIndices, skelDensity);
         return;
       }
       this.pending.delete(id);
@@ -106,7 +108,8 @@ export class EngineClient {
       p: OptProgress,
       density: Float32Array,
       skelPositions?: Float32Array,
-      skelIndices?: Uint32Array
+      skelIndices?: Uint32Array,
+      skelDensity?: Float32Array
     ) => void
   ): Promise<OptimizeOutput> {
     return this.call(
@@ -122,8 +125,15 @@ export class EngineClient {
   }
 
   /** Isosurface of the final continuous density field at `threshold` (0..1). */
-  densityShape(threshold: number): Promise<{ positions: Float32Array; indices: Uint32Array }> {
+  densityShape(
+    threshold: number
+  ): Promise<{ positions: Float32Array; indices: Uint32Array; density: Float32Array }> {
     return this.call({ op: "densityShape", threshold });
+  }
+
+  /** Re-smooth the extracted regions live (affects display + exports). */
+  resmoothRegions(iters: number): Promise<{ regions: OptRegion[] }> {
+    return this.call({ op: "resmooth", iters });
   }
 
   exportThreeMf(): Promise<Uint8Array> {

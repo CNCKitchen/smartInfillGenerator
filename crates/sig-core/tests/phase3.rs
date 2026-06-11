@@ -303,6 +303,34 @@ fn conv_trace() {
 }
 
 #[test]
+fn subdivision_preserves_area_and_respects_cap() {
+    let m = primitives::boxx([0.0; 3], [40.0, 6.0, 6.0]);
+    let area = |mm: &sig_core::TriMesh| -> f64 {
+        mm.tris
+            .iter()
+            .map(|t| {
+                let e1 = [(t[3] - t[0]) as f64, (t[4] - t[1]) as f64, (t[5] - t[2]) as f64];
+                let e2 = [(t[6] - t[0]) as f64, (t[7] - t[1]) as f64, (t[8] - t[2]) as f64];
+                let c = [
+                    e1[1] * e2[2] - e1[2] * e2[1],
+                    e1[2] * e2[0] - e1[0] * e2[2],
+                    e1[0] * e2[1] - e1[1] * e2[0],
+                ];
+                0.5 * (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt()
+            })
+            .sum()
+    };
+    let s = m.subdivided(1.0, 1_000_000);
+    assert!(s.len() > 1000, "40mm edges at 1mm target should refine ({} tris)", s.len());
+    assert!((area(&s) - area(&m)).abs() / area(&m) < 1e-4, "area preserved");
+    let capped = m.subdivided(0.1, 5_000);
+    assert!(capped.len() <= 5_000, "budget respected ({} tris)", capped.len());
+    // Already-fine mesh passes through unchanged.
+    let fine = s.subdivided(10.0, 1_000_000);
+    assert_eq!(fine.len(), s.len());
+}
+
+#[test]
 fn voxel_surface_mesh_counts() {
     let grid = VoxelGrid::solid_box(2, 2, 2, 1.0);
     let (tris, edges) = grid.surface_mesh();

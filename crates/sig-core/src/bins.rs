@@ -163,9 +163,18 @@ pub struct RegionMesh {
 }
 
 /// Extract one watertight region mesh for cells where `inside` is true.
-/// Field: node lattice with one-cell void margin; node value = mean of the
-/// 8 adjacent cell indicators; surface at `iso` (0.4 => slight dilation).
+/// Binary indicator + iso 0.4 => slight dilation; used for export regions
+/// (bin membership is a set, not a smooth field).
 pub fn extract_region(grid: &VoxelGrid, inside: &dyn Fn(usize) -> bool, iso: f64) -> RegionMesh {
+    extract_iso(grid, &|ci| if inside(ci) { 1.0 } else { 0.0 }, iso)
+}
+
+/// Isosurface of an arbitrary per-cell scalar at `iso`. Node lattice with a
+/// one-cell void margin; node value = mean of the 8 adjacent cell values.
+/// For smooth fields (e.g. filtered densities) this yields the true smooth
+/// level set — the binary variant rasterizes to cell granularity and grows
+/// tent-shaped spikes wherever single cells cross the threshold.
+pub fn extract_iso(grid: &VoxelGrid, cell_value: &dyn Fn(usize) -> f64, iso: f64) -> RegionMesh {
     let (nx, ny, nz) = (grid.nx, grid.ny, grid.nz);
     // Lattice nodes: grid nodes plus a margin ring => (nx+3) per axis.
     let (lx, ly, lz) = (nx + 3, ny + 3, nz + 3);
@@ -187,9 +196,7 @@ pub fn extract_region(grid: &VoxelGrid, inside: &dyn Fn(usize) -> bool, iso: f64
                         continue;
                     }
                     let ci = (cz * ny + cy) * nx + cx;
-                    if inside(ci) {
-                        acc += 1.0;
-                    }
+                    acc += cell_value(ci);
                 }
             }
         }

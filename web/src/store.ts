@@ -83,7 +83,6 @@ interface AppState {
   material: Material;
   materials: Material[];
   curves: Record<PatternKey, PatternCurve>;
-  gravity: boolean;
   resolution: ResolutionKey;
   // optimization inputs
   budget: number; // % of solid mass
@@ -133,7 +132,6 @@ interface AppState {
   setCurve(pattern: PatternKey, c: PatternCurve): void;
   resetCurves(): void;
   openSettings(open: boolean): void;
-  setGravity(on: boolean): void;
   setResolution(r: ResolutionKey): void;
   setBudget(v: number): void;
   setPattern(p: PatternKey): void;
@@ -156,6 +154,7 @@ interface AppState {
 
 let bcCounter = 0;
 let isoTimer: ReturnType<typeof setTimeout> | null = null;
+let smoothTimer: ReturnType<typeof setTimeout> | null = null;
 
 /** Events the 3D scene listens to (kept out of React rendering). */
 export interface SceneEvents {
@@ -169,8 +168,13 @@ export interface SceneEvents {
   onViewState?: (mode: ViewMode, deformScale: number) => void;
   onVoxelMesh?: (hull: Float32Array | null, edges: Float32Array | null) => void;
   onAnimateDeformed?: (on: boolean) => void;
-  /** Live optimization skeleton or density-threshold cutaway mesh. */
-  onOptShape?: (positions: Float32Array | null, indices: Uint32Array | null) => void;
+  /** Live optimization skeleton or density-threshold cutaway mesh,
+   *  optionally colored by a per-vertex density scalar. */
+  onOptShape?: (
+    positions: Float32Array | null,
+    indices: Uint32Array | null,
+    density?: Float32Array | null
+  ) => void;
   onRegionVisibility?: (visible: boolean[]) => void;
 }
 
@@ -232,7 +236,6 @@ export const useStore = create<AppState>((set, get) => ({
   material: initialSettings.materials[0],
   materials: initialSettings.materials,
   curves: initialSettings.curves,
-  gravity: false,
   resolution: "preview",
   budget: 50,
   pattern: "gyroid",
@@ -265,7 +268,6 @@ export const useStore = create<AppState>((set, get) => ({
       const model = await engine.load(bytes, name.replace(/\.(stl|3mf)$/i, ""));
       const m = get().material;
       await engine.setMaterial(m.e0, m.nu, m.density);
-      await engine.setGravity(get().gravity);
       await engine.setResolution(RESOLUTIONS[get().resolution]);
       set({
         fileName: name,
@@ -429,12 +431,6 @@ export const useStore = create<AppState>((set, get) => ({
     set({ settingsOpen: open });
   },
 
-  setGravity(on) {
-    set({ gravity: on });
-    invalidateResults(set, get);
-    void engine.setGravity(on);
-  },
-
   setResolution(r) {
     set({ resolution: r });
     invalidateResults(set, get);
@@ -455,7 +451,23 @@ export const useStore = create<AppState>((set, get) => ({
     set({ lineWidth: Math.min(1.5, Math.max(0.1, v)) });
   },
   setSmoothIters(v) {
-    set({ smoothIters: Math.min(20, Math.max(0, Math.round(v))) });
+    const iters = Math.min(20, Math.max(0, Math.round(v)));
+    set({ smoothIters: iters });
+    // Live re-smooth of an existing result (also affects later exports).
+    if (!get().optSummary) return;
+    if (smoothTimer) clearTimeout(smoothTimer);
+    smoothTimer = setTimeout(() => {
+      void (async () => {
+        try {
+          const { regions } = await engine.resmoothRegions(iters);
+          if (get().smoothIters !== iters || !get().optSummary) return;
+          sceneEvents.onRegions?.(regions);
+          sceneEvents.onRegionVisibility?.(get().regionVisible);
+        } catch {
+          // result vanished mid-drag: ignore
+        }
+      })();
+    }, 160);
   },
   setNBins(v) {
     set({ nBins: v });
@@ -481,8 +493,8 @@ export const useStore = create<AppState>((set, get) => ({
           return;
         }
         try {
-          const { positions, indices } = await engine.densityShape(v / 100);
-          if (get().densityThreshold === v) sceneEvents.onOptShape?.(positions, indices);
+          const { positions, indices, density } = await engine.densityShape(v / 100);
+          if (get().densityThreshold === v) sceneEvents.onOptShape?.(positions, indices, density);
         } catch {
           // grid/result vanished mid-drag: ignore
         }
@@ -549,7 +561,7 @@ export const useStore = create<AppState>((set, get) => ({
         st.lineWidth,
         st.smoothIters,
         st.nBins,
-        (p, density, skelPositions, skelIndices) => {
+        (p, density, skelPositions, skelIndices, skelDensity) => {
           set({ optProgress: { iteration: p.iteration, maxIter: p.maxIter } });
           if (get().viewMode !== "density") {
             set({ viewMode: "density" });
@@ -557,7 +569,7 @@ export const useStore = create<AppState>((set, get) => ({
           }
           sceneEvents.onVertexDensity?.(density);
           // Watch the optimized shape gain detail iteration by iteration.
-          sceneEvents.onOptShape?.(skelPositions ?? null, skelIndices ?? null);
+          sceneEvents.onOptShape?.(skelPositions ?? null, skelIndices ?? null, skelDensity ?? null);
         }
       );
       const vis = out.regions.map(() => true);

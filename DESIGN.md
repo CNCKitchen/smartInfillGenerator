@@ -156,7 +156,26 @@ panel. Fallback pattern law: conservative generic n = 2.
 
 ## 9. Open items
 
-- [ ] **Calibration data**: locate/compile CNC Kitchen stiffness-vs-density measurements for gyroid/cubic/grid (else schedule a short test series).
+- [ ] **Calibration data**: locate/compile CNC Kitchen stiffness-vs-density measurements for gyroid/cubic/grid (else schedule a short test series). The ⚙ Settings page already exposes c and n per pattern.
 - [ ] **Name/branding** for the tool.
 - [ ] Minimal `project_settings.config` experiment (what Orca tolerates) — Phase 4.
 - [ ] Orca/Bambu/Prusa version test matrix definition.
+- Self-weight: engine supports it, UI hides it (negligible for desktop plastic prints; revisit for large/heavy parts).
+
+## 10. Future simulation types (requested 2026-06, not scheduled)
+
+- **Inertia relief + point masses** (quadcopter frames and other free-flying
+  parts): no supports — applied loads (motor thrust at arms) are balanced by
+  d'Alembert inertial body forces from the rigid-body acceleration computed
+  off the total load and the mass distribution. Needs: lumped **mass points**
+  attachable to surfaces (motors, battery, ESCs) entering both the mass
+  matrix and the balancing acceleration; solver-side it is the same K but
+  with a self-equilibrated RHS and the 6 rigid-body modes projected out of
+  the Krylov space (our RBM machinery from the constraint check provides the
+  modes). Fits the existing MGCG solver well.
+- **Modal analysis + frequency optimization**: lowest eigenpairs of
+  K φ = λ M φ (lumped mass incl. mass points) via matrix-free LOBPCG/Lanczos
+  preconditioned by the existing multigrid; display mode shapes with the RBM
+  animation path. Optimization objective "maximize first resonance
+  frequency" (Rayleigh-quotient sensitivities — known to need mode-switching
+  care). Useful for drone frames (prop-wash excitation) and machine parts.
