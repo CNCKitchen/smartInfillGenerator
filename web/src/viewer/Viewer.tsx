@@ -208,6 +208,9 @@ function Legend() {
   const stats = useStore((s) => s.stats);
   const autoScale = useStore((s) => s.autoScale);
   const deformScale = useStore((s) => s.deformScale);
+  const setDeformScale = useStore((s) => s.setDeformScale);
+  const showExtremes = useStore((s) => s.showExtremes);
+  const setShowExtremes = useStore((s) => s.setShowExtremes);
   const optSummary = useStore((s) => s.optSummary);
   const voxelInfo = useStore((s) => s.voxelInfo);
   const resultField = useStore((s) => s.resultField);
@@ -256,8 +259,30 @@ function Legend() {
             ↺ auto scale
           </button>
         )}
+        <label className="legendcheck">
+          <input
+            type="checkbox"
+            checked={showExtremes}
+            onChange={(e) => setShowExtremes(e.target.checked)}
+          />
+          <span>mark min / max</span>
+        </label>
+        {isSf && (
+          <div className="legendnote">allowable scales with E(ρ) — red marks the critical low</div>
+        )}
+        {isField && !isSf && (
+          <div className="legendnote">cell-center values — voxel-edge peaks are approximate</div>
+        )}
         <div className="legendnote">
-          shape exaggerated {totalLabel}
+          exaggerated{" "}
+          <EditableBound
+            value={total}
+            display={totalLabel}
+            hint="total ×, 0 = undeformed"
+            onCommit={(v) =>
+              setDeformScale(Math.min(10, Math.max(0, v / Math.max(autoScale, 1e-9))))
+            }
+          />
           {deformScale === 0 ? " (undeformed)" : ""}
         </div>
       </div>

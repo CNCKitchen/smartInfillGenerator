@@ -727,6 +727,39 @@ input[type="number"] {
   font-weight: 600;
 }
 
+.fieldchip {
+  position: absolute;
+  top: 46px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(252, 252, 250, 0.94);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.1);
+  padding: 2px;
+}
+
+.fieldchip select {
+  border: none;
+  background: transparent;
+  box-shadow: none;
+  font-weight: 500;
+  font-size: 12px;
+  padding: 4px 6px;
+  max-width: 230px;
+}
+
+.playchip {
+  position: absolute;
+  bottom: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 5px 14px;
+  font-weight: 600;
+  font-size: 12px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.1);
+}
+
 .sectionchip {
   position: absolute;
   bottom: 12px;
@@ -845,8 +878,18 @@ input[type="number"] {
 
 .legend .legendedit,
 .legend .legendinput,
-.legend .legendreset {
+.legend .legendreset,
+.legend .legendcheck {
   pointer-events: auto;
+}
+
+.legendcheck {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--ink);
+  cursor: pointer;
 }
 
 .legendedit {
@@ -877,7 +920,7 @@ input[type="number"] {
 
 .busy {
   position: absolute;
-  top: 48px;
+  top: 86px;
   left: 50%;
   transform: translateX(-50%);
   background: rgba(252, 252, 250, 0.95);

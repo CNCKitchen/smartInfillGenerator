@@ -19,8 +19,9 @@ npm run dev     # opens on http://localhost:5173
 The app is laid out like an instrument ("Werkbank" design): a top bar with the
 part and the Export action, a numbered **step rail** (the orange carriage marks
 where you are), a panel showing only the active step, the viewport (view modes
-top-center, section plane bottom-left), a **results dock** on the right after
-an optimization, and a **status strip** with live solver telemetry.
+top-center, result controls riding on the view itself, section plane
+bottom-left), a **results dock** on the right after an optimization, and a
+**status strip** with live solver telemetry.
 
 Workflow in the app:
 
@@ -44,17 +45,18 @@ Workflow in the app:
    persisted per browser), resolution (Preview recommended for the first
    pass). The `Mesh` view shows the actual voxel mesh the solver runs on.
 4. **Verify** — `Check setup` animates any remaining rigid-body freedom;
-   `Solve once` shows the deformed shape (jet colormap + value legend,
-   exaggeration slider + readout, optional 0→max deflection animation).
-   A **Result field** selector switches between displacement, a **safety
-   factor** (σₜ/σᵥM with the material's tensile strength; graded infill's
-   allowable scales with the same E(ρ) law as its stiffness; inverted
-   colormap — red marks the critical low), stress (von Mises,
-   σxx/σyy/σzz, τxy/τyz/τzx in MPa) and strain (equivalent +
-   components) — cell-center values mapped to the surface. A **section
-   plane** (gizmo to move/rotate, Flip, X/Y/Z presets) cuts through any
-   view with stencil-filled caps, so the part and the analysis mesh read
-   as solid at the cut.
+   `Solve once` lands in the **Results** view, where review happens on the
+   viewport itself: the **result field** picker sits right under the view
+   tabs (displacement, a **safety factor** σₜ/σᵥM — graded infill's
+   allowable scales with the same E(ρ) law as its stiffness, inverted
+   colormap so red marks the critical low —, stress von Mises /
+   σxx/σyy/σzz / τxy/τyz/τzx in MPa, strain equivalent + components;
+   cell-center values mapped to the surface), **▶ Play deflection**
+   (0→max loop) bottom-center, and the legend carries the click-to-edit
+   color scale, a **mark min/max** toggle, and the click-to-edit
+   **exaggeration** factor. A **section plane** (gizmo to move/rotate,
+   Flip, X/Y/Z presets) cuts through any view with stencil-filled caps,
+   so the part and the analysis mesh read as solid at the cut.
 5. **Optimize infill** — pick a goal: **Stiffest at budget** (classic — max
    stiffness at a given mean infill) or **Match uniform stiffness** (the
    dual: the LIGHTEST design as stiff as a uniform X% print — a few

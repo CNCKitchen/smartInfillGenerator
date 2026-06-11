@@ -49,7 +49,11 @@ Reference points:
   result readouts, machine status strip. Layout: top bar (part + Export), caliper-scale
   step rail (1 Model … 6 Export, orange carriage on the active station), one panel
   showing only the active step, dominant viewport (view modes top-center, section plane
-  bottom-left), results dock right, telemetry strip bottom. Type: Barlow / Barlow Semi
+  bottom-left), results dock right, telemetry strip bottom. Result review happens ON the
+  viewport (2026-06): the deformed view is labeled "Results"; the field picker floats
+  under the view tabs, deflection playback bottom-center, and the legend hosts the
+  click-to-edit color scale, the min/max-marker toggle, and a click-to-edit
+  exaggeration factor. Type: Barlow / Barlow Semi
   Condensed / B612 Mono — all SIL OFL 1.1, self-hosted under `web/public/fonts/` with
   their licenses. Rejected drafts (drawing-office light, operator dark) kept in
   `design-drafts/` for reference.

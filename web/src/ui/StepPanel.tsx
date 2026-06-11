@@ -7,7 +7,6 @@
 import { useEffect, useRef } from "react";
 import { budgetBounds, useStore } from "../store";
 import { NumInput } from "./NumInput";
-import { RESULT_FIELDS } from "../types";
 import type { Bc, BcKind, PatternKey } from "../types";
 import { fmtDisp, fmtLen, rampCss } from "./fmt";
 
@@ -391,8 +390,9 @@ function StepVerify() {
         </div>
       )}
       <div className="hint">
-        Check animates any remaining rigid-body freedom. Solve shows the deformed shape — switch
-        the result field and section the part from step 6.
+        Check animates any remaining rigid-body freedom. Solve lands in the <b>Results</b> view —
+        the field picker sits under the view tabs, playback at the bottom, min/max markers and
+        click-to-edit scale & exaggeration in the legend.
       </div>
     </>
   );
@@ -596,7 +596,7 @@ function StepExport() {
     <>
       {!s.hasResult && !s.optSummary && (
         <div className="hint">
-          Nothing to show yet — run <b>Solve once</b> (step 4) for a deformed view or{" "}
+          Nothing to show yet — run <b>Solve once</b> (step 4) for the Results view or{" "}
           <b>Optimize infill</b> (step 5) for density regions. View modes sit at the top of the
           viewport, the section plane at its bottom left.
         </div>
@@ -653,74 +653,10 @@ function StepExport() {
         </div>
       )}
       {s.viewMode === "deformed" && (
-        <>
-          <div className="group">
-            <div className="g-label">
-              <span>Result field</span>
-            </div>
-            <select value={s.resultField} onChange={(e) => void s.setResultField(e.target.value)}>
-              <option value="u">Displacement |u|</option>
-              <option value="sf">Safety factor σₜ/σᵥᴹ</option>
-              <optgroup label="Stress (MPa)">
-                {RESULT_FIELDS.filter((f) => f.unit === "MPa").map((f) => (
-                  <option key={f.value} value={f.value}>
-                    {f.label}
-                  </option>
-                ))}
-              </optgroup>
-              <optgroup label="Strain">
-                {RESULT_FIELDS.filter((f) => f.unit === "" && f.value !== "sf").map((f) => (
-                  <option key={f.value} value={f.value}>
-                    {f.label}
-                  </option>
-                ))}
-              </optgroup>
-            </select>
-            {s.resultField === "sf" && (
-              <div className="dim small">
-                σₜ from the material table; the allowable of graded infill scales with the same
-                E(ρ) law as its stiffness (first-order). Red marks the lowest factor — enable
-                "Mark min/max" to pin it.
-              </div>
-            )}
-          </div>
-          <div className="group">
-            <div className="g-label">
-              <span>Exaggeration</span>
-              <b>×{s.deformScale.toFixed(1)}</b>
-            </div>
-            <input
-              type="range"
-              min={0}
-              max={3}
-              step={0.1}
-              value={s.deformScale}
-              onChange={(e) => s.setDeformScale(Number(e.target.value))}
-            />
-          </div>
-          <label className="rowcheck">
-            <input
-              type="checkbox"
-              checked={s.animateDeformed}
-              onChange={(e) => s.setAnimateDeformed(e.target.checked)}
-            />
-            <span>Animate deflection (loop 0 → max)</span>
-          </label>
-          <label className="rowcheck">
-            <input
-              type="checkbox"
-              checked={s.showExtremes}
-              onChange={(e) => s.setShowExtremes(e.target.checked)}
-            />
-            <span>Mark min / max locations</span>
-          </label>
-          {s.resultField !== "u" && (
-            <div className="dim small">
-              Cell-center values mapped to the surface — stair-step concentrations at the voxel
-              boundary are approximate. Click the legend numbers to set a custom scale.
-            </div>
-          )}
-        </>
+        <div className="dim small">
+          Result review lives on the viewport: field picker under the view tabs, playback at the
+          bottom, min/max markers and click-to-edit scale & exaggeration in the legend.
+        </div>
       )}
       {s.optSummary && (
         <>
