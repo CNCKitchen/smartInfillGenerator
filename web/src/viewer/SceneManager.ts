@@ -92,13 +92,27 @@ export class SceneManager {
 
   // Scalar result field (stress/strain) overriding displacement colors.
   private scalarField: { values: Float32Array; min: number; max: number } | null = null;
+  /** User override of the color-scale range (click-to-edit legend). */
+  private legendRange: { min: number | null; max: number | null } = { min: null, max: null };
 
-  // Section plane: clipping + stencil caps + transform gizmo.
+  // Min/max value markers for the active result plot.
+  private extremesOn = false;
+  private extremesUnit = "";
+  private extremeData: { minIdx: number; maxIdx: number; minVal: number; maxVal: number } | null =
+    null;
+  private markerMin: THREE.Group | null = null;
+  private markerMax: THREE.Group | null = null;
+  private extremeDisposables: { dispose(): void }[] = [];
+
+  // Section plane: clipping + stencil caps + combined transform gizmo
+  // (translate along the normal only + two rotation rings).
   private sectionOn = false;
   private sectionPlane = new THREE.Plane(new THREE.Vector3(-1, 0, 0), 0);
   private sectionProxy = new THREE.Object3D();
-  private sectionControls: TransformControls | null = null;
-  private sectionHelper: THREE.PlaneHelper | null = null;
+  private sectionTranslate: TransformControls | null = null;
+  private sectionRotate: TransformControls | null = null;
+  private sectionQuad: THREE.Group | null = null;
+  private sectionQuadDisposables: { dispose(): void }[] = [];
   private capPart: THREE.Object3D[] = [];
   private capVoxel: THREE.Object3D[] = [];
   private capDisposables: { dispose(): void }[] = [];
@@ -291,19 +305,10 @@ export class SceneManager {
     }
 
     // Section plane follows the new part.
-    if (this.sectionControls) {
+    if (this.sectionTranslate) {
       this.sectionProxy.position.copy(this.controls.target);
+      this.buildSectionQuad(); // resize to the new part
       this.syncSectionFromProxy();
-      if (this.sectionHelper) {
-        this.scene.remove(this.sectionHelper);
-        this.sectionHelper.dispose();
-        this.sectionHelper = new THREE.PlaneHelper(
-          this.sectionPlane,
-          this.bboxDiag * 1.1,
-          0x4f9cf9
-        );
-        this.scene.add(this.sectionHelper);
-      }
       this.rebuildCapGroups();
     }
     this.refreshClipping();
@@ -644,7 +649,7 @@ export class SceneManager {
       this.voxelDisposables.push(geo, mat);
       this.voxelGroup.add(new THREE.LineSegments(geo, mat));
     }
-    if (this.sectionControls) this.rebuildCapGroups();
+    if (this.sectionTranslate) this.rebuildCapGroups();
     this.refreshClipping();
     this.refreshView();
   }
@@ -761,18 +766,26 @@ export class SceneManager {
     this.refreshView();
   }
 
+  /** Clamp the color scale to a user range (null = auto). */
+  setLegendRange(min: number | null, max: number | null) {
+    this.legendRange = { min, max };
+    this.refreshView();
+  }
+
+  /** Toggle the min/max location markers; unit drives label formatting. */
+  setShowExtremes(on: boolean, unit: string) {
+    this.extremesOn = on;
+    this.extremesUnit = unit;
+    this.refreshView();
+  }
+
   // ---------- section plane ----------
 
   setSection(on: boolean) {
     this.sectionOn = on;
     if (on) this.ensureSectionObjects();
-    if (this.sectionControls) this.sectionControls.enabled = on;
     this.refreshClipping();
     this.refreshView();
-  }
-
-  setSectionMode(mode: "translate" | "rotate") {
-    this.sectionControls?.setMode(mode);
   }
 
   flipSection() {
@@ -792,27 +805,69 @@ export class SceneManager {
   }
 
   private ensureSectionObjects() {
-    if (!this.sectionControls) {
+    if (!this.sectionTranslate) {
       this.sectionProxy.position.copy(this.controls.target);
       this.sectionProxy.quaternion.setFromUnitVectors(
         new THREE.Vector3(0, 0, 1),
         new THREE.Vector3(1, 0, 0)
       );
       this.scene.add(this.sectionProxy);
-      const tc = new TransformControls(this.camera, this.renderer.domElement);
-      tc.setSize(0.8);
-      tc.addEventListener("dragging-changed", (e: { value?: unknown }) => {
-        this.controls.enabled = !e.value && this.tool !== "brush";
+      const make = (mode: "translate" | "rotate", size: number, cfg: (tc: TransformControls) => void) => {
+        const tc = new TransformControls(this.camera, this.renderer.domElement);
+        tc.setMode(mode);
+        tc.setSpace("local");
+        tc.setSize(size);
+        cfg(tc);
+        tc.addEventListener("dragging-changed", (e: { value?: unknown }) => {
+          this.controls.enabled = !e.value && this.tool !== "brush";
+        });
+        tc.addEventListener("objectChange", () => this.syncSectionFromProxy());
+        tc.attach(this.sectionProxy);
+        this.scene.add(tc.getHelper());
+        return tc;
+      };
+      // One combined gizmo: the plane cuts everything, so tangential motion
+      // is meaningless — only the normal arrow translates; two rings rotate
+      // (spinning about the normal is a no-op and stays hidden).
+      this.sectionTranslate = make("translate", 0.75, (tc) => {
+        tc.showX = false;
+        tc.showY = false;
       });
-      tc.addEventListener("objectChange", () => this.syncSectionFromProxy());
-      tc.attach(this.sectionProxy);
-      this.scene.add(tc.getHelper());
-      this.sectionControls = tc;
-      this.sectionHelper = new THREE.PlaneHelper(this.sectionPlane, this.bboxDiag * 1.1, 0x4f9cf9);
-      this.scene.add(this.sectionHelper);
+      this.sectionRotate = make("rotate", 1.05, (tc) => {
+        tc.showZ = false;
+      });
+      this.buildSectionQuad();
       this.syncSectionFromProxy();
     }
     this.rebuildCapGroups();
+  }
+
+  /** Translucent plane rectangle, child of the proxy so it is ALWAYS
+   *  centered on the gizmo (PlaneHelper centers on the world origin's
+   *  foot point instead, which strands the gizmo off to one side). */
+  private buildSectionQuad() {
+    if (this.sectionQuad) {
+      this.sectionProxy.remove(this.sectionQuad);
+      for (const d of this.sectionQuadDisposables) d.dispose();
+      this.sectionQuadDisposables = [];
+    }
+    const d = this.bboxDiag * 1.15;
+    const group = new THREE.Group();
+    const quadGeo = new THREE.PlaneGeometry(d, d);
+    const quadMat = new THREE.MeshBasicMaterial({
+      color: 0x4f9cf9,
+      transparent: true,
+      opacity: 0.08,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    });
+    const edgeGeo = new THREE.EdgesGeometry(quadGeo);
+    const edgeMat = new THREE.LineBasicMaterial({ color: 0x4f9cf9, transparent: true, opacity: 0.7 });
+    this.sectionQuadDisposables.push(quadGeo, quadMat, edgeGeo, edgeMat);
+    group.add(new THREE.Mesh(quadGeo, quadMat));
+    group.add(new THREE.LineSegments(edgeGeo, edgeMat));
+    this.sectionQuad = group;
+    this.sectionProxy.add(group);
   }
 
   private syncSectionFromProxy() {
@@ -887,7 +942,7 @@ export class SceneManager {
 
   /** (Re)create cap groups for the part mesh and the voxel hull. */
   private rebuildCapGroups() {
-    if (!this.sectionControls) return; // section never enabled yet
+    if (!this.sectionTranslate) return; // section never enabled yet
     for (const o of [...this.capPart, ...this.capVoxel]) this.scene.remove(o);
     for (const d of this.capDisposables) d.dispose();
     this.capPart = [];
@@ -925,11 +980,13 @@ export class SceneManager {
 
   private updateSectionVisibility() {
     const gizmoVisible = this.sectionOn;
-    if (this.sectionControls) {
-      this.sectionControls.getHelper().visible = gizmoVisible;
-      this.sectionControls.enabled = gizmoVisible;
+    for (const tc of [this.sectionTranslate, this.sectionRotate]) {
+      if (tc) {
+        tc.getHelper().visible = gizmoVisible;
+        tc.enabled = gizmoVisible;
+      }
     }
-    if (this.sectionHelper) this.sectionHelper.visible = gizmoVisible;
+    this.sectionProxy.visible = gizmoVisible; // carries the plane quad
     // Caps only where an OPAQUE solid is being cut (ghosted part: see inside).
     const mat = this.mesh?.material as THREE.MeshStandardMaterial | undefined;
     const partCap = this.sectionOn && !!this.mesh?.visible && !!mat && !mat.transparent;
@@ -984,15 +1041,17 @@ export class SceneManager {
     if (this.viewMode === "deformed" && this.displacements) {
       const sf = this.scalarField;
       if (sf && sf.values.length * 2 === this.uvs.length) {
-        // Stress/strain field coloring.
-        const range = sf.max - sf.min;
-        const inv = range > 1e-30 ? 1 / range : 0;
+        // Stress/strain field coloring (user range override clamps).
+        const lo = this.legendRange.min ?? sf.min;
+        const hi = this.legendRange.max ?? sf.max;
+        const inv = hi - lo > 1e-30 ? 1 / (hi - lo) : 0;
         for (let i = 0; i < sf.values.length; i++) {
-          this.uvs[2 * i] = (sf.values[i] - sf.min) * inv;
+          this.uvs[2 * i] = Math.min(1, Math.max(0, (sf.values[i] - lo) * inv));
           this.uvs[2 * i + 1] = 0.5;
         }
         uvAttr.needsUpdate = true;
         this.setSurfaceMaterialMode("jet");
+        this.trackExtremes(sf.values, 1);
         return;
       }
       const d = this.displacements;
@@ -1003,12 +1062,16 @@ export class SceneManager {
         mags[i] = Math.hypot(d[3 * i], d[3 * i + 1], d[3 * i + 2]);
         maxMag = Math.max(maxMag, mags[i]);
       }
+      const lo = this.legendRange.min ?? 0;
+      const hi = this.legendRange.max ?? maxMag;
+      const inv = hi - lo > 1e-30 ? 1 / (hi - lo) : 0;
       for (let i = 0; i < n; i++) {
-        this.uvs[2 * i] = mags[i] / maxMag;
+        this.uvs[2 * i] = Math.min(1, Math.max(0, (mags[i] - lo) * inv));
         this.uvs[2 * i + 1] = 0.5;
       }
       uvAttr.needsUpdate = true;
       this.setSurfaceMaterialMode("jet");
+      this.trackExtremes(mags, 1);
       return;
     }
     if (this.viewMode === "density" && this.vertexDensity) {
@@ -1021,7 +1084,111 @@ export class SceneManager {
       return;
     }
     this.setSurfaceMaterialMode("none");
+    this.extremeData = null;
+    this.updateExtremeMarkers();
     this.repaint();
+  }
+
+  // ---------- min/max markers ----------
+
+  private trackExtremes(values: Float32Array | ArrayLike<number>, _stride: number) {
+    let minIdx = 0;
+    let maxIdx = 0;
+    let minVal = Infinity;
+    let maxVal = -Infinity;
+    for (let i = 0; i < values.length; i++) {
+      const v = values[i];
+      if (v < minVal) {
+        minVal = v;
+        minIdx = i;
+      }
+      if (v > maxVal) {
+        maxVal = v;
+        maxIdx = i;
+      }
+    }
+    this.extremeData = { minIdx, maxIdx, minVal, maxVal };
+    this.updateExtremeMarkers();
+  }
+
+  private fmtExtreme(v: number): string {
+    if (this.extremesUnit === "mm") {
+      return v >= 0.01 || v === 0 ? `${v.toFixed(3)} mm` : `${(v * 1000).toFixed(1)} µm`;
+    }
+    if (this.extremesUnit === "MPa") {
+      return `${Math.abs(v) >= 0.01 || v === 0 ? v.toPrecision(3) : v.toExponential(1)} MPa`;
+    }
+    return v === 0 ? "0" : v.toExponential(2);
+  }
+
+  private makeExtremeMarker(color: number): THREE.Group {
+    const g = new THREE.Group();
+    const r = 0.011 * this.bboxDiag;
+    const geo = new THREE.SphereGeometry(r, 16, 12);
+    const mat = new THREE.MeshBasicMaterial({ color, depthTest: false });
+    this.extremeDisposables.push(geo, mat);
+    const dot = new THREE.Mesh(geo, mat);
+    dot.renderOrder = 10;
+    g.add(dot);
+    return g;
+  }
+
+  private setMarkerLabel(group: THREE.Group, text: string, color: number) {
+    // children[1] is the label sprite; rebuild it (values change rarely).
+    const old = group.children[1] as THREE.Sprite | undefined;
+    if (old) {
+      group.remove(old);
+      (old.material as THREE.SpriteMaterial).map?.dispose();
+      (old.material as THREE.Material).dispose();
+    }
+    const canvas = document.createElement("canvas");
+    const ctx = canvas.getContext("2d")!;
+    const font = "bold 28px 'Segoe UI', system-ui, sans-serif";
+    ctx.font = font;
+    const w = Math.ceil(ctx.measureText(text).width) + 18;
+    canvas.width = w;
+    canvas.height = 40;
+    ctx.font = font;
+    ctx.fillStyle = "#14181dcc";
+    ctx.fillRect(0, 0, w, 40);
+    ctx.fillStyle = `#${color.toString(16).padStart(6, "0")}`;
+    ctx.textBaseline = "middle";
+    ctx.fillText(text, 9, 21);
+    const tex = new THREE.CanvasTexture(canvas);
+    const mat = new THREE.SpriteMaterial({ map: tex, depthTest: false, transparent: true });
+    const sprite = new THREE.Sprite(mat);
+    const hWorld = 0.045 * this.bboxDiag;
+    sprite.scale.set((hWorld * w) / 40, hWorld, 1);
+    sprite.position.set(0, 0, 0.05 * this.bboxDiag);
+    sprite.renderOrder = 11;
+    group.add(sprite);
+  }
+
+  /** Place (or hide) the min/max markers at the DISPLAYED vertex positions. */
+  private updateExtremeMarkers(positionsOnly = false) {
+    const show =
+      this.extremesOn &&
+      this.viewMode === "deformed" &&
+      !!this.extremeData &&
+      !!this.geometry &&
+      !!this.displacements;
+    if (!this.markerMin) {
+      this.markerMin = this.makeExtremeMarker(0x60a5fa);
+      this.markerMax = this.makeExtremeMarker(0xff5252);
+      this.scene.add(this.markerMin, this.markerMax!);
+    }
+    this.markerMin.visible = show;
+    this.markerMax!.visible = show;
+    if (!show || !this.extremeData) return;
+    const pos = (this.geometry!.getAttribute("position") as THREE.BufferAttribute)
+      .array as Float32Array;
+    const d = this.extremeData;
+    this.markerMin.position.set(pos[3 * d.minIdx], pos[3 * d.minIdx + 1], pos[3 * d.minIdx + 2]);
+    this.markerMax!.position.set(pos[3 * d.maxIdx], pos[3 * d.maxIdx + 1], pos[3 * d.maxIdx + 2]);
+    if (!positionsOnly) {
+      this.setMarkerLabel(this.markerMin, `min ${this.fmtExtreme(d.minVal)}`, 0x9cc4f7);
+      this.setMarkerLabel(this.markerMax!, `max ${this.fmtExtreme(d.maxVal)}`, 0xffb3b3);
+    }
   }
 
   private applyPositions(rbmOffset?: number, deformFactor = 1) {
@@ -1048,6 +1215,8 @@ export class SceneManager {
     }
     attr.needsUpdate = true;
     this.geometry.computeVertexNormals();
+    // Markers ride the displayed (deformed/animated) vertices.
+    this.updateExtremeMarkers(true);
   }
 
   private tick() {

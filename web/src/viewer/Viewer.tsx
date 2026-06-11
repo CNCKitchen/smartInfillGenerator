@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { SceneManager } from "./SceneManager";
 import { sceneEvents, useStore } from "../store";
 import { RESULT_FIELDS } from "../types";
@@ -66,8 +66,9 @@ export function Viewer() {
     sceneEvents.onOptShape = (p, i, d) => scene.setOptShape(p, i, d);
     sceneEvents.onRegionVisibility = (vis) => scene.setRegionVisibility(vis);
     sceneEvents.onScalarField = (v) => scene.setScalarField(v);
+    sceneEvents.onLegendRange = (min, max) => scene.setLegendRange(min, max);
+    sceneEvents.onShowExtremes = (on, unit) => scene.setShowExtremes(on, unit);
     sceneEvents.onSectionState = (on) => scene.setSection(on);
-    sceneEvents.onSectionMode = (m) => scene.setSectionMode(m);
     sceneEvents.onSectionFlip = () => scene.flipSection();
     sceneEvents.onSectionAxis = (a) => scene.setSectionAxis(a);
 
@@ -148,6 +149,54 @@ function fmtField(v: number, unit: string): string {
   return v === 0 ? "0" : v.toExponential(2);
 }
 
+/** Click-to-edit legend bound: shows the formatted value, becomes an input. */
+function EditableBound({
+  value,
+  display,
+  hint,
+  onCommit,
+}: {
+  value: number;
+  display: string;
+  hint: string;
+  onCommit: (v: number) => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [text, setText] = useState("");
+  const commit = () => {
+    setEditing(false);
+    const v = parseFloat(text);
+    if (Number.isFinite(v)) onCommit(v);
+  };
+  if (!editing) {
+    return (
+      <span
+        className="legendedit"
+        title={`Click to set (${hint})`}
+        onClick={() => {
+          setText(String(Number(value.toPrecision(4))));
+          setEditing(true);
+        }}
+      >
+        {display}
+      </span>
+    );
+  }
+  return (
+    <input
+      className="legendinput"
+      autoFocus
+      value={text}
+      onChange={(e) => setText(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") commit();
+        if (e.key === "Escape") setEditing(false);
+      }}
+    />
+  );
+}
+
 function Legend() {
   const viewMode = useStore((s) => s.viewMode);
   const stats = useStore((s) => s.stats);
@@ -157,42 +206,49 @@ function Legend() {
   const voxelInfo = useStore((s) => s.voxelInfo);
   const resultField = useStore((s) => s.resultField);
   const fieldRange = useStore((s) => s.fieldRange);
+  const legendMin = useStore((s) => s.legendMin);
+  const legendMax = useStore((s) => s.legendMax);
+  const setLegendRange = useStore((s) => s.setLegendRange);
 
   if (viewMode === "deformed" && stats) {
     const total = autoScale * deformScale;
     const totalLabel = total >= 9.5 ? `×${Math.round(total)}` : `×${total.toFixed(1)}`;
     const def = RESULT_FIELDS.find((f) => f.value === resultField);
-    if (resultField !== "u" && def && fieldRange) {
-      return (
-        <div className="legend">
-          <div className="legendtitle">{def.label}</div>
-          <div className="legendbody">
-            <div className="legendbar" style={{ background: JET_GRADIENT }} />
-            <div className="legendlabels">
-              <span>{fmtField(fieldRange.max, def.unit)}</span>
-              <span>{fmtField((fieldRange.min + fieldRange.max) / 2, def.unit)}</span>
-              <span>{fmtField(fieldRange.min, def.unit)}</span>
-            </div>
-          </div>
-          <div className="legendnote">
-            shape exaggerated {totalLabel}
-            {deformScale === 0 ? " (undeformed)" : ""}
-          </div>
-        </div>
-      );
-    }
-    const max = stats.maxDisplacement;
+    const isField = resultField !== "u" && !!def && !!fieldRange;
+    const unit = isField ? def!.unit : "mm";
+    const autoMin = isField ? fieldRange!.min : 0;
+    const autoMax = isField ? fieldRange!.max : stats.maxDisplacement;
+    const effMin = legendMin ?? autoMin;
+    const effMax = legendMax ?? autoMax;
+    const overridden = legendMin !== null || legendMax !== null;
+    const fmt = (v: number) => (isField ? fmtField(v, unit) : fmtDisp(v));
+    const hint = unit === "MPa" ? "MPa" : unit === "mm" ? "mm" : "strain";
     return (
       <div className="legend">
-        <div className="legendtitle">Displacement |u|</div>
+        <div className="legendtitle">{isField ? def!.label : "Displacement |u|"}</div>
         <div className="legendbody">
           <div className="legendbar" style={{ background: JET_GRADIENT }} />
           <div className="legendlabels">
-            <span>{fmtDisp(max)}</span>
-            <span>{fmtDisp(max / 2)}</span>
-            <span>0</span>
+            <EditableBound
+              value={effMax}
+              display={fmt(effMax)}
+              hint={hint}
+              onCommit={(v) => setLegendRange(effMin, v)}
+            />
+            <span>{fmt((effMin + effMax) / 2)}</span>
+            <EditableBound
+              value={effMin}
+              display={fmt(effMin)}
+              hint={hint}
+              onCommit={(v) => setLegendRange(v, effMax)}
+            />
           </div>
         </div>
+        {overridden && (
+          <button className="legendreset" onClick={() => setLegendRange(null, null)}>
+            ↺ auto scale
+          </button>
+        )}
         <div className="legendnote">
           shape exaggerated {totalLabel}
           {deformScale === 0 ? " (undeformed)" : ""}

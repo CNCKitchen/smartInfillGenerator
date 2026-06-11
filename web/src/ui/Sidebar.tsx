@@ -440,10 +440,18 @@ export function Sidebar() {
                 />
                 <span>Animate deflection (loop 0 → max)</span>
               </label>
+              <label className="rowcheck">
+                <input
+                  type="checkbox"
+                  checked={s.showExtremes}
+                  onChange={(e) => s.setShowExtremes(e.target.checked)}
+                />
+                <span>Mark min / max locations</span>
+              </label>
               {s.resultField !== "u" && (
                 <div className="dim small">
                   Cell-center values mapped to the surface — stair-step concentrations at the
-                  voxel boundary are approximate.
+                  voxel boundary are approximate. Click the legend numbers to set a custom scale.
                 </div>
               )}
             </>
@@ -454,30 +462,17 @@ export function Sidebar() {
             </button>
             {s.sectionOn && (
               <>
-                <button
-                  className={s.sectionMode === "translate" ? "on" : ""}
-                  onClick={() => s.setSectionMode("translate")}
-                >
-                  Move
-                </button>
-                <button
-                  className={s.sectionMode === "rotate" ? "on" : ""}
-                  onClick={() => s.setSectionMode("rotate")}
-                >
-                  Rotate
-                </button>
                 <button onClick={() => s.flipSection()}>Flip</button>
+                <button onClick={() => s.setSectionAxis("x")}>X</button>
+                <button onClick={() => s.setSectionAxis("y")}>Y</button>
+                <button onClick={() => s.setSectionAxis("z")}>Z</button>
               </>
             )}
           </div>
           {s.sectionOn && (
-            <div className="row">
-              <span className="dim small">Align normal</span>
-              <div className="toolrow" style={{ flex: 1 }}>
-                <button onClick={() => s.setSectionAxis("x")}>X</button>
-                <button onClick={() => s.setSectionAxis("y")}>Y</button>
-                <button onClick={() => s.setSectionAxis("z")}>Z</button>
-              </div>
+            <div className="dim small">
+              Drag the arrow to slide the plane along its normal, the rings to tilt it. X/Y/Z
+              aligns the normal; Flip keeps the other half.
             </div>
           )}
           {s.optSummary && (

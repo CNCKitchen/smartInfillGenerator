@@ -12,7 +12,7 @@ import type {
   SolveStats,
   VoxelInfo,
 } from "./types";
-import { DEFAULT_CURVES, DEFAULT_MATERIALS, RESOLUTIONS } from "./types";
+import { DEFAULT_CURVES, DEFAULT_MATERIALS, RESOLUTIONS, RESULT_FIELDS } from "./types";
 
 export type Tool = "orbit" | "select" | "brush";
 export type ViewMode = "setup" | "mesh" | "deformed" | "density" | "infill";
@@ -117,9 +117,13 @@ interface AppState {
   resultField: string;
   /** Min/max of the active stress/strain field, for the legend. */
   fieldRange: { min: number; max: number } | null;
+  /** User override of the color scale (null = auto). */
+  legendMin: number | null;
+  legendMax: number | null;
+  /** Mark the locations of the min/max values in the plot. */
+  showExtremes: boolean;
   // Section plane.
   sectionOn: boolean;
-  sectionMode: "translate" | "rotate";
 
   loadFile(name: string, bytes: ArrayBuffer): Promise<void>;
   setSegAngle(angle: number): Promise<void>;
@@ -149,8 +153,9 @@ interface AppState {
   setRegionVisible(index: number, on: boolean): void;
   setDensityThreshold(v: number): void;
   setResultField(kind: string): Promise<void>;
+  setLegendRange(min: number | null, max: number | null): void;
+  setShowExtremes(on: boolean): void;
   toggleSection(): void;
-  setSectionMode(mode: "translate" | "rotate"): void;
   flipSection(): void;
   setSectionAxis(axis: "x" | "y" | "z"): void;
   runCheck(): Promise<void>;
@@ -169,6 +174,10 @@ let isoTimer: ReturnType<typeof setTimeout> | null = null;
 let smoothTimer: ReturnType<typeof setTimeout> | null = null;
 /** Per-kind cache of fetched stress/strain fields (cleared on invalidation). */
 const fieldCache = new Map<string, Float32Array>();
+
+function fieldUnit(kind: string): string {
+  return RESULT_FIELDS.find((f) => f.value === kind)?.unit ?? "";
+}
 
 /** Events the 3D scene listens to (kept out of React rendering). */
 export interface SceneEvents {
@@ -192,9 +201,12 @@ export interface SceneEvents {
   onRegionVisibility?: (visible: boolean[]) => void;
   /** Stress/strain scalars for the deformed view (null = |u| colors). */
   onScalarField?: (values: Float32Array | null) => void;
+  /** User override of the color-scale range (nulls = auto). */
+  onLegendRange?: (min: number | null, max: number | null) => void;
+  /** Min/max location markers; unit drives the label formatting. */
+  onShowExtremes?: (on: boolean, unit: string) => void;
   // Section plane controls.
   onSectionState?: (on: boolean) => void;
-  onSectionMode?: (mode: "translate" | "rotate") => void;
   onSectionFlip?: () => void;
   onSectionAxis?: (axis: "x" | "y" | "z") => void;
 }
@@ -216,8 +228,11 @@ function invalidateResults(set: (p: Partial<AppState>) => void, get: () => AppSt
     densityThreshold: 0,
     resultField: "u",
     fieldRange: null,
+    legendMin: null,
+    legendMax: null,
   });
   fieldCache.clear();
+  sceneEvents.onLegendRange?.(null, null);
   sceneEvents.onScalarField?.(null);
   sceneEvents.onRegions?.(null);
   sceneEvents.onVertexDensity?.(null);
@@ -288,8 +303,10 @@ export const useStore = create<AppState>((set, get) => ({
   densityThreshold: 0,
   resultField: "u",
   fieldRange: null,
+  legendMin: null,
+  legendMax: null,
+  showExtremes: false,
   sectionOn: false,
-  sectionMode: "translate",
 
   async loadFile(name, bytes) {
     set({ busy: "Parsing & segmenting…", error: null, notice: null });
@@ -318,6 +335,8 @@ export const useStore = create<AppState>((set, get) => ({
         densityThreshold: 0,
         resultField: "u",
         fieldRange: null,
+        legendMin: null,
+        legendMax: null,
         busy: null,
         notice:
           (model as LoadedModel & { meshObjects?: number }).meshObjects &&
@@ -580,6 +599,7 @@ export const useStore = create<AppState>((set, get) => ({
       }
       const { stats, displacements } = await engine.solve();
       fieldCache.clear(); // stress fields belong to the previous solution
+      sceneEvents.onLegendRange?.(null, null);
       set({
         stats,
         hasResult: true,
@@ -587,6 +607,8 @@ export const useStore = create<AppState>((set, get) => ({
         busy: null,
         resultField: "u",
         fieldRange: null,
+        legendMin: null,
+        legendMax: null,
         notice: stats.converged
           ? null
           : `Solver stopped at the iteration cap (residual ${stats.relResidual.toExponential(1)}) — the shown result is a close approximation. Preview resolution converges faster.`,
@@ -628,9 +650,12 @@ export const useStore = create<AppState>((set, get) => ({
       );
       const vis = out.regions.map(() => true);
       fieldCache.clear(); // stress fields belong to the previous solution
+      sceneEvents.onLegendRange?.(null, null);
       set({
         resultField: "u",
         fieldRange: null,
+        legendMin: null,
+        legendMax: null,
         optSummary: out.summary,
         optProgress: null,
         busy: null,
@@ -710,7 +735,10 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   async setResultField(kind) {
-    set({ resultField: kind });
+    // The custom scale belongs to the previous field.
+    set({ resultField: kind, legendMin: null, legendMax: null });
+    sceneEvents.onLegendRange?.(null, null);
+    sceneEvents.onShowExtremes?.(get().showExtremes, fieldUnit(kind));
     if (kind === "u") {
       set({ fieldRange: null });
       sceneEvents.onScalarField?.(null);
@@ -737,15 +765,21 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
+  setLegendRange(min, max) {
+    if (min !== null && max !== null && !(max > min)) return; // ignore inverted
+    set({ legendMin: min, legendMax: max });
+    sceneEvents.onLegendRange?.(min, max);
+  },
+
+  setShowExtremes(on) {
+    set({ showExtremes: on });
+    sceneEvents.onShowExtremes?.(on, fieldUnit(get().resultField));
+  },
+
   toggleSection() {
     const on = !get().sectionOn;
     set({ sectionOn: on });
     sceneEvents.onSectionState?.(on);
-  },
-
-  setSectionMode(mode) {
-    set({ sectionMode: mode });
-    sceneEvents.onSectionMode?.(mode);
   },
 
   flipSection() {
