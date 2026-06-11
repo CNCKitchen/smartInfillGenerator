@@ -274,6 +274,7 @@ export const useStore = create<AppState>((set, get) => ({
         model,
         bcs: [],
         activeBcId: null,
+        tool: "orbit",
         check: null,
         stats: null,
         hasResult: false,
@@ -283,6 +284,9 @@ export const useStore = create<AppState>((set, get) => ({
         voxelInfo: null,
         voxelMeshReady: false,
         autoScale: 1,
+        regionInfos: [],
+        regionVisible: [],
+        densityThreshold: 0,
         busy: null,
         notice:
           (model as LoadedModel & { meshObjects?: number }).meshObjects &&
@@ -290,13 +294,16 @@ export const useStore = create<AppState>((set, get) => ({
             ? "3MF contained multiple meshes — analyzing the largest body only."
             : null,
       });
-      sceneEvents.onModelLoaded?.(model);
+      // Clear stale overlays BEFORE the model swap so nothing survives even
+      // if a later step fails.
       sceneEvents.onBcsChanged?.([], null);
       sceneEvents.onDisplacements?.(null, null);
       sceneEvents.onVertexDensity?.(null);
       sceneEvents.onRegions?.(null);
       sceneEvents.onAnimateMode?.(null);
       sceneEvents.onVoxelMesh?.(null, null);
+      sceneEvents.onOptShape?.(null, null);
+      sceneEvents.onModelLoaded?.(model);
       sceneEvents.onViewState?.("setup", get().deformScale);
     } catch (e) {
       set({ busy: null, error: e instanceof Error ? e.message : String(e) });
@@ -345,6 +352,7 @@ export const useStore = create<AppState>((set, get) => ({
       bcs: get().bcs.filter((b) => b.id !== id),
       activeBcId: get().activeBcId === id ? null : get().activeBcId,
     });
+    if (get().bcs.length === 0) set({ tool: "orbit" });
     invalidateResults(set, get);
     sceneEvents.onBcsChanged?.(get().bcs, get().activeBcId);
     void pushBcs(get);
@@ -352,6 +360,7 @@ export const useStore = create<AppState>((set, get) => ({
 
   setActiveBc(id) {
     set({ activeBcId: id });
+    if (id === null) set({ tool: "orbit" });
     sceneEvents.onBcsChanged?.(get().bcs, id);
   },
 

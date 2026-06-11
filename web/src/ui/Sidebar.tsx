@@ -26,8 +26,9 @@ export function Sidebar() {
     await s.loadFile(f.name, await f.arrayBuffer());
   };
 
-  // Leaving the supports & loads workspace snaps the tool back to Orbit so a
-  // stray click in the viewport can't silently edit a selection.
+  // Leaving the supports & loads workspace (clicking another step) or
+  // pressing Esc snaps the tool back to plain orbiting so a stray click in
+  // the viewport can't silently edit a selection.
   useEffect(() => {
     const onDown = (e: PointerEvent) => {
       const st = useStore.getState();
@@ -36,8 +37,17 @@ export function Sidebar() {
       if (!el || el.closest("[data-bcsection]") || el.closest(".viewer")) return;
       st.setTool("orbit");
     };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      const st = useStore.getState();
+      if (st.tool !== "orbit") st.setTool("orbit");
+    };
     document.addEventListener("pointerdown", onDown, true);
-    return () => document.removeEventListener("pointerdown", onDown, true);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("pointerdown", onDown, true);
+      document.removeEventListener("keydown", onKey);
+    };
   }, []);
 
   return (
@@ -96,17 +106,33 @@ export function Sidebar() {
       {s.model && (
         <section data-bcsection>
           <header>2 · Supports & loads</header>
-          <div className="toolrow">
-            <button className={s.tool === "orbit" ? "on" : ""} onClick={() => s.setTool("orbit")}>
-              Orbit
-            </button>
-            <button className={s.tool === "select" ? "on" : ""} onClick={() => s.setTool("select")}>
-              Pick surface
-            </button>
-            <button className={s.tool === "brush" ? "on" : ""} onClick={() => s.setTool("brush")}>
-              Brush
-            </button>
+          {s.bcs.map((bc) => (
+            <BcRow key={bc.id} bc={bc} />
+          ))}
+
+          <div className="addrow">
+            <button onClick={() => s.addBc("fixed")}>+ Fixed</button>
+            <button onClick={() => s.addBc("frictionless")}>+ Slide</button>
+            <button onClick={() => s.addBc("force")}>+ Force</button>
+            <button onClick={() => s.addBc("pressure")}>+ Pressure</button>
           </div>
+
+          {s.bcs.length > 0 && (
+            <div className="toolrow">
+              <button
+                className={s.tool === "select" ? "on" : ""}
+                onClick={() => s.setTool(s.tool === "select" ? "orbit" : "select")}
+              >
+                Pick surface
+              </button>
+              <button
+                className={s.tool === "brush" ? "on" : ""}
+                onClick={() => s.setTool(s.tool === "brush" ? "orbit" : "brush")}
+              >
+                Brush
+              </button>
+            </div>
+          )}
           {s.tool === "brush" && (
             <>
               <label className="row">
@@ -130,21 +156,16 @@ export function Sidebar() {
               </label>
             </>
           )}
-
-          {s.bcs.map((bc) => (
-            <BcRow key={bc.id} bc={bc} />
-          ))}
-
-          <div className="addrow">
-            <button onClick={() => s.addBc("fixed")}>+ Fixed</button>
-            <button onClick={() => s.addBc("frictionless")}>+ Slide</button>
-            <button onClick={() => s.addBc("force")}>+ Force</button>
-            <button onClick={() => s.addBc("pressure")}>+ Pressure</button>
-          </div>
-          {s.activeBcId && (
+          {s.activeBcId && s.tool !== "orbit" && (
             <div className="hint">
-              Click surfaces to add to the highlighted condition (click again to remove, or use the
-              brush). Shift-click always removes. Clicking outside this section returns to Orbit.
+              Click surfaces to add to the highlighted condition (click again to remove,
+              shift-click always removes). Esc or clicking another step returns to orbiting.
+            </div>
+          )}
+          {s.activeBcId && s.tool === "orbit" && (
+            <div className="hint">
+              Choose <b>Pick surface</b> or <b>Brush</b> to assign surfaces to the highlighted
+              condition. Orbiting is always active.
             </div>
           )}
         </section>

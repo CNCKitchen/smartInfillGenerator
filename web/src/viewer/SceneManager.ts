@@ -204,6 +204,11 @@ export class SceneManager {
       this.scene.remove(this.mesh);
       this.geometry?.dispose();
       (this.mesh.material as THREE.Material).dispose();
+      // Null immediately: cleanup below triggers refreshView, which must
+      // not touch the old geometry with new-sized buffers (set() with a
+      // longer source throws "offset is out of bounds").
+      this.mesh = null;
+      this.geometry = null;
     }
     this.triCount = model.triCount;
     this.basePositions = new Float32Array(model.positions);
@@ -214,6 +219,7 @@ export class SceneManager {
     this.viewMode = "setup";
     this.setRegions(null);
     this.setVoxelMesh(null, null);
+    this.setOptShape(null, null);
 
     this.geometry = new THREE.BufferGeometry();
     this.geometry.setAttribute("position", new THREE.BufferAttribute(model.positions, 3));
@@ -775,6 +781,7 @@ export class SceneManager {
     const attr = this.geometry.getAttribute("position") as THREE.BufferAttribute;
     const out = attr.array as Float32Array;
     const base = this.basePositions;
+    if (out.length !== base.length) return; // mid-model-swap: sizes disagree
     if (this.rbmMode && rbmOffset !== undefined) {
       const m = this.rbmMode;
       const s = rbmOffset * this.rbmAmp;

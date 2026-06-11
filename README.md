@@ -24,9 +24,10 @@ Workflow in the app:
    original mesh. Adjust the surface-detection angle if patches come out too
    coarse/fine. An axis gizmo (bottom-right) shows the orientation; supports
    are marked with classic FEA triangles. Parallel projection throughout.
-2. **Supports & loads** — add Fixed / Slide / Force / Pressure conditions and
-   click surfaces (or brush) to assign them. Clicking anywhere outside this
-   section snaps the tool back to Orbit. (Self-weight exists in the engine
+2. **Supports & loads** — add Fixed / Slide / Force / Pressure conditions,
+   then arm **Pick surface** or **Brush** (below the condition list) to
+   assign surfaces to the highlighted one. Orbiting is always active; Esc or
+   clicking another step disarms the tool. (Self-weight exists in the engine
    but is hidden in the UI — negligible for desktop plastic prints.)
 3. **Material & analysis** — material presets (editable in ⚙ Settings,
    persisted per browser), resolution (Preview recommended for the first
