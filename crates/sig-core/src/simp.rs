@@ -14,8 +14,8 @@
 //! density filter (radius ~1.6 cells) against checkerboards and slivers.
 
 use crate::fem::ke_hex;
-use crate::mg::{Level, MgSolver};
-use crate::solve::{NodeProblem, SolveSettings};
+use crate::mg::Level;
+use crate::solve::{solve_cached, NodeProblem, SolverCache, SolveSettings};
 use crate::voxel::VoxelGrid;
 
 const EMIN_REL: f32 = 1e-6;
@@ -329,56 +329,30 @@ pub fn build_rhs(grid: &VoxelGrid, problem: &NodeProblem) -> Vec<f64> {
     b
 }
 
-fn solve_once(
-    grid: &VoxelGrid,
-    levels: usize,
-    eps: Vec<f32>,
-    problem: &NodeProblem,
-    settings: &SolveSettings,
-    b: &[f64],
-    u: &mut [f64],
-    tol: f64,
-) -> Result<(Level, f64), crate::solve::SolveError> {
-    let (nx, ny, nz) = (grid.nx, grid.ny, grid.nz);
-    let (mx, my, mz) = (nx + 1, ny + 1, nz + 1);
-    let ndof = 3 * mx * my * mz;
-    let mut fixed = vec![false; ndof];
-    for &n in &problem.fixed {
-        for d in 0..3 {
-            fixed[3 * n as usize + d] = true;
-        }
-    }
-    let ke64 = ke_hex(settings.e0, settings.nu, grid.h);
-    let finest = Level::new(nx, ny, nz, grid.h, eps, ke64, &fixed, problem.springs.clone());
-    let mut bb = b.to_vec();
-    for (i, c) in finest.constrained.iter().enumerate() {
-        if *c {
-            bb[i] = 0.0;
-        }
-    }
-    // The level is consumed by the solver; rebuild a cheap copy for energy
-    // evaluation by keeping KE outside. We return the finest via a fresh build
-    // — instead, solve and recompute compliance from b·u (cheaper, exact).
-    let mut solver = MgSolver::new(finest, levels);
-    // Hitting the cap is acceptable here: the verification/baseline solves
-    // only feed the comparison card, and the warm-started iterate at the cap
-    // is accurate to ~1e-4 — aborting a finished optimization over the last
-    // decimals would be far worse UX.
-    let _ = solver.solve_warm(&bb, u, tol, 600);
-    let mut compliance = 0f64;
-    for i in 0..ndof {
-        compliance += bb[i] * u[i];
-    }
-    let level = solver.levels.swap_remove(0);
-    Ok((level, compliance))
-}
-
 /// Run the optimization. `progress` is called once per iteration.
 /// `x0`/`u0` warm-start the design and displacement fields — the
 /// stiffness-match outer loop re-runs at slightly different budgets, where
 /// a warm pass converges in a fraction of the iterations (the OC volume
 /// bisection shifts the mean to the new budget in the first update).
 pub fn optimize(
+    grid: &VoxelGrid,
+    levels: usize,
+    problem: &NodeProblem,
+    settings: &SolveSettings,
+    params: &OptimizeParams,
+    x0: Option<&[f64]>,
+    u0: Option<&[f64]>,
+    progress: impl FnMut(&OptimizeProgress, &[f64], &[u32]),
+) -> Result<OptimizeResult, OptimizeError> {
+    optimize_cached(&mut None, grid, levels, problem, settings, params, x0, u0, progress)
+}
+
+/// `optimize` reusing (and leaving behind) the hierarchy + displacement in
+/// `slot` — the verification/baseline solves right after, and the warm
+/// re-passes of the stiffness-match loop, then skip the full solver rebuild.
+#[allow(clippy::too_many_arguments)]
+pub fn optimize_cached(
+    slot: &mut Option<SolverCache>,
     grid: &VoxelGrid,
     levels: usize,
     problem: &NodeProblem,
@@ -431,22 +405,16 @@ pub fn optimize(
     let mut small_streak = 0usize;
     let mut last_mean_change = f64::INFINITY;
 
-    // Build the hierarchy ONCE; iterations only swap stiffness values in.
-    let mut fixed = vec![false; ndof];
-    for &n in &problem.fixed {
-        for d in 0..3 {
-            fixed[3 * n as usize + d] = true;
-        }
-    }
+    // Build the hierarchy ONCE (or reuse a cached one — same grid/BC/void
+    // pattern); iterations only swap stiffness values in.
     let eps0 = build_eps(grid, &skin, &design_cells, &x, params.exponent, params.coeff);
-    let finest = Level::new(nx, ny, nz, grid.h, eps0, ke64, &fixed, problem.springs.clone());
+    let cache = SolverCache::prepare(slot, grid, levels, problem, settings, eps0);
     let mut bb = b.clone();
-    for (i, c) in finest.constrained.iter().enumerate() {
+    for (i, c) in cache.solver.levels[0].constrained.iter().enumerate() {
         if *c {
             bb[i] = 0.0;
         }
     }
-    let mut solver = MgSolver::new(finest, levels);
 
     for it in 0..params.max_iter {
         iterations = it + 1;
@@ -455,7 +423,7 @@ pub fn optimize(
             *v = v.clamp(params.floor, params.cap);
         }
         let eps = build_eps(grid, &skin, &design_cells, &x_phys, params.exponent, params.coeff);
-        solver.update_eps(eps);
+        cache.solver.update_eps(eps);
         // Inexact inner solves are standard in topology optimization: while
         // the layout is forming, sensitivity noise is tolerated (filter +
         // move limits), so cap the MGCG work. Once the design slows down,
@@ -463,13 +431,13 @@ pub fn optimize(
         // keep creeping toward the true solution for tens of iterations and
         // the design never becomes stationary.
         let (tol_i, cap_i) = if last_mean_change < 0.012 { (2e-4, 60) } else { (5e-4, 15) };
-        let inner = solver.solve_warm(&bb, &mut u, tol_i, cap_i);
+        let inner = cache.solver.solve_warm(&bb, &mut u, tol_i, cap_i);
         compliance = 0.0;
         for i in 0..ndof {
             compliance += bb[i] * u[i];
         }
 
-        cell_strain_energy(&solver.levels[0], &ke64, &u, &design_cells, &mut se);
+        cell_strain_energy(&cache.solver.levels[0], &ke64, &u, &design_cells, &mut se);
         // dC/dx_phys = -(1-emin) * c * n * x^(n-1) * se
         for k in 0..design_cells.len() {
             sens_phys[k] = -(1.0 - EMIN_REL as f64)
@@ -571,6 +539,9 @@ pub fn optimize(
     for v in x_phys.iter_mut() {
         *v = v.clamp(params.floor, params.cap);
     }
+    // Leave the final displacement in the cache: the verification solves
+    // that follow warm-start from it.
+    cache.last_u.copy_from_slice(&u);
 
     Ok(OptimizeResult {
         x: x_phys,
@@ -599,21 +570,46 @@ pub fn evaluate(
     coeff: f64,
     warm: Option<&[f64]>,
 ) -> Result<(f64, f64, Vec<f64>), crate::solve::SolveError> {
-    let eps = build_eps(grid, skin, design_cells, x, exponent, coeff);
-    let b = build_rhs(grid, problem);
-    let ndof = b.len();
-    let mut u = vec![0f64; ndof];
+    let mut slot = None;
     if let Some(w) = warm {
-        u.copy_from_slice(w);
+        // Seed the warm start through a prepared cache.
+        let eps = build_eps(grid, skin, design_cells, x, exponent, coeff);
+        let cache = SolverCache::prepare(&mut slot, grid, levels, problem, settings, eps);
+        if cache.last_u.len() == w.len() {
+            cache.last_u.copy_from_slice(w);
+        }
     }
-    let (_, compliance) =
-        solve_once(grid, levels, eps, problem, settings, &b, &mut u, settings.tol)?;
+    evaluate_cached(&mut slot, grid, levels, problem, settings, skin, design_cells, x, exponent, coeff)
+}
+
+/// `evaluate` reusing the hierarchy + warm start in `slot`.
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_cached(
+    slot: &mut Option<SolverCache>,
+    grid: &VoxelGrid,
+    levels: usize,
+    problem: &NodeProblem,
+    settings: &SolveSettings,
+    skin: &[u32],
+    design_cells: &[u32],
+    x: &[f64],
+    exponent: f64,
+    coeff: f64,
+) -> Result<(f64, f64, Vec<f64>), crate::solve::SolveError> {
+    let eps = build_eps(grid, skin, design_cells, x, exponent, coeff);
+    // Hitting the cap is acceptable here: the verification/baseline solves
+    // only feed the comparison card, and the warm-started iterate at the cap
+    // is accurate to ~1e-4 — aborting a finished optimization over the last
+    // decimals would be far worse UX.
+    let r = solve_cached(slot, grid, levels, problem, settings, eps, settings.tol, 600)?;
     let mut max2 = 0f64;
-    for n in 0..ndof / 3 {
-        let m = u[3 * n] * u[3 * n] + u[3 * n + 1] * u[3 * n + 1] + u[3 * n + 2] * u[3 * n + 2];
+    for n in 0..r.u.len() / 3 {
+        let m = r.u[3 * n] * r.u[3 * n]
+            + r.u[3 * n + 1] * r.u[3 * n + 1]
+            + r.u[3 * n + 2] * r.u[3 * n + 2];
         max2 = max2.max(m);
     }
-    Ok((compliance, max2.sqrt(), u))
+    Ok((r.compliance, max2.sqrt(), r.u))
 }
 
 /// Solve with an explicit per-cell stiffness field and return a full
@@ -627,50 +623,34 @@ pub fn solve_with_eps(
     settings: &SolveSettings,
     eps: Vec<f32>,
 ) -> Result<(crate::solve::Solution, f64), crate::solve::SolveError> {
-    if grid.solid_count() == 0 {
-        return Err(crate::solve::SolveError::NoSolidCells);
-    }
-    if problem.fixed.is_empty() && problem.springs.is_empty() {
-        return Err(crate::solve::SolveError::NoFixedNodes);
-    }
-    let (nx, ny, nz) = (grid.nx, grid.ny, grid.nz);
-    let (mx, my, mz) = (nx + 1, ny + 1, nz + 1);
-    let ndof = 3 * mx * my * mz;
-    let mut fixed = vec![false; ndof];
-    for &n in &problem.fixed {
-        for d in 0..3 {
-            fixed[3 * n as usize + d] = true;
-        }
-    }
-    let mut b = build_rhs(grid, problem);
-    let ke64 = ke_hex(settings.e0, settings.nu, grid.h);
-    let finest = Level::new(nx, ny, nz, grid.h, eps, ke64, &fixed, problem.springs.clone());
-    for (i, c) in finest.constrained.iter().enumerate() {
-        if *c {
-            b[i] = 0.0;
-        }
-    }
-    let mut solver = MgSolver::new(finest, levels);
-    let mut u = vec![0f64; ndof];
-    let stats = solver.solve(&b, &mut u, settings.tol, settings.max_iter);
-    let mut compliance = 0f64;
-    for i in 0..ndof {
-        compliance += b[i] * u[i];
-    }
+    solve_with_eps_cached(&mut None, grid, levels, problem, settings, eps)
+}
+
+/// `solve_with_eps` reusing the hierarchy + warm start in `slot`.
+pub fn solve_with_eps_cached(
+    slot: &mut Option<SolverCache>,
+    grid: &VoxelGrid,
+    levels: usize,
+    problem: &NodeProblem,
+    settings: &SolveSettings,
+    eps: Vec<f32>,
+) -> Result<(crate::solve::Solution, f64), crate::solve::SolveError> {
+    let r = solve_cached(slot, grid, levels, problem, settings, eps, settings.tol, settings.max_iter)?;
+    let (mx, my, mz) = (grid.nx + 1, grid.ny + 1, grid.nz + 1);
     Ok((
         crate::solve::Solution {
-            u: u.iter().map(|&v| v as f32).collect(),
+            u: r.u.iter().map(|&v| v as f32).collect(),
             mx,
             my,
             mz,
             h: grid.h,
             origin: grid.origin,
             active: crate::solve::active_nodes(grid),
-            iterations: stats.iterations,
-            rel_residual: stats.rel_residual,
-            converged: stats.converged,
-            residuals: std::mem::take(&mut solver.last_trace),
+            iterations: r.stats.iterations,
+            rel_residual: r.stats.rel_residual,
+            converged: r.stats.converged,
+            residuals: r.residuals,
         },
-        compliance,
+        r.compliance,
     ))
 }

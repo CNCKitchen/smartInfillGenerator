@@ -2,5 +2,8 @@
 /web/node_modules
 /web/dist
 /web/src/wasm/
+/web/public/wasm-mt/
+/web/bench-out.txt
+/web/bench-err.txt
 _sample_extracted/
 *.stl.tmp

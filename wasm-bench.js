@@ -1,5 +1,6 @@
 // Phase-1 WASM benchmark harness (Node >= 18).
-// Times the same scenarios as the native bench, single-threaded WASM + SIMD128.
+// Times the same scenarios as the native bench in single-threaded WASM.
+// Usage: node wasm-bench.js [label]
 const fs = require("fs");
 const path = require("path");
 
@@ -12,7 +13,20 @@ const wasmPath = path.join(
 );
 const bytes = fs.readFileSync(wasmPath);
 const mod = new WebAssembly.Module(bytes);
-const inst = new WebAssembly.Instance(mod, {});
+
+// The module carries wasm-bindgen imports for the Model API; the C-ABI bench
+// exports never call back into JS, so throwing stubs satisfy instantiation.
+const imports = {};
+for (const im of WebAssembly.Module.imports(mod)) {
+  imports[im.module] = imports[im.module] || {};
+  imports[im.module][im.name] =
+    im.kind === "function"
+      ? () => {
+          throw new Error(`unexpected JS call: ${im.module}.${im.name}`);
+        }
+      : undefined;
+}
+const inst = new WebAssembly.Instance(mod, imports);
 const e = inst.exports;
 
 function time(label, fn) {
@@ -23,7 +37,8 @@ function time(label, fn) {
   return dt;
 }
 
-console.log(`wasm module: ${(bytes.length / 1024).toFixed(0)} KiB, single thread + simd128`);
+const label = process.argv[2] || "unlabeled build";
+console.log(`wasm module: ${(bytes.length / 1024).toFixed(0)} KiB, single thread, ${label}`);
 time("voxelize sphere h=0.5 (1.05M cells)", () => e.bench_voxelize(0.5));
 time("voxelize sphere h=0.3 (4.66M cells)", () => e.bench_voxelize(0.3));
 time("solve 128x32x32 (0.13M cells) ratio", () => e.bench_solve(128, 32, 32, 0.5).toFixed(4));

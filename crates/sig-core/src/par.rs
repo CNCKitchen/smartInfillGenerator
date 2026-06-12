@@ -100,6 +100,21 @@ pub fn sub(out: &mut [f32], a: &[f32], b: &[f32]) {
     }
 }
 
+/// y[i] = a * y[i] + b * x[i]  (Chebyshev direction update)
+pub fn axpby(y: &mut [f32], a: f32, b: f32, x: &[f32]) {
+    debug_assert_eq!(y.len(), x.len());
+    #[cfg(feature = "parallel")]
+    y.par_chunks_mut(CHUNK).zip(x.par_chunks(CHUNK)).for_each(|(yc, xc)| {
+        for (yi, xi) in yc.iter_mut().zip(xc) {
+            *yi = a * *yi + b * xi;
+        }
+    });
+    #[cfg(not(feature = "parallel"))]
+    for (yi, xi) in y.iter_mut().zip(x) {
+        *yi = a * *yi + b * xi;
+    }
+}
+
 pub fn fill(y: &mut [f32], v: f32) {
     #[cfg(feature = "parallel")]
     y.par_chunks_mut(CHUNK).for_each(|c| c.fill(v));

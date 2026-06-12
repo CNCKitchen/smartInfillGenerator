@@ -330,6 +330,176 @@ impl Solution {
     }
 }
 
+/// Per-cell stiffness factors for a plain solid solve (grid occupancy).
+pub fn grid_eps(grid: &VoxelGrid) -> Vec<f32> {
+    let mut eps = vec![0f32; grid.cell_count()];
+    for (i, &sc) in grid.scale.iter().enumerate() {
+        if sc > 0.0 {
+            eps[i] = EMIN_REL + (1.0 - EMIN_REL) * sc;
+        }
+    }
+    eps
+}
+
+/// Solver hierarchy + warm-start cache across solves. The expensive setup of
+/// a solve (parity colors, constraint masks, block-Jacobi inverses, the
+/// coarsened hierarchy, the smoother's eigenvalue estimate) depends only on
+/// the grid, the KE parameters (e0, nu, h), the BC set and the VOID pattern
+/// of eps — all of which usually survive across interactive re-solves,
+/// as-printed checks and the optimizer's verification passes. eps VALUE
+/// changes ride the cheap `update_eps` path; anything else falls back to a
+/// cold rebuild. Also keeps the last displacement field as the warm start
+/// for the next solve (a load tweak then converges in a few iterations).
+pub struct SolverCache {
+    nx: usize,
+    ny: usize,
+    nz: usize,
+    h: f64,
+    e0: f64,
+    nu: f64,
+    levels: usize,
+    fixed: Vec<u32>,
+    springs: Vec<(u32, [f64; 3], f64)>,
+    pub solver: MgSolver,
+    /// Displacement of the last solve through this cache.
+    pub last_u: Vec<f64>,
+}
+
+impl SolverCache {
+    fn build(
+        grid: &VoxelGrid,
+        levels: usize,
+        problem: &NodeProblem,
+        s: &SolveSettings,
+        eps: Vec<f32>,
+    ) -> Self {
+        let (nx, ny, nz) = (grid.nx, grid.ny, grid.nz);
+        let ndof = 3 * (nx + 1) * (ny + 1) * (nz + 1);
+        let mut fixed = vec![false; ndof];
+        for &n in &problem.fixed {
+            for d in 0..3 {
+                fixed[3 * n as usize + d] = true;
+            }
+        }
+        let ke64 = ke_hex(s.e0, s.nu, grid.h);
+        let finest = Level::new(nx, ny, nz, grid.h, eps, ke64, &fixed, problem.springs.clone());
+        let solver = MgSolver::new(finest, levels);
+        Self {
+            nx,
+            ny,
+            nz,
+            h: grid.h,
+            e0: s.e0,
+            nu: s.nu,
+            levels,
+            fixed: problem.fixed.clone(),
+            springs: problem.springs.clone(),
+            solver,
+            last_u: vec![0f64; ndof],
+        }
+    }
+
+    fn matches(
+        &self,
+        grid: &VoxelGrid,
+        levels: usize,
+        problem: &NodeProblem,
+        s: &SolveSettings,
+        eps: &[f32],
+    ) -> bool {
+        self.nx == grid.nx
+            && self.ny == grid.ny
+            && self.nz == grid.nz
+            && self.h == grid.h
+            && self.e0 == s.e0
+            && self.nu == s.nu
+            && self.levels == levels
+            && self.fixed == problem.fixed
+            && self.springs == problem.springs
+            && self.solver.eps_exact().len() == eps.len()
+            && self.solver.eps_exact().iter().zip(eps).all(|(a, b)| (*a > 0.0) == (*b > 0.0))
+    }
+
+    /// Make `slot` valid for this problem — reuse (with `update_eps` when
+    /// only stiffness values changed) or cold-rebuild — and return it.
+    pub fn prepare<'a>(
+        slot: &'a mut Option<SolverCache>,
+        grid: &VoxelGrid,
+        levels: usize,
+        problem: &NodeProblem,
+        s: &SolveSettings,
+        eps: Vec<f32>,
+    ) -> &'a mut SolverCache {
+        let reuse = slot.as_ref().is_some_and(|c| c.matches(grid, levels, problem, s, &eps));
+        if reuse {
+            let c = slot.as_mut().unwrap();
+            if c.solver.eps_exact() != &eps[..] {
+                c.solver.update_eps(eps);
+            }
+        } else {
+            *slot = Some(Self::build(grid, levels, problem, s, eps));
+        }
+        slot.as_mut().unwrap()
+    }
+}
+
+/// One cache-aware solve: assemble the rhs, (re)use the hierarchy in `slot`,
+/// warm-start from the cache's last displacement.
+pub struct CachedSolve {
+    pub stats: crate::mg::SolveStats,
+    /// Displacement field (f64, padded node grid).
+    pub u: Vec<f64>,
+    /// Relative residual per MGCG iteration (element 0 = initial).
+    pub residuals: Vec<f32>,
+    /// Compliance b·u of this solve.
+    pub compliance: f64,
+}
+
+pub fn solve_cached(
+    slot: &mut Option<SolverCache>,
+    grid: &VoxelGrid,
+    levels: usize,
+    problem: &NodeProblem,
+    s: &SolveSettings,
+    eps: Vec<f32>,
+    tol: f64,
+    max_iter: usize,
+) -> Result<CachedSolve, SolveError> {
+    if grid.solid_count() == 0 {
+        return Err(SolveError::NoSolidCells);
+    }
+    if problem.fixed.is_empty() && problem.springs.is_empty() {
+        return Err(SolveError::NoFixedNodes);
+    }
+    let cache = SolverCache::prepare(slot, grid, levels, problem, s, eps);
+    let ndof = cache.solver.levels[0].ndof();
+    let mut b = vec![0f64; ndof];
+    for &(n, f) in &problem.forces {
+        for d in 0..3 {
+            b[3 * n as usize + d] += f[d];
+        }
+    }
+    for (i, c) in cache.solver.levels[0].constrained.iter().enumerate() {
+        if *c {
+            b[i] = 0.0;
+        }
+    }
+    let mut u = std::mem::take(&mut cache.last_u);
+    debug_assert_eq!(u.len(), ndof);
+    let stats = cache.solver.solve_warm(&b, &mut u, tol, max_iter);
+    let mut compliance = 0f64;
+    for i in 0..ndof {
+        compliance += b[i] * u[i];
+    }
+    cache.last_u = u.clone();
+    Ok(CachedSolve {
+        stats,
+        u,
+        residuals: std::mem::take(&mut cache.solver.last_trace),
+        compliance,
+    })
+}
+
 /// Solve with node-level BCs. `grid` must already be padded (`pad_for_levels`).
 pub fn solve_nodes(
     grid: &VoxelGrid,
@@ -337,63 +507,33 @@ pub fn solve_nodes(
     problem: &NodeProblem,
     s: &SolveSettings,
 ) -> Result<Solution, SolveError> {
-    if grid.solid_count() == 0 {
-        return Err(SolveError::NoSolidCells);
-    }
-    if problem.fixed.is_empty() && problem.springs.is_empty() {
-        return Err(SolveError::NoFixedNodes);
-    }
-    let (nx, ny, nz) = (grid.nx, grid.ny, grid.nz);
-    let (mx, my, mz) = (nx + 1, ny + 1, nz + 1);
-    let ndof = 3 * mx * my * mz;
+    solve_nodes_cached(&mut None, grid, levels, problem, s)
+}
 
-    let mut eps = vec![0f32; nx * ny * nz];
-    for (i, &sc) in grid.scale.iter().enumerate() {
-        if sc > 0.0 {
-            eps[i] = EMIN_REL + (1.0 - EMIN_REL) * sc;
-        }
-    }
-
-    let mut fixed = vec![false; ndof];
-    for &n in &problem.fixed {
-        for d in 0..3 {
-            fixed[3 * n as usize + d] = true;
-        }
-    }
-
-    let mut b = vec![0f64; ndof];
-    for &(n, f) in &problem.forces {
-        for d in 0..3 {
-            b[3 * n as usize + d] += f[d];
-        }
-    }
-
-    let ke64 = ke_hex(s.e0, s.nu, grid.h);
-    let finest = Level::new(nx, ny, nz, grid.h, eps, ke64, &fixed, problem.springs.clone());
-    for (i, c) in finest.constrained.iter().enumerate() {
-        if *c {
-            b[i] = 0.0;
-        }
-    }
-
-    let active = active_nodes(grid);
-    let mut solver = MgSolver::new(finest, levels);
-    let mut u = vec![0f64; ndof];
-    let stats = solver.solve(&b, &mut u, s.tol, s.max_iter);
+/// `solve_nodes` reusing (and refreshing) the hierarchy in `slot`.
+pub fn solve_nodes_cached(
+    slot: &mut Option<SolverCache>,
+    grid: &VoxelGrid,
+    levels: usize,
+    problem: &NodeProblem,
+    s: &SolveSettings,
+) -> Result<Solution, SolveError> {
+    let r = solve_cached(slot, grid, levels, problem, s, grid_eps(grid), s.tol, s.max_iter)?;
+    let (mx, my, mz) = (grid.nx + 1, grid.ny + 1, grid.nz + 1);
     // Hitting the cap is reported, not fatal: the iterate is the best
     // available approximation and usually visually indistinguishable.
     Ok(Solution {
-        u: u.iter().map(|&v| v as f32).collect(),
+        u: r.u.iter().map(|&v| v as f32).collect(),
         mx,
         my,
         mz,
         h: grid.h,
         origin: grid.origin,
-        active,
-        iterations: stats.iterations,
-        rel_residual: stats.rel_residual,
-        converged: stats.converged,
-        residuals: std::mem::take(&mut solver.last_trace),
+        active: active_nodes(grid),
+        iterations: r.stats.iterations,
+        rel_residual: r.stats.rel_residual,
+        converged: r.stats.converged,
+        residuals: r.residuals,
     })
 }
 

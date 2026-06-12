@@ -4,10 +4,35 @@
 /// <reference lib="webworker" />
 // The wasm Model lives here; the main thread talks via EngineClient.
 
-import init, { Model } from "../wasm/sig_wasm.js";
+import type { Model } from "../wasm/sig_wasm.js";
 
 let model: Model | null = null;
-const ready = init();
+let ModelCtor: typeof Model;
+
+// Pick the threaded module when the page is cross-origin isolated
+// (SharedArrayBuffer available); otherwise the single-threaded fallback.
+// Both expose the identical Model API.
+const ready = (async () => {
+  if (self.crossOriginIsolated) {
+    // Static asset (web/public/wasm-mt), deliberately NOT bundled — the
+    // rayon pool workers re-import the glue by plain relative URL.
+    const mt = (await import(
+      /* @vite-ignore */ new URL("/wasm-mt/sig_wasm.js", self.location.origin).href
+    )) as typeof import("../wasm/sig_wasm.js") & {
+      initThreadPool(threads: number): Promise<unknown>;
+    };
+    await mt.default();
+    const threads = Math.max(1, navigator.hardwareConcurrency || 4);
+    await mt.initThreadPool(threads);
+    ModelCtor = mt.Model;
+    console.info(`engine: threaded wasm (${threads} threads)`);
+  } else {
+    const st = await import("../wasm/sig_wasm.js");
+    await st.default();
+    ModelCtor = st.Model;
+    console.info("engine: single-threaded wasm (page not cross-origin isolated)");
+  }
+})();
 
 type Req =
   | { id: number; op: "load"; bytes: ArrayBuffer; name: string }
@@ -86,7 +111,7 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
     switch (msg.op) {
       case "load": {
         model?.free();
-        model = new Model(new Uint8Array(msg.bytes), msg.name);
+        model = new ModelCtor(new Uint8Array(msg.bytes), msg.name);
         const positions = model.positions();
         const patchIds = model.patch_ids();
         const data = {

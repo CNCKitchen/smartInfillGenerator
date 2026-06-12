@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# WASM builds always get fixed-width SIMD: measured ~1.2x on the MGCG solve
+# (see wasm-bench.js), supported by all browsers since 2021. Applies to both
+# the wasm-pack production build and the raw cargo benchmark build.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+simd128"]

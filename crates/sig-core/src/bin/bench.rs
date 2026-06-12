@@ -87,6 +87,60 @@ fn bench_cantilever(nx: usize, ny: usize, nz: usize, h: f64) {
     );
 }
 
+/// Real-part case: 3DBenchy (thin shells, jagged boundaries — the MGCG
+/// iteration-count worst case). Fix the hull bottom, press the top down.
+fn bench_benchy() {
+    let bytes = match std::fs::read("3dbenchy.stl") {
+        Ok(b) => b,
+        Err(_) => {
+            println!("benchy:   3dbenchy.stl not found (run from repo root) — skipped");
+            return;
+        }
+    };
+    let mesh = sig_core::mesh::TriMesh::from_stl(&bytes).expect("benchy parse");
+    let (lo, hi) = mesh.bounds().unwrap();
+    let vol = (hi[0] - lo[0]) * (hi[1] - lo[1]) * (hi[2] - lo[2]);
+    let h = sig_core::voxel::pick_voxel_size(vol, 300_000.0, 0.0);
+    let t0 = Instant::now();
+    let grid = VoxelGrid::voxelize(&mesh, h);
+    let t_vox = t0.elapsed();
+    let problem = StaticProblem {
+        grid,
+        fixed: vec![BoxRegion::new(
+            [lo[0] - 1.0, lo[1] - 1.0, lo[2] - 1.0],
+            [hi[0] + 1.0, hi[1] + 1.0, lo[2] + 1.0],
+        )],
+        loads: vec![(
+            BoxRegion::new(
+                [lo[0] - 1.0, lo[1] - 1.0, hi[2] - 3.0],
+                [hi[0] + 1.0, hi[1] + 1.0, hi[2] + 1.0],
+            ),
+            [0.0, 0.0, -50.0],
+        )],
+        settings: SolveSettings {
+            // Hierarchy-depth diagnostic: SIG_LEVELS=N caps the level count.
+            max_levels: std::env::var("SIG_LEVELS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(SolveSettings::default().max_levels),
+            ..SolveSettings::default()
+        },
+    };
+    let t0 = Instant::now();
+    let sol = solve_static(&problem).expect("benchy solve");
+    let dt = t0.elapsed();
+    println!(
+        "benchy:   {:.2}M-cell grid: voxelize {:.2} s, solve {:.2} s, {} MGCG iters ({:.0} ms/iter), max u {:.3} mm, res {:.1e}",
+        problem.grid.cell_count() as f64 / 1e6,
+        t_vox.as_secs_f64(),
+        dt.as_secs_f64(),
+        sol.iterations,
+        dt.as_secs_f64() * 1000.0 / sol.iterations.max(1) as f64,
+        sol.max_displacement(),
+        sol.rel_residual,
+    );
+}
+
 fn main() {
     #[cfg(feature = "parallel")]
     println!("threads: {}", rayon::current_num_threads());
@@ -94,10 +148,16 @@ fn main() {
     println!("threads: 1 (sequential build)");
 
     let big = !std::env::args().any(|a| a == "--small");
+    let benchy_only = std::env::args().any(|a| a == "--benchy");
 
+    if benchy_only {
+        bench_benchy();
+        return;
+    }
     bench_voxelize();
     bench_cantilever(128, 32, 32, 0.5);
     if big {
         bench_cantilever(256, 64, 64, 0.25);
     }
+    bench_benchy();
 }

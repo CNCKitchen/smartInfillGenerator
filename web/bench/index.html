@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Solver benchmark page: runs the single-threaded and threaded wasm
+     modules in a worker (rayon blocks, so never on the main thread) and
+     publishes results on window.__benchResults for the headless driver. -->
+<html>
+  <head><meta charset="utf-8" /><title>sig solver bench</title></head>
+  <body>
+    <pre id="out">running…</pre>
+    <script type="module">
+      const out = document.getElementById("out");
+      const log = (s) => { out.textContent += "\n" + s; console.log(s); };
+      log(`crossOriginIsolated: ${self.crossOriginIsolated}`);
+      const worker = new Worker("./bench.worker.js", { type: "module" });
+      const results = [];
+      worker.onmessage = (e) => {
+        if (e.data.done) {
+          window.__benchResults = results;
+          log("DONE");
+          return;
+        }
+        results.push(e.data);
+        log(JSON.stringify(e.data));
+      };
+      worker.onerror = (e) => {
+        window.__benchResults = { error: e.message };
+        log("worker error: " + e.message);
+      };
+      worker.postMessage({ threads: navigator.hardwareConcurrency });
+    </script>
+  </body>
+</html>

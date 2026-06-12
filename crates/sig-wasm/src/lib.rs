@@ -14,12 +14,19 @@ use sig_core::bins::{
 };
 use sig_core::mesh::TriMesh;
 use sig_core::segment::{segment, Segmentation};
-use sig_core::simp::{evaluate, optimize as simp_optimize, OptimizeParams};
-use sig_core::solve::{active_nodes, pad_for_levels, solve_nodes, SolveSettings, Solution};
+use sig_core::simp::{evaluate_cached, optimize_cached as simp_optimize, OptimizeParams};
+use sig_core::solve::{
+    active_nodes, pad_for_levels, solve_nodes_cached, SolveSettings, Solution, SolverCache,
+};
 use sig_core::stress::{cell_field, FieldKind};
 use sig_core::threemf::{export_orca_3mf, export_stl_zip, import_3mf, weld};
 use sig_core::voxel::VoxelGrid;
 use wasm_bindgen::prelude::*;
+
+/// Threaded builds expose `initThreadPool(n)` on the JS side; the worker
+/// must await it before constructing a Model. Plain builds don't have it.
+#[cfg(feature = "parallel")]
+pub use wasm_bindgen_rayon::init_thread_pool;
 
 const GRAVITY_MM_S2: [f64; 3] = [0.0, 0.0, -9810.0];
 
@@ -145,6 +152,9 @@ pub struct Model {
     /// resolved by an integer number of cell layers.
     snap_wall: f64,
     grid: Option<(VoxelGrid, usize)>, // padded grid + level count
+    /// Reused solver hierarchy + warm start across solves (self-validating:
+    /// falls back to a cold rebuild when grid/material/BCs/topology change).
+    solver_cache: Option<SolverCache>,
     solution: Option<Solution>,
     /// Per-cell stiffness factors the CURRENT solution was computed with:
     /// None = plain solid solve (grid.scale), Some = binned-infill field.
@@ -207,6 +217,7 @@ impl Model {
             target_cells: 300_000,
             snap_wall: 0.0,
             grid: None,
+            solver_cache: None,
             solution: None,
             solution_eps: None,
             opt: None,
@@ -415,7 +426,8 @@ impl Model {
         if !report.ok {
             return Err(err("model is under-constrained — run check() for details"));
         }
-        let sol = solve_nodes(grid, *levels, &asm.problem, &self.settings).map_err(err)?;
+        let sol = solve_nodes_cached(&mut self.solver_cache, grid, *levels, &asm.problem, &self.settings)
+            .map_err(err)?;
         let out = serde_json::json!({
             "iterations": sol.iterations,
             "relResidual": sol.rel_residual,
@@ -458,9 +470,15 @@ impl Model {
         let (skin, design) = sig_core::simp::classify_cells(grid, wall_mm);
         let x = vec![infill; design.len()];
         let eps = sig_core::simp::build_eps(grid, &skin, &design, &x, eval_exp, eval_coeff);
-        let (sol, _compliance) =
-            sig_core::simp::solve_with_eps(grid, *levels, &asm.problem, &self.settings, eps.clone())
-                .map_err(err)?;
+        let (sol, _compliance) = sig_core::simp::solve_with_eps_cached(
+            &mut self.solver_cache,
+            grid,
+            *levels,
+            &asm.problem,
+            &self.settings,
+            eps.clone(),
+        )
+        .map_err(err)?;
         // Mass at these print settings: solid skin + interior at the ratio.
         let cell_vol = grid.h * grid.h * grid.h;
         let n_skin = skin.len() as f64;
@@ -639,9 +657,9 @@ impl Model {
                 ));
             }
             let x_ref = vec![ref_frac; design_t.len()];
-            let (c_ref, _, _) = evaluate(
-                grid, *levels, &asm.problem, &self.settings, &skin_t, &design_t, &x_ref,
-                eval_exp, eval_coeff, None,
+            let (c_ref, _, _) = evaluate_cached(
+                &mut self.solver_cache, grid, *levels, &asm.problem, &self.settings, &skin_t,
+                &design_t, &x_ref, eval_exp, eval_coeff,
             )
             .map_err(err)?;
             c_target = c_ref;
@@ -663,6 +681,7 @@ impl Model {
         let (result, centers, bins, x_binned, c_binned, u_binned) = loop {
             let params_k = OptimizeParams { budget: budget_k, ..params };
             let result = simp_optimize(
+                &mut self.solver_cache,
                 grid,
                 *levels,
                 &asm.problem,
@@ -742,10 +761,11 @@ impl Model {
             cleanup_small_regions(grid, &result.design_cells, &mut bins, centers.len(), min_cells);
             let x_binned: Vec<f64> = bins.iter().map(|&b| centers[b as usize]).collect();
 
-            // Verification solve of the binned design (calibrated law).
-            let (c_b, _maxd, u_b) = evaluate(
-                grid, *levels, &asm.problem, &self.settings, &result.skin_cells,
-                &result.design_cells, &x_binned, eval_exp, eval_coeff, Some(&result.u),
+            // Verification solve of the binned design (calibrated law);
+            // warm-started from the optimizer's displacement via the cache.
+            let (c_b, _maxd, u_b) = evaluate_cached(
+                &mut self.solver_cache, grid, *levels, &asm.problem, &self.settings,
+                &result.skin_cells, &result.design_cells, &x_binned, eval_exp, eval_coeff,
             )
             .map_err(err)?;
             pass_trace.push((budget_k, c_b));
@@ -787,15 +807,15 @@ impl Model {
 
         let mean_binned = x_binned.iter().sum::<f64>() / x_binned.len().max(1) as f64;
         let x_uniform = vec![mean_binned; x_binned.len()];
-        let (c_uniform, _, _) = evaluate(
-            grid, *levels, &asm.problem, &self.settings, &result.skin_cells,
-            &result.design_cells, &x_uniform, eval_exp, eval_coeff, Some(&result.u),
+        let (c_uniform, _, _) = evaluate_cached(
+            &mut self.solver_cache, grid, *levels, &asm.problem, &self.settings,
+            &result.skin_cells, &result.design_cells, &x_uniform, eval_exp, eval_coeff,
         )
         .map_err(err)?;
         let x_solid = vec![1.0; x_binned.len()];
-        let (c_solid, _, _) = evaluate(
-            grid, *levels, &asm.problem, &self.settings, &result.skin_cells,
-            &result.design_cells, &x_solid, eval_exp, eval_coeff, Some(&result.u),
+        let (c_solid, _, _) = evaluate_cached(
+            &mut self.solver_cache, grid, *levels, &asm.problem, &self.settings,
+            &result.skin_cells, &result.design_cells, &x_solid, eval_exp, eval_coeff,
         )
         .map_err(err)?;
 

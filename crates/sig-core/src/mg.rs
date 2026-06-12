@@ -5,8 +5,12 @@
 //!
 //! - Matrix-free: one reference KE per level, scaled per cell by a stiffness
 //!   factor; cells are processed in 8 parity colors so scatter-adds never race.
-//! - Smoother: damped block-Jacobi (3x3 node blocks), symmetric, so the
-//!   V-cycle is a valid SPD preconditioner for CG.
+//! - Smoother: Chebyshev polynomial over block-Jacobi (3x3 node blocks).
+//!   A fixed polynomial in Dinv*K is a constant symmetric operator, so the
+//!   V-cycle remains a valid SPD preconditioner for CG — but it damps the
+//!   upper spectrum far better than a fixed-weight Jacobi sweep, which is
+//!   what cuts MGCG iterations on high-contrast (thin shell + soft infill)
+//!   grids. Cost per step is identical (one apply + one Dinv).
 //! - Coarsening: rediscretization with averaged cell stiffness (KE scales
 //!   linearly with h on cube cells), trilinear prolongation, restriction = P^T.
 //! - Dirichlet/inactive DOFs are masked: vectors stay zero there throughout.
@@ -16,7 +20,18 @@ use crate::par::{self, UnsafeSlice};
 
 pub const NU1: usize = 3;
 pub const NU2: usize = 3;
-pub const OMEGA: f32 = 0.6;
+/// Chebyshev smoothing interval: [lmax/CHEB_EIG_RATIO, lmax]. Smaller ratio =
+/// gentler polynomial; larger targets more of the spectrum per sweep.
+const CHEB_EIG_RATIO: f32 = 8.0;
+/// Safety headroom on the power-iteration lmax estimate (an UNDER-estimated
+/// lmax makes Chebyshev amplify the top modes, which diverges). Power
+/// iteration approaches lmax from below, so headroom is mandatory.
+const CHEB_LMAX_SAFETY: f32 = 1.1;
+/// Power-iteration counts: cold start vs warm restart from the stored
+/// eigenvector (the SIMP loop refreshes eps every iteration — tiny spectral
+/// shifts, so a few warm steps suffice).
+const LMAX_ITERS_COLD: usize = 8;
+const LMAX_ITERS_WARM: usize = 3;
 const NODE_CHUNK: usize = 4096;
 
 /// Map (dx,dy,dz) in {0,1}^3 to the local hex node index.
@@ -53,6 +68,11 @@ pub struct Level {
     dinv: Vec<f32>,
     /// Penalty springs (node, unit direction, stiffness N/mm) — frictionless supports.
     springs: Vec<(u32, [f64; 3], f64)>,
+    /// Largest eigenvalue estimate of Dinv*K (power iteration), the Chebyshev
+    /// smoothing interval's upper end. Refreshed on every eps update.
+    lmax: f32,
+    /// Last power-iteration eigenvector — warm restart across eps updates.
+    eigvec: Vec<f32>,
 }
 
 impl Level {
@@ -108,11 +128,52 @@ impl Level {
             constrained: vec![false; ndof],
             dinv: Vec::new(),
             springs,
+            lmax: 1.0,
+            eigvec: Vec::new(),
         };
         level.build_colors();
         level.build_constrained(fixed);
         level.build_dinv();
+        level.refresh_lmax();
         level
+    }
+
+    /// Power-iteration estimate of the largest eigenvalue of Dinv*K. Must be
+    /// re-run whenever eps (and hence K and Dinv) changes; warm-restarts from
+    /// the previous eigenvector when one exists.
+    fn refresh_lmax(&mut self) {
+        let n = self.ndof();
+        let mut v = std::mem::take(&mut self.eigvec);
+        let iters = if v.len() == n {
+            LMAX_ITERS_WARM
+        } else {
+            // Deterministic pseudo-random start so solves are reproducible.
+            v = vec![0f32; n];
+            for (i, vi) in v.iter_mut().enumerate() {
+                let mut x = (i as u32).wrapping_mul(2654435761).wrapping_add(40503);
+                x ^= x >> 13;
+                x = x.wrapping_mul(0x9E37_79B1);
+                x ^= x >> 16;
+                *vi = x as f32 / u32::MAX as f32 - 0.5;
+            }
+            LMAX_ITERS_COLD
+        };
+        par::mask_zero(&mut v, &self.constrained);
+        let mut t = vec![0f32; n];
+        let mut w = vec![0f32; n];
+        let mut lambda = 1.0f64;
+        for _ in 0..iters {
+            self.apply(&v, &mut t);
+            self.diag_apply(&t, &mut w);
+            let nw = par::norm2(&w);
+            if !(nw > 0.0) {
+                break;
+            }
+            lambda = nw;
+            par::axpby(&mut v, 0.0, (1.0 / nw) as f32, &w);
+        }
+        self.lmax = lambda as f32;
+        self.eigvec = v;
     }
 
     /// Rediscretized coarse level: half resolution, child-averaged stiffness.
@@ -294,6 +355,46 @@ impl Level {
         self.dinv = dinv;
     }
 
+    /// One cell's scatter-add contribution to y = K x.
+    /// # Safety
+    /// Concurrent callers must not target cells sharing nodes (color rule);
+    /// sequential callers are always fine.
+    #[inline(always)]
+    unsafe fn apply_cell(&self, ci: usize, e: f32, x: &[f32], ys: &UnsafeSlice<f32>) {
+        let (nx, ny) = (self.nx, self.ny);
+        let (mx, my) = (self.mx, self.my);
+        let cx = ci % nx;
+        let cy = (ci / nx) % ny;
+        let cz = ci / (nx * ny);
+        let mut xl = [0f32; 24];
+        let mut nidx = [0usize; 8];
+        for l in 0..8 {
+            let [ox, oy, oz] = NODE_OFFSETS[l];
+            let n = ((cz + oz) * my + (cy + oy)) * mx + (cx + ox);
+            nidx[l] = n;
+            xl[3 * l] = x[3 * n];
+            xl[3 * l + 1] = x[3 * n + 1];
+            xl[3 * l + 2] = x[3 * n + 2];
+        }
+        // Row-reduction form: measured FASTER than the column-axpy
+        // variant under simd128 (LLVM SLP-vectorizes across rows).
+        let mut yl = [0f32; 24];
+        for i in 0..24 {
+            let row = &self.ke[i];
+            let mut s = 0f32;
+            for j in 0..24 {
+                s += row[j] * xl[j];
+            }
+            yl[i] = e * s;
+        }
+        for l in 0..8 {
+            let n = nidx[l];
+            *ys.get_mut(3 * n) += yl[3 * l];
+            *ys.get_mut(3 * n + 1) += yl[3 * l + 1];
+            *ys.get_mut(3 * n + 2) += yl[3 * l + 2];
+        }
+    }
+
     /// y = K x (masked at constrained DOFs). x must be zero at constrained DOFs.
     pub fn apply(&self, x: &[f32], y: &mut [f32]) {
         debug_assert_eq!(x.len(), self.ndof());
@@ -301,44 +402,23 @@ impl Level {
         par::fill(y, 0.0);
         {
             let ys = UnsafeSlice::new(y);
-            let (nx, ny) = (self.nx, self.ny);
-            let (mx, my) = (self.mx, self.my);
+            // Threaded: 8 parity colors so scatter-adds never race.
+            #[cfg(feature = "parallel")]
             for color in 0..8 {
-                par::for_each(&self.colors[color], |&ci| {
-                    let ci = ci as usize;
-                    let cx = ci % nx;
-                    let cy = (ci / nx) % ny;
-                    let cz = ci / (nx * ny);
-                    let e = self.eps[ci];
-                    let mut xl = [0f32; 24];
-                    let mut nidx = [0usize; 8];
-                    for l in 0..8 {
-                        let [ox, oy, oz] = NODE_OFFSETS[l];
-                        let n = ((cz + oz) * my + (cy + oy)) * mx + (cx + ox);
-                        nidx[l] = n;
-                        xl[3 * l] = x[3 * n];
-                        xl[3 * l + 1] = x[3 * n + 1];
-                        xl[3 * l + 2] = x[3 * n + 2];
-                    }
-                    let mut yl = [0f32; 24];
-                    for i in 0..24 {
-                        let row = &self.ke[i];
-                        let mut s = 0f32;
-                        for j in 0..24 {
-                            s += row[j] * xl[j];
-                        }
-                        yl[i] = e * s;
-                    }
-                    // SAFETY: cells within one color never share nodes.
-                    unsafe {
-                        for l in 0..8 {
-                            let n = nidx[l];
-                            *ys.get_mut(3 * n) += yl[3 * l];
-                            *ys.get_mut(3 * n + 1) += yl[3 * l + 1];
-                            *ys.get_mut(3 * n + 2) += yl[3 * l + 2];
-                        }
-                    }
+                // SAFETY: cells within one color never share nodes.
+                par::for_each(&self.colors[color], |&ci| unsafe {
+                    self.apply_cell(ci as usize, self.eps[ci as usize], x, &ys);
                 });
+            }
+            // Sequential: no races possible — one natural-order pass beats
+            // 8 strided color passes on cache locality (measured ~2% on 1M
+            // cells; mainly it avoids building the color lists at all).
+            #[cfg(not(feature = "parallel"))]
+            for (ci, &e) in self.eps.iter().enumerate() {
+                if e > 0.0 {
+                    // SAFETY: sequential.
+                    unsafe { self.apply_cell(ci, e, x, &ys) };
+                }
             }
         }
         for &(n, dir, k) in &self.springs {
@@ -354,11 +434,56 @@ impl Level {
         par::mask_zero(y, &self.constrained);
     }
 
+    /// f64 twin of `apply_cell` (outer-CG operator).
+    /// # Safety
+    /// Same disjoint-scatter rule as `apply_cell`.
+    #[inline(always)]
+    unsafe fn apply_cell64(&self, ci: usize, e: f64, x: &[f64], ys: &UnsafeSlice<f64>) {
+        let (nx, ny) = (self.nx, self.ny);
+        let (mx, my) = (self.mx, self.my);
+        let cx = ci % nx;
+        let cy = (ci / nx) % ny;
+        let cz = ci / (nx * ny);
+        let mut xl = [0f64; 24];
+        let mut nidx = [0usize; 8];
+        for l in 0..8 {
+            let [ox, oy, oz] = NODE_OFFSETS[l];
+            let n = ((cz + oz) * my + (cy + oy)) * mx + (cx + ox);
+            nidx[l] = n;
+            xl[3 * l] = x[3 * n];
+            xl[3 * l + 1] = x[3 * n + 1];
+            xl[3 * l + 2] = x[3 * n + 2];
+        }
+        let mut yl = [0f64; 24];
+        for i in 0..24 {
+            let row = &self.ke64[i];
+            let mut s = 0f64;
+            for j in 0..24 {
+                s += row[j] * xl[j];
+            }
+            yl[i] = e * s;
+        }
+        for l in 0..8 {
+            let n = nidx[l];
+            *ys.get_mut(3 * n) += yl[3 * l];
+            *ys.get_mut(3 * n + 1) += yl[3 * l + 1];
+            *ys.get_mut(3 * n + 2) += yl[3 * l + 2];
+        }
+    }
+
     /// y = K x in f64 (used by the outer CG; the cancellation in K·u near
     /// equilibrium exceeds f32 precision, which caps attainable accuracy).
     pub fn apply64(&self, x: &[f64], y: &mut [f64]) {
+        self.apply64_eps(&self.eps, x, y);
+    }
+
+    /// `apply64` with an explicit per-cell stiffness field: the outer CG runs
+    /// on the EXACT eps while the level hierarchy (preconditioner only) may
+    /// hold contrast-clamped values. `eps` must share this level's void set.
+    pub fn apply64_eps(&self, eps: &[f32], x: &[f64], y: &mut [f64]) {
         debug_assert_eq!(x.len(), self.ndof());
         debug_assert_eq!(y.len(), self.ndof());
+        debug_assert_eq!(eps.len(), self.eps.len());
         #[cfg(feature = "parallel")]
         {
             use rayon::prelude::*;
@@ -368,44 +493,19 @@ impl Level {
         y.fill(0.0);
         {
             let ys = UnsafeSlice::new(y);
-            let (nx, ny) = (self.nx, self.ny);
-            let (mx, my) = (self.mx, self.my);
+            #[cfg(feature = "parallel")]
             for color in 0..8 {
-                par::for_each(&self.colors[color], |&ci| {
-                    let ci = ci as usize;
-                    let cx = ci % nx;
-                    let cy = (ci / nx) % ny;
-                    let cz = ci / (nx * ny);
-                    let e = self.eps[ci] as f64;
-                    let mut xl = [0f64; 24];
-                    let mut nidx = [0usize; 8];
-                    for l in 0..8 {
-                        let [ox, oy, oz] = NODE_OFFSETS[l];
-                        let n = ((cz + oz) * my + (cy + oy)) * mx + (cx + ox);
-                        nidx[l] = n;
-                        xl[3 * l] = x[3 * n];
-                        xl[3 * l + 1] = x[3 * n + 1];
-                        xl[3 * l + 2] = x[3 * n + 2];
-                    }
-                    let mut yl = [0f64; 24];
-                    for i in 0..24 {
-                        let row = &self.ke64[i];
-                        let mut s = 0f64;
-                        for j in 0..24 {
-                            s += row[j] * xl[j];
-                        }
-                        yl[i] = e * s;
-                    }
-                    // SAFETY: cells within one color never share nodes.
-                    unsafe {
-                        for l in 0..8 {
-                            let n = nidx[l];
-                            *ys.get_mut(3 * n) += yl[3 * l];
-                            *ys.get_mut(3 * n + 1) += yl[3 * l + 1];
-                            *ys.get_mut(3 * n + 2) += yl[3 * l + 2];
-                        }
-                    }
+                // SAFETY: cells within one color never share nodes.
+                par::for_each(&self.colors[color], |&ci| unsafe {
+                    self.apply_cell64(ci as usize, eps[ci as usize] as f64, x, &ys);
                 });
+            }
+            #[cfg(not(feature = "parallel"))]
+            for (ci, &e) in eps.iter().enumerate() {
+                if e > 0.0 {
+                    // SAFETY: sequential.
+                    unsafe { self.apply_cell64(ci, e as f64, x, &ys) };
+                }
             }
         }
         for &(n, dir, k) in &self.springs {
@@ -437,39 +537,64 @@ impl Level {
         }
     }
 
-    /// First damped block-Jacobi sweep with zero initial guess: z = omega * Dinv r.
-    fn smooth_first(&self, z: &mut [f32], r: &[f32]) {
+    /// w = Dinv (r - t)  where t = K z was computed by the caller.
+    fn dinv_residual(&self, w: &mut [f32], r: &[f32], t: &[f32]) {
         let dinv = &self.dinv;
-        par::chunks_mut_indexed(z, 3 * NODE_CHUNK, |off, zc| {
+        par::chunks_mut_indexed(w, 3 * NODE_CHUNK, |off, wc| {
             let n0 = off / 3;
-            for (k, zn) in zc.chunks_mut(3).enumerate() {
-                let n = n0 + k;
-                let d = &dinv[9 * n..9 * n + 9];
-                let rr = [r[3 * n], r[3 * n + 1], r[3 * n + 2]];
-                for row in 0..3 {
-                    zn[row] = OMEGA
-                        * (d[3 * row] * rr[0] + d[3 * row + 1] * rr[1] + d[3 * row + 2] * rr[2]);
-                }
-            }
-        });
-    }
-
-    /// z += omega * Dinv (r - t)  where t = K z was computed by the caller.
-    fn smooth_update(&self, z: &mut [f32], r: &[f32], t: &[f32]) {
-        let dinv = &self.dinv;
-        par::chunks_mut_indexed(z, 3 * NODE_CHUNK, |off, zc| {
-            let n0 = off / 3;
-            for (k, zn) in zc.chunks_mut(3).enumerate() {
+            for (k, wn) in wc.chunks_mut(3).enumerate() {
                 let n = n0 + k;
                 let d = &dinv[9 * n..9 * n + 9];
                 let rr =
                     [r[3 * n] - t[3 * n], r[3 * n + 1] - t[3 * n + 1], r[3 * n + 2] - t[3 * n + 2]];
                 for row in 0..3 {
-                    zn[row] += OMEGA
-                        * (d[3 * row] * rr[0] + d[3 * row + 1] * rr[1] + d[3 * row + 2] * rr[2]);
+                    wn[row] =
+                        d[3 * row] * rr[0] + d[3 * row + 1] * rr[1] + d[3 * row + 2] * rr[2];
                 }
             }
         });
+    }
+
+    /// Chebyshev smoother: z gets `degree` steps toward K z = r, damping the
+    /// Dinv*K spectrum on [lmax/CHEB_EIG_RATIO, lmax]. A fixed polynomial —
+    /// same operator every call — so MG stays a constant SPD preconditioner.
+    /// `from_zero` skips the first residual apply (pre-smoothing starts at 0).
+    /// Workspaces: t (K z), w (Dinv residual), d (direction).
+    fn cheb_smooth(
+        &self,
+        z: &mut [f32],
+        r: &[f32],
+        t: &mut [f32],
+        w: &mut [f32],
+        d: &mut [f32],
+        degree: usize,
+        from_zero: bool,
+    ) {
+        let lmax = (self.lmax * CHEB_LMAX_SAFETY) as f64;
+        let lmin = lmax / CHEB_EIG_RATIO as f64;
+        let theta = 0.5 * (lmax + lmin);
+        let delta = 0.5 * (lmax - lmin);
+        let sigma = theta / delta;
+        let mut rho = 1.0 / sigma;
+        // First step: d = (1/theta) * Dinv*(r - K z); z += d.
+        if from_zero {
+            par::fill(z, 0.0);
+            self.diag_apply(r, w);
+        } else {
+            self.apply(z, t);
+            self.dinv_residual(w, r, t);
+        }
+        par::axpby(d, 0.0, (1.0 / theta) as f32, w);
+        par::axpy(z, 1.0, d);
+        for _ in 1..degree {
+            self.apply(z, t);
+            self.dinv_residual(w, r, t);
+            let rho_new = 1.0 / (2.0 * sigma - rho);
+            // d = (rho_new*rho) d + (2 rho_new / delta) w; z += d
+            par::axpby(d, (rho_new * rho) as f32, (2.0 * rho_new / delta) as f32, w);
+            par::axpy(z, 1.0, d);
+            rho = rho_new;
+        }
     }
 
     /// z = Dinv r (undamped; used as the coarse-level CG preconditioner).
@@ -488,6 +613,19 @@ impl Level {
             }
         });
     }
+}
+
+/// Raise non-void cells to the preconditioner stiffness floor. Returns true
+/// if anything changed (callers then refresh dinv/lmax).
+fn clamp_pc_eps(eps: &mut [f32]) -> bool {
+    let mut changed = false;
+    for e in eps.iter_mut() {
+        if *e > 0.0 && *e < PC_EPS_FLOOR {
+            *e = PC_EPS_FLOOR;
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// Child-averaged stiffness for the next-coarser grid (fine dims must be even).
@@ -516,6 +654,27 @@ fn average_coarse_eps(fine_eps: &[f32], fnx: usize, fny: usize, fnz: usize) -> V
     }
     eps
 }
+
+/// Trilinear parent weights of fine node coordinate x (even: one parent).
+#[inline]
+fn parent_weights(x: usize) -> [(usize, f64); 2] {
+    if x % 2 == 0 {
+        [(x / 2, 1.0), (0, 0.0)]
+    } else {
+        [(x / 2, 0.5), (x / 2 + 1, 0.5)]
+    }
+}
+
+// NEGATIVE RESULTS on the Benchy worst case (205 MGCG iters at 300k cells),
+// kept so nobody re-treads them: (a) renormalizing transfer weights over
+// active-only coarse parents — no change; (b) exact-solving the coarse level
+// (2-level hierarchy, tol 1e-8) — no change, so W-cycles can't help either;
+// (c) a true Galerkin two-grid (coarse operator P^T K P, measured via a
+// matrix-free prolong->apply->restrict PCG) reached 142 iters — only 1.45x,
+// the ceiling for ANY coarse-operator improvement. The residual iterations
+// are local thin-feature modes (1-2 cell beams/rails) that a half-resolution
+// trilinear space cannot represent at all; they are resolution-limited, not
+// solver-limited.
 
 /// Restriction r_c = P^T r_f (trilinear weights), masked at coarse constrained DOFs.
 fn restrict(fine: &Level, fine_res: &[f32], coarse: &Level, out: &mut [f32]) {
@@ -547,8 +706,8 @@ fn restrict(fine: &Level, fine_res: &[f32], coarse: &Level, out: &mut [f32]) {
                         if x < 0 || x >= fine.mx as isize {
                             continue;
                         }
-                        let w = wz * wy * (1.0 - 0.5 * dx.abs() as f64);
                         let nf = ((z as usize * fine.my + y as usize) * fine.mx) + x as usize;
+                        let w = wz * wy * (1.0 - 0.5 * dx.abs() as f64);
                         for d in 0..3 {
                             acc[d] += w * fine_res[3 * nf + d] as f64;
                         }
@@ -574,12 +733,7 @@ fn prolong_add(fine: &Level, coarse: &Level, zc: &[f32], zf: &mut [f32]) {
             let x = nf % fmx;
             let y = (nf / fmx) % fmy;
             let z = nf / (fmx * fmy);
-            let xw: [(usize, f64); 2] =
-                if x % 2 == 0 { [(x / 2, 1.0), (0, 0.0)] } else { [(x / 2, 0.5), (x / 2 + 1, 0.5)] };
-            let yw: [(usize, f64); 2] =
-                if y % 2 == 0 { [(y / 2, 1.0), (0, 0.0)] } else { [(y / 2, 0.5), (y / 2 + 1, 0.5)] };
-            let zw: [(usize, f64); 2] =
-                if z % 2 == 0 { [(z / 2, 1.0), (0, 0.0)] } else { [(z / 2, 0.5), (z / 2 + 1, 0.5)] };
+            let (xw, yw, zw) = (parent_weights(x), parent_weights(y), parent_weights(z));
             let mut acc = [0f64; 3];
             for &(zi, wz) in &zw {
                 if wz == 0.0 {
@@ -615,6 +769,7 @@ struct Workspaces {
     z: Vec<Vec<f32>>,
     t: Vec<Vec<f32>>,
     t2: Vec<Vec<f32>>,
+    d: Vec<Vec<f32>>,
 }
 
 fn v_cycle(levels: &[Level], ws: &mut Workspaces, l: usize) {
@@ -624,11 +779,9 @@ fn v_cycle(levels: &[Level], ws: &mut Workspaces, l: usize) {
     }
     let level = &levels[l];
     // Pre-smooth (zero initial guess).
-    level.smooth_first(&mut ws.z[l], &ws.r[l]);
-    for _ in 1..NU1 {
-        level.apply(&ws.z[l], &mut ws.t[l]);
-        level.smooth_update(&mut ws.z[l], &ws.r[l], &ws.t[l]);
-    }
+    level.cheb_smooth(
+        &mut ws.z[l], &ws.r[l], &mut ws.t[l], &mut ws.t2[l], &mut ws.d[l], NU1, true,
+    );
     // Coarse-grid correction.
     level.apply(&ws.z[l], &mut ws.t[l]);
     par::sub(&mut ws.t2[l], &ws.r[l], &ws.t[l]);
@@ -639,10 +792,9 @@ fn v_cycle(levels: &[Level], ws: &mut Workspaces, l: usize) {
         prolong_add(level, &levels[l + 1], &zb[0], &mut za[l]);
     }
     // Post-smooth.
-    for _ in 0..NU2 {
-        level.apply(&ws.z[l], &mut ws.t[l]);
-        level.smooth_update(&mut ws.z[l], &ws.r[l], &ws.t[l]);
-    }
+    level.cheb_smooth(
+        &mut ws.z[l], &ws.r[l], &mut ws.t[l], &mut ws.t2[l], &mut ws.d[l], NU2, false,
+    );
 }
 
 /// Block-diagonal preconditioned CG for the coarsest level (small).
@@ -682,10 +834,20 @@ fn coarse_pcg(level: &Level, b: &[f32], x: &mut [f32]) {
 pub struct MgSolver {
     pub levels: Vec<Level>,
     ws: Workspaces,
+    /// EXACT finest-level eps, used by the outer CG operator (apply64). The
+    /// level hierarchy itself — preconditioner only — runs on contrast-
+    /// clamped eps (see PC_EPS_FLOOR): any SPD preconditioner converges to
+    /// the same answer, and bounding the up-to-1e6:1 boundary-sliver contrast
+    /// is what keeps the V-cycle effective on voxelized parts.
+    eps_exact: Vec<f32>,
     /// Relative residual after each CG iteration of the LAST solve (element 0
     /// is the initial residual) — convergence-plot material, refreshed per call.
     pub last_trace: Vec<f32>,
 }
+
+/// Stiffness floor (relative to solid) applied to non-void cells INSIDE the
+/// preconditioner hierarchy only. Exactness lives in `eps_exact`.
+const PC_EPS_FLOOR: f32 = 0.20;
 
 pub struct SolveStats {
     pub iterations: usize,
@@ -695,7 +857,12 @@ pub struct SolveStats {
 
 impl MgSolver {
     /// Coarsen while dimensions stay even and at least 2 cells per axis.
-    pub fn new(finest: Level, max_levels: usize) -> Self {
+    pub fn new(mut finest: Level, max_levels: usize) -> Self {
+        let eps_exact = finest.eps.clone();
+        if clamp_pc_eps(&mut finest.eps) {
+            finest.build_dinv();
+            finest.refresh_lmax();
+        }
         let mut levels = vec![finest];
         while levels.len() < max_levels {
             let f = levels.last().unwrap();
@@ -713,8 +880,14 @@ impl MgSolver {
             z: levels.iter().map(|l| vec![0f32; l.ndof()]).collect(),
             t: levels.iter().map(|l| vec![0f32; l.ndof()]).collect(),
             t2: levels.iter().map(|l| vec![0f32; l.ndof()]).collect(),
+            d: levels.iter().map(|l| vec![0f32; l.ndof()]).collect(),
         };
-        Self { levels, ws, last_trace: Vec::new() }
+        Self { levels, ws, eps_exact, last_trace: Vec::new() }
+    }
+
+    /// The exact (unclamped) finest-level eps this solver was last given.
+    pub fn eps_exact(&self) -> &[f32] {
+        &self.eps_exact
     }
 
     /// Update per-cell stiffness factors in place (same void/solid topology!)
@@ -722,13 +895,17 @@ impl MgSolver {
     /// to rebuilding levels — the optimization loop calls this every iteration.
     pub fn update_eps(&mut self, eps: Vec<f32>) {
         debug_assert_eq!(eps.len(), self.levels[0].eps.len());
+        self.eps_exact = eps.clone();
         self.levels[0].eps = eps;
+        clamp_pc_eps(&mut self.levels[0].eps);
         self.levels[0].build_dinv();
+        self.levels[0].refresh_lmax();
         for l in 1..self.levels.len() {
             let f = &self.levels[l - 1];
             let coarse = average_coarse_eps(&f.eps, f.nx, f.ny, f.nz);
             self.levels[l].eps = coarse;
             self.levels[l].build_dinv();
+            self.levels[l].refresh_lmax();
         }
     }
 
@@ -762,7 +939,7 @@ impl MgSolver {
         }
         // r = b - A u0
         let mut r = vec![0f64; n];
-        self.levels[0].apply64(u, &mut r);
+        self.levels[0].apply64_eps(&self.eps_exact, u, &mut r);
         for i in 0..n {
             r[i] = b[i] - r[i];
         }
@@ -781,7 +958,7 @@ impl MgSolver {
 
         let mut res = f64::INFINITY;
         for it in 0..max_iter {
-            self.levels[0].apply64(&p, &mut q);
+            self.levels[0].apply64_eps(&self.eps_exact, &p, &mut q);
             let pq = par::dot64(&p, &q);
             if pq <= 0.0 {
                 return SolveStats { iterations: it, rel_residual: res, converged: false };
