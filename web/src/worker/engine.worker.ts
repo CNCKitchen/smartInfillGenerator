@@ -17,7 +17,7 @@ const ready = (async () => {
     // Static asset (web/public/wasm-mt), deliberately NOT bundled — the
     // rayon pool workers re-import the glue by plain relative URL.
     const mt = (await import(
-      /* @vite-ignore */ new URL("/wasm-mt/sig_wasm.js", self.location.origin).href
+      /* @vite-ignore */ new URL(import.meta.env.BASE_URL + "wasm-mt/sig_wasm.js", self.location.origin).href
     )) as typeof import("../wasm/sig_wasm.js") & {
       initThreadPool(threads: number): Promise<unknown>;
     };

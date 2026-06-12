@@ -11,6 +11,9 @@ const coiHeaders = {
 };
 
 export default defineConfig({
+  // VITE_BASE is set by the GitHub Actions deploy workflow to /smartInfillGenerator/.
+  // Unset in local dev → defaults to '/'.
+  base: process.env.VITE_BASE,
   plugins: [react()],
   build: { target: "esnext" },
   worker: { format: "es" },
