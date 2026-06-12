@@ -74,6 +74,8 @@ export function Viewer() {
     sceneEvents.onOptShape = (p, i, d) => scene.setOptShape(p, i, d);
     sceneEvents.onRegionVisibility = (vis) => scene.setRegionVisibility(vis);
     sceneEvents.onScalarField = (v, flip) => scene.setScalarField(v, flip ?? false);
+    sceneEvents.onVoxelResult = (p, d, e, ed) => scene.setVoxelResult(p, d, e, ed);
+    sceneEvents.onResultSurface = (s) => scene.setResultSurface(s);
     sceneEvents.onLegendRange = (min, max) => scene.setLegendRange(min, max);
     sceneEvents.onShowExtremes = (on, unit) => scene.setShowExtremes(on, unit);
     sceneEvents.onSectionState = (on) => scene.setSection(on);

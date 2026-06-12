@@ -153,6 +153,28 @@ rootUz /= rootN;
 assert(tipUz < -0.05, `tip deflects down (${tipUz.toFixed(4)} mm)`);
 assert(rootUz < 1e-3, `root stays put (${rootUz.toExponential(1)} mm)`);
 
+// Results on the voxel mesh: hull + exact nodal displacements + per-cell field.
+{
+  const vr = model.voxel_results();
+  const vpos = vr[0], vdisp = vr[1], vedges = vr[2], vedisp = vr[3];
+  assert(vpos.length > 0 && vpos.length % 9 === 0, `voxel result hull (${vpos.length / 9} tris)`);
+  assert(vdisp.length === vpos.length, "hull displacement per vertex");
+  assert(vedges.length > 0 && vedisp.length === vedges.length, "edge displacements match edges");
+  let vmax = 0;
+  for (let i = 0; i < vdisp.length; i += 3)
+    vmax = Math.max(vmax, Math.hypot(vdisp[i], vdisp[i + 1], vdisp[i + 2]));
+  assert(Math.abs(vmax - stats.maxDisplacement) < 0.05 * stats.maxDisplacement + 1e-6,
+    `voxel nodal max |u| matches solve (${vmax.toFixed(4)} vs ${stats.maxDisplacement.toFixed(4)})`);
+  const vvm = model.voxel_result_field("vm");
+  assert(vvm.length === vpos.length / 3, "voxel field value per hull vertex");
+  assert(vvm.every((v) => Number.isFinite(v)) && fmax(vvm) > 0, "voxel von Mises sane");
+  // Flat per-cell coloring: all 3 vertices of a triangle share one value.
+  for (let t = 0; t < 30; t++)
+    assert(vvm[3 * t] === vvm[3 * t + 1] && vvm[3 * t] === vvm[3 * t + 2],
+      "per-cell flat values on the voxel hull");
+}
+console.log("ok: voxel-mesh result view (nodal displacements + per-cell fields)");
+
 // Frictionless + pressure paths execute.
 model.add_frictionless(sel(1, "min"));
 model.add_pressure(sel(2, "max"), 0.05);
@@ -336,7 +358,7 @@ assert(iso.length === 3 && iso[0].length > 0 && iso[1].length % 3 === 0,
   `density isosurface at 30% (${iso[1].length / 3} tris)`);
 assert(iso[2].length * 3 === iso[0].length, "cutaway carries per-vertex density");
 
-const threeMf = optModel.export_3mf();
+const threeMf = optModel.export_3mf("orca");
 assert(threeMf.length > 500 && threeMf[0] === 0x50 && threeMf[1] === 0x4b, "3MF export is a zip");
 // The part carries the perimeter count from the optimize call (2 above);
 // modifiers override ONLY the infill density — walls inherit from the part.
@@ -348,6 +370,18 @@ assert(threeMf.length > 500 && threeMf[0] === 0x50 && threeMf[1] === 0x4b, "3MF 
   assert(raw.includes('wall_loops" value="2"'), "wall_loops = perimeters set in optimize");
   assert(raw.indexOf("wall_loops") < raw.indexOf("<part "), "wall_loops at object level, not in a part");
   assert(raw.includes("sparse_infill_density"), "densities present");
+}
+// PrusaSlicer flavor: one object, volumes by triangle range in
+// Slic3r_PE_model.config, perimeters + base fill_density at object scope.
+{
+  const prusaMf = optModel.export_3mf("prusa");
+  const raw = new TextDecoder("latin1").decode(prusaMf);
+  assert(raw.includes("Slic3r_PE_model.config"), "prusa export carries the PE model config");
+  assert(raw.includes("slic3rpe:Version3mf"), "prusa flavor marker present");
+  assert(raw.includes("ParameterModifier"), "modifier volumes declared");
+  assert(raw.includes('key="perimeters" value="2"'), "perimeters at object scope");
+  assert(raw.includes('key="fill_density"'), "fill densities present");
+  assert(!raw.includes("wall_loops"), "no bambu keys in the prusa flavor");
 }
 const stlZip = optModel.export_stls();
 assert(stlZip.length > 100 && stlZip[0] === 0x50, "STL zip export");
@@ -383,12 +417,14 @@ assert(Math.abs(binSummary.bins[1].density - 1.0) < 1e-9, "top level = solid");
 assert(Math.abs(binSummary.meanInfill - 0.3) < 0.05, `binary mean tracks budget (${binSummary.meanInfill})`);
 assert(binSummary.gainVsUniform > 0.0, "binary core beats uniform infill");
 {
-  const binMf = binModel.export_3mf();
+  const binMf = binModel.export_3mf("orca");
   const raw = new TextDecoder("latin1").decode(binMf);
-  assert(raw.includes('internal_solid_infill_pattern" value="concentric"'),
-    "binary export carries the solid-fill pattern");
-  assert(raw.indexOf("internal_solid_infill_pattern") < raw.indexOf("<part "),
-    "solid pattern at object level");
+  assert(raw.includes('sparse_infill_pattern" value="concentric"'),
+    "binary export carries the solid-fill pattern on the modifier");
+  assert(!raw.includes("internal_solid_infill_pattern"),
+    "deprecated object-level key never written (Bambu renamed rectilinear -> zig-zag)");
+  assert(raw.indexOf("<part ") < raw.indexOf("sparse_infill_pattern"),
+    "pattern inside a modifier part, not at object level");
   assert(raw.includes('sparse_infill_density" value="100%"'), "solid region modifier at 100%");
   assert(raw.includes('sparse_infill_density" value="5%"'), "base density 5%");
 }

@@ -2,7 +2,12 @@
 // Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
 
 import { create } from "zustand";
-import { engine, type OptRegion, type OptSummary } from "./engine/EngineClient";
+import {
+  engine,
+  type OptRegion,
+  type OptSummary,
+  type SlicerFlavor,
+} from "./engine/EngineClient";
 import type {
   Bc,
   BcKind,
@@ -208,13 +213,21 @@ interface AppState {
   voxelInfo: VoxelInfo | null;
   voxelMeshReady: boolean;
   settingsOpen: boolean;
+  /** Startup disclaimer (legal): shown every load unless skipped below. */
+  disclaimerOpen: boolean;
+  /** Dev/testing escape hatch (persisted in this browser). */
+  disclaimerSkipped: boolean;
   /** Densities of the extracted modifier regions (for the region list). */
   regionInfos: { density: number }[];
   regionVisible: boolean[];
   /** Density cutaway threshold in %, 0 = off (surface paint only). */
   densityThreshold: number;
+  /** Target slicer for the project 3MF export. */
+  exportSlicer: SlicerFlavor;
   /** Result field shown in the Deformed view ("u" or a stress/strain kind). */
   resultField: string;
+  /** Surface the results are mapped on: smooth STL or the analysis voxels. */
+  resultSurface: "stl" | "voxel";
   /** Min/max of the active stress/strain field, for the legend. */
   fieldRange: { min: number; max: number } | null;
   /** User override of the color scale (null = auto). */
@@ -270,6 +283,10 @@ interface AppState {
   updateLevelSettings(p: Partial<LevelSettings>): void;
   setRegionVisible(index: number, on: boolean): void;
   setDensityThreshold(v: number): void;
+  setExportSlicer(s: SlicerFlavor): void;
+  setResultSurface(surface: "stl" | "voxel"): Promise<void>;
+  consentDisclaimer(): void;
+  setDisclaimerSkipped(on: boolean): void;
   setResultField(kind: string): Promise<void>;
   setLegendRange(min: number | null, max: number | null): void;
   setShowExtremes(on: boolean): void;
@@ -331,8 +348,66 @@ let meshCutTimer: ReturnType<typeof setTimeout> | null = null;
 /** Last section plane reported by the scene (three.js convention:
  *  kept side is normal·p + constant ≥ 0). */
 let lastSectionPlane: { normal: [number, number, number]; constant: number } | null = null;
+/** Dev/testing escape hatch for the startup disclaimer (this browser only). */
+const SKIP_DISCLAIMER_KEY = "sig-skip-disclaimer";
+
+function disclaimerSkippedInit(): boolean {
+  try {
+    return localStorage.getItem(SKIP_DISCLAIMER_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
 /** Per-kind cache of fetched stress/strain fields (cleared on invalidation). */
 const fieldCache = new Map<string, Float32Array>();
+/** Same, sized for the voxel-hull surface; plus whether the hull geometry
+ *  (positions + nodal displacements) for the CURRENT solution is in the scene. */
+const voxFieldCache = new Map<string, Float32Array>();
+let voxelResultLoaded = false;
+
+/** New solution / model: voxel-result geometry + field caches are stale. */
+function invalidateVoxelResult() {
+  voxelResultLoaded = false;
+  voxFieldCache.clear();
+  sceneEvents.onVoxelResult?.(null, null, null, null);
+}
+
+/** Fetch the voxel hull + nodal displacements once per solution. */
+async function loadVoxelResult() {
+  if (voxelResultLoaded) return;
+  const r = await engine.voxelResults();
+  sceneEvents.onVoxelResult?.(r.positions, r.displacements, r.edges, r.edgeDisplacements);
+  voxelResultLoaded = true;
+}
+
+/** Push the active result field, sized for the active result surface
+ *  ("u" = displacement coloring straight from the displacement arrays). */
+async function pushScalarField(set: SetState, get: () => AppState) {
+  const kind = get().resultField;
+  if (kind === "u") {
+    set({ fieldRange: null });
+    sceneEvents.onScalarField?.(null);
+    return;
+  }
+  const vox = get().resultSurface === "voxel";
+  const cache = vox ? voxFieldCache : fieldCache;
+  let values = cache.get(kind);
+  if (!values) {
+    values = vox ? await engine.voxelResultField(kind) : await engine.resultField(kind);
+    cache.set(kind, values);
+  }
+  if (get().resultField !== kind) return; // user moved on mid-fetch
+  let min = Infinity;
+  let max = -Infinity;
+  for (let i = 0; i < values.length; i++) {
+    min = Math.min(min, values[i]);
+    max = Math.max(max, values[i]);
+  }
+  set({ fieldRange: { min, max } });
+  // Safety factor: invert the colormap so red marks the critical LOW.
+  sceneEvents.onScalarField?.(values, kind.startsWith("sf"));
+}
 
 const MAX_LOG_LINES = 800;
 
@@ -409,6 +484,16 @@ export interface SceneEvents {
   /** Stress/strain scalars for the deformed view (null = |u| colors).
    *  flip inverts the colormap (safety factor: red = critical LOW). */
   onScalarField?: (values: Float32Array | null, flip?: boolean) => void;
+  /** Voxel-hull result geometry: hull soup + exact nodal displacements,
+   *  cell-edge segments + their displacements (nulls clear it). */
+  onVoxelResult?: (
+    positions: Float32Array | null,
+    displacements: Float32Array | null,
+    edges: Float32Array | null,
+    edgeDisplacements: Float32Array | null
+  ) => void;
+  /** Which surface the deformed view shows: smooth STL or analysis voxels. */
+  onResultSurface?: (surface: "stl" | "voxel") => void;
   /** User override of the color-scale range (nulls = auto). */
   onLegendRange?: (min: number | null, max: number | null) => void;
   /** Min/max location markers; unit drives the label formatting. */
@@ -472,6 +557,7 @@ function invalidateResults(set: (p: Partial<AppState>) => void, get: () => AppSt
     legendMax: null,
   });
   fieldCache.clear();
+  invalidateVoxelResult();
   sceneEvents.onLegendRange?.(null, null);
   sceneEvents.onScalarField?.(null);
   sceneEvents.onRegions?.(null);
@@ -548,10 +634,14 @@ export const useStore = create<AppState>((set, get) => ({
   voxelInfo: null,
   voxelMeshReady: false,
   settingsOpen: false,
+  disclaimerOpen: !disclaimerSkippedInit(),
+  disclaimerSkipped: disclaimerSkippedInit(),
   regionInfos: [],
   regionVisible: [],
   densityThreshold: 0,
+  exportSlicer: "orca",
   resultField: "u",
+  resultSurface: "stl",
   fieldRange: null,
   legendMin: null,
   legendMax: null,
@@ -610,6 +700,7 @@ export const useStore = create<AppState>((set, get) => ({
             : null,
       });
       fieldCache.clear();
+      invalidateVoxelResult();
       // Clear stale overlays BEFORE the model swap so nothing survives even
       // if a later step fails.
       sceneEvents.onScalarField?.(null);
@@ -1013,6 +1104,7 @@ export const useStore = create<AppState>((set, get) => ({
         displacements = out.displacements;
       }
       fieldCache.clear(); // stress fields belong to the previous solution
+      invalidateVoxelResult();
       sceneEvents.onLegendRange?.(null, null);
       appendLog(
         set,
@@ -1040,6 +1132,15 @@ export const useStore = create<AppState>((set, get) => ({
       sceneEvents.onScalarField?.(null);
       sceneEvents.onDisplacements?.(displacements, stats);
       sceneEvents.onViewState?.("deformed", get().deformScale);
+      // Voxel result surface active: reload its hull for the new solution.
+      if (get().resultSurface === "voxel") {
+        try {
+          await loadVoxelResult();
+        } catch {
+          set({ resultSurface: "stl" });
+          sceneEvents.onResultSurface?.("stl");
+        }
+      }
       if (printedSummary) {
         // Min safety factors for the dock — both limits, so the dock can say
         // WHICH one governs. Fields are cached: picking them in the viewer
@@ -1195,6 +1296,7 @@ export const useStore = create<AppState>((set, get) => ({
       }
       const vis = out.regions.map(() => true);
       fieldCache.clear(); // stress fields belong to the previous solution
+      invalidateVoxelResult();
       sceneEvents.onLegendRange?.(null, null);
       set({
         resultField: "u",
@@ -1235,9 +1337,27 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
+  setExportSlicer(slicer) {
+    set({ exportSlicer: slicer });
+  },
+
+  consentDisclaimer() {
+    set({ disclaimerOpen: false });
+  },
+
+  setDisclaimerSkipped(on) {
+    set({ disclaimerSkipped: on });
+    try {
+      if (on) localStorage.setItem(SKIP_DISCLAIMER_KEY, "1");
+      else localStorage.removeItem(SKIP_DISCLAIMER_KEY);
+    } catch {
+      // private mode: the checkbox still works for this session
+    }
+  },
+
   async downloadThreeMf() {
     try {
-      const bytes = await engine.exportThreeMf();
+      const bytes = await engine.exportThreeMf(get().exportSlicer);
       const base = (get().fileName ?? "part").replace(/\.(stl|3mf)$/i, "");
       download(bytes, `${base}_smart_infill.3mf`, "model/3mf");
     } catch (e) {
@@ -1274,6 +1394,16 @@ export const useStore = create<AppState>((set, get) => ({
     sceneEvents.onVoxelCutActive?.(false);
     set({ viewMode: mode });
     sceneEvents.onViewState?.(mode, get().deformScale);
+    // Entering results with the voxel surface chosen: (re)load lazily —
+    // an optimize lands on the density view, so the hull may be stale.
+    if (mode === "deformed" && get().resultSurface === "voxel" && !voxelResultLoaded) {
+      loadVoxelResult()
+        .then(() => pushScalarField(set, get))
+        .catch(() => {
+          set({ resultSurface: "stl" });
+          sceneEvents.onResultSurface?.("stl");
+        });
+    }
   },
 
   setDeformScale(s) {
@@ -1291,30 +1421,27 @@ export const useStore = create<AppState>((set, get) => ({
     set({ resultField: kind, legendMin: null, legendMax: null });
     sceneEvents.onLegendRange?.(null, null);
     sceneEvents.onShowExtremes?.(get().showExtremes, fieldUnit(kind));
-    if (kind === "u") {
-      set({ fieldRange: null });
-      sceneEvents.onScalarField?.(null);
-      return;
-    }
     try {
-      let values = fieldCache.get(kind);
-      if (!values) {
-        values = await engine.resultField(kind);
-        fieldCache.set(kind, values);
-      }
-      if (get().resultField !== kind) return; // user moved on mid-fetch
-      let min = Infinity;
-      let max = -Infinity;
-      for (let i = 0; i < values.length; i++) {
-        min = Math.min(min, values[i]);
-        max = Math.max(max, values[i]);
-      }
-      set({ fieldRange: { min, max } });
-      // Safety factor: invert the colormap so red marks the critical LOW.
-      sceneEvents.onScalarField?.(values, kind.startsWith("sf"));
+      await pushScalarField(set, get);
     } catch (e) {
       set({ error: e instanceof Error ? e.message : String(e), resultField: "u", fieldRange: null });
       sceneEvents.onScalarField?.(null);
+    }
+  },
+
+  async setResultSurface(surface) {
+    if (get().resultSurface === surface) return;
+    set({ resultSurface: surface });
+    try {
+      if (surface === "voxel") {
+        await loadVoxelResult();
+      }
+      sceneEvents.onResultSurface?.(surface);
+      // The scalar field is sized per surface — re-push for the active one.
+      await pushScalarField(set, get);
+    } catch (e) {
+      set({ error: e instanceof Error ? e.message : String(e), resultSurface: "stl" });
+      sceneEvents.onResultSurface?.("stl");
     }
   },
 

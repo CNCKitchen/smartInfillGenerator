@@ -83,7 +83,7 @@ Workflow in the app:
    printability floor (default 5%) or 100% solid — the optimizer runs
    SIMP-penalized (p=3) so the design converges black/white, the dense
    regions slice as solid fill (optionally pinned to rectilinear or
-   concentric via object-level `internal_solid_infill_pattern`), and the
+   concentric via the modifiers' `sparse_infill_pattern`), and the
    comparison still uses the calibrated pattern curve. Then pick an infill
    budget (the target MEAN interior density — same scale as your slicer's
    uniform infill setting; walls/shells come on top — initialized from the

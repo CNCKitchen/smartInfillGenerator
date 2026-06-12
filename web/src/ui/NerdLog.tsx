@@ -111,6 +111,8 @@ export function NerdLog() {
   const solveResiduals = useStore((s) => s.solveResiduals);
   const setLogOpen = useStore((s) => s.setLogOpen);
   const clearLog = useStore((s) => s.clearLog);
+  const disclaimerSkipped = useStore((s) => s.disclaimerSkipped);
+  const setDisclaimerSkipped = useStore((s) => s.setDisclaimerSkipped);
   const listRef = useRef<HTMLDivElement>(null);
 
   // Follow the tail like a terminal.
@@ -177,6 +179,14 @@ export function NerdLog() {
           ))
         )}
       </div>
+      <label className="nl-skip dim small">
+        <input
+          type="checkbox"
+          checked={disclaimerSkipped}
+          onChange={(e) => setDisclaimerSkipped(e.target.checked)}
+        />
+        Skip the startup disclaimer in this browser (dev/testing)
+      </label>
     </div>
   );
 }

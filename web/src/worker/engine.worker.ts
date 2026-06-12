@@ -85,7 +85,9 @@ type Req =
   | { id: number; op: "densityShape"; threshold: number }
   | { id: number; op: "resmooth"; iters: number }
   | { id: number; op: "resultField"; kind: string }
-  | { id: number; op: "exportThreeMf" }
+  | { id: number; op: "voxelResults" }
+  | { id: number; op: "voxelResultField"; kind: string }
+  | { id: number; op: "exportThreeMf"; slicer: string }
   | { id: number; op: "exportStls" };
 
 /** Collect region meshes + transfer list (shared by optimize + resmooth). */
@@ -295,8 +297,27 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
         ]);
         return;
       }
+      case "voxelResults": {
+        const arr = requireModel().voxel_results();
+        const positions = arr[0] as Float32Array;
+        const displacements = arr[1] as Float32Array;
+        const edges = arr[2] as Float32Array;
+        const edgeDisplacements = arr[3] as Float32Array;
+        (self as unknown as Worker).postMessage(
+          { id: msg.id, ok: true, data: { positions, displacements, edges, edgeDisplacements } },
+          [positions.buffer, displacements.buffer, edges.buffer, edgeDisplacements.buffer]
+        );
+        return;
+      }
+      case "voxelResultField": {
+        const values = requireModel().voxel_result_field(msg.kind);
+        (self as unknown as Worker).postMessage({ id: msg.id, ok: true, data: values }, [
+          values.buffer,
+        ]);
+        return;
+      }
       case "exportThreeMf": {
-        const bytes = requireModel().export_3mf();
+        const bytes = requireModel().export_3mf(msg.slicer);
         (self as unknown as Worker).postMessage({ id: msg.id, ok: true, data: bytes }, [
           bytes.buffer,
         ]);

@@ -33,6 +33,22 @@ export function ViewportChips() {
 
       {resultsView && (
         <div className="fieldchip">
+          <div className="seg">
+            <button
+              className={s.resultSurface === "stl" ? "on" : ""}
+              onClick={() => void s.setResultSurface("stl")}
+              title="Results sampled onto the smooth part surface"
+            >
+              STL
+            </button>
+            <button
+              className={s.resultSurface === "voxel" ? "on" : ""}
+              onClick={() => void s.setResultSurface("voxel")}
+              title="Results on the analysis voxel mesh — exact nodal displacements, per-cell field values"
+            >
+              Voxels
+            </button>
+          </div>
           <select
             value={s.resultField}
             onChange={(e) => void s.setResultField(e.target.value)}

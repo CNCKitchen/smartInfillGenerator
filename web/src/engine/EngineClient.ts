@@ -164,14 +164,35 @@ export class EngineClient {
     return this.call({ op: "resultField", kind });
   }
 
-  exportThreeMf(): Promise<Uint8Array> {
-    return this.call({ op: "exportThreeMf" });
+  /** Voxel hull with exact nodal displacements (results-on-voxel-mesh view). */
+  voxelResults(): Promise<{
+    positions: Float32Array;
+    displacements: Float32Array;
+    edges: Float32Array;
+    edgeDisplacements: Float32Array;
+  }> {
+    return this.call({ op: "voxelResults" });
+  }
+
+  /** Result field per voxel-hull vertex (owning cell's value, flat per cell). */
+  voxelResultField(kind: string): Promise<Float32Array> {
+    return this.call({ op: "voxelResultField", kind });
+  }
+
+  /** Project 3MF in the chosen slicer's flavor. */
+  exportThreeMf(slicer: SlicerFlavor): Promise<Uint8Array> {
+    return this.call({ op: "exportThreeMf", slicer });
   }
 
   exportStls(): Promise<Uint8Array> {
     return this.call({ op: "exportStls" });
   }
 }
+
+/** Target slicer for the project 3MF export. "bambu" maps the rectilinear
+ *  pattern value to Bambu Studio's renamed "zig-zag"; "prusa" writes the
+ *  PrusaSlicer volume/config format. */
+export type SlicerFlavor = "orca" | "bambu" | "prusa";
 
 /** Mirrors the wasm PrintedOpts (serialized to JSON in the worker). */
 export interface PrintedOptions {
@@ -214,7 +235,7 @@ export interface OptimizeOptions {
   levelsPct: number[] | null;
   /** Binary (hollow/solid) mode — optimizer runs SIMP-penalized (p=3). */
   binary: boolean;
-  /** Object-level internal_solid_infill_pattern for the export. */
+  /** Per-modifier sparse_infill_pattern for the export (binary mode). */
   solidPattern: string | null;
   /** "budget" = stiffest at the given mean infill; "match" = lightest design
    *  as stiff as a uniform print at budgetPct (secant on the budget). */

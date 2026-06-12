@@ -737,6 +737,19 @@ input[type="number"] {
   border-radius: var(--r);
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.1);
   padding: 2px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* Result-surface toggle (STL / Voxels) inside the field chip. */
+.fieldchip .seg {
+  margin: 0;
+}
+
+.fieldchip .seg button {
+  padding: 3px 8px;
+  font-size: 11px;
 }
 
 .fieldchip select {
@@ -1293,6 +1306,58 @@ input[type="number"] {
   display: flex;
   align-items: center;
   justify-content: space-between;
+}
+
+/* ---------------- startup disclaimer ---------------- */
+
+.disclaimerback {
+  z-index: 100; /* above settings, busy, toasts — consent first */
+  background: rgba(38, 40, 42, 0.6);
+}
+
+.modal.disclaimer {
+  width: 640px;
+  gap: 12px;
+}
+
+.modal.disclaimer h2 {
+  font-size: 18px;
+  line-height: 1.35;
+  text-align: center;
+  padding: 4px 0 2px;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 12px;
+}
+
+.modal.disclaimer ul {
+  margin: 0;
+  padding-left: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.modal.disclaimer a {
+  color: var(--orange);
+  font-weight: 600;
+}
+
+.modal.disclaimer .consent {
+  align-self: center;
+  padding: 8px 22px;
+  font-weight: 600;
+  margin-top: 2px;
+}
+
+/* Disclaimer escape hatch at the bottom of the nerd log. */
+.nl-skip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px 6px;
+  user-select: none;
 }
 
 .modal h2 {

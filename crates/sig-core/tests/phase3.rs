@@ -13,7 +13,9 @@ use sig_core::bins::{
 use sig_core::mesh::primitives;
 use sig_core::simp::{classify_cells, evaluate, optimize, OptimizeParams};
 use sig_core::solve::SolveSettings;
-use sig_core::threemf::{export_orca_3mf, export_stl_zip, import_3mf, weld, IndexedMesh};
+use sig_core::threemf::{
+    export_orca_3mf, export_prusa_3mf, export_stl_zip, import_3mf, weld, IndexedMesh,
+};
 use sig_core::zip::{read_zip, ZipWriter};
 use sig_core::{pad_for_levels, solve_static, BoxRegion, StaticProblem, VoxelGrid};
 use std::collections::HashMap;
@@ -365,10 +367,13 @@ fn orca_3mf_roundtrips_through_own_zip_and_import() {
     assert!(cfg.contains("wall_loops\" value=\"3\""), "user perimeter count on the part");
     let object_level = &cfg[..cfg.find("<part").unwrap()];
     assert!(object_level.contains("wall_loops"), "wall_loops at object level, not in a part");
-    assert!(!cfg.contains("internal_solid_infill_pattern"), "no solid pattern unless requested");
+    assert!(!cfg.contains("sparse_infill_pattern"), "no pattern override unless requested");
     assert!(cfg.contains("bracket &amp; arm"));
 
-    // Binary mode requests a solid-fill pattern — object level only.
+    // Binary mode requests a solid-fill pattern — written as
+    // sparse_infill_pattern ON EACH MODIFIER, never as object-level
+    // internal_solid_infill_pattern (newer Bambu Studio renamed that key's
+    // "rectilinear" value to "zig-zag" and warns on every project load).
     let bytes2 = export_orca_3mf("p", &part, &regions, 0.05, 2, Some("concentric"));
     let entries2 = read_zip(&bytes2).unwrap();
     let cfg2 = entries2
@@ -376,10 +381,43 @@ fn orca_3mf_roundtrips_through_own_zip_and_import() {
         .find(|(n, _)| n == "Metadata/model_settings.config")
         .map(|(_, d)| String::from_utf8_lossy(d).into_owned())
         .unwrap();
-    assert_eq!(cfg2.matches("internal_solid_infill_pattern").count(), 1);
-    assert!(cfg2.contains("internal_solid_infill_pattern\" value=\"concentric\""));
+    assert!(!cfg2.contains("internal_solid_infill_pattern"), "deprecated key never written");
+    assert_eq!(cfg2.matches("sparse_infill_pattern").count(), 2, "pattern on each modifier");
+    assert!(cfg2.contains("sparse_infill_pattern\" value=\"concentric\""));
     let obj2 = &cfg2[..cfg2.find("<part").unwrap()];
-    assert!(obj2.contains("internal_solid_infill_pattern"), "solid pattern at object level");
+    assert!(!obj2.contains("sparse_infill_pattern"), "pattern in modifiers, not object level");
+
+    // PrusaSlicer flavor: ONE object, volumes as triangle ranges in
+    // Slic3r_PE_model.config (part = ModelPart, regions = ParameterModifier
+    // with fill_density; fill_pattern only when a solid pattern is chosen).
+    let bytes3 = export_prusa_3mf("bracket & arm", &part, &regions, 0.12, 3, Some("concentric"));
+    let entries3 = read_zip(&bytes3).unwrap();
+    let names3: Vec<&str> = entries3.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(names3.contains(&"Metadata/Slic3r_PE_model.config"));
+    let model3 = entries3
+        .iter()
+        .find(|(n, _)| n == "3D/3dmodel.model")
+        .map(|(_, d)| String::from_utf8_lossy(d).into_owned())
+        .unwrap();
+    assert!(model3.contains("slic3rpe:Version3mf"), "PrusaSlicer recognizes its own flavor");
+    assert_eq!(model3.matches("<object ").count(), 1, "one object, volumes via config");
+    let cfg3 = entries3
+        .iter()
+        .find(|(n, _)| n == "Metadata/Slic3r_PE_model.config")
+        .map(|(_, d)| String::from_utf8_lossy(d).into_owned())
+        .unwrap();
+    assert_eq!(cfg3.matches("<volume ").count(), 3, "part + 2 modifier volumes");
+    assert_eq!(cfg3.matches("ParameterModifier").count(), 2);
+    assert!(cfg3.contains("ModelPart"));
+    // Part has 12 tris -> volume 0 is tris 0..=11; first modifier starts at 12.
+    assert!(cfg3.contains("<volume firstid=\"0\" lastid=\"11\""));
+    assert!(cfg3.contains("<volume firstid=\"12\""));
+    assert!(cfg3.contains("fill_density\" value=\"25%\""));
+    assert!(cfg3.contains("fill_density\" value=\"50%\""));
+    assert!(cfg3.contains("fill_density\" value=\"12%\""), "base density on the object");
+    assert!(cfg3.contains("perimeters\" value=\"3\""));
+    assert_eq!(cfg3.matches("fill_pattern").count(), 2, "pattern per modifier");
+    assert!(cfg3.contains("fill_pattern\" value=\"concentric\""));
 
     // Geometry comes back via the import path (largest bbox = the part).
     let (mesh, count) = import_3mf(&bytes).expect("import own 3mf");

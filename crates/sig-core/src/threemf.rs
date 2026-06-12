@@ -85,12 +85,16 @@ fn region_to_indexed(r: &RegionMesh) -> IndexedMesh {
 /// (the perimeter count the analysis assumed) are written as object-level
 /// overrides so the print matches the simulation without touching the user's
 /// process preset. `solid_pattern` (e.g. "rectilinear" / "concentric"), when
-/// given, sets the object-level internal_solid_infill_pattern — used by the
-/// binary (hollow/solid) mode where the dense regions slice as solid fill.
-/// Modifiers override ONLY the infill density — walls/shells inherit from
-/// the part (a modifier wall key strips/changes perimeters wherever it
-/// touches the surface). Regions must be sorted ascending by density
-/// (slicer modifier order resolves the nesting).
+/// given, sets sparse_infill_pattern ON EACH MODIFIER — used by the binary
+/// (hollow/solid) mode where the dense regions slice as solid fill. It is
+/// deliberately NOT written as object-level internal_solid_infill_pattern:
+/// newer Bambu Studio renamed that key's "rectilinear" value to "zig-zag"
+/// and pops a "values have been replaced" dialog on every load, while
+/// "rectilinear"/"concentric" remain valid sparse-pattern values everywhere.
+/// Modifiers otherwise override ONLY the infill density — walls/shells
+/// inherit from the part (a modifier wall key strips/changes perimeters
+/// wherever it touches the surface). Regions must be sorted ascending by
+/// density (slicer modifier order resolves the nesting).
 pub fn export_orca_3mf(
     part_name: &str,
     part: &IndexedMesh,
@@ -166,12 +170,6 @@ pub fn export_orca_3mf(
         (base_density * 100.0).round() as u32
     ));
     cfg.push_str(&format!("    <metadata key=\"wall_loops\" value=\"{wall_loops}\"/>\n"));
-    if let Some(p) = solid_pattern {
-        cfg.push_str(&format!(
-            "    <metadata key=\"internal_solid_infill_pattern\" value=\"{}\"/>\n",
-            xml_escape(p)
-        ));
-    }
     cfg.push_str("    <part id=\"1\" subtype=\"normal_part\">\n");
     cfg.push_str(&format!("      <metadata key=\"name\" value=\"{}\"/>\n", xml_escape(part_name)));
     cfg.push_str("      <metadata key=\"matrix\" value=\"1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1\"/>\n");
@@ -187,6 +185,12 @@ pub fn export_orca_3mf(
         cfg.push_str(&format!(
             "      <metadata key=\"sparse_infill_density\" value=\"{pct}%\"/>\n"
         ));
+        if let Some(p) = solid_pattern {
+            cfg.push_str(&format!(
+                "      <metadata key=\"sparse_infill_pattern\" value=\"{}\"/>\n",
+                xml_escape(p)
+            ));
+        }
         cfg.push_str("      <mesh_stat edges_fixed=\"0\" degenerate_facets=\"0\" facets_removed=\"0\" facets_reversed=\"0\" backwards_edges=\"0\"/>\n");
         cfg.push_str("    </part>\n");
     }
@@ -216,6 +220,133 @@ pub fn export_orca_3mf(
     zip.add("3D/_rels/3dmodel.model.rels", model_rels.as_bytes());
     zip.add("3D/Objects/object_1.model", obj.as_bytes());
     zip.add("Metadata/model_settings.config", cfg.as_bytes());
+    zip.finish()
+}
+
+/// Build the PrusaSlicer project 3MF (reverse-engineered from a reference
+/// export, `testhook_prusaslicer.3mf`): ONE object whose mesh concatenates
+/// the part and all modifier meshes; volumes are triangle ranges declared in
+/// Metadata/Slic3r_PE_model.config (`ModelPart` / `ParameterModifier`).
+/// Object-level config carries `fill_density` (base) and `perimeters`;
+/// modifiers override `fill_density` (+ `fill_pattern` in binary mode —
+/// "rectilinear"/"concentric" are valid PrusaSlicer values). Geometry is
+/// centered on the bbox like PrusaSlicer's own exports, with the build item
+/// placing it at bed center, bottom on the plate. No print profile is
+/// embedded: the user's printer/filament/print presets stay active.
+pub fn export_prusa_3mf(
+    part_name: &str,
+    part: &IndexedMesh,
+    regions: &[RegionMesh],
+    base_density: f64,
+    perimeters: u32,
+    solid_pattern: Option<&str>,
+) -> Vec<u8> {
+    // ---- concatenate part + regions into one mesh, tracking tri ranges ----
+    let mut vertices: Vec<[f32; 3]> = part.vertices.clone();
+    let mut triangles: Vec<[u32; 3]> = part.triangles.clone();
+    // (first_tri, last_tri) inclusive, per volume; part is volume 0.
+    let mut ranges: Vec<(usize, usize)> = vec![(0, triangles.len().saturating_sub(1))];
+    for r in regions {
+        let m = region_to_indexed(r);
+        let v0 = vertices.len() as u32;
+        let t0 = triangles.len();
+        vertices.extend_from_slice(&m.vertices);
+        triangles.extend(m.triangles.iter().map(|t| [t[0] + v0, t[1] + v0, t[2] + v0]));
+        ranges.push((t0, triangles.len().saturating_sub(1)));
+    }
+
+    // ---- center on the combined bbox (PrusaSlicer convention); the build
+    // item then drops it at bed center with the bottom on the plate ----
+    let (mut lo, mut hi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
+    for v in &vertices {
+        for d in 0..3 {
+            lo[d] = lo[d].min(v[d]);
+            hi[d] = hi[d].max(v[d]);
+        }
+    }
+    let c = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0, (lo[2] + hi[2]) / 2.0];
+    for v in vertices.iter_mut() {
+        for d in 0..3 {
+            v[d] -= c[d];
+        }
+    }
+    let tz = (hi[2] - lo[2]) / 2.0;
+    let mesh = IndexedMesh { vertices, triangles };
+
+    // ---- 3D/3dmodel.model ----
+    let mut model = String::new();
+    model.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    model.push_str("<model unit=\"millimeter\" xml:lang=\"en-US\" xmlns=\"http://schemas.microsoft.com/3dmanufacturing/core/2015/02\" xmlns:slic3rpe=\"http://schemas.slic3r.org/3mf/2017/06\">\n");
+    model.push_str(" <metadata name=\"slic3rpe:Version3mf\">1</metadata>\n");
+    model.push_str(&format!(" <metadata name=\"Title\">{}</metadata>\n", xml_escape(part_name)));
+    model.push_str(" <metadata name=\"Application\">SmartInfillGenerator-0.1.0</metadata>\n");
+    model.push_str(" <resources>\n  <object id=\"1\" type=\"model\">\n");
+    model.push_str(&mesh_xml(&mesh));
+    model.push_str("  </object>\n </resources>\n <build>\n");
+    model.push_str(&format!(
+        "  <item objectid=\"1\" transform=\"1 0 0 0 1 0 0 0 1 125 105 {tz}\" printable=\"1\"/>\n"
+    ));
+    model.push_str(" </build>\n</model>\n");
+
+    // ---- Metadata/Slic3r_PE_model.config ----
+    let mut cfg = String::new();
+    cfg.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<config>\n");
+    cfg.push_str(" <object id=\"1\" instances_count=\"1\">\n");
+    cfg.push_str(&format!(
+        "  <metadata type=\"object\" key=\"name\" value=\"{}\"/>\n",
+        xml_escape(part_name)
+    ));
+    cfg.push_str(&format!(
+        "  <metadata type=\"object\" key=\"fill_density\" value=\"{}%\"/>\n",
+        (base_density * 100.0).round() as u32
+    ));
+    cfg.push_str(&format!(
+        "  <metadata type=\"object\" key=\"perimeters\" value=\"{perimeters}\"/>\n"
+    ));
+    for (k, (first, last)) in ranges.iter().enumerate() {
+        cfg.push_str(&format!("  <volume firstid=\"{first}\" lastid=\"{last}\">\n"));
+        if k == 0 {
+            cfg.push_str(&format!(
+                "   <metadata type=\"volume\" key=\"name\" value=\"{}\"/>\n",
+                xml_escape(part_name)
+            ));
+            cfg.push_str("   <metadata type=\"volume\" key=\"volume_type\" value=\"ModelPart\"/>\n");
+        } else {
+            let pct = (regions[k - 1].density * 100.0).round() as u32;
+            cfg.push_str(&format!(
+                "   <metadata type=\"volume\" key=\"name\" value=\"infill {pct}%\"/>\n"
+            ));
+            cfg.push_str("   <metadata type=\"volume\" key=\"modifier\" value=\"1\"/>\n");
+            cfg.push_str(
+                "   <metadata type=\"volume\" key=\"volume_type\" value=\"ParameterModifier\"/>\n",
+            );
+            cfg.push_str(&format!(
+                "   <metadata type=\"volume\" key=\"fill_density\" value=\"{pct}%\"/>\n"
+            ));
+            if let Some(p) = solid_pattern {
+                cfg.push_str(&format!(
+                    "   <metadata type=\"volume\" key=\"fill_pattern\" value=\"{}\"/>\n",
+                    xml_escape(p)
+                ));
+            }
+        }
+        cfg.push_str(
+            "   <metadata type=\"volume\" key=\"matrix\" value=\"1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1\"/>\n",
+        );
+        cfg.push_str("   <mesh edges_fixed=\"0\" degenerate_facets=\"0\" facets_removed=\"0\" facets_reversed=\"0\" backwards_edges=\"0\"/>\n");
+        cfg.push_str("  </volume>\n");
+    }
+    cfg.push_str(" </object>\n</config>\n");
+
+    // ---- container plumbing ----
+    let content_types = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\n <Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\n <Default Extension=\"model\" ContentType=\"application/vnd.ms-package.3dmanufacturing-3dmodel+xml\"/>\n</Types>\n";
+    let rels = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\n <Relationship Target=\"/3D/3dmodel.model\" Id=\"rel-1\" Type=\"http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel\"/>\n</Relationships>\n";
+
+    let mut zip = ZipWriter::new();
+    zip.add("[Content_Types].xml", content_types.as_bytes());
+    zip.add("_rels/.rels", rels.as_bytes());
+    zip.add("3D/3dmodel.model", model.as_bytes());
+    zip.add("Metadata/Slic3r_PE_model.config", cfg.as_bytes());
     zip.finish()
 }
 

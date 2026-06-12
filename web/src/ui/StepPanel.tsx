@@ -10,6 +10,12 @@ import { NumInput } from "./NumInput";
 import type { Bc, BcKind, PatternKey } from "../types";
 import { fmtDisp, fmtLen, rampCss } from "./fmt";
 
+const SLICER_NAMES = {
+  orca: "OrcaSlicer",
+  bambu: "Bambu Studio",
+  prusa: "PrusaSlicer",
+} as const;
+
 const KIND_LABEL: Record<BcKind, string> = {
   fixed: "Fixed support",
   frictionless: "Frictionless support",
@@ -759,14 +765,37 @@ function StepExport() {
             <div className="g-label">
               <span>Hand off</span>
             </div>
+            <div className="seg">
+              <button
+                className={s.exportSlicer === "orca" ? "on" : ""}
+                onClick={() => s.setExportSlicer("orca")}
+                title="OrcaSlicer project flavor"
+              >
+                Orca
+              </button>
+              <button
+                className={s.exportSlicer === "bambu" ? "on" : ""}
+                onClick={() => s.setExportSlicer("bambu")}
+                title="Bambu Studio flavor (its renamed pattern values — no 'values replaced' dialog)"
+              >
+                Bambu
+              </button>
+              <button
+                className={s.exportSlicer === "prusa" ? "on" : ""}
+                onClick={() => s.setExportSlicer("prusa")}
+                title="PrusaSlicer flavor (modifier volumes + per-volume infill config)"
+              >
+                Prusa
+              </button>
+            </div>
             <button className="primary" onClick={() => void s.downloadThreeMf()}>
-              Download OrcaSlicer project (.3mf)
+              Download {SLICER_NAMES[s.exportSlicer]} project (.3mf)
             </button>
             <button onClick={() => void s.downloadStls()}>Download modifier STLs (.zip)</button>
           </div>
           <div className="hint">
-            The 3MF opens in OrcaSlicer/Bambu Studio with the part, the modifier volumes, and
-            their infill densities already set (base infill{" "}
+            The 3MF opens in {SLICER_NAMES[s.exportSlicer]} with the part, the modifier volumes,
+            and their infill densities already set (base infill{" "}
             {Math.round(s.optSummary.baseDensity * 100)}% on the object). Only densities are
             overridden — walls, shells, and everything else come from your own profiles.
           </div>

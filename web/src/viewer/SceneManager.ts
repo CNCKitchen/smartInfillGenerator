@@ -88,6 +88,20 @@ export class SceneManager {
   // Result views
   private displacements: Float32Array | null = null;
   private vertexDensity: Float32Array | null = null;
+  /** Results on the analysis voxel hull (exact nodal displacements) —
+   *  alternate surface for the deformed view, toggled by resultSurface. */
+  private resultSurface: "stl" | "voxel" = "stl";
+  private voxRes: {
+    group: THREE.Group;
+    geo: THREE.BufferGeometry;
+    base: Float32Array;
+    disp: Float32Array;
+    uvs: Float32Array;
+    lineGeo: THREE.BufferGeometry | null;
+    lineBase: Float32Array | null;
+    lineDisp: Float32Array | null;
+  } | null = null;
+  private voxResDisposables: { dispose(): void }[] = [];
   private regionMeshes: THREE.Mesh[] = [];
   private regionVisible: boolean[] = [];
   private viewMode: ViewMode = "setup";
@@ -701,6 +715,76 @@ export class SceneManager {
     this.refreshView();
   }
 
+  /** Voxel hull + exact nodal displacements for the results view
+   *  (alternate result surface; nulls clear it). */
+  setVoxelResult(
+    positions: Float32Array | null,
+    disp: Float32Array | null,
+    edges: Float32Array | null,
+    edgeDisp: Float32Array | null
+  ) {
+    if (this.voxRes) {
+      this.scene.remove(this.voxRes.group);
+      for (const d of this.voxResDisposables) d.dispose();
+    }
+    this.voxRes = null;
+    this.voxResDisposables = [];
+    if (positions && disp && positions.length) {
+      const group = new THREE.Group();
+      const geo = new THREE.BufferGeometry();
+      // The attribute gets a copy: the original stays as the morph base.
+      geo.setAttribute("position", new THREE.BufferAttribute(positions.slice(), 3));
+      const uvs = new Float32Array((positions.length / 3) * 2);
+      geo.setAttribute("uv", new THREE.BufferAttribute(uvs, 2));
+      geo.computeVertexNormals(); // soup → flat per-face normals
+      const mat = new THREE.MeshStandardMaterial({
+        map: this.lutJet,
+        roughness: 0.85,
+        metalness: 0.05,
+        flatShading: true,
+        side: THREE.DoubleSide,
+        polygonOffset: true,
+        polygonOffsetFactor: 1,
+        polygonOffsetUnits: 1,
+      });
+      this.voxResDisposables.push(geo, mat);
+      group.add(new THREE.Mesh(geo, mat));
+      let lineGeo: THREE.BufferGeometry | null = null;
+      let lineBase: Float32Array | null = null;
+      let lineDisp: Float32Array | null = null;
+      if (edges && edgeDisp && edges.length) {
+        lineGeo = new THREE.BufferGeometry();
+        lineGeo.setAttribute("position", new THREE.BufferAttribute(edges.slice(), 3));
+        const lmat = new THREE.LineBasicMaterial({
+          color: 0x2a2d30,
+          transparent: true,
+          opacity: 0.35,
+        });
+        this.voxResDisposables.push(lineGeo, lmat);
+        group.add(new THREE.LineSegments(lineGeo, lmat));
+        lineBase = edges;
+        lineDisp = edgeDisp;
+      }
+      group.visible = false;
+      this.scene.add(group);
+      this.voxRes = { group, geo, base: positions, disp, uvs, lineGeo, lineBase, lineDisp };
+    }
+    this.refreshClipping();
+    this.refreshView();
+  }
+
+  /** Switch the deformed view between the smooth STL and the voxel hull. */
+  setResultSurface(surface: "stl" | "voxel") {
+    if (this.resultSurface === surface) return;
+    this.resultSurface = surface;
+    this.refreshView();
+  }
+
+  /** Voxel result surface currently driving the deformed view. */
+  private voxResultActive(): boolean {
+    return this.viewMode === "deformed" && this.resultSurface === "voxel" && !!this.voxRes;
+  }
+
   /** Tint the skin cells (within wall thickness) in the mesh view. */
   setMeshSkinTint(on: boolean) {
     this.meshSkinTint = on;
@@ -1069,6 +1153,9 @@ export class SceneManager {
     };
     apply(this.mesh?.material, planes);
     for (const c of this.voxelGroup.children) apply((c as THREE.Mesh).material, voxelPlanes);
+    for (const c of this.voxRes?.group.children ?? []) {
+      apply((c as THREE.Mesh).material, planes);
+    }
     for (const m of this.regionMeshes) apply(m.material, planes);
     apply(this.optShapeMesh?.material ?? undefined, planes);
   }
@@ -1104,8 +1191,10 @@ export class SceneManager {
     mat.opacity = ghost ? 0.15 : 1.0;
     mat.depthWrite = !ghost;
     mat.needsUpdate = true;
-    this.mesh.visible = this.viewMode !== "mesh";
+    const voxResult = this.voxResultActive();
+    this.mesh.visible = this.viewMode !== "mesh" && !voxResult;
     this.voxelGroup.visible = this.viewMode === "mesh";
+    if (this.voxRes) this.voxRes.group.visible = voxResult;
     this.regionMeshes.forEach((m, i) => {
       m.visible = infill && this.regionVisible[i] !== false;
     });
@@ -1130,9 +1219,53 @@ export class SceneManager {
     mat.needsUpdate = true;
   }
 
+  /** Write a scalar (or |u|) into the voxel hull's uv channel (jet LUT). */
+  private colorVoxelResult() {
+    const vr = this.voxRes!;
+    const uvAttr = vr.geo.getAttribute("uv") as THREE.BufferAttribute;
+    const sf = this.scalarField;
+    if (sf && sf.values.length * 2 === vr.uvs.length) {
+      const lo = this.legendRange.min ?? sf.min;
+      const hi = this.legendRange.max ?? sf.max;
+      const inv = hi - lo > 1e-30 ? 1 / (hi - lo) : 0;
+      for (let i = 0; i < sf.values.length; i++) {
+        const t = Math.min(1, Math.max(0, (sf.values[i] - lo) * inv));
+        vr.uvs[2 * i] = sf.flip ? 1 - t : t;
+        vr.uvs[2 * i + 1] = 0.5;
+      }
+      uvAttr.array.set(vr.uvs);
+      uvAttr.needsUpdate = true;
+      this.trackExtremes(sf.values, 1);
+      return;
+    }
+    const d = vr.disp;
+    const n = d.length / 3;
+    const mags = new Float32Array(n);
+    let maxMag = 1e-12;
+    for (let i = 0; i < n; i++) {
+      mags[i] = Math.hypot(d[3 * i], d[3 * i + 1], d[3 * i + 2]);
+      maxMag = Math.max(maxMag, mags[i]);
+    }
+    const lo = this.legendRange.min ?? 0;
+    const hi = this.legendRange.max ?? maxMag;
+    const inv = hi - lo > 1e-30 ? 1 / (hi - lo) : 0;
+    for (let i = 0; i < n; i++) {
+      vr.uvs[2 * i] = Math.min(1, Math.max(0, (mags[i] - lo) * inv));
+      vr.uvs[2 * i + 1] = 0.5;
+    }
+    uvAttr.array.set(vr.uvs);
+    uvAttr.needsUpdate = true;
+    this.trackExtremes(mags, 1);
+  }
+
   private applyColors() {
     if (!this.geometry || !this.colors || !this.uvs) return;
     const uvAttr = this.geometry.getAttribute("uv") as THREE.BufferAttribute;
+    if (this.voxResultActive()) {
+      this.colorVoxelResult();
+      this.repaint();
+      return;
+    }
     if (this.viewMode === "deformed" && this.displacements) {
       const sf = this.scalarField;
       if (sf && sf.values.length * 2 === this.uvs.length) {
@@ -1265,12 +1398,15 @@ export class SceneManager {
 
   /** Place (or hide) the min/max markers at the DISPLAYED vertex positions. */
   private updateExtremeMarkers(positionsOnly = false) {
+    const vox = this.voxResultActive();
+    const geom = vox ? this.voxRes!.geo : this.geometry;
+    const disp = vox ? this.voxRes!.disp : this.displacements;
     const show =
       this.extremesOn &&
       this.viewMode === "deformed" &&
       !!this.extremeData &&
-      !!this.geometry &&
-      !!this.displacements;
+      !!geom &&
+      !!disp;
     if (!this.markerMin) {
       this.markerMin = this.makeExtremeMarker(0x60a5fa);
       this.markerMax = this.makeExtremeMarker(0xff5252);
@@ -1279,8 +1415,7 @@ export class SceneManager {
     this.markerMin.visible = show;
     this.markerMax!.visible = show;
     if (!show || !this.extremeData) return;
-    const pos = (this.geometry!.getAttribute("position") as THREE.BufferAttribute)
-      .array as Float32Array;
+    const pos = (geom!.getAttribute("position") as THREE.BufferAttribute).array as Float32Array;
     const d = this.extremeData;
     this.markerMin.position.set(pos[3 * d.minIdx], pos[3 * d.minIdx + 1], pos[3 * d.minIdx + 2]);
     this.markerMax!.position.set(pos[3 * d.maxIdx], pos[3 * d.maxIdx + 1], pos[3 * d.maxIdx + 2]);
@@ -1314,8 +1449,29 @@ export class SceneManager {
     }
     attr.needsUpdate = true;
     this.geometry.computeVertexNormals();
+    this.morphVoxelResult(deformFactor);
     // Markers ride the displayed (deformed/animated) vertices.
     this.updateExtremeMarkers(true);
+  }
+
+  /** Deform the voxel-result hull (and its cell edges) like the part. */
+  private morphVoxelResult(deformFactor: number) {
+    const vr = this.voxRes;
+    if (!vr || !vr.group.visible) return;
+    const s = this.autoScale * this.deformScale * deformFactor;
+    const attr = vr.geo.getAttribute("position") as THREE.BufferAttribute;
+    const out = attr.array as Float32Array;
+    for (let i = 0; i < vr.base.length; i++) out[i] = vr.base[i] + s * vr.disp[i];
+    attr.needsUpdate = true;
+    vr.geo.computeVertexNormals();
+    if (vr.lineGeo && vr.lineBase && vr.lineDisp) {
+      const la = vr.lineGeo.getAttribute("position") as THREE.BufferAttribute;
+      const lo = la.array as Float32Array;
+      for (let i = 0; i < vr.lineBase.length; i++) {
+        lo[i] = vr.lineBase[i] + s * vr.lineDisp[i];
+      }
+      la.needsUpdate = true;
+    }
   }
 
   private tick() {

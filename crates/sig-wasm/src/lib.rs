@@ -44,8 +44,8 @@ struct OptOutput {
     /// Perimeter count the analysis skin assumed — exported as the part-level
     /// wall_loops so the print matches the simulation.
     perimeters: u32,
-    /// Object-level internal_solid_infill_pattern for the export (binary
-    /// mode's rectilinear/concentric solid fill); None = profile default.
+    /// Per-modifier sparse_infill_pattern for the export (binary mode's
+    /// rectilinear/concentric solid fill); None = profile default.
     solid_pattern: Option<String>,
     summary: String,
 }
@@ -1006,15 +1006,9 @@ impl Model {
         Ok(self.sample_cell_field(grid, &opt.cell_density))
     }
 
-    /// Stress/strain scalar per soup vertex, from the current solution.
-    /// Kinds: "vm" | "sxx" | "syy" | "szz" | "sxy" | "syz" | "szx" (MPa),
-    /// "evm" | "exx" | "eyy" | "ezz" | "gxy" | "gyz" | "gzx" (strain), and
-    /// "sf" — safety factor σ_allow/σ_vM, where the allowable of graded
-    /// infill scales with the SAME relative factor as its stiffness
-    /// (Gibson–Ashby strength tracks stiffness to first order; the skin
-    /// carries the full tensile strength). Capped at 99.
-    /// Evaluated at cell centers with the eps the solve actually used.
-    pub fn result_field(&self, kind: &str) -> Result<Vec<f32>, JsValue> {
+    /// Per-cell scalar values of a result field on the padded grid (valid
+    /// where grid.scale > 0), evaluated with the eps the solve actually used.
+    fn cell_values(&self, kind: &str) -> Result<Vec<f32>, JsValue> {
         let sol =
             self.solution.as_ref().ok_or_else(|| err("no solution — run Solve or Optimize"))?;
         let (grid, _) = self.grid.as_ref().ok_or_else(|| err("no grid"))?;
@@ -1052,7 +1046,7 @@ impl Model {
             }
             Ok(c)
         };
-        let cells = match kind {
+        Ok(match kind {
             "sfm" => sf_material(),
             "sfz" => sf_layer()?,
             "sf" => {
@@ -1067,25 +1061,88 @@ impl Model {
                 let k = FieldKind::parse(kind).ok_or_else(|| err("unknown result field"))?;
                 cell_field(grid, &sol.u, self.settings.e0, self.settings.nu, eps, k)
             }
-        };
+        })
+    }
+
+    /// Stress/strain scalar per soup vertex, from the current solution.
+    /// Kinds: "vm" | "sxx" | "syy" | "szz" | "sxy" | "syz" | "szx" (MPa),
+    /// "evm" | "exx" | "eyy" | "ezz" | "gxy" | "gyz" | "gzx" (strain), and
+    /// "sf" — safety factor σ_allow/σ_vM, where the allowable of graded
+    /// infill scales with the SAME relative factor as its stiffness
+    /// (Gibson–Ashby strength tracks stiffness to first order; the skin
+    /// carries the full tensile strength). Capped at 99.
+    /// Evaluated at cell centers with the eps the solve actually used.
+    pub fn result_field(&self, kind: &str) -> Result<Vec<f32>, JsValue> {
+        let cells = self.cell_values(kind)?;
+        let (grid, _) = self.grid.as_ref().ok_or_else(|| err("no grid"))?;
         Ok(sample_cell_values(&self.mesh.tris, grid, &cells))
     }
 
-    /// Orca/Bambu project 3MF with part + nested modifiers. The part mesh is
-    /// the ORIGINAL import tessellation (display subdivision stays internal);
-    /// the part carries the perimeter count the optimization assumed.
-    pub fn export_3mf(&self) -> Result<Vec<u8>, JsValue> {
+    /// Voxel-hull result geometry: the analysis mesh with EXACT nodal
+    /// displacements (hull vertices ARE grid nodes — no surface sampling
+    /// like the STL view). Returns [positions f32 (9/tri), displacements
+    /// f32 (9/tri), edges f32 (6/segment), edge displacements f32].
+    pub fn voxel_results(&self) -> Result<js_sys::Array, JsValue> {
+        let sol =
+            self.solution.as_ref().ok_or_else(|| err("no solution — run Solve or Optimize"))?;
+        let (grid, _) = self.grid.as_ref().ok_or_else(|| err("no grid"))?;
+        let (tris, edges) = grid.surface_mesh();
+        let tri_disp = node_displacements(&tris, grid, sol);
+        let edge_disp = node_displacements(&edges, grid, sol);
+        Ok(js_sys::Array::of4(
+            &js_sys::Float32Array::from(tris.as_slice()),
+            &js_sys::Float32Array::from(tri_disp.as_slice()),
+            &js_sys::Float32Array::from(edges.as_slice()),
+            &js_sys::Float32Array::from(edge_disp.as_slice()),
+        ))
+    }
+
+    /// Result field on the voxel hull: one value per hull vertex (3 per
+    /// triangle), each triangle carrying its OWNING CELL's value — crisp
+    /// per-cell coloring instead of the STL view's smoothed sampling.
+    /// Kinds as in `result_field`.
+    pub fn voxel_result_field(&self, kind: &str) -> Result<Vec<f32>, JsValue> {
+        let cells = self.cell_values(kind)?;
+        let (grid, _) = self.grid.as_ref().ok_or_else(|| err("no grid"))?;
+        let (_tris, _edges, cell_of_tri) = grid.surface_mesh_where(&|_| true);
+        let mut out = Vec::with_capacity(cell_of_tri.len() * 3);
+        for &ci in &cell_of_tri {
+            let v = cells[ci as usize];
+            out.extend_from_slice(&[v, v, v]);
+        }
+        Ok(out)
+    }
+
+    /// Project 3MF with part + modifiers for the chosen slicer flavor:
+    /// "orca" (default), "bambu", or "prusa". The part mesh is the ORIGINAL
+    /// import tessellation (display subdivision stays internal); the part
+    /// carries the perimeter count the optimization assumed. Bambu Studio
+    /// (>= 2.06) renamed the "rectilinear" pattern value to "zig-zag"
+    /// (still displayed as Rectilinear), so the bambu flavor maps it —
+    /// otherwise every project load pops a "values replaced" dialog.
+    pub fn export_3mf(&self, slicer: &str) -> Result<Vec<u8>, JsValue> {
         let opt = self.opt.as_ref().ok_or_else(|| err("no optimization result — run optimize first"))?;
         let part = weld(&self.mesh_orig);
         let name = if self.name.is_empty() { "part" } else { &self.name };
-        Ok(export_orca_3mf(
-            name,
-            &part,
-            &opt.regions,
-            opt.base_density,
-            opt.perimeters,
-            opt.solid_pattern.as_deref(),
-        ))
+        let pattern = opt.solid_pattern.as_deref();
+        Ok(match slicer {
+            "prusa" => sig_core::threemf::export_prusa_3mf(
+                name,
+                &part,
+                &opt.regions,
+                opt.base_density,
+                opt.perimeters,
+                pattern,
+            ),
+            s => export_orca_3mf(
+                name,
+                &part,
+                &opt.regions,
+                opt.base_density,
+                opt.perimeters,
+                pattern.map(|p| if s == "bambu" && p == "rectilinear" { "zig-zag" } else { p }),
+            ),
+        })
     }
 
     /// Voxel mesh for the Mesh view, optionally cut by a plane: cells whose
@@ -1264,6 +1321,22 @@ fn sample_cell_values(tris: &[[f32; 9]], grid: &VoxelGrid, values: &[f32]) -> Ve
             }
             out.push(val);
         }
+    }
+    out
+}
+
+/// Nodal displacement for xyz points that lie ON grid nodes (voxel hull
+/// vertices and cell-edge endpoints) — exact lookup, no interpolation.
+fn node_displacements(points: &[f32], grid: &VoxelGrid, sol: &Solution) -> Vec<f32> {
+    let h = grid.h;
+    let o = grid.origin;
+    let mut out = Vec::with_capacity(points.len());
+    for p in points.chunks_exact(3) {
+        let x = (((p[0] as f64 - o[0]) / h).round() as usize).min(sol.mx - 1);
+        let y = (((p[1] as f64 - o[1]) / h).round() as usize).min(sol.my - 1);
+        let z = (((p[2] as f64 - o[2]) / h).round() as usize).min(sol.mz - 1);
+        let n = (z * sol.my + y) * sol.mx + x;
+        out.extend_from_slice(&sol.u[3 * n..3 * n + 3]);
     }
     out
 }

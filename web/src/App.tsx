@@ -9,6 +9,7 @@ import { Inspector } from "./ui/Inspector";
 import { StatusStrip } from "./ui/StatusStrip";
 import { ViewportChips } from "./ui/ViewportChips";
 import { SettingsModal } from "./ui/Settings";
+import { Disclaimer } from "./ui/Disclaimer";
 import { NerdLog } from "./ui/NerdLog";
 import { Viewer } from "./viewer/Viewer";
 import { useStore } from "./store";
@@ -53,6 +54,7 @@ export function App() {
       </div>
       <StatusStrip />
       <SettingsModal />
+      <Disclaimer />
     </div>
   );
 }
