@@ -245,20 +245,34 @@ model.add_force(sel(0, "max"), 0, 0, -5);
   assert(fmin(sfm) >= sfPrintedMin - 1e-6 && fmin(sfz) >= sfPrintedMin - 1e-6,
     `worst SF is the most conservative (m ${fmin(sfm).toFixed(1)}, z ${fmin(sfz).toFixed(1)}, worst ${sfPrintedMin.toFixed(1)})`);
 
-  // Voxel mesh with skin mask + voxel-true section cut.
-  const full = model.voxel_mesh_cut(false, 0, 0, 0, 0, 0.9);
-  const fullPos = full[0], fullSkin = full[1], fullEdges = full[2];
+  // Voxel mesh with element density + voxel-true section cut: skin cells
+  // carry 1.0, exposed interior cells the uniform infill ratio (25%).
+  const full = model.voxel_mesh_cut(false, 0, 0, 0, 0, 0.9, 25);
+  const fullPos = full[0], fullDensity = full[1], fullEdges = full[2];
   assert(fullPos.length > 0 && fullPos.length % 9 === 0, "voxel mesh positions (9 floats/tri)");
-  assert(fullSkin.length === fullPos.length / 3, "skin mask one value per vertex");
+  assert(fullDensity.length === fullPos.length / 3, "element density one value per vertex");
   assert(fullEdges.length > 0 && fullEdges.length % 6 === 0, "voxel mesh edges");
-  assert(fullSkin.every((v) => v > 0.5), "uncut hull shows only skin cells (all faces touch the surface)");
+  assert(fullDensity.every((v) => v > 0.5), "uncut hull shows only skin cells (all faces touch the surface)");
   // Drop the half with x > 20 (three.js plane convention: keep n·p + c >= 0).
-  const cutArr = model.voxel_mesh_cut(true, -1, 0, 0, 20, 0.9);
-  const cutPos = cutArr[0], cutSkin = cutArr[1];
+  const cutArr = model.voxel_mesh_cut(true, -1, 0, 0, 20, 0.9, 25);
+  const cutPos = cutArr[0], cutDensity = cutArr[1];
   assert(cutPos.length > 0 && cutPos.length < fullPos.length, "cut mesh is a strict subset");
-  const interiorShare = cutSkin.reduce((a, v) => a + (v < 0.5 ? 1 : 0), 0) / cutSkin.length;
+  const interior = cutDensity.reduce((a, v) => a + (Math.abs(v - 0.25) < 1e-6 ? 1 : 0), 0);
+  const interiorShare = interior / cutDensity.length;
   assert(interiorShare > 0.02,
-    `voxel cut exposes interior cells (${(100 * interiorShare).toFixed(1)}% of cut-mesh vertices)`);
+    `voxel cut exposes interior cells at the infill density (${(100 * interiorShare).toFixed(1)}% of cut-mesh vertices)`);
+
+  // Smoothed stress display: same field nodal-averaged + surface-sampled —
+  // same length, finite everywhere, and averaging never raises the peak.
+  model.set_smooth_stress(true);
+  const vmSmooth = model.result_field("vm");
+  model.set_smooth_stress(false);
+  const vmFlat = model.result_field("vm");
+  assert(vmSmooth.length === vmFlat.length, "smoothed field has the same vertex count");
+  assert(vmSmooth.every((v) => Number.isFinite(v)), "smoothed field finite everywhere");
+  assert(fmax(vmSmooth) <= fmax(vmFlat) + 1e-6,
+    `nodal averaging never raises the peak (${fmax(vmSmooth).toFixed(2)} vs ${fmax(vmFlat).toFixed(2)} MPa)`);
+  console.log("ok: smoothed stress (nodal recovery + surface sampling)");
 
   model.set_snap_wall(0); // back to nominal sizing for the remaining sections
 }

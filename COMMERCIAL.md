@@ -1,6 +1,6 @@
 # Commercial licensing
 
-The Smart Infill Generator is open source under the **GNU AGPL-3.0-only**
+InFEAll (formerly "Smart Infill Generator") is open source under the **GNU AGPL-3.0-only**
 (see [LICENSE](LICENSE)). In short: you may use, modify, self-host, and
 redistribute it freely — but if you distribute it, or offer it (modified or
 not) to users over a network, you must make the complete corresponding

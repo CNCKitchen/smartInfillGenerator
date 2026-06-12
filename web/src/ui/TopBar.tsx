@@ -9,9 +9,9 @@ export function TopBar() {
   const m = s.model;
   return (
     <header className="top">
-      <div className="brandmark">SI</div>
+      <div className="brandmark">IF</div>
       <div className="brand">
-        <b>Smart Infill Generator</b>
+        <b>InFEAll</b>
         <span>CNC Kitchen · browser FEA</span>
       </div>
       <div className="partchip">

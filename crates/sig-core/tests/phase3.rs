@@ -32,6 +32,7 @@ struct OptFixture {
     settings: SolveSettings,
     skin: Vec<u32>,
     design: Vec<u32>,
+    skin_frac: Vec<f32>,
     x: Vec<f64>,
     u: Vec<f64>,
     se: Vec<f64>,
@@ -75,6 +76,7 @@ fn run_cantilever_optimization() -> OptFixture {
         settings,
         skin: result.skin_cells,
         design: result.design_cells,
+        skin_frac: result.skin_frac,
         x: result.x,
         u: result.u,
         se: result.se,
@@ -106,13 +108,13 @@ fn optimized_bins_beat_uniform_infill_at_equal_mass() {
     let x_uniform = vec![mean; x_binned.len()];
 
     let (c_binned, maxd_binned, _) = evaluate(
-        &f.grid, f.levels, &f.problem, &f.settings, &f.skin, &f.design, &x_binned, 1.5, 1.0,
-        Some(&f.u),
+        &f.grid, f.levels, &f.problem, &f.settings, &f.skin, &f.design, &f.skin_frac, &x_binned,
+        1.5, 1.0, Some(&f.u),
     )
     .expect("binned eval");
     let (c_uniform, _, _) = evaluate(
-        &f.grid, f.levels, &f.problem, &f.settings, &f.skin, &f.design, &x_uniform, 1.5, 1.0,
-        Some(&f.u),
+        &f.grid, f.levels, &f.problem, &f.settings, &f.skin, &f.design, &f.skin_frac, &x_uniform,
+        1.5, 1.0, Some(&f.u),
     )
     .expect("uniform eval");
 
@@ -198,15 +200,15 @@ fn bin_placement_ab() {
     let f = run_cantilever_optimization();
     let eval_layout = |x_b: &[f64], label: &str, centers: &[f64]| {
         let (c, _, _) = evaluate(
-            &f.grid, f.levels, &f.problem, &f.settings, &f.skin, &f.design, x_b, 1.5, 1.0,
-            Some(&f.u),
+            &f.grid, f.levels, &f.problem, &f.settings, &f.skin, &f.design, &f.skin_frac, x_b,
+            1.5, 1.0, Some(&f.u),
         )
         .unwrap();
         let mean = x_b.iter().sum::<f64>() / x_b.len() as f64;
         let x_u = vec![mean; x_b.len()];
         let (cu, _, _) = evaluate(
-            &f.grid, f.levels, &f.problem, &f.settings, &f.skin, &f.design, &x_u, 1.5, 1.0,
-            Some(&f.u),
+            &f.grid, f.levels, &f.problem, &f.settings, &f.skin, &f.design, &f.skin_frac, &x_u,
+            1.5, 1.0, Some(&f.u),
         )
         .unwrap();
         println!(
@@ -288,13 +290,13 @@ fn binary_mode_solid_or_floor_beats_uniform() {
 
     let (c_binned, _, _) = evaluate(
         &grid, levels, &asm.problem, &settings, &result.skin_cells, &result.design_cells,
-        &x_binned, 1.5, 1.0, Some(&result.u),
+        &result.skin_frac, &x_binned, 1.5, 1.0, Some(&result.u),
     )
     .unwrap();
     let x_uniform = vec![mean; x_binned.len()];
     let (c_uniform, _, _) = evaluate(
         &grid, levels, &asm.problem, &settings, &result.skin_cells, &result.design_cells,
-        &x_uniform, 1.5, 1.0, Some(&result.u),
+        &result.skin_frac, &x_uniform, 1.5, 1.0, Some(&result.u),
     )
     .unwrap();
     let gain = c_uniform / c_binned;
@@ -730,13 +732,82 @@ fn zip_writer_reader_roundtrip() {
 fn classify_cells_skin_vs_interior() {
     let grid0 = VoxelGrid::solid_box(10, 10, 10, 1.0);
     let (grid, _) = pad_for_levels(&grid0, 1);
-    let (skin, interior) = classify_cells(&grid, 1.0);
-    assert_eq!(skin.len() + interior.len(), 1000);
+    let s = classify_cells(&grid, 1.0, false);
+    assert_eq!(s.skin.len() + s.design.len(), 1000);
     // 1-layer skin of a 10^3 box: 10^3 - 8^3 = 488.
-    assert_eq!(skin.len(), 488, "one skin layer expected");
-    let (skin2, interior2) = classify_cells(&grid, 2.0);
-    assert_eq!(skin2.len(), 1000 - 6 * 6 * 6);
-    assert_eq!(interior2.len(), 216);
+    assert_eq!(s.skin.len(), 488, "one skin layer expected");
+    assert!(s.skin_frac.iter().all(|&f| f == 0.0), "legacy mode: no fractions");
+    let s2 = classify_cells(&grid, 2.0, false);
+    assert_eq!(s2.skin.len(), 1000 - 6 * 6 * 6);
+    assert_eq!(s2.design.len(), 216);
+
+    // Composite mode at integer wall/h reproduces the legacy split exactly.
+    let c2 = classify_cells(&grid, 2.0, true);
+    assert_eq!(c2.skin, s2.skin);
+    assert_eq!(c2.design, s2.design);
+    assert!(c2.skin_frac.iter().all(|&f| f == 0.0));
+}
+
+#[test]
+fn nodal_recovery_averages_adjacent_cells() {
+    use sig_core::stress::recover_nodal;
+    // 2x1x1 solid cells with values 1 and 3: shared face nodes average to 2,
+    // outer nodes keep their cell's value, and a padded void region (the
+    // grid is 4 wide) yields NaN on nodes touching no solid cell.
+    let mut grid = VoxelGrid::solid_box(4, 1, 1, 1.0);
+    grid.scale[2] = 0.0;
+    grid.scale[3] = 0.0;
+    let values = vec![1.0f32, 3.0, 0.0, 0.0];
+    let nodal = recover_nodal(&grid, &values);
+    let (mx, my) = (5, 2);
+    let n = |x: usize, y: usize, z: usize| (z * my + y) * mx + x;
+    for y in 0..2 {
+        for z in 0..2 {
+            assert_eq!(nodal[n(0, y, z)], 1.0, "outer nodes of cell 0");
+            assert_eq!(nodal[n(1, y, z)], 2.0, "shared nodes average 1 and 3");
+            assert_eq!(nodal[n(2, y, z)], 3.0, "outer nodes of cell 1");
+            assert!(nodal[n(4, y, z)].is_nan(), "void-only nodes are NaN");
+        }
+    }
+}
+
+#[test]
+fn classify_cells_composite_fractions() {
+    // Wall = half a cell: no cell is fully skin; surface cells carry the
+    // overlapping-slab fraction of the 0.5-cell band.
+    let grid0 = VoxelGrid::solid_box(10, 10, 10, 1.0);
+    let (grid, _) = pad_for_levels(&grid0, 1);
+    let c = classify_cells(&grid, 0.5, true);
+    assert!(c.skin.is_empty(), "no cell is fully inside a half-cell band");
+    assert_eq!(c.design.len(), 1000);
+    // Face cells: one void side -> f = 0.5. Edge cells: two orthogonal void
+    // sides -> 1 - 0.5^2 = 0.75. Corner cells: 1 - 0.5^3 = 0.875.
+    let (mut n_half, mut n_edge, mut n_corner, mut n_interior) = (0, 0, 0, 0);
+    for &f in &c.skin_frac {
+        if (f - 0.5).abs() < 1e-6 {
+            n_half += 1;
+        } else if (f - 0.75).abs() < 1e-6 {
+            n_edge += 1;
+        } else if (f - 0.875).abs() < 1e-6 {
+            n_corner += 1;
+        } else if f == 0.0 {
+            n_interior += 1;
+        } else {
+            panic!("unexpected skin fraction {f}");
+        }
+    }
+    assert_eq!(n_half, 6 * 8 * 8, "face cells");
+    assert_eq!(n_edge, 12 * 8, "edge cells");
+    assert_eq!(n_corner, 8, "corner cells");
+    assert_eq!(n_interior, 8 * 8 * 8, "interior cells");
+
+    // A 1-cell-thick plate with a 0.4-cell wall: both faces exposed along
+    // one axis -> two slabs, f = 0.8 in the plate's face cells.
+    let plate0 = VoxelGrid::solid_box(10, 10, 1, 1.0);
+    let (plate, _) = pad_for_levels(&plate0, 1);
+    let p = classify_cells(&plate, 0.4, true);
+    let n_two_sided = p.skin_frac.iter().filter(|&&f| (f - 0.8).abs() < 1e-6).count();
+    assert_eq!(n_two_sided, 8 * 8, "plate face cells count both walls");
 }
 
 #[test]

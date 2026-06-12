@@ -84,6 +84,22 @@ export class EngineClient {
     return this.call({ op: "setSnapWall", wall });
   }
 
+  /** Composite skin: surface cells the wall only partially covers get a
+   *  blended (part-wall, part-infill) stiffness instead of rounding the
+   *  skin to whole voxel layers — thin walls stay representable on coarse
+   *  grids. Off = legacy whole-layer skin. */
+  setCompositeSkin(on: boolean): Promise<void> {
+    return this.call({ op: "setCompositeSkin", on });
+  }
+
+  /** Smoothed stress display: result fields are volume-averaged to the grid
+   *  nodes and evaluated at the true surface, instead of painting each
+   *  cell's center value flat — removes the staircase checkerboard. Pure
+   *  post-processing; the solution is untouched. */
+  setSmoothStress(on: boolean): Promise<void> {
+    return this.call({ op: "setSmoothStress", on });
+  }
+
   setBcs(bcs: Bc[]): Promise<void> {
     // Copy tri arrays: the originals stay with the UI.
     const payload = bcs.map((bc) => ({
@@ -137,14 +153,17 @@ export class EngineClient {
     return this.call({ op: "voxelMesh" });
   }
 
-  /** Voxel mesh with a per-vertex skin mask, optionally cut by a plane —
-   *  cells on the dropped side vanish entirely (voxel-true section).
-   *  Plane in three.js convention: kept side is normal·p + constant ≥ 0. */
+  /** Voxel mesh with a per-vertex element DENSITY (0..1: skin = 1, interior
+   *  = its infill ratio — optimized densities when available, composite
+   *  cells blended), optionally cut by a plane — cells on the dropped side
+   *  vanish entirely (voxel-true section). Plane in three.js convention:
+   *  kept side is normal·p + constant ≥ 0. */
   voxelMeshCut(
     plane: { normal: [number, number, number]; constant: number } | null,
-    wall: number
-  ): Promise<{ hull: Float32Array; skin: Float32Array; edges: Float32Array; info: VoxelInfo }> {
-    return this.call({ op: "voxelMeshCut", plane, wall });
+    wall: number,
+    infillPct: number
+  ): Promise<{ hull: Float32Array; density: Float32Array; edges: Float32Array; info: VoxelInfo }> {
+    return this.call({ op: "voxelMeshCut", plane, wall, infillPct });
   }
 
   /** Isosurface of the final continuous density field at `threshold` (0..1). */
@@ -213,8 +232,12 @@ export interface PrintedStats extends SolveStats {
   massSolidGrams: number;
   skinCells: number;
   interiorCells: number;
-  /** Cell layers the grid resolves the skin with (k after snapping). */
+  /** Cell layers the skin is modeled with. Legacy mode: rounded, minimum 1.
+   *  Composite mode: exact wall/h — fractional (and < 1) values are real
+   *  and handled by blending. */
   skinLayers: number;
+  /** True when the solve used the composite (blended) skin model. */
+  compositeSkin: boolean;
 }
 
 /** Mirrors the wasm OptimizeOpts (serialized to JSON in the worker). */

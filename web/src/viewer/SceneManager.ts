@@ -143,9 +143,10 @@ export class SceneManager {
   private sectionQuadDisposables: { dispose(): void }[] = [];
   private capPart: THREE.Object3D[] = [];
   private capVoxel: THREE.Object3D[] = [];
-  /** Per-vertex skin mask of the current voxel hull (1 = skin cell). */
-  private voxelSkin: Float32Array | null = null;
-  private meshSkinTint = false;
+  /** Per-vertex element density of the current voxel hull (0–1: skin = 1,
+   *  interior = infill ratio / optimized density, composite cells blended). */
+  private voxelDensity: Float32Array | null = null;
+  private meshDensity = false;
   /** The voxel hull already carries the section cut in its geometry. */
   private voxelCutActive = false;
   private capDisposables: { dispose(): void }[] = [];
@@ -678,11 +679,15 @@ export class SceneManager {
     if (!on) this.applyPositions(); // restore full deflection
   }
 
-  setVoxelMesh(hull: Float32Array | null, edges: Float32Array | null, skin?: Float32Array | null) {
+  setVoxelMesh(
+    hull: Float32Array | null,
+    edges: Float32Array | null,
+    density?: Float32Array | null
+  ) {
     for (const d of this.voxelDisposables) d.dispose();
     this.voxelDisposables = [];
     this.voxelGroup.clear();
-    this.voxelSkin = skin ?? null;
+    this.voxelDensity = density ?? null;
     if (hull && hull.length) {
       const geo = new THREE.BufferGeometry();
       geo.setAttribute("position", new THREE.BufferAttribute(hull, 3));
@@ -785,9 +790,9 @@ export class SceneManager {
     return this.viewMode === "deformed" && this.resultSurface === "voxel" && !!this.voxRes;
   }
 
-  /** Tint the skin cells (within wall thickness) in the mesh view. */
-  setMeshSkinTint(on: boolean) {
-    this.meshSkinTint = on;
+  /** Color the mesh-view cells by element density (0–1 ramp). */
+  setMeshDensity(on: boolean) {
+    this.meshDensity = on;
     this.applyMeshTint();
   }
 
@@ -808,14 +813,22 @@ export class SceneManager {
     const colors = hullMesh.geometry.getAttribute("color") as THREE.BufferAttribute | undefined;
     if (!colors) return;
     const arr = colors.array as Float32Array;
-    const skin = this.voxelSkin;
-    // base 0x7e8b99; skin tint: Werkbank orange family, kept light enough
-    // that the cell edges stay readable.
+    const density = this.voxelDensity;
+    // Element-density plot: the same blue→cyan→yellow→red ramp as the
+    // infill-density legend, plain 0–1 scale (1 = solid skin). Off: the
+    // flat chassis gray-blue.
+    const c = new THREE.Color();
     for (let v = 0; v < arr.length / 3; v++) {
-      const isSkin = this.meshSkinTint && !!skin && skin[v] > 0.5;
-      arr[3 * v] = isSkin ? 0.851 : 0.494;
-      arr[3 * v + 1] = isSkin ? 0.486 : 0.545;
-      arr[3 * v + 2] = isSkin ? 0.165 : 0.6;
+      if (this.meshDensity && density) {
+        ramp(Math.min(1, Math.max(0, density[v])), c);
+        arr[3 * v] = c.r;
+        arr[3 * v + 1] = c.g;
+        arr[3 * v + 2] = c.b;
+      } else {
+        arr[3 * v] = 0.494;
+        arr[3 * v + 1] = 0.545;
+        arr[3 * v + 2] = 0.6;
+      }
     }
     colors.needsUpdate = true;
   }

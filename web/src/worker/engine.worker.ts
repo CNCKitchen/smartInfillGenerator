@@ -66,10 +66,15 @@ type Req =
       op: "voxelMeshCut";
       plane: { normal: [number, number, number]; constant: number } | null;
       wall: number;
+      /** Uniform infill % for interior-cell density (optimized densities
+       *  win when an optimization result exists). */
+      infillPct: number;
     }
   | { id: number; op: "check" }
   | { id: number; op: "solve" }
   | { id: number; op: "setSnapWall"; wall: number }
+  | { id: number; op: "setCompositeSkin"; on: boolean }
+  | { id: number; op: "setSmoothStress"; on: boolean }
   | {
       id: number;
       op: "solvePrinted";
@@ -151,6 +156,12 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
       case "setSnapWall":
         requireModel().set_snap_wall(msg.wall);
         break;
+      case "setCompositeSkin":
+        requireModel().set_composite_skin(msg.on);
+        break;
+      case "setSmoothStress":
+        requireModel().set_smooth_stress(msg.on);
+        break;
       case "setBcs": {
         const m = requireModel();
         m.clear_bcs();
@@ -190,15 +201,16 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
           p?.normal[1] ?? 0,
           p?.normal[2] ?? 0,
           p?.constant ?? 0,
-          msg.wall
+          msg.wall,
+          msg.infillPct
         );
         const hull = arr[0] as Float32Array;
-        const skin = arr[1] as Float32Array;
+        const density = arr[1] as Float32Array;
         const edges = arr[2] as Float32Array;
         const info = JSON.parse(m.voxel_info());
         (self as unknown as Worker).postMessage(
-          { id: msg.id, ok: true, data: { hull, skin, edges, info } },
-          [hull.buffer, skin.buffer, edges.buffer]
+          { id: msg.id, ok: true, data: { hull, density, edges, info } },
+          [hull.buffer, density.buffer, edges.buffer]
         );
         return;
       }

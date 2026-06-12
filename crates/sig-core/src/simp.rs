@@ -34,6 +34,10 @@ pub struct OptimizeParams {
     pub cap: f64,
     /// Skin (wall + shell) thickness in mm.
     pub wall_mm: f64,
+    /// Composite skin: surface cells the wall band only partially covers
+    /// stay design cells with a blended stiffness, instead of rounding the
+    /// band to whole cell layers (legacy).
+    pub composite_skin: bool,
     pub max_iter: usize,
 }
 
@@ -46,6 +50,7 @@ impl Default for OptimizeParams {
             floor: 0.10,
             cap: 0.70,
             wall_mm: 0.9,
+            composite_skin: false,
             max_iter: 40,
         }
     }
@@ -75,6 +80,8 @@ pub struct OptimizeResult {
     pub design_cells: Vec<u32>,
     /// Cell ids of skin cells (always solid).
     pub skin_cells: Vec<u32>,
+    /// Per-design-cell wall-band fraction (composite skin; zeros when off).
+    pub skin_frac: Vec<f32>,
     /// Target mean infill actually used (budget clamped to [floor, cap]).
     pub effective_budget: f64,
     pub iterations: usize,
@@ -107,12 +114,45 @@ impl std::fmt::Display for OptimizeError {
     }
 }
 
-/// Split solid cells into skin (within `wall_mm` of the surface) and interior.
-pub fn classify_cells(grid: &VoxelGrid, wall_mm: f64) -> (Vec<u32>, Vec<u32>) {
+/// Result of `classify_cells`: which solid cells are fully skin, which carry
+/// a design density, and how much of each design cell the wall band covers.
+pub struct SkinSplit {
+    /// Cells fully inside the wall band (always solid).
+    pub skin: Vec<u32>,
+    /// Cells carrying a design/infill density — includes COMPOSITE cells the
+    /// wall band partially covers.
+    pub design: Vec<u32>,
+    /// Per-design-cell fraction of the cell inside the wall band, in [0, 1).
+    /// All zeros in legacy (non-composite) mode.
+    pub skin_frac: Vec<f32>,
+}
+
+/// Split solid cells into skin (within `wall_mm` of the surface) and design
+/// cells. With `composite` on, the wall band is measured in FRACTIONAL cell
+/// layers: a cell the band only partially covers (wall thinner than the cell,
+/// or a non-integer wall/h) stays a design cell but records the covered
+/// fraction, and its stiffness/mass are later blended (Voigt) between solid
+/// and infill — so the skin no longer needs h <= wall to be representable.
+/// Surface cells exposed on several sides count the overlapping slabs
+/// (a convex corner at wall/h = 0.5 is 7/8 skin, not 1/2). With `composite`
+/// off, the band is the legacy round(wall/h), minimum one full layer.
+pub fn classify_cells(grid: &VoxelGrid, wall_mm: f64, composite: bool) -> SkinSplit {
     let (nx, ny, nz) = (grid.nx, grid.ny, grid.nz);
-    let layers = (wall_mm / grid.h).round().max(1.0) as usize;
-    // depth 0 = surface cell (touches void/outside), then BFS inward.
+    // Wall thickness in cell layers; the legacy model rounds to >= 1.
+    let t = if composite {
+        wall_mm / grid.h
+    } else {
+        (wall_mm / grid.h).round().max(1.0)
+    };
+    // depth 0 = surface cell (touches void/outside), then BFS inward while
+    // the band still reaches the next layer. Void faces of surface cells are
+    // counted per axis for the overlapping-slab fraction.
     let mut depth = vec![u32::MAX; nx * ny * nz];
+    let mut void_faces = vec![[0u8; 3]; 0];
+    let mut surface_slot = vec![u32::MAX; 0];
+    if composite {
+        surface_slot = vec![u32::MAX; nx * ny * nz];
+    }
     let mut queue: std::collections::VecDeque<usize> = Default::default();
     for cz in 0..nz {
         for cy in 0..ny {
@@ -121,25 +161,34 @@ pub fn classify_cells(grid: &VoxelGrid, wall_mm: f64) -> (Vec<u32>, Vec<u32>) {
                 if grid.scale[ci] <= 0.0 {
                     continue;
                 }
-                let mut surface = cx == 0 || cx + 1 == nx || cy == 0 || cy + 1 == ny || cz == 0 || cz + 1 == nz;
-                if !surface {
-                    surface = grid.scale[ci - 1] <= 0.0
-                        || grid.scale[ci + 1] <= 0.0
-                        || grid.scale[ci - nx] <= 0.0
-                        || grid.scale[ci + nx] <= 0.0
-                        || grid.scale[ci - nx * ny] <= 0.0
-                        || grid.scale[ci + nx * ny] <= 0.0;
-                }
-                if surface {
+                let void_at = |dx: i64, dy: i64, dz: i64| -> bool {
+                    let (x, y, z) = (cx as i64 + dx, cy as i64 + dy, cz as i64 + dz);
+                    if x < 0 || y < 0 || z < 0 || x >= nx as i64 || y >= ny as i64 || z >= nz as i64
+                    {
+                        return true; // outside the grid counts as void
+                    }
+                    grid.scale[((z as usize) * ny + y as usize) * nx + x as usize] <= 0.0
+                };
+                let faces = [
+                    void_at(-1, 0, 0) as u8 + void_at(1, 0, 0) as u8,
+                    void_at(0, -1, 0) as u8 + void_at(0, 1, 0) as u8,
+                    void_at(0, 0, -1) as u8 + void_at(0, 0, 1) as u8,
+                ];
+                if faces[0] + faces[1] + faces[2] > 0 {
                     depth[ci] = 0;
                     queue.push_back(ci);
+                    if composite {
+                        surface_slot[ci] = void_faces.len() as u32;
+                        void_faces.push(faces);
+                    }
                 }
             }
         }
     }
     while let Some(ci) = queue.pop_front() {
         let d = depth[ci];
-        if d as usize + 1 >= layers {
+        // The band reaches layer d+1 only while d+1 < t.
+        if (d as f64 + 1.0) >= t - 1e-9 {
             continue;
         }
         let cx = ci % nx;
@@ -171,18 +220,34 @@ pub fn classify_cells(grid: &VoxelGrid, wall_mm: f64) -> (Vec<u32>, Vec<u32>) {
         }
     }
     let mut skin = Vec::new();
-    let mut interior = Vec::new();
+    let mut design = Vec::new();
+    let mut skin_frac = Vec::new();
     for ci in 0..nx * ny * nz {
         if grid.scale[ci] <= 0.0 {
             continue;
         }
-        if depth[ci] != u32::MAX {
+        let f = match depth[ci] {
+            u32::MAX => 0.0,
+            0 if composite => {
+                // Union of wall slabs from each exposed face: the uncovered
+                // core is the product of the per-axis remainders.
+                let faces = void_faces[surface_slot[ci] as usize];
+                let mut core = 1.0f64;
+                for a in 0..3 {
+                    core *= (1.0 - faces[a] as f64 * t).max(0.0);
+                }
+                1.0 - core
+            }
+            d => (t - d as f64).clamp(0.0, 1.0),
+        };
+        if f >= 1.0 - 1e-6 {
             skin.push(ci as u32);
         } else {
-            interior.push(ci as u32);
+            design.push(ci as u32);
+            skin_frac.push(if f <= 1e-6 { 0.0 } else { f as f32 });
         }
     }
-    (skin, interior)
+    SkinSplit { skin, design, skin_frac }
 }
 
 /// Linear density filter over interior cells (conic weights, radius in cells).
@@ -296,11 +361,15 @@ fn cell_strain_energy(
 }
 
 /// Build the per-cell stiffness factors for a given interior density field.
-/// Infill law E/E0 = coeff * x^exponent, capped at solid (1.0).
+/// Infill law E/E0 = coeff * x^exponent, capped at solid (1.0). A design
+/// cell partially covered by the wall band (`skin_frac` > 0, composite skin)
+/// gets the volume-fraction blend of solid and infill — the same
+/// homogenization step as the infill law itself, applied at the surface.
 pub fn build_eps(
     grid: &VoxelGrid,
     skin: &[u32],
     design_cells: &[u32],
+    skin_frac: &[f32],
     x: &[f64],
     exponent: f64,
     coeff: f64,
@@ -311,8 +380,9 @@ pub fn build_eps(
     }
     for (k, &c) in design_cells.iter().enumerate() {
         let rel = (coeff * x[k].powf(exponent)).min(1.0);
-        let e = EMIN_REL as f64 + (1.0 - EMIN_REL as f64) * rel;
-        eps[c as usize] = e as f32;
+        let e_infill = EMIN_REL as f64 + (1.0 - EMIN_REL as f64) * rel;
+        let f = skin_frac[k] as f64;
+        eps[c as usize] = (f + (1.0 - f) * e_infill) as f32;
     }
     eps
 }
@@ -362,12 +432,19 @@ pub fn optimize_cached(
     u0: Option<&[f64]>,
     mut progress: impl FnMut(&OptimizeProgress, &[f64], &[u32]),
 ) -> Result<OptimizeResult, OptimizeError> {
-    let (skin, design_cells) = classify_cells(grid, params.wall_mm);
+    let SkinSplit { skin, design: design_cells, skin_frac } =
+        classify_cells(grid, params.wall_mm, params.composite_skin);
     if design_cells.is_empty() {
         return Err(OptimizeError::NoInterior);
     }
     let n_solid = (skin.len() + design_cells.len()) as f64;
-    let n_int = design_cells.len() as f64;
+    // Infill volume share per design cell — a composite cell is only
+    // (1 - skin_frac) infill; all 1 with composite skin off. Means and the
+    // mass budget weight by it so "mean infill" keeps meaning what a slicer
+    // percentage means.
+    let w: Vec<f64> = skin_frac.iter().map(|&f| 1.0 - f as f64).collect();
+    let w_sum: f64 = w.iter().sum();
+    let sum_f: f64 = skin_frac.iter().map(|&f| f as f64).sum();
 
     // The budget IS the target interior mean (infill %), so the result is
     // directly comparable to a uniform print at the same slicer percentage.
@@ -407,7 +484,7 @@ pub fn optimize_cached(
 
     // Build the hierarchy ONCE (or reuse a cached one — same grid/BC/void
     // pattern); iterations only swap stiffness values in.
-    let eps0 = build_eps(grid, &skin, &design_cells, &x, params.exponent, params.coeff);
+    let eps0 = build_eps(grid, &skin, &design_cells, &skin_frac, &x, params.exponent, params.coeff);
     let cache = SolverCache::prepare(slot, grid, levels, problem, settings, eps0);
     let mut bb = b.clone();
     for (i, c) in cache.solver.levels[0].constrained.iter().enumerate() {
@@ -422,7 +499,8 @@ pub fn optimize_cached(
         for v in x_phys.iter_mut() {
             *v = v.clamp(params.floor, params.cap);
         }
-        let eps = build_eps(grid, &skin, &design_cells, &x_phys, params.exponent, params.coeff);
+        let eps =
+            build_eps(grid, &skin, &design_cells, &skin_frac, &x_phys, params.exponent, params.coeff);
         cache.solver.update_eps(eps);
         // Inexact inner solves are standard in topology optimization: while
         // the layout is forming, sensitivity noise is tolerated (filter +
@@ -438,7 +516,13 @@ pub fn optimize_cached(
         }
 
         cell_strain_energy(&cache.solver.levels[0], &ke64, &u, &design_cells, &mut se);
-        // dC/dx_phys = -(1-emin) * c * n * x^(n-1) * se
+        // Composite cells: only the infill share of the cell responds to x —
+        // scaling the energy by it makes se the honest dC/dx weight (also
+        // for the bin placement that reuses the stored se).
+        for k in 0..design_cells.len() {
+            se[k] *= w[k];
+        }
+        // dC/dx_phys = -(1-emin) * (1-f) * c * n * x^(n-1) * se
         for k in 0..design_cells.len() {
             sens_phys[k] = -(1.0 - EMIN_REL as f64)
                 * params.coeff
@@ -473,9 +557,9 @@ pub fn optimize_cached(
                 *v = v.clamp(params.floor, params.cap);
             }
             for k in 0..x.len() {
-                mean_phys += x_phys[k];
+                mean_phys += w[k] * x_phys[k];
             }
-            mean_phys /= n_int;
+            mean_phys /= w_sum.max(1e-12);
             if mean_phys > target_mean {
                 lo = lambda;
             } else {
@@ -506,14 +590,14 @@ pub fn optimize_cached(
         last_mean_change = mean_change;
         x.copy_from_slice(&x_new);
 
-        let sum_x = x_phys.iter().sum::<f64>();
-        let mass_frac = (skin.len() as f64 + sum_x) / n_solid;
+        let sum_wx = w.iter().zip(&x_phys).map(|(&wk, &xk)| wk * xk).sum::<f64>();
+        let mass_frac = (skin.len() as f64 + sum_f + sum_wx) / n_solid;
         progress(
             &OptimizeProgress {
                 iteration: it + 1,
                 compliance,
                 mass_frac,
-                mean_infill: sum_x / n_int,
+                mean_infill: sum_wx / w_sum.max(1e-12),
                 change,
                 mean_change,
                 inner_iters: inner.iterations,
@@ -547,6 +631,7 @@ pub fn optimize_cached(
         x: x_phys,
         design_cells,
         skin_cells: skin,
+        skin_frac,
         effective_budget,
         iterations,
         converged,
@@ -558,6 +643,7 @@ pub fn optimize_cached(
 
 /// Compliance of a given interior density field (one tight solve).
 /// Returns (compliance, max nodal displacement, u).
+#[allow(clippy::too_many_arguments)]
 pub fn evaluate(
     grid: &VoxelGrid,
     levels: usize,
@@ -565,6 +651,7 @@ pub fn evaluate(
     settings: &SolveSettings,
     skin: &[u32],
     design_cells: &[u32],
+    skin_frac: &[f32],
     x: &[f64],
     exponent: f64,
     coeff: f64,
@@ -573,13 +660,16 @@ pub fn evaluate(
     let mut slot = None;
     if let Some(w) = warm {
         // Seed the warm start through a prepared cache.
-        let eps = build_eps(grid, skin, design_cells, x, exponent, coeff);
+        let eps = build_eps(grid, skin, design_cells, skin_frac, x, exponent, coeff);
         let cache = SolverCache::prepare(&mut slot, grid, levels, problem, settings, eps);
         if cache.last_u.len() == w.len() {
             cache.last_u.copy_from_slice(w);
         }
     }
-    evaluate_cached(&mut slot, grid, levels, problem, settings, skin, design_cells, x, exponent, coeff)
+    evaluate_cached(
+        &mut slot, grid, levels, problem, settings, skin, design_cells, skin_frac, x, exponent,
+        coeff,
+    )
 }
 
 /// `evaluate` reusing the hierarchy + warm start in `slot`.
@@ -592,11 +682,12 @@ pub fn evaluate_cached(
     settings: &SolveSettings,
     skin: &[u32],
     design_cells: &[u32],
+    skin_frac: &[f32],
     x: &[f64],
     exponent: f64,
     coeff: f64,
 ) -> Result<(f64, f64, Vec<f64>), crate::solve::SolveError> {
-    let eps = build_eps(grid, skin, design_cells, x, exponent, coeff);
+    let eps = build_eps(grid, skin, design_cells, skin_frac, x, exponent, coeff);
     // Hitting the cap is acceptable here: the verification/baseline solves
     // only feed the comparison card, and the warm-started iterate at the cap
     // is accurate to ~1e-4 — aborting a finished optimization over the last

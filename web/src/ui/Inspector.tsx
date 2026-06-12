@@ -79,7 +79,9 @@ function PrintedResults() {
       <div className="kv">
         <span>Skin resolution</span>
         <b>
-          {p.skinLayers} cell layer{p.skinLayers === 1 ? "" : "s"}
+          {p.compositeSkin
+            ? `${p.skinLayers.toFixed(2)} layers · composite`
+            : `${p.skinLayers} cell layer${p.skinLayers === 1 ? "" : "s"}`}
         </b>
       </div>
       <div className="kv">
@@ -92,10 +94,10 @@ function PrintedResults() {
         <span>Advisory</span>
         <b>homogenized infill · static linear</b>
       </div>
-      {p.skinLayers === 1 && (
+      {!p.compositeSkin && p.skinLayers === 1 && (
         <div className="warnrow">
           The wall is one voxel layer at this resolution — coarse. Raise the resolution in
-          Properties for a trustworthy printed-mode result.
+          Properties (or enable composite skin) for a trustworthy printed-mode result.
         </div>
       )}
     </aside>

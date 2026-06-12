@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
 
-//! sig-core: voxel-based structural analysis engine for the Smart Infill Generator.
+//! sig-core: voxel-based structural analysis engine for InFEAll
+//! (formerly "Smart Infill Generator" — hence the `sig` crate prefix).
 //!
 //! Pipeline: triangle mesh (STL) -> winding-number voxelization -> matrix-free
 //! hex-element FEA preconditioned by geometric multigrid (MGCG).

@@ -177,12 +177,20 @@ interface AppState {
   printInfill: number;
   /** Snap the voxel size to wall/k so the skin is k exact cell layers. */
   snapVoxel: boolean;
+  /** Composite skin: blend part-wall surface cells (skin fraction) instead
+   *  of rounding the skin to whole voxel layers — thin walls stay
+   *  representable on coarse grids. Off = legacy whole-layer skin. */
+  compositeSkin: boolean;
   /** What "Solve once" analyzes: the print or the CAD-ideal solid. */
   analyzeMode: "printed" | "solid";
   /** Extras of the last as-printed solve (results dock); null = solid run. */
   printedStats: PrintedSummary | null;
-  /** Mesh view: tint the skin cells (within wall thickness of the surface). */
-  meshSkinTint: boolean;
+  /** Mesh view: color each cell by its element density (0–1: skin = 1,
+   *  interior = infill ratio / optimized density, composite cells blended). */
+  meshDensity: boolean;
+  /** Smoothed stress display: fields nodal-averaged and evaluated on the
+   *  true surface instead of flat per-cell (post-processing only). */
+  smoothStress: boolean;
   // optimization inputs
   budget: number; // infill budget: target mean interior density in %
   smoothIters: number; // Taubin passes on modifier regions
@@ -271,8 +279,10 @@ interface AppState {
   setLineWidth(v: number): void;
   setPrintInfill(v: number): void;
   setSnapVoxel(on: boolean): void;
+  setCompositeSkin(on: boolean): void;
   setAnalyzeMode(m: "printed" | "solid"): void;
-  setMeshSkinTint(on: boolean): void;
+  setMeshDensity(on: boolean): void;
+  setSmoothStress(on: boolean): void;
   /** Scene → store: the section plane moved (three.js plane convention). */
   onSectionPlaneMoved(normal: [number, number, number], constant: number): void;
   setSmoothIters(v: number): void;
@@ -315,8 +325,10 @@ export interface LogLine {
 export interface PrintedSummary {
   massGrams: number;
   massSolidGrams: number;
-  /** Cell layers resolving the skin (k after voxel snapping). */
+  /** Cell layers modeling the skin — fractional with composite skin on. */
   skinLayers: number;
+  /** The solve used the composite (blended) skin model. */
+  compositeSkin: boolean;
   /** Print settings the solve used (the dock labels them honestly). */
   infillPct: number;
   pattern: PatternKey;
@@ -409,6 +421,37 @@ async function pushScalarField(set: SetState, get: () => AppState) {
   sceneEvents.onScalarField?.(values, kind.startsWith("sf"));
 }
 
+/** Fetch + cache both safety-factor fields and write the min (and which
+ *  limit governs) into printedStats. Returns the minima for logging, or
+ *  null when there is no printed result / it vanished mid-fetch. */
+async function refreshMinSf(
+  set: SetState,
+  get: () => AppState
+): Promise<{ minSf: number; governs: "layer" | "material" } | null> {
+  if (!get().printedStats) return null;
+  try {
+    const [sfm, sfz] = await Promise.all([
+      engine.resultField("sfm"),
+      engine.resultField("sfz"),
+    ]);
+    fieldCache.set("sfm", sfm);
+    fieldCache.set("sfz", sfz);
+    let minM = Infinity;
+    let minZ = Infinity;
+    for (let i = 0; i < sfm.length; i++) minM = Math.min(minM, sfm[i]);
+    for (let i = 0; i < sfz.length; i++) minZ = Math.min(minZ, sfz[i]);
+    const minSf = Math.min(minM, minZ);
+    if (Number.isFinite(minSf) && get().printedStats) {
+      const governs: "layer" | "material" = minZ < minM ? "layer" : "material";
+      set({ printedStats: { ...get().printedStats!, minSf, sfGoverns: governs } });
+      return { minSf, governs };
+    }
+  } catch {
+    // result vanished mid-fetch: the dock shows mass/deflection only
+  }
+  return null;
+}
+
 const MAX_LOG_LINES = 800;
 
 function logTime(): string {
@@ -465,10 +508,10 @@ export interface SceneEvents {
   onVoxelMesh?: (
     hull: Float32Array | null,
     edges: Float32Array | null,
-    skin?: Float32Array | null
+    density?: Float32Array | null
   ) => void;
-  /** Tint skin cells in the mesh view. */
-  onMeshSkinTint?: (on: boolean) => void;
+  /** Color mesh-view cells by element density. */
+  onMeshDensity?: (on: boolean) => void;
   /** Voxel-true section active: the scene must NOT plane-clip the voxel
    *  group (the cut already lives in the geometry) and hides its cap. */
   onVoxelCutActive?: (on: boolean) => void;
@@ -526,14 +569,15 @@ async function refreshMeshView(set: SetState, get: () => AppState): Promise<bool
   const wall = st.perimeters * st.lineWidth;
   const cutting = st.sectionOn && lastSectionPlane !== null;
   try {
-    const { hull, edges, skin, info } = await engine.voxelMeshCut(
+    const { hull, edges, density, info } = await engine.voxelMeshCut(
       cutting ? lastSectionPlane : null,
-      wall
+      wall,
+      st.printInfill
     );
     if (get().viewMode !== "mesh") return true; // user moved on mid-fetch
     set({ voxelInfo: info, voxelMeshReady: true });
     sceneEvents.onVoxelCutActive?.(cutting);
-    sceneEvents.onVoxelMesh?.(hull, edges, skin);
+    sceneEvents.onVoxelMesh?.(hull, edges, density);
     return true;
   } catch (e) {
     set({ error: e instanceof Error ? e.message : String(e) });
@@ -610,9 +654,11 @@ export const useStore = create<AppState>((set, get) => ({
   lineWidth: 0.45,
   printInfill: 25,
   snapVoxel: true,
+  compositeSkin: true,
   analyzeMode: "printed",
   printedStats: null,
-  meshSkinTint: false,
+  meshDensity: false,
+  smoothStress: true,
   smoothIters: 15,
   nBins: 3,
   goal: "budget",
@@ -668,6 +714,8 @@ export const useStore = create<AppState>((set, get) => ({
       await engine.setSnapWall(
         get().snapVoxel ? get().perimeters * get().lineWidth : 0
       );
+      await engine.setCompositeSkin(get().compositeSkin);
+      await engine.setSmoothStress(get().smoothStress);
       set({
         fileName: name,
         model,
@@ -903,6 +951,14 @@ export const useStore = create<AppState>((set, get) => ({
     // "Here's your print today — now beat it": the optimizer's budget
     // follows the print setting (still clamped to its own band).
     get().setBudget(pct);
+    // The mesh view's element-density colors follow the infill setting —
+    // debounce the rebuild while the slider drags.
+    if (get().viewMode === "mesh") {
+      if (meshCutTimer) clearTimeout(meshCutTimer);
+      meshCutTimer = setTimeout(() => {
+        void refreshMeshView(set, get);
+      }, 200);
+    }
   },
   setSnapVoxel(on) {
     set({ snapVoxel: on });
@@ -911,13 +967,37 @@ export const useStore = create<AppState>((set, get) => ({
     invalidateGrid(set, get);
     void pushSnap(get);
   },
+  setCompositeSkin(on) {
+    set({ compositeSkin: on, printedStats: null });
+    // The grid survives (classification is per-solve); results and the
+    // mesh-view skin tint don't.
+    invalidateResults(set, get);
+    invalidateGrid(set, get);
+    if (get().model) void engine.setCompositeSkin(on);
+  },
   setAnalyzeMode(m) {
     set({ analyzeMode: m });
   },
 
-  setMeshSkinTint(on) {
-    set({ meshSkinTint: on });
-    sceneEvents.onMeshSkinTint?.(on);
+  setMeshDensity(on) {
+    set({ meshDensity: on });
+    sceneEvents.onMeshDensity?.(on);
+  },
+
+  setSmoothStress(on) {
+    set({ smoothStress: on });
+    if (!get().model) return;
+    void (async () => {
+      await engine.setSmoothStress(on);
+      // Pure post-processing: the solution stays valid — just re-fetch the
+      // active field and the dock's min-SF under the new sampling.
+      fieldCache.clear();
+      voxFieldCache.clear();
+      if (get().hasResult) {
+        await pushScalarField(set, get);
+        await refreshMinSf(set, get);
+      }
+    })();
   },
 
   onSectionPlaneMoved(normal, constant) {
@@ -1085,6 +1165,7 @@ export const useStore = create<AppState>((set, get) => ({
           massGrams: out.stats.massGrams,
           massSolidGrams: out.stats.massSolidGrams,
           skinLayers: out.stats.skinLayers,
+          compositeSkin: out.stats.compositeSkin,
           infillPct: st0.printInfill,
           pattern: st0.pattern,
           perimeters: st0.perimeters,
@@ -1095,7 +1176,9 @@ export const useStore = create<AppState>((set, get) => ({
         appendLog(
           set,
           `  as printed: mass ${out.stats.massGrams.toFixed(1)} g of ${out.stats.massSolidGrams.toFixed(1)} g solid · ` +
-            `skin resolved by ${out.stats.skinLayers} cell layer${out.stats.skinLayers === 1 ? "" : "s"}`
+            (out.stats.compositeSkin
+              ? `skin spans ${out.stats.skinLayers.toFixed(2)} cell layers (composite blend)`
+              : `skin resolved by ${out.stats.skinLayers} cell layer${out.stats.skinLayers === 1 ? "" : "s"}`)
         );
       } else {
         appendLog(set, `Solve solid: ${m.name} (E₀ ${m.e0} MPa, ν ${m.nu}) …`);
@@ -1124,8 +1207,8 @@ export const useStore = create<AppState>((set, get) => ({
         legendMin: null,
         legendMax: null,
         notice: stats.converged
-          ? printedSummary && printedSummary.skinLayers === 1
-            ? "The wall is only one voxel layer thick at this resolution — printed-mode results are coarse. Raise the resolution in Properties."
+          ? printedSummary && !printedSummary.compositeSkin && printedSummary.skinLayers === 1
+            ? "The wall is only one voxel layer thick at this resolution — printed-mode results are coarse. Raise the resolution in Properties, or enable composite skin."
             : null
           : `Solver stopped at the iteration cap (residual ${stats.relResidual.toExponential(1)}) — the shown result is a close approximation. Preview resolution converges faster.`,
       });
@@ -1145,31 +1228,15 @@ export const useStore = create<AppState>((set, get) => ({
         // Min safety factors for the dock — both limits, so the dock can say
         // WHICH one governs. Fields are cached: picking them in the viewer
         // afterwards is instant.
-        try {
-          const [sfm, sfz] = await Promise.all([
-            engine.resultField("sfm"),
-            engine.resultField("sfz"),
-          ]);
-          fieldCache.set("sfm", sfm);
-          fieldCache.set("sfz", sfz);
-          let minM = Infinity;
-          let minZ = Infinity;
-          for (let i = 0; i < sfm.length; i++) minM = Math.min(minM, sfm[i]);
-          for (let i = 0; i < sfz.length; i++) minZ = Math.min(minZ, sfz[i]);
-          const minSf = Math.min(minM, minZ);
-          if (Number.isFinite(minSf) && get().printedStats) {
-            const governs = minZ < minM ? "layer" : "material";
-            set({ printedStats: { ...get().printedStats!, minSf, sfGoverns: governs } });
-            appendLog(
-              set,
-              `  min safety factor ${minSf.toFixed(2)}× — ` +
-                (governs === "layer"
-                  ? `layer adhesion governs (σₜᶻ ${m.strengthZ} MPa vs σzz tension)`
-                  : `material governs (σₜ ${m.strength} MPa vs σᵥᴹ)`)
-            );
-          }
-        } catch {
-          // result vanished mid-fetch: the dock shows mass/deflection only
+        const sf = await refreshMinSf(set, get);
+        if (sf) {
+          appendLog(
+            set,
+            `  min safety factor ${sf.minSf.toFixed(2)}× — ` +
+              (sf.governs === "layer"
+                ? `layer adhesion governs (σₜᶻ ${m.strengthZ} MPa vs σzz tension)`
+                : `material governs (σₜ ${m.strength} MPa vs σᵥᴹ)`)
+          );
         }
       }
     } catch (e) {

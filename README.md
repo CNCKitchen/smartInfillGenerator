@@ -1,4 +1,6 @@
-# Smart Infill Generator
+# InFEAll
+
+*FEA-driven infill for FDM prints (formerly "Smart Infill Generator").*
 
 Web tool: load a 3D-printable model, define loads and constraints by picking
 surfaces, run a structural analysis and density optimization **entirely in the

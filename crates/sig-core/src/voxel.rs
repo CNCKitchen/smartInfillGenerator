@@ -175,10 +175,12 @@ impl VoxelGrid {
 
 /// Voxel size for a cell budget over a bbox volume, optionally snapped to an
 /// integer fraction of the wall thickness (h = wall/k) so a `wall_mm` solid
-/// skin is resolved by exactly k cell layers on flat faces (`classify_cells`
-/// uses layers = round(wall/h)). Snapping may refine the grid past the
-/// budget; a hard cell cap bounds the cost, and when even k = 1 (h = wall)
-/// would blow past the cap the snap is abandoned for the nominal size.
+/// skin is resolved by exactly k cell layers on flat faces (the legacy skin
+/// model uses layers = round(wall/h); with composite skin the snap is an
+/// accuracy nicety, not a requirement). Snapping may refine the grid past
+/// the budget; a hard cell cap bounds the cost, and when even k = 1
+/// (h = wall) would blow past the cap the snap is abandoned for the nominal
+/// size.
 pub fn pick_voxel_size(bbox_volume: f64, target_cells: f64, snap_wall_mm: f64) -> f64 {
     let h0 = (bbox_volume / target_cells.max(1.0)).cbrt().max(1e-3);
     if snap_wall_mm <= 0.0 {

@@ -62,6 +62,45 @@ impl FieldKind {
     }
 }
 
+/// Volume-averaged nodal recovery of a per-cell field: each node gets the
+/// mean of its adjacent SOLID cells' values (all cells share one volume, so
+/// the volume weighting is a plain mean). This is the standard remedy for
+/// the staircase checkerboard of voxel surface stresses — cell-center values
+/// are individually accurate (superconvergent point); the noise lives in the
+/// flat per-cell pattern between them. Nodes touching no solid cell get NaN
+/// so samplers can renormalize around them. Returns (nx+1)(ny+1)(nz+1)
+/// values, node index (z*(ny+1) + y)*(nx+1) + x.
+pub fn recover_nodal(grid: &VoxelGrid, cell_values: &[f32]) -> Vec<f32> {
+    let (nx, ny, nz) = (grid.nx, grid.ny, grid.nz);
+    let (mx, my, mz) = (nx + 1, ny + 1, nz + 1);
+    let mut sum = vec![0f32; mx * my * mz];
+    let mut count = vec![0u16; mx * my * mz];
+    for cz in 0..nz {
+        for cy in 0..ny {
+            for cx in 0..nx {
+                let ci = (cz * ny + cy) * nx + cx;
+                if grid.scale[ci] <= 0.0 {
+                    continue;
+                }
+                let v = cell_values[ci];
+                for oz in 0..2 {
+                    for oy in 0..2 {
+                        for ox in 0..2 {
+                            let n = ((cz + oz) * my + (cy + oy)) * mx + (cx + ox);
+                            sum[n] += v;
+                            count[n] += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for n in 0..sum.len() {
+        sum[n] = if count[n] > 0 { sum[n] / count[n] as f32 } else { f32::NAN };
+    }
+    sum
+}
+
 /// Selected scalar per cell (cell-center evaluation); 0.0 for void cells.
 /// `u` is the padded nodal displacement field (3 per node), `eps` the
 /// per-cell stiffness factors actually used in the solve.

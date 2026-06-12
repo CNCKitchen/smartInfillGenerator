@@ -1,6 +1,7 @@
-# Smart Infill Generator — Design Document
+# InFEAll — Design Document
 
-*Resolved via design interview, 2026-06-10. Working name: Smart Infill Generator (naming open).*
+*Resolved via design interview, 2026-06-10. Named **InFEAll** on 2026-06-12 (working name
+was "Smart Infill Generator"); the GitHub repo / deploy path still carry the old slug.*
 
 ## 1. Product definition
 
@@ -76,8 +77,43 @@ Reference points:
   settings and deflection feed the results dock). This makes the tool a general FDM-FEA
   whose accuracy IS the accuracy of the measured E(ρ) calibration. Voxel size optionally
   snaps to wall/k (`pick_voxel_size`) so the skin is an exact integer number of cell
-  layers (`classify_cells` uses layers = round(wall/h)); hard 4M-cell cap, snap abandoned
-  when even k = 1 would exceed it. The Mesh view exposes the model: a skin-cell tint
+  layers; hard 4M-cell cap, snap abandoned when even k = 1 would exceed it.
+- **Composite skin (2026-06, toggleable):** `classify_cells` measures the wall band in
+  FRACTIONAL cell layers — a cell the band only partially covers stays a design cell and
+  records its covered fraction f; `build_eps` blends its stiffness Voigt-style
+  (f + (1−f)·E_infill(ρ)), the same homogenization move as the infill law, applied at the
+  surface. Surface cells exposed on several sides count the overlapping slabs (a convex
+  corner at wall/h = 0.5 is 7/8 skin). Consequences: walls THINNER than a voxel stay
+  representable (large parts no longer need h ≤ wall — the snap becomes an accuracy
+  nicety), mass and "mean infill" weight composite cells by their infill share (1−f), the
+  optimizer's sensitivities scale by (1−f), and modifier regions may reach the surface
+  cells behind a sub-voxel wall (correct: the slicer prints perimeters there regardless and
+  the modifier only sets the infill behind them). Validated against the composite-beam
+  closed form at h = 1 mm / wall = 0.45 mm (legacy is ~30+% too stiff there, composite
+  within ~10%). The checkbox lives in step 3 Properties (default ON); OFF restores the
+  legacy whole-layer skin (round(wall/h), min 1 layer) — kept for comparison "for now".
+  The dock's "skin resolution" shows fractional layers with a "composite" tag. Trade-off
+  stated: surface stress/SF readouts smear over the cell — deflection/stiffness is the
+  trustworthy output (unchanged advisory framing).
+- **Smoothed stress display (2026-06, toggleable):** result fields are recovered to the
+  grid NODES (volume-averaged over adjacent solid cells — ZZ-style; cell centers are the
+  superconvergent points, the staircase checkerboard lives between them) and evaluated AT
+  the display surface: trilinear interpolation at STL vertices (weights renormalized over
+  valid nodes, nearest-cell fallback), exact nodal values on the voxel hull (its vertices
+  ARE nodes → smooth shading). Applies to every cell field including SF, so the dock's
+  min-SF follows the active mode. Pure post-processing — the solution is untouched and
+  toggling re-fetches fields only. Checkbox "smoothed (nodal average)" lives in the
+  results legend (default ON); OFF restores flat per-cell painting. NOT fixed by this:
+  re-entrant-corner singularities (peaks there never converge — advisory framing stands).
+  Considered and deferred: snapping boundary nodes onto the STL (body-fitted voxels) —
+  legitimate isoparametric FEM but it breaks the one-KE-scaled matrix-free/SIMD fast path
+  for boundary cells and needs heavy element-quality guards; revisit only if surface SF
+  noise still bites after recovery.
+- **Element density plot (2026-06):** the Mesh view's "color skin cells" tint was replaced
+  by an "element density" plot — each cell colored 0–1 through the density ramp (skin = 1,
+  interior = the print-settings infill ratio, or the OPTIMIZED per-cell density once an
+  optimization result exists; composite surface cells blend by wall fraction). Works with
+  the voxel-true section; legend shows the ramp and what the interior value means. The Mesh view exposes the model: a skin-cell tint
   (legend checkbox) and a VOXEL-TRUE section — cells on the far side of the plane drop
   out entirely (`surface_mesh_where`, plane in three.js normal·p + c ≥ 0 convention,
   recut debounced while the gizmo drags) so the interior cells and the modeled wall

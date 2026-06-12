@@ -67,8 +67,8 @@ export function Viewer() {
     sceneEvents.onVertexDensity = (d) => scene.setVertexDensity(d);
     sceneEvents.onRegions = (r) => scene.setRegions(r);
     sceneEvents.onViewState = (mode, scale) => scene.setViewState(mode, scale);
-    sceneEvents.onVoxelMesh = (hull, edges, skin) => scene.setVoxelMesh(hull, edges, skin);
-    sceneEvents.onMeshSkinTint = (on) => scene.setMeshSkinTint(on);
+    sceneEvents.onVoxelMesh = (hull, edges, density) => scene.setVoxelMesh(hull, edges, density);
+    sceneEvents.onMeshDensity = (on) => scene.setMeshDensity(on);
     sceneEvents.onVoxelCutActive = (on) => scene.setVoxelCutActive(on);
     sceneEvents.onAnimateDeformed = (on) => scene.setDeformAnimate(on);
     sceneEvents.onOptShape = (p, i, d) => scene.setOptShape(p, i, d);
@@ -225,6 +225,8 @@ function Legend() {
   const legendMin = useStore((s) => s.legendMin);
   const legendMax = useStore((s) => s.legendMax);
   const setLegendRange = useStore((s) => s.setLegendRange);
+  const smoothStress = useStore((s) => s.smoothStress);
+  const setSmoothStress = useStore((s) => s.setSmoothStress);
 
   if (viewMode === "deformed" && stats) {
     const total = autoScale * deformScale;
@@ -274,11 +276,25 @@ function Legend() {
           />
           <span>mark min / max</span>
         </label>
+        {isField && (
+          <label className="legendcheck">
+            <input
+              type="checkbox"
+              checked={smoothStress}
+              onChange={(e) => setSmoothStress(e.target.checked)}
+            />
+            <span>smoothed (nodal average)</span>
+          </label>
+        )}
         {isSf && (
           <div className="legendnote">allowable scales with E(ρ) — red marks the critical low</div>
         )}
         {isField && !isSf && (
-          <div className="legendnote">cell-center values — voxel-edge peaks are approximate</div>
+          <div className="legendnote">
+            {smoothStress
+              ? "nodal-averaged, evaluated on the surface"
+              : "cell-center values — voxel-edge peaks are approximate"}
+          </div>
         )}
         <div className="legendnote">
           exaggerated{" "}
@@ -319,14 +335,15 @@ function Legend() {
   return null;
 }
 
-/** Mesh-view legend: grid stats + the skin-cell tint toggle. */
+/** Mesh-view legend: grid stats + the element-density plot toggle. */
 function MeshLegend() {
   const voxelInfo = useStore((s) => s.voxelInfo)!;
-  const meshSkinTint = useStore((s) => s.meshSkinTint);
-  const setMeshSkinTint = useStore((s) => s.setMeshSkinTint);
+  const meshDensity = useStore((s) => s.meshDensity);
+  const setMeshDensity = useStore((s) => s.setMeshDensity);
   const sectionOn = useStore((s) => s.sectionOn);
   const perimeters = useStore((s) => s.perimeters);
   const lineWidth = useStore((s) => s.lineWidth);
+  const optSummary = useStore((s) => s.optSummary);
   return (
     <div className="legend">
       <div className="legendtitle">Analysis mesh</div>
@@ -340,13 +357,31 @@ function MeshLegend() {
       <label className="legendcheck">
         <input
           type="checkbox"
-          checked={meshSkinTint}
-          onChange={(e) => setMeshSkinTint(e.target.checked)}
+          checked={meshDensity}
+          onChange={(e) => setMeshDensity(e.target.checked)}
         />
-        <span>color skin cells</span>
+        <span>element density</span>
       </label>
+      {meshDensity && (
+        <div className="legendbody">
+          <div className="legendbar" style={{ background: RAMP_GRADIENT }} />
+          <div className="legendlabels">
+            <span>100%</span>
+            <span>50%</span>
+            <span>0%</span>
+          </div>
+        </div>
+      )}
       <div className="legendnote">
-        skin = {(perimeters * lineWidth).toFixed(2)} mm wall
+        {meshDensity ? (
+          <>
+            skin ({(perimeters * lineWidth).toFixed(2)} mm wall) = 100%
+            <br />
+            interior = {optSummary ? "optimized density" : "infill setting"}
+          </>
+        ) : (
+          <>skin = {(perimeters * lineWidth).toFixed(2)} mm wall</>
+        )}
         {sectionOn ? (
           <>
             <br />

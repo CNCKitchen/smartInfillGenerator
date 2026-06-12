@@ -451,11 +451,21 @@ function StepProperties() {
           />
           <span>Snap voxel size to the wall (h = wall/k)</span>
         </label>
+        <label className="rowcheck">
+          <input
+            type="checkbox"
+            checked={s.compositeSkin}
+            onChange={(e) => s.setCompositeSkin(e.target.checked)}
+          />
+          <span>Composite skin (blend part-wall cells)</span>
+        </label>
         <div className="dim small">
           {s.voxelInfo
-            ? `Grid h = ${s.voxelInfo.h.toFixed(2)} mm — the ${wall.toFixed(2)} mm skin is ${k} cell layer${k === 1 ? "" : "s"} thick.`
+            ? s.compositeSkin
+              ? `Grid h = ${s.voxelInfo.h.toFixed(2)} mm — the ${wall.toFixed(2)} mm skin spans ${(wall / s.voxelInfo.h).toFixed(2)} cell layers; partially covered cells get a blended wall + infill stiffness.`
+              : `Grid h = ${s.voxelInfo.h.toFixed(2)} mm — the ${wall.toFixed(2)} mm skin is ${k} cell layer${k === 1 ? "" : "s"} thick.`
             : "Grid size is computed at the next check/solve/optimize."}
-          {s.snapVoxel && k === 1 && (
+          {!s.compositeSkin && s.snapVoxel && k === 1 && (
             <> Single-layer skin is coarse — raise the resolution for printed-mode accuracy.</>
           )}
         </div>

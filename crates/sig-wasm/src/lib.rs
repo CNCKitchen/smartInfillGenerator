@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
 
-//! WASM API for the Smart Infill Generator web app.
+//! WASM API for the InFEAll web app.
 //!
 //! One `Model` instance lives in a web worker and owns mesh, segmentation,
 //! voxel grid, boundary conditions, and the last solution. Bulk data crosses
@@ -18,7 +18,7 @@ use sig_core::simp::{evaluate_cached, optimize_cached as simp_optimize, Optimize
 use sig_core::solve::{
     active_nodes, pad_for_levels, solve_nodes_cached, SolveSettings, Solution, SolverCache,
 };
-use sig_core::stress::{cell_field, FieldKind};
+use sig_core::stress::{cell_field, recover_nodal, FieldKind};
 use sig_core::threemf::{export_orca_3mf, export_stl_zip, import_3mf, weld};
 use sig_core::voxel::VoxelGrid;
 use wasm_bindgen::prelude::*;
@@ -151,6 +151,15 @@ pub struct Model {
     /// Snap the voxel size to wall/k (0 = off) so the printed skin is
     /// resolved by an integer number of cell layers.
     snap_wall: f64,
+    /// Composite skin: cells the wall band only partially covers carry a
+    /// blended (skin-fraction) stiffness instead of rounding the band to
+    /// whole cell layers — thin walls stay representable on coarse grids.
+    composite_skin: bool,
+    /// Smoothed stress display: result fields are recovered to the nodes
+    /// (volume-averaged) and sampled at the true surface, instead of painting
+    /// each cell's center value flat. Removes the staircase checkerboard.
+    /// Display-side only — the solution is untouched.
+    smooth_stress: bool,
     grid: Option<(VoxelGrid, usize)>, // padded grid + level count
     /// Reused solver hierarchy + warm start across solves (self-validating:
     /// falls back to a cold rebuild when grid/material/BCs/topology change).
@@ -216,6 +225,8 @@ impl Model {
             gravity_on: false,
             target_cells: 300_000,
             snap_wall: 0.0,
+            composite_skin: false,
+            smooth_stress: false,
             grid: None,
             solver_cache: None,
             solution: None,
@@ -311,6 +322,24 @@ impl Model {
             self.solution_eps = None;
             self.opt = None;
         }
+    }
+
+    /// Composite skin on/off (see the `composite_skin` field). The grid
+    /// itself is unaffected — only results depend on the classification.
+    pub fn set_composite_skin(&mut self, on: bool) {
+        if on != self.composite_skin {
+            self.composite_skin = on;
+            self.solution = None;
+            self.solution_eps = None;
+            self.opt = None;
+        }
+    }
+
+    /// Smoothed stress display on/off (see the `smooth_stress` field).
+    /// Pure post-processing: the solution stays valid, fields are simply
+    /// recomputed on the next fetch.
+    pub fn set_smooth_stress(&mut self, on: bool) {
+        self.smooth_stress = on;
     }
 
     pub fn clear_bcs(&mut self) {
@@ -467,9 +496,11 @@ impl Model {
         let infill = (opts.infill_pct / 100.0).clamp(0.01, 1.0);
         // A part thinner than the wall everywhere simply prints solid —
         // design is empty and the solve degenerates to the solid case.
-        let (skin, design) = sig_core::simp::classify_cells(grid, wall_mm);
+        let split = sig_core::simp::classify_cells(grid, wall_mm, self.composite_skin);
+        let (skin, design, skin_frac) = (split.skin, split.design, split.skin_frac);
         let x = vec![infill; design.len()];
-        let eps = sig_core::simp::build_eps(grid, &skin, &design, &x, eval_exp, eval_coeff);
+        let eps =
+            sig_core::simp::build_eps(grid, &skin, &design, &skin_frac, &x, eval_exp, eval_coeff);
         let (sol, _compliance) = sig_core::simp::solve_with_eps_cached(
             &mut self.solver_cache,
             grid,
@@ -479,11 +510,15 @@ impl Model {
             eps.clone(),
         )
         .map_err(err)?;
-        // Mass at these print settings: solid skin + interior at the ratio.
+        // Mass at these print settings: solid skin + interior at the ratio;
+        // composite cells contribute their wall-band fraction as solid and
+        // the rest at the infill ratio.
         let cell_vol = grid.h * grid.h * grid.h;
         let n_skin = skin.len() as f64;
         let n_design = design.len() as f64;
-        let mass = (n_skin + infill * n_design) * cell_vol * self.density * 1e6;
+        let sum_f: f64 = skin_frac.iter().map(|&f| f as f64).sum();
+        let mass =
+            (n_skin + sum_f + infill * (n_design - sum_f)) * cell_vol * self.density * 1e6;
         let mass_solid = (n_skin + n_design) * cell_vol * self.density * 1e6;
         let out = serde_json::json!({
             "iterations": sol.iterations,
@@ -495,8 +530,15 @@ impl Model {
             "massSolidGrams": mass_solid,
             "skinCells": skin.len(),
             "interiorCells": design.len(),
-            // Cell layers the grid resolves the skin with (k after snapping).
-            "skinLayers": (wall_mm / grid.h).round().max(1.0) as u32,
+            // Cell layers the skin is modeled with: the legacy model rounds
+            // (minimum one full layer), composite skin is exact — fractional
+            // values (< 1 included) are real and handled by blending.
+            "skinLayers": if self.composite_skin {
+                wall_mm / grid.h
+            } else {
+                (wall_mm / grid.h).round().max(1.0)
+            },
+            "compositeSkin": self.composite_skin,
         })
         .to_string();
         self.solution = Some(sol);
@@ -624,6 +666,7 @@ impl Model {
             floor,
             cap,
             wall_mm: wall_mm.clamp(0.2, 5.0),
+            composite_skin: self.composite_skin,
             // Cap is a safety net; the change-based convergence criterion
             // normally stops the loop earlier.
             max_iter: 40,
@@ -650,16 +693,17 @@ impl Model {
         let ref_frac = (budget_pct / 100.0).clamp(params.floor, params.cap);
         let mut c_target = 0.0f64;
         if goal_match {
-            let (skin_t, design_t) = sig_core::simp::classify_cells(grid, params.wall_mm);
-            if design_t.is_empty() {
+            let split_t =
+                sig_core::simp::classify_cells(grid, params.wall_mm, params.composite_skin);
+            if split_t.design.is_empty() {
                 return Err(err(
                     "part is thinner than the wall thickness everywhere — nothing to optimize (it prints solid)",
                 ));
             }
-            let x_ref = vec![ref_frac; design_t.len()];
+            let x_ref = vec![ref_frac; split_t.design.len()];
             let (c_ref, _, _) = evaluate_cached(
-                &mut self.solver_cache, grid, *levels, &asm.problem, &self.settings, &skin_t,
-                &design_t, &x_ref, eval_exp, eval_coeff,
+                &mut self.solver_cache, grid, *levels, &asm.problem, &self.settings, &split_t.skin,
+                &split_t.design, &split_t.skin_frac, &x_ref, eval_exp, eval_coeff,
             )
             .map_err(err)?;
             c_target = c_ref;
@@ -765,7 +809,8 @@ impl Model {
             // warm-started from the optimizer's displacement via the cache.
             let (c_b, _maxd, u_b) = evaluate_cached(
                 &mut self.solver_cache, grid, *levels, &asm.problem, &self.settings,
-                &result.skin_cells, &result.design_cells, &x_binned, eval_exp, eval_coeff,
+                &result.skin_cells, &result.design_cells, &result.skin_frac, &x_binned, eval_exp,
+                eval_coeff,
             )
             .map_err(err)?;
             pass_trace.push((budget_k, c_b));
@@ -805,17 +850,25 @@ impl Model {
             pass_no.set(pass_no.get() + 1);
         };
 
-        let mean_binned = x_binned.iter().sum::<f64>() / x_binned.len().max(1) as f64;
+        // Infill volume share per design cell (composite cells are partly
+        // wall) — means and masses weight by it.
+        let w_inf: Vec<f64> = result.skin_frac.iter().map(|&f| 1.0 - f as f64).collect();
+        let w_sum: f64 = w_inf.iter().sum();
+        let sum_f: f64 = result.skin_frac.iter().map(|&f| f as f64).sum();
+        let sum_wx = |x: &[f64]| w_inf.iter().zip(x).map(|(&w, &v)| w * v).sum::<f64>();
+        let mean_binned = sum_wx(&x_binned) / w_sum.max(1e-12);
         let x_uniform = vec![mean_binned; x_binned.len()];
         let (c_uniform, _, _) = evaluate_cached(
             &mut self.solver_cache, grid, *levels, &asm.problem, &self.settings,
-            &result.skin_cells, &result.design_cells, &x_uniform, eval_exp, eval_coeff,
+            &result.skin_cells, &result.design_cells, &result.skin_frac, &x_uniform, eval_exp,
+            eval_coeff,
         )
         .map_err(err)?;
         let x_solid = vec![1.0; x_binned.len()];
         let (c_solid, _, _) = evaluate_cached(
             &mut self.solver_cache, grid, *levels, &asm.problem, &self.settings,
-            &result.skin_cells, &result.design_cells, &x_solid, eval_exp, eval_coeff,
+            &result.skin_cells, &result.design_cells, &result.skin_frac, &x_solid, eval_exp,
+            eval_coeff,
         )
         .map_err(err)?;
 
@@ -834,6 +887,7 @@ impl Model {
             grid,
             &result.skin_cells,
             &result.design_cells,
+            &result.skin_frac,
             &x_binned,
             eval_exp,
             eval_coeff,
@@ -872,13 +926,15 @@ impl Model {
         let regions = smooth_regions(&regions_raw, smooth_iters);
 
         // ---- mass + summary ----
+        // Composite cells: their wall-band fraction is always solid; only
+        // the infill share follows the density field.
         let cell_vol = grid.h * grid.h * grid.h;
         let n_skin = result.skin_cells.len() as f64;
         let n_solid = n_skin + result.design_cells.len() as f64;
-        let grams = |interior: f64| (n_skin + interior) * cell_vol * self.density * 1e6;
-        let mass_part = grams(x_binned.iter().sum::<f64>());
-        let mass_solid = grams(result.design_cells.len() as f64);
-        let mass_frac = (n_skin + x_binned.iter().sum::<f64>()) / n_solid;
+        let grams = |infill_vol: f64| (n_skin + sum_f + infill_vol) * cell_vol * self.density * 1e6;
+        let mass_part = grams(sum_wx(&x_binned));
+        let mass_solid = grams(w_sum);
+        let mass_frac = (n_skin + sum_f + sum_wx(&x_binned)) / n_solid;
 
         let bin_counts: Vec<usize> =
             (0..centers.len()).map(|c| bins.iter().filter(|&&b| b as usize == c).count()).collect();
@@ -1072,10 +1128,19 @@ impl Model {
     /// (Gibson–Ashby strength tracks stiffness to first order; the skin
     /// carries the full tensile strength). Capped at 99.
     /// Evaluated at cell centers with the eps the solve actually used.
+    /// With smooth_stress on, the per-cell field is recovered to the nodes
+    /// (volume-averaged) and interpolated AT the surface vertex — the
+    /// boundary cells' staircase noise averages out instead of being copied
+    /// onto the surface.
     pub fn result_field(&self, kind: &str) -> Result<Vec<f32>, JsValue> {
         let cells = self.cell_values(kind)?;
         let (grid, _) = self.grid.as_ref().ok_or_else(|| err("no grid"))?;
-        Ok(sample_cell_values(&self.mesh.tris, grid, &cells))
+        if self.smooth_stress {
+            let nodal = recover_nodal(grid, &cells);
+            Ok(sample_nodal_values(&self.mesh.tris, grid, &nodal, &cells))
+        } else {
+            Ok(sample_cell_values(&self.mesh.tris, grid, &cells))
+        }
     }
 
     /// Voxel-hull result geometry: the analysis mesh with EXACT nodal
@@ -1098,13 +1163,30 @@ impl Model {
     }
 
     /// Result field on the voxel hull: one value per hull vertex (3 per
-    /// triangle), each triangle carrying its OWNING CELL's value — crisp
-    /// per-cell coloring instead of the STL view's smoothed sampling.
-    /// Kinds as in `result_field`.
+    /// triangle). Default: each triangle carries its OWNING CELL's value —
+    /// crisp per-cell coloring. With smooth_stress on, every hull vertex IS
+    /// a grid node, so it carries the recovered nodal value — the hull
+    /// shades smoothly instead of flat per cell. Kinds as in `result_field`.
     pub fn voxel_result_field(&self, kind: &str) -> Result<Vec<f32>, JsValue> {
         let cells = self.cell_values(kind)?;
         let (grid, _) = self.grid.as_ref().ok_or_else(|| err("no grid"))?;
-        let (_tris, _edges, cell_of_tri) = grid.surface_mesh_where(&|_| true);
+        let (tris, _edges, cell_of_tri) = grid.surface_mesh_where(&|_| true);
+        if self.smooth_stress {
+            let nodal = recover_nodal(grid, &cells);
+            let (mx, my, mz) = (grid.nx + 1, grid.ny + 1, grid.nz + 1);
+            let (h, o) = (grid.h, grid.origin);
+            let mut out = Vec::with_capacity(tris.len() / 3);
+            for p in tris.chunks_exact(3) {
+                // Hull vertices lie exactly on grid nodes; nodes of a solid
+                // cell always have a recovered value.
+                let x = (((p[0] as f64 - o[0]) / h).round() as usize).min(mx - 1);
+                let y = (((p[1] as f64 - o[1]) / h).round() as usize).min(my - 1);
+                let z = (((p[2] as f64 - o[2]) / h).round() as usize).min(mz - 1);
+                let v = nodal[(z * my + y) * mx + x];
+                out.push(if v.is_nan() { 0.0 } else { v });
+            }
+            return Ok(out);
+        }
         let mut out = Vec::with_capacity(cell_of_tri.len() * 3);
         for &ci in &cell_of_tri {
             let v = cells[ci as usize];
@@ -1149,7 +1231,11 @@ impl Model {
     /// CENTER satisfies n·c + constant < 0 are dropped entirely, exposing the
     /// interior cells (voxel-true section — skin thickness inspectable)
     /// instead of a planar cut. Returns [positions f32 (9/tri),
-    /// skin f32 (3/tri, 1 = within wall_mm of the surface), edges f32].
+    /// density f32 (3/tri, the cell's relative material density in [0,1]:
+    /// skin = 1, interior = its infill ratio — the OPTIMIZED per-cell
+    /// density when an optimization result exists, else `infill_pct` —
+    /// composite surface cells blend the two by their wall fraction),
+    /// edges f32].
     pub fn voxel_mesh_cut(
         &mut self,
         cut: bool,
@@ -1158,11 +1244,25 @@ impl Model {
         nz: f64,
         constant: f64,
         wall_mm: f64,
+        infill_pct: f64,
     ) -> Result<js_sys::Array, JsValue> {
         self.ensure_grid()?;
         let (grid, _) = self.grid.as_ref().unwrap();
-        let (skin, _) = sig_core::simp::classify_cells(grid, wall_mm.clamp(0.2, 5.0));
-        let skin_set: std::collections::HashSet<u32> = skin.into_iter().collect();
+        let split =
+            sig_core::simp::classify_cells(grid, wall_mm.clamp(0.2, 5.0), self.composite_skin);
+        let uniform = (infill_pct / 100.0).clamp(0.0, 1.0);
+        let opt_density = self.opt.as_ref().map(|o| &o.cell_density);
+        let mut density_of_cell = vec![0f32; grid.cell_count()];
+        for &c in &split.skin {
+            density_of_cell[c as usize] = 1.0;
+        }
+        for (k, &c) in split.design.iter().enumerate() {
+            let x = opt_density
+                .and_then(|m| m.get(&c).copied())
+                .unwrap_or(uniform);
+            let f = split.skin_frac[k] as f64;
+            density_of_cell[c as usize] = (f + (1.0 - f) * x) as f32;
+        }
         let (gnx, gny) = (grid.nx, grid.ny);
         let (h, o) = (grid.h, grid.origin);
         let keep = move |ci: usize| -> bool {
@@ -1180,14 +1280,14 @@ impl Model {
             d >= 0.0
         };
         let (tris, edges, cell_of_tri) = grid.surface_mesh_where(&keep);
-        let mut skin_flag = Vec::with_capacity(cell_of_tri.len() * 3);
+        let mut density = Vec::with_capacity(cell_of_tri.len() * 3);
         for &c in &cell_of_tri {
-            let f = if skin_set.contains(&c) { 1.0f32 } else { 0.0 };
-            skin_flag.extend_from_slice(&[f, f, f]);
+            let d = density_of_cell[c as usize];
+            density.extend_from_slice(&[d, d, d]);
         }
         Ok(js_sys::Array::of3(
             &js_sys::Float32Array::from(tris.as_slice()),
-            &js_sys::Float32Array::from(skin_flag.as_slice()),
+            &js_sys::Float32Array::from(density.as_slice()),
             &js_sys::Float32Array::from(edges.as_slice()),
         ))
     }
@@ -1320,6 +1420,66 @@ fn sample_cell_values(tris: &[[f32; 9]], grid: &VoxelGrid, values: &[f32]) -> Ve
                 }
             }
             out.push(val);
+        }
+    }
+    out
+}
+
+/// Sample a recovered NODAL field (NaN = no adjacent solid cell) at every
+/// soup vertex by trilinear interpolation in the containing cell, weights
+/// renormalized over the valid nodes — this evaluates the field AT the true
+/// surface point instead of copying the nearest boundary cell. Falls back to
+/// nearest-cell sampling for the rare vertex whose cell corners are all void.
+fn sample_nodal_values(
+    tris: &[[f32; 9]],
+    grid: &VoxelGrid,
+    nodal: &[f32],
+    cells: &[f32],
+) -> Vec<f32> {
+    let (nx, ny, nz) = (grid.nx, grid.ny, grid.nz);
+    let (mx, my) = (nx + 1, ny + 1);
+    let h = grid.h;
+    let o = grid.origin;
+    let mut out = Vec::with_capacity(tris.len() * 3);
+    let mut fallback: Vec<usize> = Vec::new();
+    for (ti, t) in tris.iter().enumerate() {
+        for v in 0..3 {
+            let p = [t[3 * v] as f64, t[3 * v + 1] as f64, t[3 * v + 2] as f64];
+            // Containing cell, clamped into the grid.
+            let f = |d: usize| ((p[d] - o[d]) / h).clamp(0.0, [nx, ny, nz][d] as f64 - 1e-9);
+            let (fx, fy, fz) = (f(0), f(1), f(2));
+            let (cx, cy, cz) = (fx.floor() as usize, fy.floor() as usize, fz.floor() as usize);
+            let (tx, ty, tz) = (fx - cx as f64, fy - cy as f64, fz - cz as f64);
+            let mut val = 0f64;
+            let mut wsum = 0f64;
+            for oz in 0..2 {
+                for oy in 0..2 {
+                    for ox in 0..2 {
+                        let nv =
+                            nodal[((cz + oz) * my + (cy + oy)) * mx + (cx + ox)];
+                        if nv.is_nan() {
+                            continue;
+                        }
+                        let w = (if ox == 1 { tx } else { 1.0 - tx })
+                            * (if oy == 1 { ty } else { 1.0 - ty })
+                            * (if oz == 1 { tz } else { 1.0 - tz });
+                        val += w * nv as f64;
+                        wsum += w;
+                    }
+                }
+            }
+            if wsum > 1e-9 {
+                out.push((val / wsum) as f32);
+            } else {
+                out.push(0.0);
+                fallback.push(ti * 3 + v);
+            }
+        }
+    }
+    if !fallback.is_empty() {
+        let near = sample_cell_values(tris, grid, cells);
+        for i in fallback {
+            out[i] = near[i];
         }
     }
     out
