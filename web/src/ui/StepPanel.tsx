@@ -149,23 +149,35 @@ function StepModel() {
 
 // ---------------- 2 · Boundary conditions ----------------
 
+const SUPPORT_KINDS: BcKind[] = ["fixed", "elastic", "frictionless"];
+
 function StepBcs() {
   const s = useStore();
+  const supports = s.bcs.filter((bc) => SUPPORT_KINDS.includes(bc.kind));
+  const loads = s.bcs.filter((bc) => !SUPPORT_KINDS.includes(bc.kind));
   return (
     <>
-      {s.bcs.map((bc) => (
-        <BcRow key={bc.id} bc={bc} />
-      ))}
-
       <div className="group">
         <div className="g-label">
-          <span>Add condition</span>
+          <span>Supports</span>
         </div>
+        {supports.map((bc) => (
+          <BcRow key={bc.id} bc={bc} />
+        ))}
         <div className="addrow">
           <button onClick={() => s.addBc("fixed")}>+ Fixed</button>
           <button onClick={() => s.addBc("elastic")}>+ Elastic</button>
           <button onClick={() => s.addBc("frictionless")}>+ Slide</button>
         </div>
+      </div>
+
+      <div className="group">
+        <div className="g-label">
+          <span>Loads</span>
+        </div>
+        {loads.map((bc) => (
+          <BcRow key={bc.id} bc={bc} />
+        ))}
         <div className="addrow">
           <button onClick={() => s.addBc("force")}>+ Force</button>
           <button onClick={() => s.addBc("pressure")}>+ Pressure</button>
@@ -190,6 +202,20 @@ function StepBcs() {
             >
               Brush
             </button>
+          </div>
+          <div className="g-label" style={{ marginTop: 4 }}>
+            <span>Surface detection</span>
+            <b>{s.segAngle}°</b>
+          </div>
+          <input
+            type="range"
+            min={5}
+            max={80}
+            value={s.segAngle}
+            onChange={(e) => void s.setSegAngle(Number(e.target.value))}
+          />
+          <div className="dim small">
+            Lower the angle if pickable patches merge, raise it if they shatter.
           </div>
         </div>
       )}
