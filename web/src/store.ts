@@ -508,7 +508,7 @@ export const useStore = create<AppState>((set, get) => ({
   activeStep: 1,
   fileName: null,
   model: null,
-  segAngle: 30,
+  segAngle: 10,
   tool: "orbit",
   brushRadius: 3,
   brushErase: false,

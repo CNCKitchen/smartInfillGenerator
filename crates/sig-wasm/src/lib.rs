@@ -168,7 +168,8 @@ fn remap_segmentation(orig: &Segmentation, parents: &[u32]) -> Segmentation {
 
 #[wasm_bindgen]
 impl Model {
-    /// Parse STL (binary/ASCII) or 3MF (detected by zip magic); segment at 30°.
+    /// Parse STL (binary/ASCII) or 3MF (detected by zip magic); segment at
+    /// 10° (fine patches pick better; the slider re-segments live).
     #[wasm_bindgen(constructor)]
     pub fn new(bytes: &[u8], name: &str) -> Result<Model, JsValue> {
         let (mesh_orig, mesh_objects) = if bytes.len() >= 2 && &bytes[..2] == b"PK" {
@@ -189,7 +190,7 @@ impl Model {
             }
             None => (mesh_orig.clone(), (0..mesh_orig.len() as u32).collect()),
         };
-        let seg = remap_segmentation(&segment(&mesh_orig, 30.0), &parents);
+        let seg = remap_segmentation(&segment(&mesh_orig, 10.0), &parents);
         Ok(Model {
             mesh,
             mesh_orig,
