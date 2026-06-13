@@ -5,7 +5,7 @@
 // all-at-once sidebar offered is still here, just shown one step at a time.
 
 import { useEffect, useRef } from "react";
-import { budgetBounds, useStore } from "../store";
+import { budgetBounds, symLabel, useStore } from "../store";
 import { NumInput } from "./NumInput";
 import type { Bc, BcKind, PatternKey } from "../types";
 import { fmtDisp, fmtLen, rampCss } from "./fmt";
@@ -128,23 +128,54 @@ function StepModel() {
         <div className="dim drophint">…or drop a file into the viewport. Units: mm.</div>
       )}
       {s.model && (
-        <div className="group">
-          <div className="g-label">
-            <span>Surface detection</span>
-            <b>{s.segAngle}°</b>
+        <>
+          <div className="group">
+            <div className="g-label">
+              <span>Print orientation</span>
+              <b>Z = build direction</b>
+            </div>
+            <div className="toolrow">
+              <button
+                className={s.tool === "place" ? "on" : ""}
+                onClick={() => s.setTool(s.tool === "place" ? "orbit" : "place")}
+                title="Click the surface the part prints on — it becomes the bottom"
+              >
+                ⤓ Place on face
+              </button>
+              <button onClick={() => void s.rotateModel("x")} title="Rotate +90° about X">
+                ⟳X
+              </button>
+              <button onClick={() => void s.rotateModel("y")} title="Rotate +90° about Y">
+                ⟳Y
+              </button>
+              <button onClick={() => void s.rotateModel("z")} title="Rotate +90° about Z">
+                ⟳Z
+              </button>
+            </div>
+            <div className="dim small">
+              {s.tool === "place"
+                ? "Click the face the part prints ON — it turns to the build plate (Z−)."
+                : "Layer-adhesion safety treats Z as the layer direction. Loads keep their world directions; results reset on reorientation."}
+            </div>
           </div>
-          <input
-            type="range"
-            min={5}
-            max={80}
-            value={s.segAngle}
-            onChange={(e) => void s.setSegAngle(Number(e.target.value))}
-          />
-          <div className="dim small">
-            Splits the skin into pickable surfaces — lower the angle if patches merge, raise it if
-            they shatter.
+          <div className="group">
+            <div className="g-label">
+              <span>Surface detection</span>
+              <b>{s.segAngle}°</b>
+            </div>
+            <input
+              type="range"
+              min={5}
+              max={80}
+              value={s.segAngle}
+              onChange={(e) => void s.setSegAngle(Number(e.target.value))}
+            />
+            <div className="dim small">
+              Splits the skin into pickable surfaces — lower the angle if patches merge, raise it
+              if they shatter.
+            </div>
           </div>
-        </div>
+        </>
       )}
       <div className="hint">
         Static linear analysis on a voxel grid — all computation stays in your browser.
@@ -396,8 +427,41 @@ function StepProperties() {
         </div>
       </div>
       <div className="dim small">
-        ≈ {wall.toFixed(2)} mm solid skin — what the analysis assumes and what the 3MF's
+        ≈ {wall.toFixed(2)} mm solid wall — what the analysis assumes and what the 3MF's
         wall_loops will print. Match the line width to your profile.
+      </div>
+
+      <div className="duo">
+        <div className="group">
+          <div className="g-label">
+            <span>Top/bottom layers</span>
+          </div>
+          <NumInput
+            value={s.topBottomLayers}
+            step={1}
+            min={0}
+            max={20}
+            onCommit={(v) => s.setTopBottomLayers(v)}
+          />
+        </div>
+        <div className="group">
+          <div className="g-label">
+            <span>Layer height</span>
+            <b>mm</b>
+          </div>
+          <NumInput
+            value={s.layerHeight}
+            step={0.05}
+            min={0.04}
+            max={0.6}
+            onCommit={(v) => s.setLayerHeight(v)}
+          />
+        </div>
+      </div>
+      <div className="dim small">
+        {s.topBottomLayers > 0
+          ? `≈ ${(s.topBottomLayers * s.layerHeight).toFixed(2)} mm solid shells on up/down-facing surfaces — exported as top/bottom shell layers.`
+          : "0 layers: no top/bottom shells — the infill shows through the surface (showpieces). Exported as 0 shell layers."}
       </div>
 
       <div className="duo">
@@ -437,12 +501,53 @@ function StepProperties() {
         </div>
         <select
           value={s.resolution}
-          onChange={(e) => s.setResolution(e.target.value as "preview" | "normal" | "fine")}
+          onChange={(e) =>
+            s.setResolution(e.target.value as "preview" | "normal" | "fine" | "custom")
+          }
         >
-          <option value="preview">Preview (fast)</option>
-          <option value="normal">Normal</option>
-          <option value="fine">Fine</option>
+          <option value="preview">Preview (fast, ~100k cells)</option>
+          <option value="normal">Normal (~300k cells)</option>
+          <option value="fine">Fine (~1M cells)</option>
+          <option value="custom">Custom…</option>
         </select>
+        {s.resolution === "custom" &&
+          (() => {
+            const b = s.model?.bbox;
+            const vol = b ? (b[3] - b[0]) * (b[4] - b[1]) * (b[5] - b[2]) : 0;
+            const cells = vol > 0 && s.customH > 0 ? vol / s.customH ** 3 : 0;
+            const tooFine = cells > 4_000_000;
+            const tooCoarse = cells > 0 && cells < 10_000;
+            return (
+              <>
+                <label className="row">
+                  <span className="dim small">Cell size h (mm)</span>
+                  <NumInput
+                    value={s.customH}
+                    step={0.1}
+                    min={0.05}
+                    max={20}
+                    onCommit={(v) => s.setCustomH(v)}
+                  />
+                </label>
+                <div className="dim small">
+                  {cells > 0
+                    ? `≈ ${Math.round(cells / 1000).toLocaleString()}k cells at this size.`
+                    : "Load a model to size the grid."}
+                  {tooFine &&
+                    " Too fine — past the 4M-cell cap; the engine will coarsen to fit."}
+                  {tooCoarse && " Very coarse — expect blocky geometry and rough numbers."}
+                  {!tooFine && !tooCoarse && cells > 0 && s.customH > wall + 1e-9 && (
+                    <>
+                      {" "}
+                      Coarser than the {wall.toFixed(2)} mm wall — composite skin keeps the
+                      stiffness honest, but the geometry stays blocky.
+                    </>
+                  )}
+                  {s.snapVoxel && " Voxel snap may still adjust h to wall/k."}
+                </div>
+              </>
+            );
+          })()}
         <label className="rowcheck">
           <input
             type="checkbox"
@@ -652,6 +757,48 @@ function StepOptimize() {
               <option value={4}>4</option>
             </select>
           </label>
+        )}
+      </div>
+
+      <div className="group">
+        <div className="g-label">
+          <span>Symmetry</span>
+          {s.symOn && <b>{symLabel(s.symNormal, s.symC)}</b>}
+        </div>
+        <label className="rowcheck">
+          <input type="checkbox" checked={s.symOn} onChange={() => s.toggleSymmetry()} />
+          <span>Planar symmetry constraint</span>
+        </label>
+        {s.symOn && (
+          <>
+            <div className="toolrow">
+              {(["x", "y", "z"] as const).map((a) => {
+                const aligned =
+                  Math.abs(s.symNormal[a === "x" ? 0 : a === "y" ? 1 : 2]) > 0.9999;
+                return (
+                  <button
+                    key={a}
+                    className={aligned ? "on" : ""}
+                    onClick={() => s.setSymAxis(a)}
+                    title={`Align the plane normal with ${a.toUpperCase()}`}
+                  >
+                    ⊥{a.toUpperCase()}
+                  </button>
+                );
+              })}
+              <button
+                onClick={() => s.centerSymmetry()}
+                title="Center the plane in the part's bounding box"
+              >
+                ⌖ Center
+              </button>
+            </div>
+            <div className="dim small">
+              Mirror-paired cells share one density. Drag the orange plane's arrow to move it,
+              the rings to tilt it (shown while editing on this step). Cells whose mirror lands
+              outside the part stay free.
+            </div>
+          </>
         )}
       </div>
 

@@ -22,7 +22,7 @@ import type {
 } from "./types";
 import { DEFAULT_CURVES, DEFAULT_MATERIALS, RESOLUTIONS, RESULT_FIELDS } from "./types";
 
-export type Tool = "orbit" | "select" | "brush";
+export type Tool = "orbit" | "select" | "brush" | "place";
 export type ViewMode = "setup" | "mesh" | "deformed" | "density" | "infill";
 
 // ---- persisted user settings (materials + infill stiffness curves) ----
@@ -167,12 +167,19 @@ interface AppState {
   material: Material;
   materials: Material[];
   curves: Record<PatternKey, PatternCurve>;
-  resolution: ResolutionKey;
+  resolution: ResolutionKey | "custom";
+  /** Cell size h in mm when resolution = "custom" (0 = not yet chosen —
+   *  initialized from the current grid on first selection). */
+  customH: number;
   // print properties (step 3 · Properties) — shared by the as-printed
   // verify solve, the optimizer's skin model, and the 3MF export
   pattern: PatternKey;
   perimeters: number;
   lineWidth: number; // mm
+  /** Solid top/bottom shells: count × layerHeight = shell thickness.
+   *  0 = none (open-top showpieces — the infill shows). */
+  topBottomLayers: number;
+  layerHeight: number; // mm
   /** Uniform interior infill % "as printed" — the slicer setting. */
   printInfill: number;
   /** Snap the voxel size to wall/k so the skin is k exact cell layers. */
@@ -200,6 +207,11 @@ interface AppState {
   goal: "budget" | "match";
   /** Graded densities vs binary (hollow/solid core). */
   optMode: "graded" | "binary";
+  /** Planar symmetry constraint for the optimizer. Plane n·p = c (n unit,
+   *  world mm) — the gizmo's rings can tilt it off-axis. */
+  symOn: boolean;
+  symNormal: [number, number, number];
+  symC: number;
   /** Solid-fill pattern written to the 3MF in binary mode. */
   solidPattern: "default" | "rectilinear" | "concentric";
   /** Density-level configuration (persisted with materials/curves). */
@@ -221,6 +233,8 @@ interface AppState {
   voxelInfo: VoxelInfo | null;
   voxelMeshReady: boolean;
   settingsOpen: boolean;
+  /** Imprint & privacy modal (German Impressumspflicht). */
+  imprintOpen: boolean;
   /** Startup disclaimer (legal): shown every load unless skipped below. */
   disclaimerOpen: boolean;
   /** Dev/testing escape hatch (persisted in this browser). */
@@ -257,6 +271,16 @@ interface AppState {
   loadFile(name: string, bytes: ArrayBuffer): Promise<void>;
   setSegAngle(angle: number): Promise<void>;
   setTool(tool: Tool): void;
+  /** Print-orientation tools (Model step): rotate 90° about a world axis,
+   *  or place the clicked face on the build plate (face normal → −Z). */
+  rotateModel(axis: "x" | "y" | "z"): Promise<void>;
+  applyPlaceOnFace(normal: [number, number, number]): Promise<void>;
+  /** Symmetry plane (Optimize step). */
+  toggleSymmetry(): void;
+  setSymAxis(axis: "x" | "y" | "z"): void;
+  centerSymmetry(): void;
+  /** Scene → store: the symmetry gizmo was dragged/rotated. */
+  onSymmetryPlaneMoved(normal: [number, number, number], c: number): void;
   setBrushRadius(r: number): void;
   setBrushErase(on: boolean): void;
   addBc(kind: BcKind): void;
@@ -272,11 +296,15 @@ interface AppState {
   setCurve(pattern: PatternKey, c: PatternCurve): void;
   resetCurves(): void;
   openSettings(open: boolean): void;
-  setResolution(r: ResolutionKey): void;
+  openImprint(open: boolean): void;
+  setResolution(r: ResolutionKey | "custom"): void;
+  setCustomH(v: number): void;
   setBudget(v: number): void;
   setPattern(p: PatternKey): void;
   setPerimeters(v: number): void;
   setLineWidth(v: number): void;
+  setTopBottomLayers(v: number): void;
+  setLayerHeight(v: number): void;
   setPrintInfill(v: number): void;
   setSnapVoxel(on: boolean): void;
   setCompositeSkin(on: boolean): void;
@@ -313,6 +341,8 @@ interface AppState {
   setViewMode(mode: ViewMode): Promise<void>;
   setDeformScale(s: number): void;
   setAnimateDeformed(on: boolean): void;
+  /** Stop the running solve/optimization at its next solver checkpoint. */
+  cancelRun(): void;
   clearError(): void;
 }
 
@@ -452,6 +482,58 @@ async function refreshMinSf(
   return null;
 }
 
+/** Apply a rotation about the part's bbox center, then seat it on the build
+ *  plate (z-min → 0). Patches and BC selections survive (index-based); the
+ *  grid and every result drop on both sides. */
+async function transformModel(set: SetState, get: () => AppState, r: number[]) {
+  const st = get();
+  if (!st.model || st.busy) return;
+  const b = st.model.bbox;
+  const c = [(b[0] + b[3]) / 2, (b[1] + b[4]) / 2, (b[2] + b[5]) / 2];
+  const t = [
+    c[0] - (r[0] * c[0] + r[1] * c[1] + r[2] * c[2]),
+    c[1] - (r[3] * c[0] + r[4] * c[1] + r[5] * c[2]),
+    c[2] - (r[6] * c[0] + r[7] * c[1] + r[8] * c[2]),
+  ];
+  try {
+    let out = await engine.transform([...r, ...t]);
+    if (Math.abs(out.bbox[2]) > 1e-6) {
+      out = await engine.transform([1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, -out.bbox[2]]);
+    }
+    const bbox = out.bbox as LoadedModel["bbox"];
+    set({ model: { ...get().model!, positions: out.positions, bbox } });
+    invalidateResults(set, get);
+    invalidateGrid(set, get);
+    sceneEvents.onModelTransformed?.(out.positions, bbox);
+    // The symmetry plane keeps its world position; re-center it on the
+    // moved part so it doesn't strand outside.
+    if (get().symOn) get().centerSymmetry();
+  } catch (e) {
+    set({ error: e instanceof Error ? e.message : String(e) });
+  }
+}
+
+/** Push the symmetry plane to the viewport. Visible only while it's being
+ *  edited: checkbox on, Optimize step active, nothing running (the scene
+ *  additionally hides it in result views). */
+function pushSymmetry(get: () => AppState) {
+  const s = get();
+  const enabled = s.symOn && s.activeStep === 5 && !s.busy;
+  sceneEvents.onSymmetry?.(enabled, s.symNormal, s.symC);
+}
+
+/** Short human label of the symmetry plane for logs and the panel. */
+export function symLabel(normal: [number, number, number], c: number): string {
+  const axes: ["X" | "Y" | "Z", number][] = [
+    ["X", normal[0]],
+    ["Y", normal[1]],
+    ["Z", normal[2]],
+  ];
+  const major = axes.find(([, v]) => Math.abs(v) > 0.9999);
+  if (major) return `⊥${major[0]} @ ${(c * Math.sign(major[1])).toFixed(1)} mm`;
+  return `tilted (n = ${normal.map((v) => v.toFixed(2)).join(", ")})`;
+}
+
 const MAX_LOG_LINES = 800;
 
 function logTime(): string {
@@ -510,6 +592,10 @@ export interface SceneEvents {
     edges: Float32Array | null,
     density?: Float32Array | null
   ) => void;
+  /** Same part, new pose (orientation tools): swap positions in place. */
+  onModelTransformed?: (positions: Float32Array, bbox: LoadedModel["bbox"]) => void;
+  /** Symmetry plane state for the viewport: enabled + plane n·p = c. */
+  onSymmetry?: (enabled: boolean, normal: [number, number, number], c: number) => void;
   /** Color mesh-view cells by element density. */
   onMeshDensity?: (on: boolean) => void;
   /** Voxel-true section active: the scene must NOT plane-clip the voxel
@@ -553,6 +639,24 @@ async function pushBcs(get: () => AppState) {
   await engine.setBcs(get().bcs);
 }
 
+/** Bounding-box volume of the loaded model (mm³), 0 without a model. */
+function bboxVolume(s: AppState): number {
+  const b = s.model?.bbox;
+  if (!b) return 0;
+  return Math.max(0, (b[3] - b[0]) * (b[4] - b[1]) * (b[5] - b[2]));
+}
+
+/** Target cell count of the active resolution. Custom mode derives it from
+ *  the user's cell SIZE and the part's bbox (engine-capped 10k–4M). */
+function resolutionCells(s: AppState): number {
+  if (s.resolution === "custom") {
+    const vol = bboxVolume(s);
+    if (vol <= 0 || s.customH <= 0) return RESOLUTIONS.normal;
+    return Math.min(4_000_000, Math.max(10_000, Math.round(vol / s.customH ** 3)));
+  }
+  return RESOLUTIONS[s.resolution];
+}
+
 /** Push the voxel-snap wall to the engine from the current print settings. */
 async function pushSnap(get: () => AppState) {
   const s = get();
@@ -572,6 +676,7 @@ async function refreshMeshView(set: SetState, get: () => AppState): Promise<bool
     const { hull, edges, density, info } = await engine.voxelMeshCut(
       cutting ? lastSectionPlane : null,
       wall,
+      st.topBottomLayers * st.layerHeight,
       st.printInfill
     );
     if (get().viewMode !== "mesh") return true; // user moved on mid-fetch
@@ -648,10 +753,13 @@ export const useStore = create<AppState>((set, get) => ({
   materials: initialSettings.materials,
   curves: initialSettings.curves,
   resolution: "preview",
+  customH: 0,
   budget: 25,
   pattern: "gyroid",
   perimeters: 2,
   lineWidth: 0.45,
+  topBottomLayers: 5,
+  layerHeight: 0.2,
   printInfill: 25,
   snapVoxel: true,
   compositeSkin: true,
@@ -662,6 +770,9 @@ export const useStore = create<AppState>((set, get) => ({
   smoothIters: 15,
   nBins: 3,
   goal: "budget",
+  symOn: false,
+  symNormal: [1, 0, 0],
+  symC: 0,
   optMode: "graded",
   solidPattern: "default",
   levelSettings: initialSettings.levels,
@@ -680,6 +791,7 @@ export const useStore = create<AppState>((set, get) => ({
   voxelInfo: null,
   voxelMeshReady: false,
   settingsOpen: false,
+  imprintOpen: false,
   disclaimerOpen: !disclaimerSkippedInit(),
   disclaimerSkipped: disclaimerSkippedInit(),
   regionInfos: [],
@@ -700,6 +812,8 @@ export const useStore = create<AppState>((set, get) => ({
 
   setActiveStep(n) {
     set({ activeStep: Math.min(6, Math.max(1, Math.round(n))) });
+    // The symmetry plane is an Optimize-step editing aid — hide it elsewhere.
+    pushSymmetry(get);
   },
 
   async loadFile(name, bytes) {
@@ -708,7 +822,7 @@ export const useStore = create<AppState>((set, get) => ({
       const model = await engine.load(bytes, name.replace(/\.(stl|3mf)$/i, ""));
       const m = get().material;
       await engine.setMaterial(m.e0, m.nu, m.density, m.strength, m.strengthZ);
-      await engine.setResolution(RESOLUTIONS[get().resolution]);
+      await engine.setResolution(resolutionCells(get()));
       // A fresh wasm Model defaults to snap off; push the current setting.
       // (Inline, not pushSnap: the store's `model` isn't set yet.)
       await engine.setSnapWall(
@@ -724,6 +838,7 @@ export const useStore = create<AppState>((set, get) => ({
         bcs: [],
         activeBcId: null,
         tool: "orbit",
+        symOn: false,
         check: null,
         stats: null,
         hasResult: false,
@@ -761,6 +876,7 @@ export const useStore = create<AppState>((set, get) => ({
       sceneEvents.onOptShape?.(null, null);
       sceneEvents.onModelLoaded?.(model);
       sceneEvents.onViewState?.("setup", get().deformScale);
+      pushSymmetry(get); // hide a previous model's symmetry plane
       const [bx, by, bz] = [
         model.bbox[3] - model.bbox[0],
         model.bbox[4] - model.bbox[1],
@@ -792,6 +908,80 @@ export const useStore = create<AppState>((set, get) => ({
   setTool(tool) {
     set({ tool });
   },
+
+  async rotateModel(axis) {
+    // +90° about the world axis, applied about the part's bbox center.
+    const R: Record<"x" | "y" | "z", number[]> = {
+      x: [1, 0, 0, 0, 0, -1, 0, 1, 0],
+      y: [0, 0, 1, 0, 1, 0, -1, 0, 0],
+      z: [0, -1, 0, 1, 0, 0, 0, 0, 1],
+    };
+    appendLog(set, `Rotate +90° about ${axis.toUpperCase()} — results reset`);
+    await transformModel(set, get, R[axis]);
+  },
+
+  async applyPlaceOnFace(normal) {
+    set({ tool: "orbit" }); // disarm: one click places
+    // Rotation taking the clicked face's outward normal to −Z (build plate).
+    const [ax, ay, az] = normal;
+    const dot = -az; // n · (0,0,−1)
+    let R: number[];
+    if (dot > 1 - 1e-9) {
+      R = [1, 0, 0, 0, 1, 0, 0, 0, 1]; // already facing down — just seat
+    } else if (dot < -1 + 1e-9) {
+      R = [1, 0, 0, 0, -1, 0, 0, 0, -1]; // 180° about X
+    } else {
+      // Rodrigues about k = n × (0,0,−1) (normalized), angle = acos(dot).
+      let kx = -ay;
+      let ky = ax;
+      const kz = 0;
+      const kl = Math.hypot(kx, ky) || 1;
+      kx /= kl;
+      ky /= kl;
+      const c = dot;
+      const s = Math.sqrt(Math.max(0, 1 - c * c));
+      const t = 1 - c;
+      R = [
+        c + kx * kx * t, kx * ky * t - kz * s, kx * kz * t + ky * s,
+        ky * kx * t + kz * s, c + ky * ky * t, ky * kz * t - kx * s,
+        kz * kx * t - ky * s, kz * ky * t + kx * s, c + kz * kz * t,
+      ];
+    }
+    appendLog(set, "Place on face: clicked surface becomes the build plate (Z−) — results reset");
+    await transformModel(set, get, R);
+  },
+
+  toggleSymmetry() {
+    const on = !get().symOn;
+    set({ symOn: on });
+    if (on) get().centerSymmetry();
+    else pushSymmetry(get);
+  },
+  setSymAxis(axis) {
+    set({
+      symNormal: [axis === "x" ? 1 : 0, axis === "y" ? 1 : 0, axis === "z" ? 1 : 0],
+    });
+    get().centerSymmetry(); // re-anchor: c along the old normal is meaningless
+  },
+  centerSymmetry() {
+    const m = get().model;
+    if (m) {
+      const b = m.bbox;
+      const n = get().symNormal;
+      const c =
+        n[0] * ((b[0] + b[3]) / 2) + n[1] * ((b[1] + b[4]) / 2) + n[2] * ((b[2] + b[5]) / 2);
+      set({ symC: Math.round(c * 100) / 100 });
+    }
+    // Editing the plane from a result/mesh view: jump back to the setup
+    // view, where the plane is actually shown and editable.
+    if (get().symOn && get().viewMode !== "setup") void get().setViewMode("setup");
+    pushSymmetry(get);
+  },
+  onSymmetryPlaneMoved(normal, c) {
+    // The scene already moved the plane — just mirror the values.
+    set({ symNormal: normal, symC: Math.round(c * 100) / 100 });
+  },
+
   setBrushRadius(r) {
     set({ brushRadius: r });
   },
@@ -910,11 +1100,32 @@ export const useStore = create<AppState>((set, get) => ({
     set({ settingsOpen: open });
   },
 
+  openImprint(open) {
+    set({ imprintOpen: open });
+  },
+
   setResolution(r) {
     set({ resolution: r });
+    if (r === "custom" && get().customH <= 0) {
+      // Seed the cell size from the current grid (or the Normal preset).
+      const s = get();
+      const h =
+        s.voxelInfo?.h ??
+        (bboxVolume(s) > 0 ? Math.cbrt(bboxVolume(s) / RESOLUTIONS.normal) : 1);
+      set({ customH: Math.round(h * 100) / 100 });
+    }
     invalidateResults(set, get);
     invalidateGrid(set, get);
-    void engine.setResolution(RESOLUTIONS[r]);
+    void engine.setResolution(resolutionCells(get()));
+  },
+
+  setCustomH(v) {
+    set({ customH: Math.min(20, Math.max(0.05, v)) });
+    if (get().resolution === "custom") {
+      invalidateResults(set, get);
+      invalidateGrid(set, get);
+      void engine.setResolution(resolutionCells(get()));
+    }
   },
 
   setBudget(v) {
@@ -944,6 +1155,16 @@ export const useStore = create<AppState>((set, get) => ({
       invalidateGrid(set, get);
     }
     void pushSnap(get);
+  },
+  setTopBottomLayers(v) {
+    set({ topBottomLayers: Math.min(20, Math.max(0, Math.round(v))), printedStats: null });
+    invalidateResults(set, get);
+    if (get().viewMode === "mesh") void refreshMeshView(set, get);
+  },
+  setLayerHeight(v) {
+    set({ layerHeight: Math.min(0.6, Math.max(0.04, v)), printedStats: null });
+    invalidateResults(set, get);
+    if (get().viewMode === "mesh") void refreshMeshView(set, get);
   },
   setPrintInfill(v) {
     const pct = Math.min(100, Math.max(5, Math.round(v)));
@@ -1158,6 +1379,8 @@ export const useStore = create<AppState>((set, get) => ({
           coeff: curve.coeff,
           perimeters: st0.perimeters,
           lineWidth: st0.lineWidth,
+          topBottomLayers: st0.topBottomLayers,
+          layerHeight: st0.layerHeight,
         });
         stats = out.stats;
         displacements = out.displacements;
@@ -1241,8 +1464,13 @@ export const useStore = create<AppState>((set, get) => ({
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      set({ busy: null, error: msg });
-      appendLog(set, `Solve failed: ${msg}`);
+      if (/cancelled/i.test(msg)) {
+        set({ busy: null, notice: "Solve stopped." });
+        appendLog(set, "Solve cancelled by user");
+      } else {
+        set({ busy: null, error: msg });
+        appendLog(set, `Solve failed: ${msg}`);
+      }
     }
   },
 
@@ -1258,6 +1486,7 @@ export const useStore = create<AppState>((set, get) => ({
       optSeries: [],
     });
     sceneEvents.onAnimateMode?.(null);
+    pushSymmetry(get); // editing aid — hide while the optimization runs
     try {
       await pushBcs(get);
       await logGridInfo(set);
@@ -1274,7 +1503,8 @@ export const useStore = create<AppState>((set, get) => ({
             : `infill budget ${st.budget}%`) +
           ` (${st.pattern}: E/E₀ = ${curve.coeff}·ρ^${curve.exponent}), ` +
           `skin ${st.perimeters}×${st.lineWidth} mm — convergence when mean |Δρ| < 0.005 twice` +
-          (binary ? " · optimizer SIMP-penalized p=3" : "")
+          (binary ? " · optimizer SIMP-penalized p=3" : "") +
+          (st.symOn ? ` · symmetry plane ${symLabel(st.symNormal, st.symC)}` : "")
       );
       let lastPass = 0;
       const out = await engine.optimize(
@@ -1292,6 +1522,9 @@ export const useStore = create<AppState>((set, get) => ({
           binary,
           solidPattern: binary && st.solidPattern !== "default" ? st.solidPattern : null,
           goal: st.goal,
+          symmetry: st.symOn ? [...st.symNormal, st.symC] : null,
+          topBottomLayers: st.topBottomLayers,
+          layerHeight: st.layerHeight,
         },
         (p, density, skelPositions, skelIndices, skelDensity) => {
           set((s) => ({
@@ -1396,11 +1629,20 @@ export const useStore = create<AppState>((set, get) => ({
       // interior structure is the result, not the painted surface.
       sceneEvents.onViewState?.("density", get().deformScale);
       get().setDensityThreshold(25);
+      // Re-arm the plane state (still hidden in result views; it shows again
+      // when the user returns to a setup view on this step).
+      pushSymmetry(get);
     } catch (e) {
       sceneEvents.onOptShape?.(null, null);
       const msg = e instanceof Error ? e.message : String(e);
-      set({ busy: null, optProgress: null, error: msg });
-      appendLog(set, `Optimize failed: ${msg}`);
+      if (/cancelled/i.test(msg)) {
+        set({ busy: null, optProgress: null, notice: "Optimization stopped." });
+        appendLog(set, "Optimization cancelled by user");
+      } else {
+        set({ busy: null, optProgress: null, error: msg });
+        appendLog(set, `Optimize failed: ${msg}`);
+      }
+      pushSymmetry(get);
     }
   },
 
@@ -1537,6 +1779,12 @@ export const useStore = create<AppState>((set, get) => ({
 
   setSectionAxis(axis) {
     sceneEvents.onSectionAxis?.(axis);
+  },
+
+  cancelRun() {
+    if (!engine.canCancel) return;
+    engine.cancel();
+    appendLog(set, "Stop requested — halting at the next solver checkpoint…");
   },
 
   clearError() {

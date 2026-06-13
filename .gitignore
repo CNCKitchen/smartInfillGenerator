@@ -9,3 +9,6 @@
 /testhook_*.3mf
 _sample_extracted/
 *.stl.tmp
+/web/repro-box.stl
+/web/repro-busy.png
+meshbench-out.txt

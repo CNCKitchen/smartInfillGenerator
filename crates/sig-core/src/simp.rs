@@ -32,12 +32,20 @@ pub struct OptimizeParams {
     /// Printable density bounds for interior cells.
     pub floor: f64,
     pub cap: f64,
-    /// Skin (wall + shell) thickness in mm.
+    /// Lateral wall (perimeters × line width) thickness in mm.
     pub wall_mm: f64,
+    /// Top/bottom shell thickness in mm (layers × layer height); 0 = none.
+    pub top_mm: f64,
+    pub bottom_mm: f64,
     /// Composite skin: surface cells the wall band only partially covers
     /// stay design cells with a blended stiffness, instead of rounding the
     /// band to whole cell layers (legacy).
     pub composite_skin: bool,
+    /// Planar symmetry constraint: [nx, ny, nz, c] of the plane n·p = c
+    /// (world mm, n need not be unit). Mirror-paired design cells are
+    /// averaged each iteration (field and sensitivities), so the optimized
+    /// density comes out symmetric about the plane.
+    pub symmetry: Option<[f64; 4]>,
     pub max_iter: usize,
 }
 
@@ -50,7 +58,10 @@ impl Default for OptimizeParams {
             floor: 0.10,
             cap: 0.70,
             wall_mm: 0.9,
+            top_mm: 1.0, // 5 layers x 0.2 mm
+            bottom_mm: 1.0,
             composite_skin: false,
+            symmetry: None,
             max_iter: 40,
         }
     }
@@ -100,6 +111,8 @@ pub struct OptimizeResult {
 pub enum OptimizeError {
     Solve(crate::solve::SolveError),
     NoInterior,
+    /// The embedder requested a stop (see `crate::cancel`).
+    Cancelled,
 }
 
 impl std::fmt::Display for OptimizeError {
@@ -110,6 +123,7 @@ impl std::fmt::Display for OptimizeError {
                 f,
                 "part is thinner than the wall thickness everywhere — nothing to optimize (it prints solid)"
             ),
+            OptimizeError::Cancelled => write!(f, "cancelled"),
         }
     }
 }
@@ -127,98 +141,144 @@ pub struct SkinSplit {
     pub skin_frac: Vec<f32>,
 }
 
-/// Split solid cells into skin (within `wall_mm` of the surface) and design
-/// cells. With `composite` on, the wall band is measured in FRACTIONAL cell
-/// layers: a cell the band only partially covers (wall thinner than the cell,
-/// or a non-integer wall/h) stays a design cell but records the covered
-/// fraction, and its stiffness/mass are later blended (Voigt) between solid
-/// and infill — so the skin no longer needs h <= wall to be representable.
-/// Surface cells exposed on several sides count the overlapping slabs
-/// (a convex corner at wall/h = 0.5 is 7/8 skin, not 1/2). With `composite`
-/// off, the band is the legacy round(wall/h), minimum one full layer.
-pub fn classify_cells(grid: &VoxelGrid, wall_mm: f64, composite: bool) -> SkinSplit {
+/// Split solid cells into skin and design cells, with per-design-cell skin
+/// fractions, modeling the printed shell structure DIRECTIONALLY the way a
+/// slicer builds it:
+/// - WALLS (perimeters × line width = `wall_mm`): a band measured IN-PLANE
+///   from each layer's outline — per-slice 2D BFS. Vertical and sloped
+///   surfaces get walls; the band does not leak through top/bottom faces.
+/// - TOP/BOTTOM SHELLS (`top_mm`/`bottom_mm` = layers × layer height): a
+///   band measured VERTICALLY from up-/down-facing surfaces — per-column
+///   contiguous solid runs, so an internal cavity gets shells above and
+///   below it like sliced top/bottom layers. 0 = no shells (open-top
+///   showpieces print sparse right to the surface).
+///
+/// With `composite` on, both bands are FRACTIONAL cell layers (partially
+/// covered cells blend solid and infill); off rounds to whole layers (walls
+/// minimum 1, shells may round to 0). Overlapping slabs combine exactly:
+/// opposite sides along one direction add (clamped at full), orthogonal
+/// bands overlap independently — f = 1 − (1 − f_wall)(1 − f_shell).
+pub fn classify_cells(
+    grid: &VoxelGrid,
+    wall_mm: f64,
+    top_mm: f64,
+    bottom_mm: f64,
+    composite: bool,
+) -> SkinSplit {
     let (nx, ny, nz) = (grid.nx, grid.ny, grid.nz);
-    // Wall thickness in cell layers; the legacy model rounds to >= 1.
-    let t = if composite {
-        wall_mm / grid.h
-    } else {
-        (wall_mm / grid.h).round().max(1.0)
-    };
-    // depth 0 = surface cell (touches void/outside), then BFS inward while
-    // the band still reaches the next layer. Void faces of surface cells are
-    // counted per axis for the overlapping-slab fraction.
-    let mut depth = vec![u32::MAX; nx * ny * nz];
-    let mut void_faces = vec![[0u8; 3]; 0];
-    let mut surface_slot = vec![u32::MAX; 0];
-    if composite {
-        surface_slot = vec![u32::MAX; nx * ny * nz];
-    }
+    let h = grid.h;
+    let t_wall = if composite { wall_mm / h } else { (wall_mm / h).round().max(1.0) };
+    let t_top = if composite { (top_mm / h).max(0.0) } else { (top_mm / h).round().max(0.0) };
+    let t_bot =
+        if composite { (bottom_mm / h).max(0.0) } else { (bottom_mm / h).round().max(0.0) };
+
+    // ---- lateral wall band: 2D BFS per z-slice ----
+    let mut f_lat = vec![0f32; nx * ny * nz];
+    let mut depth = vec![u32::MAX; nx * ny];
+    let mut faces = vec![[0u8; 2]; nx * ny];
     let mut queue: std::collections::VecDeque<usize> = Default::default();
     for cz in 0..nz {
+        let base = cz * ny * nx;
+        depth.iter_mut().for_each(|v| *v = u32::MAX);
         for cy in 0..ny {
             for cx in 0..nx {
-                let ci = (cz * ny + cy) * nx + cx;
-                if grid.scale[ci] <= 0.0 {
+                let si = cy * nx + cx;
+                if grid.scale[base + si] <= 0.0 {
                     continue;
                 }
-                let void_at = |dx: i64, dy: i64, dz: i64| -> bool {
-                    let (x, y, z) = (cx as i64 + dx, cy as i64 + dy, cz as i64 + dz);
-                    if x < 0 || y < 0 || z < 0 || x >= nx as i64 || y >= ny as i64 || z >= nz as i64
-                    {
+                let void_at = |dx: i64, dy: i64| -> bool {
+                    let (x, y) = (cx as i64 + dx, cy as i64 + dy);
+                    if x < 0 || y < 0 || x >= nx as i64 || y >= ny as i64 {
                         return true; // outside the grid counts as void
                     }
-                    grid.scale[((z as usize) * ny + y as usize) * nx + x as usize] <= 0.0
+                    grid.scale[base + (y as usize) * nx + x as usize] <= 0.0
                 };
-                let faces = [
-                    void_at(-1, 0, 0) as u8 + void_at(1, 0, 0) as u8,
-                    void_at(0, -1, 0) as u8 + void_at(0, 1, 0) as u8,
-                    void_at(0, 0, -1) as u8 + void_at(0, 0, 1) as u8,
+                let k = [
+                    void_at(-1, 0) as u8 + void_at(1, 0) as u8,
+                    void_at(0, -1) as u8 + void_at(0, 1) as u8,
                 ];
-                if faces[0] + faces[1] + faces[2] > 0 {
-                    depth[ci] = 0;
-                    queue.push_back(ci);
-                    if composite {
-                        surface_slot[ci] = void_faces.len() as u32;
-                        void_faces.push(faces);
+                if k[0] + k[1] > 0 {
+                    depth[si] = 0;
+                    faces[si] = k;
+                    queue.push_back(si);
+                }
+            }
+        }
+        while let Some(si) = queue.pop_front() {
+            let d = depth[si];
+            if (d as f64 + 1.0) >= t_wall - 1e-9 {
+                continue;
+            }
+            let cx = si % nx;
+            let cy = si / nx;
+            let mut push = |s: usize| {
+                if grid.scale[base + s] > 0.0 && depth[s] == u32::MAX {
+                    depth[s] = d + 1;
+                    queue.push_back(s);
+                }
+            };
+            if cx > 0 {
+                push(si - 1);
+            }
+            if cx + 1 < nx {
+                push(si + 1);
+            }
+            if cy > 0 {
+                push(si - nx);
+            }
+            if cy + 1 < ny {
+                push(si + nx);
+            }
+        }
+        for si in 0..nx * ny {
+            if grid.scale[base + si] <= 0.0 {
+                continue;
+            }
+            let f = match depth[si] {
+                u32::MAX => 0.0,
+                0 if composite => {
+                    // Union of wall slabs from each exposed in-plane face:
+                    // the uncovered core is the product of the per-axis
+                    // remainders (opposite faces add via the 1 − k·t term).
+                    let k = faces[si];
+                    1.0 - (1.0 - k[0] as f64 * t_wall).max(0.0)
+                        * (1.0 - k[1] as f64 * t_wall).max(0.0)
+                }
+                d => (t_wall - d as f64).clamp(0.0, 1.0),
+            };
+            f_lat[base + si] = f as f32;
+        }
+    }
+
+    // ---- vertical shell band: contiguous solid runs per column ----
+    let mut f_vert = vec![0f32; nx * ny * nz];
+    if t_top > 1e-9 || t_bot > 1e-9 {
+        for cy in 0..ny {
+            for cx in 0..nx {
+                let at = |z: usize| (z * ny + cy) * nx + cx;
+                let mut z = 0usize;
+                while z < nz {
+                    if grid.scale[at(z)] <= 0.0 {
+                        z += 1;
+                        continue;
+                    }
+                    let z0 = z;
+                    while z < nz && grid.scale[at(z)] > 0.0 {
+                        z += 1;
+                    }
+                    let z1 = z - 1;
+                    for zz in z0..=z1 {
+                        let dt = (z1 - zz) as f64; // cells below the run's top
+                        let db = (zz - z0) as f64;
+                        let f = (t_top - dt).clamp(0.0, 1.0) + (t_bot - db).clamp(0.0, 1.0);
+                        f_vert[at(zz)] = f.min(1.0) as f32;
                     }
                 }
             }
         }
     }
-    while let Some(ci) = queue.pop_front() {
-        let d = depth[ci];
-        // The band reaches layer d+1 only while d+1 < t.
-        if (d as f64 + 1.0) >= t - 1e-9 {
-            continue;
-        }
-        let cx = ci % nx;
-        let cy = (ci / nx) % ny;
-        let cz = ci / (nx * ny);
-        let mut push = |c: usize| {
-            if grid.scale[c] > 0.0 && depth[c] == u32::MAX {
-                depth[c] = d + 1;
-                queue.push_back(c);
-            }
-        };
-        if cx > 0 {
-            push(ci - 1);
-        }
-        if cx + 1 < nx {
-            push(ci + 1);
-        }
-        if cy > 0 {
-            push(ci - nx);
-        }
-        if cy + 1 < ny {
-            push(ci + nx);
-        }
-        if cz > 0 {
-            push(ci - nx * ny);
-        }
-        if cz + 1 < nz {
-            push(ci + nx * ny);
-        }
-    }
+
+    // ---- combine (orthogonal slabs overlap independently) + split ----
     let mut skin = Vec::new();
     let mut design = Vec::new();
     let mut skin_frac = Vec::new();
@@ -226,20 +286,7 @@ pub fn classify_cells(grid: &VoxelGrid, wall_mm: f64, composite: bool) -> SkinSp
         if grid.scale[ci] <= 0.0 {
             continue;
         }
-        let f = match depth[ci] {
-            u32::MAX => 0.0,
-            0 if composite => {
-                // Union of wall slabs from each exposed face: the uncovered
-                // core is the product of the per-axis remainders.
-                let faces = void_faces[surface_slot[ci] as usize];
-                let mut core = 1.0f64;
-                for a in 0..3 {
-                    core *= (1.0 - faces[a] as f64 * t).max(0.0);
-                }
-                1.0 - core
-            }
-            d => (t - d as f64).clamp(0.0, 1.0),
-        };
+        let f = 1.0 - (1.0 - f_lat[ci] as f64) * (1.0 - f_vert[ci] as f64);
         if f >= 1.0 - 1e-6 {
             skin.push(ci as u32);
         } else {
@@ -248,6 +295,63 @@ pub fn classify_cells(grid: &VoxelGrid, wall_mm: f64, composite: bool) -> SkinSp
         }
     }
     SkinSplit { skin, design, skin_frac }
+}
+
+/// Mirror partner per design slot for a planar symmetry constraint:
+/// reflect each design cell's center across the plane n·p = c and look up
+/// the design cell containing the image (u32::MAX = no partner: the mirror
+/// lands in void, skin, or outside the grid — those cells stay free). With
+/// a grid-aligned plane on a cell boundary the pairing is an exact
+/// involution; otherwise it is the nearest-cell approximation.
+pub fn build_mirror_pairs(grid: &VoxelGrid, design_cells: &[u32], plane: [f64; 4]) -> Vec<u32> {
+    let len = (plane[0] * plane[0] + plane[1] * plane[1] + plane[2] * plane[2]).sqrt();
+    if len < 1e-12 {
+        return vec![u32::MAX; design_cells.len()];
+    }
+    let n = [plane[0] / len, plane[1] / len, plane[2] / len];
+    let c = plane[3] / len;
+    let mut slot_of: std::collections::HashMap<u32, u32> = Default::default();
+    for (k, &cell) in design_cells.iter().enumerate() {
+        slot_of.insert(cell, k as u32);
+    }
+    let (nx, ny, nz) = (grid.nx, grid.ny, grid.nz);
+    let mut partner = vec![u32::MAX; design_cells.len()];
+    for (k, &cell) in design_cells.iter().enumerate() {
+        let cell = cell as usize;
+        let p = [
+            grid.origin[0] + ((cell % nx) as f64 + 0.5) * grid.h,
+            grid.origin[1] + (((cell / nx) % ny) as f64 + 0.5) * grid.h,
+            grid.origin[2] + ((cell / (nx * ny)) as f64 + 0.5) * grid.h,
+        ];
+        let d = n[0] * p[0] + n[1] * p[1] + n[2] * p[2] - c;
+        let q = [p[0] - 2.0 * d * n[0], p[1] - 2.0 * d * n[1], p[2] - 2.0 * d * n[2]];
+        let qx = ((q[0] - grid.origin[0]) / grid.h).floor();
+        let qy = ((q[1] - grid.origin[1]) / grid.h).floor();
+        let qz = ((q[2] - grid.origin[2]) / grid.h).floor();
+        if qx < 0.0 || qy < 0.0 || qz < 0.0 {
+            continue;
+        }
+        let (qx, qy, qz) = (qx as usize, qy as usize, qz as usize);
+        if qx >= nx || qy >= ny || qz >= nz {
+            continue;
+        }
+        if let Some(&j) = slot_of.get(&(((qz * ny + qy) * nx + qx) as u32)) {
+            partner[k] = j;
+        }
+    }
+    partner
+}
+
+/// Average each value with its mirror partner's (no-op for unpaired slots).
+fn symmetrize(values: &mut [f64], partner: &[u32], buf: &mut Vec<f64>) {
+    buf.clear();
+    buf.extend_from_slice(values);
+    for k in 0..values.len() {
+        let j = partner[k];
+        if j != u32::MAX {
+            values[k] = 0.5 * (buf[k] + buf[j as usize]);
+        }
+    }
 }
 
 /// Linear density filter over interior cells (conic weights, radius in cells).
@@ -365,6 +469,8 @@ fn cell_strain_energy(
 /// cell partially covered by the wall band (`skin_frac` > 0, composite skin)
 /// gets the volume-fraction blend of solid and infill — the same
 /// homogenization step as the infill law itself, applied at the surface.
+/// Everything additionally scales by the cell's OCCUPANCY (`grid.scale`,
+/// cut boundary cells < 1) so staircase cells don't carry full stiffness.
 pub fn build_eps(
     grid: &VoxelGrid,
     skin: &[u32],
@@ -376,13 +482,14 @@ pub fn build_eps(
 ) -> Vec<f32> {
     let mut eps = vec![0f32; grid.cell_count()];
     for &c in skin {
-        eps[c as usize] = 1.0;
+        eps[c as usize] = grid.scale[c as usize];
     }
     for (k, &c) in design_cells.iter().enumerate() {
         let rel = (coeff * x[k].powf(exponent)).min(1.0);
         let e_infill = EMIN_REL as f64 + (1.0 - EMIN_REL as f64) * rel;
         let f = skin_frac[k] as f64;
-        eps[c as usize] = (f + (1.0 - f) * e_infill) as f32;
+        eps[c as usize] =
+            (grid.scale[c as usize] as f64 * (f + (1.0 - f) * e_infill)) as f32;
     }
     eps
 }
@@ -432,19 +539,41 @@ pub fn optimize_cached(
     u0: Option<&[f64]>,
     mut progress: impl FnMut(&OptimizeProgress, &[f64], &[u32]),
 ) -> Result<OptimizeResult, OptimizeError> {
-    let SkinSplit { skin, design: design_cells, skin_frac } =
-        classify_cells(grid, params.wall_mm, params.composite_skin);
+    let SkinSplit { skin, design: design_cells, skin_frac } = classify_cells(
+        grid,
+        params.wall_mm,
+        params.top_mm,
+        params.bottom_mm,
+        params.composite_skin,
+    );
     if design_cells.is_empty() {
         return Err(OptimizeError::NoInterior);
     }
-    let n_solid = (skin.len() + design_cells.len()) as f64;
-    // Infill volume share per design cell — a composite cell is only
-    // (1 - skin_frac) infill; all 1 with composite skin off. Means and the
-    // mass budget weight by it so "mean infill" keeps meaning what a slicer
-    // percentage means.
-    let w: Vec<f64> = skin_frac.iter().map(|&f| 1.0 - f as f64).collect();
+    // Infill volume share per design cell — occupancy × (1 − wall-band
+    // fraction): a composite cell is partly wall, a cut boundary cell is
+    // partly outside the part. Means and the mass budget weight by it so
+    // "mean infill" keeps meaning what a slicer percentage means.
+    let w: Vec<f64> = design_cells
+        .iter()
+        .zip(&skin_frac)
+        .map(|(&c, &f)| grid.scale[c as usize] as f64 * (1.0 - f as f64))
+        .collect();
     let w_sum: f64 = w.iter().sum();
-    let sum_f: f64 = skin_frac.iter().map(|&f| f as f64).sum();
+    // Solid volume of the wall band inside design cells (occupancy-weighted).
+    let sum_f: f64 = design_cells
+        .iter()
+        .zip(&skin_frac)
+        .map(|(&c, &f)| grid.scale[c as usize] as f64 * f as f64)
+        .sum();
+    // Skin volume + design volume = the part's solid volume (in cells).
+    let vol_skin: f64 = skin.iter().map(|&c| grid.scale[c as usize] as f64).sum();
+    let n_solid = vol_skin + sum_f + w_sum;
+    // Planar symmetry: mirror partner per design slot (empty = off).
+    let sym_partner: Vec<u32> = match params.symmetry {
+        Some(plane) => build_mirror_pairs(grid, &design_cells, plane),
+        None => Vec::new(),
+    };
+    let mut sym_buf: Vec<f64> = Vec::new();
 
     // The budget IS the target interior mean (infill %), so the result is
     // directly comparable to a uniform print at the same slicer percentage.
@@ -510,6 +639,9 @@ pub fn optimize_cached(
         // the design never becomes stationary.
         let (tol_i, cap_i) = if last_mean_change < 0.012 { (2e-4, 60) } else { (5e-4, 15) };
         let inner = cache.solver.solve_warm(&bb, &mut u, tol_i, cap_i);
+        if crate::cancel::requested() {
+            return Err(OptimizeError::Cancelled);
+        }
         compliance = 0.0;
         for i in 0..ndof {
             compliance += bb[i] * u[i];
@@ -531,6 +663,9 @@ pub fn optimize_cached(
                 * se[k];
         }
         filter.apply_t(&sens_phys, &mut sens);
+        if !sym_partner.is_empty() {
+            symmetrize(&mut sens, &sym_partner, &mut sym_buf);
+        }
 
         // OC update with bisection on the volume multiplier.
         // Move-limit continuation: full steps while the layout forms, then
@@ -579,6 +714,11 @@ pub fn optimize_cached(
                 x_new[k] = 0.5 * (x_new[k] + x[k]);
             }
         }
+        // Symmetry projection: mirror-paired cells share their average. The
+        // pairwise mean preserves the budget and keeps the OC update stable.
+        if !sym_partner.is_empty() {
+            symmetrize(&mut x_new, &sym_partner, &mut sym_buf);
+        }
         let mut change = 0f64;
         let mut mean_change = 0f64;
         for k in 0..x.len() {
@@ -591,7 +731,7 @@ pub fn optimize_cached(
         x.copy_from_slice(&x_new);
 
         let sum_wx = w.iter().zip(&x_phys).map(|(&wk, &xk)| wk * xk).sum::<f64>();
-        let mass_frac = (skin.len() as f64 + sum_f + sum_wx) / n_solid;
+        let mass_frac = (vol_skin + sum_f + sum_wx) / n_solid;
         progress(
             &OptimizeProgress {
                 iteration: it + 1,
@@ -618,10 +758,15 @@ pub fn optimize_cached(
         }
     }
 
-    // Final physical field.
+    // Final physical field — symmetrized AFTER the filter so the output (and
+    // the bins/regions built from it) is exactly mirror-symmetric even when
+    // the filter stencil isn't.
     filter.apply(&x, &mut x_phys);
     for v in x_phys.iter_mut() {
         *v = v.clamp(params.floor, params.cap);
+    }
+    if !sym_partner.is_empty() {
+        symmetrize(&mut x_phys, &sym_partner, &mut sym_buf);
     }
     // Leave the final displacement in the cache: the verification solves
     // that follow warm-start from it.

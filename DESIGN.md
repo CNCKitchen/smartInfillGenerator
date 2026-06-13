@@ -113,7 +113,95 @@ Reference points:
   by an "element density" plot — each cell colored 0–1 through the density ramp (skin = 1,
   interior = the print-settings infill ratio, or the OPTIMIZED per-cell density once an
   optimization result exists; composite surface cells blend by wall fraction). Works with
-  the voxel-true section; legend shows the ramp and what the interior value means. The Mesh view exposes the model: a skin-cell tint
+  the voxel-true section; legend shows the ramp and what the interior value means.
+- **Hover value probe (2026-06):** whenever a contour legend is on screen (result fields,
+  density/regions views, mesh-view element density) the cursor carries a DRO-style readout
+  of the value under it — barycentric interpolation on the displayed (possibly deformed)
+  triangle of the active surface (STL or voxel hull), formatted per field (mm/µm, MPa,
+  SF ×, %). Implemented as a raycast in the viewer; off whenever no legend is shown.
+- **Print orientation (2026-06, Model step):** "Place on face" (click the surface the part
+  prints on — its normal rotates to −Z) and ⟳X/⟳Y/⟳Z 90° buttons. Implemented as a rigid
+  transform in the engine (`Model::transform`, 3×3 + translation) applied to BOTH the
+  working and original meshes — exports carry the orientation; segmentation patches and BC
+  triangle selections are index-based and survive; grid/results drop. The part re-seats on
+  the plate (z-min → 0) after every transform. Z is the print direction: the layer-adhesion
+  SF reads σzz, so orientation is a physics input, not cosmetics. Loads keep their world
+  directions (documented in the panel).
+- **Symmetry constraint (2026-06, Optimize step):** optional planar symmetry for the
+  optimization. The plane uses the SAME combined gizmo as the section plane (translate
+  along the normal + two rotation rings — arbitrary plane orientation), plus ⊥X/⊥Y/⊥Z
+  align buttons and "Center" on the bbox; state is n·p = c, any normal. The plane is an
+  EDITING AID: visible only while the Optimize step is active, nothing is running, and a
+  setup-ish view is shown (hidden in deformed/density/regions views and during the run).
+  Engine: design cells are mirror-paired by reflecting cell centers (`build_mirror_pairs`;
+  nearest-cell, exact involution when the plane sits on a grid plane); each OC iteration
+  averages paired sensitivities and densities, and the FINAL field is projected after
+  filtering, so the output (and the bins/regions/exports built from it) is exactly
+  mirror-symmetric. Cells whose mirror lands outside the part/in skin stay free.
+  Asymmetric loads with symmetry ON are allowed — the result is then
+  symmetric-but-suboptimal by design (the usual reason: two mirrored load cases, one
+  printed part).
+- **Directional skin: top/bottom shells (2026-06):** `classify_cells` models the printed
+  shell structure the way a slicer builds it. WALLS (perimeters × line width) are an
+  IN-PLANE band from each layer's outline (per-slice 2D BFS — no leaking through
+  top/bottom faces); TOP/BOTTOM SHELLS (layers × layer height, "Top/bottom layers" +
+  "Layer height" in Properties, defaults 5 × 0.2 mm) are a VERTICAL band from up/down-
+  facing surfaces via per-column contiguous solid runs (internal cavities get shells
+  above/below, like sliced parts). 0 layers = open-top showpieces: infill runs to the
+  surface, and the exports say so. Bands combine exactly (opposite slabs add and clamp;
+  orthogonal bands overlap independently) and reuse the composite-skin fraction machinery
+  unchanged. Exports carry the assumed counts: Orca/Bambu `top_shell_layers` /
+  `bottom_shell_layers`, Prusa `top_solid_layers`/`bottom_solid_layers` (object level,
+  next to wall_loops/perimeters). Layer height itself is NOT exported — it's a global
+  process choice; like line width, the user matches it to their profile.
+- **Cut-cell convention — Finite-Cell occupancy (2026-06):** every boundary cell carries a
+  3×3×3-supersampled OCCUPANCY fraction in `grid.scale` — the share of the cell actually
+  inside the STL. The occupancy also decides the cell SET (Finite-Cell / ersatz-material):
+  a cell joins the solid when occupancy ≥ `BOUNDARY_FLOOR` (0.15), which **includes cells
+  whose center is outside but the surface cuts** (so the part never protrudes past its mesh
+  — the original complaint) and **drops sub-floor slivers** (the small-cut-cell conditioning
+  / false-alarm guard). Occupancy scales stiffness (`build_eps` and the plain solve multiply
+  by it), mass (all dock masses occupancy-weighted), the optimizer's infill weights, the
+  element-density plot, and the hull display (which now encloses the part). Interior cells
+  stay exactly 1, so exact-fitting test grids are unchanged.
+  - **Why this convention (decided by benchmark, not guess — `tests/meshbench.rs`):** an
+    earlier interim version (2026-06, "center-occ") kept the center-inside test for the SET
+    and only derated center-inside boundary cells — which biases volume/mass LOW (one-sided
+    derating). An 8-case harness compared five conventions (center-full, center-occ, inflate-
+    derate, inflate+floor, majority-50%) against analytic/textbook truth: sphere & rotated-box
+    volume, grid-phase robustness, rotated-square cantilever stiffness, Kirsch plate-with-hole
+    stress, solid round cantilever, thin-walled tube, and a shoulder-fillet Kt (Betancur et al.,
+    Tecciencia 12(23) 2017, D/d=1.5). Findings: **inflate-derate + 0.15 floor wins on every
+    axis** — volume bias ≈0 (vs center-occ −5 to −13% on thin walls), lowest phase wobble
+    (CoV 0.009% vs ~0.3%), accurate stiffness, AND most-accurate peak stress on curved features
+    (Kt within ~1–3% on the fillet where binary conventions over-read 12–28%, because occupancy
+    derating tempers the staircase stress spikes). The floor removes the lone pure-inflate
+    coarse-mesh sliver false-alarm (min-SF dip) while costing ~1% volume. The harness stays in
+    the tree (`cargo test -p sig-core --test meshbench -- --ignored --nocapture`) so any future
+    change is one command from re-validation.
+- **Custom analysis resolution (2026-06):** the Preview/Normal/Fine presets (~100k/300k/1M
+  cells) gained a "Custom…" option where the user sets the CELL SIZE h in mm (seeded from
+  the current grid); the panel shows the implied cell count and warns when it's past the
+  4M cap (engine coarsens to fit), absurdly coarse, or coarser than the wall.
+- **Mesh view (2026-06):** the STL stays visible as a transparent overlay on the voxel
+  hull, so the discretization quality is visible at a glance. Force arrows are solid
+  shaded glyphs with a value label ("12 N") — an ArrowHelper's line shaft vanished when
+  viewed end-on, leaving an unexplainable floating dot above the part.
+- **Post-optimize wait (2026-06):** after convergence the pipeline runs the binned
+  verification solve plus uniform and solid REFERENCE solves (comparison card) and region
+  extraction. The two reference solves now run at a relaxed tolerance (max(tol, 5e-4) —
+  compliance converges much faster than the residual; the solver cache doesn't key on tol,
+  so warm starts survive), which removes most of the silent wait between "converged" and
+  results.
+- **Stop/cancel (2026-06):** running solves and optimizations are cancellable. The worker
+  is blocked inside wasm, so a postMessage can never arrive mid-call — instead the UI
+  thread sets a SharedArrayBuffer flag (available because the site already ships COOP/COEP
+  for threaded wasm; without isolation the Stop button hides). The wasm side installs a
+  thread-local checker (`sig_core::cancel`); the MGCG loop polls it every CG iteration and
+  the SIMP loop every outer iteration, surfacing a `Cancelled` error ("■ Stop" button in
+  the busy chip → "Solve/Optimization stopped." notice, no error toast). The partial CG
+  iterate is kept as a warm start for the next run; the flag re-arms at the start of every
+  solve/optimize op. The Mesh view exposes the model: a skin-cell tint
   (legend checkbox) and a VOXEL-TRUE section — cells on the far side of the plane drop
   out entirely (`surface_mesh_where`, plane in three.js normal·p + c ≥ 0 convention,
   recut debounced while the gizmo drags) so the interior cells and the modeled wall
@@ -135,8 +223,10 @@ Reference points:
   safety factor.
 - **Project persistence:** single JSON project file (embedded mesh + setup) download/load;
   auto-save to IndexedDB.
-- **Out of scope v1:** assemblies/multi-body, print-orientation anisotropy in the solver,
-  thermal/dynamic loads, mobile browsers.
+- **Out of scope v1:** assemblies/multi-body, thermal/dynamic loads, mobile browsers.
+  Print-orientation stiffness anisotropy was out of scope here until 2026-06; now a
+  planned v1.x item (transverse isotropy, see §9) — toolpath-direction in-plane
+  orthotropy remains out of scope permanently (pre-slice tool, no toolpaths).
 
 ## 4. Pipeline
 
@@ -233,6 +323,24 @@ panel. Fallback pattern law: conservative generic n = 2.
 ## 9. Open items
 
 - [ ] **Calibration data**: locate/compile CNC Kitchen stiffness-vs-density measurements for gyroid/cubic/grid (else schedule a short test series). The ⚙ Settings page already exposes c and n per pattern.
+- [ ] **Transversely isotropic stiffness (v1.x)** — from FDM-FEA literature review 2026-06:
+  printed solid material has E_z typically 10–25% below E_xy; pattern anisotropy (grid) on
+  top. Print direction is globally Z in the grid, so a transversely isotropic material
+  (E_xy, E_z, G_xz, ν's per material card) still yields ONE reference KE scaled per voxel —
+  the matrix-free/SIMD fast path survives. Toolpath-direction in-plane orthotropy stays out
+  of scope (we are pre-slice by design). Supersedes the §3 out-of-scope entry.
+- [ ] **Offline RVE homogenization tool** — small offline Rust tool: periodic-BC FE
+  homogenization of gyroid/cubic/grid unit cells per density → E(ρ) curves incl.
+  anisotropy tensors. Fills calibration gaps where measurements are missing, provides
+  grid's anisotropy for the item above, cross-validates measured data. Output cards are
+  part of the proprietary calibration asset (license model §2.14).
+- [ ] **Shear-mode layer adhesion SF** — current SF checks tension σzz only; add in-plane
+  shear τ across the layer plane against a calibrated shear allowable (Mode-II analogue).
+  Small change in stress.rs; removes the documented "shear-mode delamination not modeled"
+  caveat.
+- [ ] **Calibration validity window** — c, n per pattern are only valid near the layer
+  height / line width they were measured at; state that window in the materials panel and
+  the limitations docs (no extra calibration dimension yet).
 - [ ] **Name/branding** for the tool.
 - [ ] Minimal `project_settings.config` experiment (what Orca tolerates) — Phase 4.
 - [ ] Orca/Bambu/Prusa version test matrix definition.

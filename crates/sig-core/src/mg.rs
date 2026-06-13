@@ -958,6 +958,11 @@ impl MgSolver {
 
         let mut res = f64::INFINITY;
         for it in 0..max_iter {
+            // Cooperative cancel: bail like an iteration-cap hit; the caller
+            // checks `cancel::requested()` and raises the Cancelled error.
+            if crate::cancel::requested() {
+                return SolveStats { iterations: it, rel_residual: res, converged: false };
+            }
             self.levels[0].apply64_eps(&self.eps_exact, &p, &mut q);
             let pq = par::dot64(&p, &q);
             if pq <= 0.0 {

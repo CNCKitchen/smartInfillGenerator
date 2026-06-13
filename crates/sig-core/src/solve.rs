@@ -67,6 +67,8 @@ pub enum SolveError {
     NoFixedNodes,
     LoadRegionEmpty(usize),
     NotConverged { iterations: usize, rel_residual: f64 },
+    /// The embedder requested a stop (see `crate::cancel`).
+    Cancelled,
 }
 
 impl std::fmt::Display for SolveError {
@@ -79,6 +81,7 @@ impl std::fmt::Display for SolveError {
                 f,
                 "solver did not converge ({iterations} iterations, residual {rel_residual:.2e})"
             ),
+            SolveError::Cancelled => write!(f, "cancelled"),
         }
     }
 }
@@ -487,6 +490,12 @@ pub fn solve_cached(
     let mut u = std::mem::take(&mut cache.last_u);
     debug_assert_eq!(u.len(), ndof);
     let stats = cache.solver.solve_warm(&b, &mut u, tol, max_iter);
+    if crate::cancel::requested() {
+        // Keep the partial iterate as a future warm start, but don't present
+        // it as a result.
+        cache.last_u = u;
+        return Err(SolveError::Cancelled);
+    }
     let mut compliance = 0f64;
     for i in 0..ndof {
         compliance += b[i] * u[i];

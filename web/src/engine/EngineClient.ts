@@ -21,11 +21,20 @@ export class EngineClient {
   private worker: Worker;
   private nextId = 1;
   private pending = new Map<number, Pending>();
+  /** Cancellation flag shared with the worker — settable while the worker
+   *  is blocked inside a solve (a postMessage could never arrive mid-call).
+   *  Needs cross-origin isolation (same requirement as threaded wasm). */
+  private cancelFlag: Int32Array | null = null;
 
   constructor() {
     this.worker = new Worker(new URL("../worker/engine.worker.ts", import.meta.url), {
       type: "module",
     });
+    if (typeof SharedArrayBuffer !== "undefined" && self.crossOriginIsolated) {
+      const buf = new SharedArrayBuffer(4);
+      this.cancelFlag = new Int32Array(buf);
+      void this.call({ op: "setCancelBuffer", buf });
+    }
     this.worker.onmessage = (ev) => {
       const { id, ok, data, error, progress, density, skelPositions, skelIndices, skelDensity } =
         ev.data;
@@ -53,12 +62,31 @@ export class EngineClient {
     });
   }
 
+  /** True when stop/cancel is available (cross-origin isolated context). */
+  get canCancel(): boolean {
+    return this.cancelFlag !== null;
+  }
+
+  /** Request the running solve/optimization to stop at its next checkpoint
+   *  (each CG iteration polls the flag). The pending call rejects with
+   *  "cancelled". No-op outside cross-origin isolation. */
+  cancel() {
+    if (this.cancelFlag) Atomics.store(this.cancelFlag, 0, 1);
+  }
+
   load(bytes: ArrayBuffer, name: string): Promise<LoadedModel> {
     return this.call<LoadedModel>({ op: "load", bytes, name }, [bytes]);
   }
 
   resegment(angle: number): Promise<{ patchIds: Uint32Array; patchCount: number }> {
     return this.call({ op: "resegment", angle });
+  }
+
+  /** Rigid-transform the part (matrix = [r00..r22 row-major, tx, ty, tz]).
+   *  Patches and BCs survive; grid/results drop. Returns the moved display
+   *  mesh and its new bbox. */
+  transform(matrix: number[]): Promise<{ positions: Float32Array; bbox: number[] }> {
+    return this.call({ op: "transform", matrix });
   }
 
   setMaterial(
@@ -161,9 +189,10 @@ export class EngineClient {
   voxelMeshCut(
     plane: { normal: [number, number, number]; constant: number } | null,
     wall: number,
+    topBottomMm: number,
     infillPct: number
   ): Promise<{ hull: Float32Array; density: Float32Array; edges: Float32Array; info: VoxelInfo }> {
-    return this.call({ op: "voxelMeshCut", plane, wall, infillPct });
+    return this.call({ op: "voxelMeshCut", plane, wall, topBottomMm, infillPct });
   }
 
   /** Isosurface of the final continuous density field at `threshold` (0..1). */
@@ -222,6 +251,9 @@ export interface PrintedOptions {
   coeff: number;
   perimeters: number;
   lineWidth: number;
+  /** Solid top/bottom shells: layers × layer height; 0 = none. */
+  topBottomLayers: number;
+  layerHeight: number;
 }
 
 /** solve() stats plus the as-printed extras. */
@@ -263,6 +295,12 @@ export interface OptimizeOptions {
   /** "budget" = stiffest at the given mean infill; "match" = lightest design
    *  as stiff as a uniform print at budgetPct (secant on the budget). */
   goal: "budget" | "match";
+  /** Planar symmetry constraint: [nx, ny, nz, c] of the plane n·p = c
+   *  (world mm). null = unconstrained. */
+  symmetry: number[] | null;
+  /** Solid top/bottom shells: layers × layer height; 0 = none. */
+  topBottomLayers: number;
+  layerHeight: number;
 }
 
 export interface OptProgress {

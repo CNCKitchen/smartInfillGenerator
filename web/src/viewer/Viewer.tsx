@@ -51,11 +51,17 @@ export function Viewer() {
         if (!bc) return;
         st.updateBcTris(bc.id, erase ? subtract(bc.tris, tris) : union(bc.tris, tris));
       },
+      onPlaceFace: (normal) => {
+        void useStore.getState().applyPlaceOnFace(normal);
+      },
       onAutoScale: (autoScale) => {
         useStore.setState({ autoScale });
       },
       onSectionMoved: (normal, constant) => {
         useStore.getState().onSectionPlaneMoved(normal, constant);
+      },
+      onSymmetryMoved: (normal, c) => {
+        useStore.getState().onSymmetryPlaneMoved(normal, c);
       },
     });
 
@@ -81,6 +87,8 @@ export function Viewer() {
     sceneEvents.onSectionState = (on) => scene.setSection(on);
     sceneEvents.onSectionFlip = () => scene.flipSection();
     sceneEvents.onSectionAxis = (a) => scene.setSectionAxis(a);
+    sceneEvents.onModelTransformed = (p, bbox) => scene.updateModelPositions(p, bbox);
+    sceneEvents.onSymmetry = (enabled, normal, c) => scene.setSymmetry(enabled, normal, c);
 
     const obs = new ResizeObserver(() => {
       const el = wrapRef.current;
@@ -97,6 +105,34 @@ export function Viewer() {
   useEffect(() => {
     sceneRef.current?.setTool(tool, brushRadius, brushErase);
   }, [tool, brushRadius, brushErase]);
+
+  // Hover value probe: a formatter whenever a contour legend is on screen
+  // (result fields, density views, mesh-view element density).
+  const viewMode = useStore((s) => s.viewMode);
+  const resultField = useStore((s) => s.resultField);
+  const meshDensity = useStore((s) => s.meshDensity);
+  useEffect(() => {
+    const scene = sceneRef.current;
+    if (!scene) return;
+    let fmt: ((v: number) => string) | null = null;
+    if (viewMode === "deformed") {
+      if (resultField === "u") {
+        fmt = (v) => fmtDisp(v);
+      } else if (resultField.startsWith("sf")) {
+        fmt = (v) => `${v.toFixed(2)}×`;
+      } else {
+        const unit = RESULT_FIELDS.find((f) => f.value === resultField)?.unit ?? "";
+        fmt = (v) => fmtField(v, unit);
+      }
+    } else if (
+      viewMode === "density" ||
+      viewMode === "infill" ||
+      (viewMode === "mesh" && meshDensity)
+    ) {
+      fmt = (v) => `${(v * 100).toFixed(0)}%`;
+    }
+    scene.setProbeFormatter(fmt);
+  }, [viewMode, resultField, meshDensity]);
 
   // Drag & drop.
   useEffect(() => {
@@ -340,7 +376,6 @@ function MeshLegend() {
   const voxelInfo = useStore((s) => s.voxelInfo)!;
   const meshDensity = useStore((s) => s.meshDensity);
   const setMeshDensity = useStore((s) => s.setMeshDensity);
-  const sectionOn = useStore((s) => s.sectionOn);
   const perimeters = useStore((s) => s.perimeters);
   const lineWidth = useStore((s) => s.lineWidth);
   const optSummary = useStore((s) => s.optSummary);
@@ -381,17 +416,6 @@ function MeshLegend() {
           </>
         ) : (
           <>skin = {(perimeters * lineWidth).toFixed(2)} mm wall</>
-        )}
-        {sectionOn ? (
-          <>
-            <br />
-            section hides whole cells — the interior (and the skin thickness) stays inspectable
-          </>
-        ) : (
-          <>
-            <br />
-            turn on Section to look inside
-          </>
         )}
       </div>
     </div>

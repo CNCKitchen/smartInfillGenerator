@@ -30,11 +30,15 @@ export interface SceneCallbacks {
   onPickPatch?: (tris: Uint32Array, additive: boolean) => void;
   /** Brush stroke: triangles under the brush. */
   onBrush?: (tris: Uint32Array, erase: boolean) => void;
+  /** Place-on-face: the clicked triangle's outward normal (world). */
+  onPlaceFace?: (normal: [number, number, number]) => void;
   /** Viewer picked a new deformation autoscale (display exaggeration base). */
   onAutoScale?: (autoScale: number) => void;
   /** Section plane changed (three.js convention: kept side is
    *  normal·p + constant ≥ 0) — the mesh view recuts its voxels from this. */
   onSectionMoved?: (normal: [number, number, number], constant: number) => void;
+  /** Symmetry plane moved/rotated: plane n·p = c (n unit, world mm). */
+  onSymmetryMoved?: (normal: [number, number, number], c: number) => void;
 }
 
 export class SceneManager {
@@ -151,6 +155,22 @@ export class SceneManager {
   private voxelCutActive = false;
   private capDisposables: { dispose(): void }[] = [];
 
+  // Symmetry plane (optimizer constraint): section-style combined gizmo
+  // (translate along the normal + two rotation rings). Visible only while
+  // it's being edited — the store gates on step/busy, the scene additionally
+  // hides it in result views.
+  private symEnabled = false;
+  private symProxy = new THREE.Object3D();
+  private symTranslate: TransformControls | null = null;
+  private symRotate: TransformControls | null = null;
+  private symQuad: THREE.Group | null = null;
+  private symQuadDisposables: { dispose(): void }[] = [];
+
+  // Hover value probe: contour value next to the cursor on result/density
+  // surfaces. The formatter doubles as the on/off switch (null = off).
+  private probeEl: HTMLDivElement | null = null;
+  private probeFormat: ((v: number) => string) | null = null;
+
   // Colormaps are sampled per-fragment from 1D LUT textures via the uv
   // channel — per-vertex colors interpolate straight through RGB and turn
   // jet into blue→purple→red on coarse meshes.
@@ -201,7 +221,19 @@ export class SceneManager {
     canvas.addEventListener("pointermove", this.onPointerMove);
     canvas.addEventListener("pointerdown", this.onPointerDown);
     canvas.addEventListener("pointerup", this.onPointerUp);
-    canvas.addEventListener("pointerleave", () => this.setHover(null));
+    canvas.addEventListener("pointerleave", () => {
+      this.setHover(null);
+      if (this.probeEl) this.probeEl.style.display = "none";
+      if (this.brushCursor) this.brushCursor.visible = false;
+    });
+
+    // Hover value probe tooltip (sibling of the canvas, .viewer is relative).
+    if (canvas.parentElement) {
+      this.probeEl = document.createElement("div");
+      this.probeEl.className = "probe";
+      this.probeEl.style.display = "none";
+      canvas.parentElement.appendChild(this.probeEl);
+    }
 
     const loop = () => {
       if (this.disposed) return;
@@ -239,7 +271,7 @@ export class SceneManager {
     this.brushErase = brushErase;
     this.controls.enabled = tool !== "brush";
     if (this.brushCursor) this.brushCursor.visible = tool === "brush";
-    if (tool !== "select") this.setHover(null);
+    if (tool !== "select" && tool !== "place") this.setHover(null);
   }
 
   // ---------- axis gizmo ----------
@@ -346,7 +378,28 @@ export class SceneManager {
       this.syncSectionFromProxy();
       this.rebuildCapGroups();
     }
+    if (this.symTranslate) this.buildSymQuad(); // symmetry plane too
     this.refreshClipping();
+  }
+
+  /** Same part, new pose (orientation tools): swap the positions in place —
+   *  triangle count, patches, and BC selections are pose-invariant. */
+  updateModelPositions(positions: Float32Array, bbox: LoadedModel["bbox"]) {
+    if (!this.mesh || !this.geometry || !this.basePositions) return;
+    if (positions.length !== this.basePositions.length) return;
+    const attr = this.geometry.getAttribute("position") as THREE.BufferAttribute;
+    (attr.array as Float32Array).set(positions);
+    attr.needsUpdate = true;
+    this.geometry.computeVertexNormals();
+    this.geometry.computeBoundingBox();
+    this.geometry.computeBoundingSphere();
+    this.basePositions = new Float32Array(positions);
+    const [lx, ly, lz, hx, hy, hz] = bbox;
+    this.bboxDiag = Math.hypot(hx - lx, hy - ly, hz - lz) || this.bboxDiag;
+    this.controls.target.set((lx + hx) / 2, (ly + hy) / 2, (lz + hz) / 2);
+    this.controls.update();
+    this.rebuildBcMarkers();
+    this.repaint();
   }
 
   setPatchIds(patchIds: Uint32Array) {
@@ -388,16 +441,39 @@ export class SceneManager {
         const centroid = this.selectionCentroid(bc.tris);
         const dir = f.clone().normalize();
         const len = this.bboxDiag * 0.18;
-        const arrow = new THREE.ArrowHelper(
-          dir,
-          centroid.clone().sub(dir.clone().multiplyScalar(len)),
-          len,
-          0xff5252,
-          len * 0.25,
-          len * 0.12
+        // Solid shaft + cone (NOT ArrowHelper): its line shaft disappears
+        // when the arrow is viewed end-on — e.g. a -Z force from a top-down
+        // camera — leaving a context-free floating dot. A shaded cylinder
+        // stays readable from every angle.
+        const mat = new THREE.MeshStandardMaterial({
+          color: 0xff5252,
+          roughness: 0.45,
+          metalness: 0.05,
+        });
+        const shaftLen = len * 0.72;
+        const shaftGeo = new THREE.CylinderGeometry(len * 0.025, len * 0.025, shaftLen, 10);
+        const headGeo = new THREE.ConeGeometry(len * 0.07, len * 0.28, 14);
+        this.markerDisposables.push(mat, shaftGeo, headGeo);
+        const g = new THREE.Group();
+        const shaft = new THREE.Mesh(shaftGeo, mat);
+        shaft.position.y = shaftLen / 2;
+        const head = new THREE.Mesh(headGeo, mat);
+        head.position.y = shaftLen + len * 0.14;
+        g.add(shaft, head);
+        // Value label at the tail: even with the arrow viewed dead-on (a
+        // -Z force from a top view collapses it to a disc) the annotation
+        // says what the dot is.
+        const mag = f.length();
+        const label = this.makeLabelSprite(
+          `${mag >= 9.95 ? mag.toFixed(0) : mag.toFixed(1)} N`,
+          0xc2330e
         );
-        this.markerDisposables.push(arrow);
-        this.bcMarkers.add(arrow);
+        label.position.set(0, -len * 0.02, 0);
+        g.add(label);
+        // Local +Y becomes the force direction; the tip lands on the surface.
+        g.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir);
+        g.position.copy(centroid.clone().sub(dir.clone().multiplyScalar(len)));
+        this.bcMarkers.add(g);
       } else if (bc.kind === "fixed" || bc.kind === "frictionless" || bc.kind === "elastic") {
         this.buildSupportGlyphs(bc);
       }
@@ -568,7 +644,8 @@ export class SceneManager {
 
   private onPointerMove = (ev: PointerEvent) => {
     if (!this.mesh) return;
-    if (this.tool === "select") {
+    this.updateProbe(ev);
+    if (this.tool === "select" || this.tool === "place") {
       const hit = this.rayTri(ev);
       const patch =
         hit && hit.faceIndex != null && this.patchIds ? this.patchIds[hit.faceIndex] : null;
@@ -594,6 +671,20 @@ export class SceneManager {
         const patch = this.patchIds[hit.faceIndex];
         const tris = this.patchToTris.get(patch);
         if (tris) this.callbacks.onPickPatch?.(new Uint32Array(tris), !ev.shiftKey);
+      }
+    } else if (this.tool === "place") {
+      const hit = this.rayTri(ev);
+      if (hit && hit.faceIndex != null && this.basePositions) {
+        // Outward geometric normal of the clicked triangle (soup winding).
+        const p = this.basePositions;
+        const o = 9 * hit.faceIndex;
+        const e1 = new THREE.Vector3(p[o + 3] - p[o], p[o + 4] - p[o + 1], p[o + 5] - p[o + 2]);
+        const e2 = new THREE.Vector3(p[o + 6] - p[o], p[o + 7] - p[o + 1], p[o + 8] - p[o + 2]);
+        const n = e1.cross(e2);
+        if (n.lengthSq() > 1e-20) {
+          n.normalize();
+          this.callbacks.onPlaceFace?.([n.x, n.y, n.z]);
+        }
       }
     } else if (this.tool === "brush") {
       this.brushing = true;
@@ -621,6 +712,96 @@ export class SceneManager {
       if (dx * dx + dy * dy + dz * dz <= r2) hit.push(t);
     }
     if (hit.length) this.callbacks.onBrush?.(new Uint32Array(hit), this.brushErase);
+  }
+
+  // ---------- hover value probe ----------
+
+  /** Formatter for the cursor value readout; null disables the probe. */
+  setProbeFormatter(fmt: ((v: number) => string) | null) {
+    this.probeFormat = fmt;
+    if (!fmt && this.probeEl) this.probeEl.style.display = "none";
+  }
+
+  /** The surface currently carrying probeable values, with a per-vertex
+   *  value accessor (vertex index into the non-indexed soup). */
+  private probeSource(): { mesh: THREE.Mesh; valueAt: (i: number) => number } | null {
+    if (this.voxResultActive()) {
+      const vr = this.voxRes!;
+      const m = vr.group.children.find((c): c is THREE.Mesh => c instanceof THREE.Mesh);
+      if (!m) return null;
+      const sf = this.scalarField;
+      if (sf && sf.values.length * 2 === vr.uvs.length) {
+        return { mesh: m, valueAt: (i) => sf.values[i] };
+      }
+      const d = vr.disp;
+      return { mesh: m, valueAt: (i) => Math.hypot(d[3 * i], d[3 * i + 1], d[3 * i + 2]) };
+    }
+    if (this.viewMode === "deformed" && this.mesh && this.displacements) {
+      const sf = this.scalarField;
+      if (sf && this.uvs && sf.values.length * 2 === this.uvs.length) {
+        return { mesh: this.mesh, valueAt: (i) => sf.values[i] };
+      }
+      const d = this.displacements;
+      return { mesh: this.mesh, valueAt: (i) => Math.hypot(d[3 * i], d[3 * i + 1], d[3 * i + 2]) };
+    }
+    if (
+      (this.viewMode === "density" || this.viewMode === "infill") &&
+      this.mesh &&
+      this.vertexDensity
+    ) {
+      const v = this.vertexDensity;
+      return { mesh: this.mesh, valueAt: (i) => v[i] };
+    }
+    if (this.viewMode === "mesh" && this.meshDensity && this.voxelDensity) {
+      const hull = this.voxelGroup.children.find(
+        (c): c is THREE.Mesh => c instanceof THREE.Mesh
+      );
+      if (!hull) return null;
+      const v = this.voxelDensity;
+      return { mesh: hull, valueAt: (i) => v[i] };
+    }
+    return null;
+  }
+
+  private updateProbe(ev: PointerEvent) {
+    const el = this.probeEl;
+    if (!el) return;
+    const fmt = this.probeFormat;
+    const src = fmt ? this.probeSource() : null;
+    if (!src || !src.mesh.visible) {
+      el.style.display = "none";
+      return;
+    }
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    this.pointer.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
+    this.pointer.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
+    this.raycaster.setFromCamera(this.pointer, this.camera);
+    const hits = this.raycaster.intersectObject(src.mesh, false);
+    const hit = hits.length ? hits[0] : null;
+    if (!hit || hit.faceIndex == null) {
+      el.style.display = "none";
+      return;
+    }
+    // Barycentric interpolation on the CURRENTLY DISPLAYED (possibly
+    // deformed) triangle — the ray hit that geometry.
+    const pos = (src.mesh.geometry.getAttribute("position") as THREE.BufferAttribute)
+      .array as Float32Array;
+    const f = hit.faceIndex;
+    const tri = new THREE.Triangle(
+      new THREE.Vector3(pos[9 * f], pos[9 * f + 1], pos[9 * f + 2]),
+      new THREE.Vector3(pos[9 * f + 3], pos[9 * f + 4], pos[9 * f + 5]),
+      new THREE.Vector3(pos[9 * f + 6], pos[9 * f + 7], pos[9 * f + 8])
+    );
+    const bary = new THREE.Vector3();
+    tri.getBarycoord(hit.point, bary);
+    const v =
+      bary.x * src.valueAt(3 * f) +
+      bary.y * src.valueAt(3 * f + 1) +
+      bary.z * src.valueAt(3 * f + 2);
+    el.textContent = fmt!(v);
+    el.style.display = "block";
+    el.style.left = `${ev.clientX - rect.left + 14}px`;
+    el.style.top = `${ev.clientY - rect.top + 14}px`;
   }
 
   // ---------- rigid-body-mode animation ----------
@@ -985,6 +1166,117 @@ export class SceneManager {
     this.syncSectionFromProxy();
   }
 
+  // ---------- symmetry plane (optimizer constraint) ----------
+
+  /** Show/update the symmetry plane n·p = c. `enabled` is the store-side
+   *  gate (checkbox on + Optimize step active + not running); the scene
+   *  additionally hides the plane in result views. */
+  setSymmetry(enabled: boolean, normal: [number, number, number], c: number) {
+    this.symEnabled = enabled;
+    if (enabled) this.ensureSymObjects();
+    if (!this.symTranslate) return;
+    const n = new THREE.Vector3(...normal);
+    if (n.lengthSq() < 1e-12) n.set(1, 0, 0);
+    n.normalize();
+    this.symProxy.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), n);
+    // Any point on the plane works; pick the one closest to the orbit
+    // target so the gizmo sits on the part.
+    const t = this.controls.target;
+    const d = n.dot(t) - c;
+    this.symProxy.position.copy(t).addScaledVector(n, -d);
+    this.updateSymVisibility();
+  }
+
+  private emitSymmetryMoved() {
+    const n = new THREE.Vector3(0, 0, 1).applyQuaternion(this.symProxy.quaternion);
+    this.callbacks.onSymmetryMoved?.([n.x, n.y, n.z], n.dot(this.symProxy.position));
+  }
+
+  /** Hide the plane outside editing contexts (result views). */
+  private updateSymVisibility() {
+    const show =
+      this.symEnabled &&
+      this.viewMode !== "deformed" &&
+      this.viewMode !== "density" &&
+      this.viewMode !== "infill";
+    this.symProxy.visible = show;
+    for (const tc of [this.symTranslate, this.symRotate]) {
+      if (tc) {
+        tc.enabled = show;
+        tc.getHelper().visible = show;
+      }
+    }
+  }
+
+  private ensureSymObjects() {
+    if (this.symTranslate) {
+      this.buildSymQuad(); // refresh size to the current part
+      return;
+    }
+    this.scene.add(this.symProxy);
+    const make = (
+      mode: "translate" | "rotate",
+      size: number,
+      cfg: (tc: TransformControls) => void
+    ) => {
+      const tc = new TransformControls(this.camera, this.renderer.domElement);
+      tc.setMode(mode);
+      tc.setSpace("local");
+      tc.setSize(size);
+      cfg(tc);
+      tc.addEventListener("dragging-changed", (e: { value?: unknown }) => {
+        this.controls.enabled = !e.value && this.tool !== "brush";
+      });
+      tc.addEventListener("objectChange", () => this.emitSymmetryMoved());
+      tc.attach(this.symProxy);
+      this.scene.add(tc.getHelper());
+      return tc;
+    };
+    // Same combined gizmo as the section plane: translate along the normal
+    // only, two rotation rings (spinning about the normal is a no-op).
+    this.symTranslate = make("translate", 0.7, (tc) => {
+      tc.showX = false;
+      tc.showY = false;
+    });
+    this.symRotate = make("rotate", 1.0, (tc) => {
+      tc.showZ = false;
+    });
+    this.buildSymQuad();
+  }
+
+  /** Translucent orange rectangle marking the symmetry plane (child of the
+   *  proxy — distinct from the blue section plane). */
+  private buildSymQuad() {
+    if (this.symQuad) {
+      this.symProxy.remove(this.symQuad);
+      for (const d of this.symQuadDisposables) d.dispose();
+      this.symQuadDisposables = [];
+    }
+    const d = this.bboxDiag * 1.1;
+    const group = new THREE.Group();
+    const quadGeo = new THREE.PlaneGeometry(d, d);
+    const quadMat = new THREE.MeshBasicMaterial({
+      color: 0xd97706,
+      transparent: true,
+      opacity: 0.1,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    });
+    const edgeGeo = new THREE.EdgesGeometry(quadGeo);
+    const edgeMat = new THREE.LineBasicMaterial({
+      color: 0xd97706,
+      transparent: true,
+      opacity: 0.8,
+    });
+    this.symQuadDisposables.push(quadGeo, quadMat, edgeGeo, edgeMat);
+    group.add(new THREE.Mesh(quadGeo, quadMat));
+    group.add(new THREE.LineSegments(edgeGeo, edgeMat));
+    this.symQuad = group;
+    this.symProxy.add(group);
+  }
+
+  // ---------- section plane objects ----------
+
   private ensureSectionObjects() {
     if (!this.sectionTranslate) {
       this.sectionProxy.position.copy(this.controls.target);
@@ -1148,6 +1440,10 @@ export class SceneManager {
   /** Push/remove the clipping plane on every content material. */
   private refreshClipping() {
     const planes = this.sectionOn ? [this.sectionPlane] : null;
+    // Mesh view: the ghosted STL overlay stays WHOLE while the voxel hull is
+    // cut — the full part silhouette is the reference the cut is judged
+    // against.
+    const partPlanes = this.viewMode === "mesh" ? null : planes;
     // The voxel hull never plane-clips while it carries a voxel-true cut.
     const voxelPlanes = this.sectionOn && !this.voxelCutActive ? [this.sectionPlane] : null;
     const apply = (
@@ -1164,7 +1460,7 @@ export class SceneManager {
         }
       }
     };
-    apply(this.mesh?.material, planes);
+    apply(this.mesh?.material, partPlanes);
     for (const c of this.voxelGroup.children) apply((c as THREE.Mesh).material, voxelPlanes);
     for (const c of this.voxRes?.group.children ?? []) {
       apply((c as THREE.Mesh).material, planes);
@@ -1199,13 +1495,16 @@ export class SceneManager {
     // part so the interior structure is what you actually see.
     const showShape = this.viewMode === "density" && !!this.optShapeMesh;
     if (this.optShapeMesh) this.optShapeMesh.visible = showShape;
-    const ghost = infill || showShape;
+    // Mesh view: the STL stays as a transparent overlay on the voxel hull,
+    // so the approximation quality is visible at a glance.
+    const meshView = this.viewMode === "mesh";
+    const ghost = infill || showShape || meshView;
     mat.transparent = ghost;
     mat.opacity = ghost ? 0.15 : 1.0;
     mat.depthWrite = !ghost;
     mat.needsUpdate = true;
     const voxResult = this.voxResultActive();
-    this.mesh.visible = this.viewMode !== "mesh" && !voxResult;
+    this.mesh.visible = !voxResult;
     this.voxelGroup.visible = this.viewMode === "mesh";
     if (this.voxRes) this.voxRes.group.visible = voxResult;
     this.regionMeshes.forEach((m, i) => {
@@ -1213,6 +1512,8 @@ export class SceneManager {
     });
     this.updateMarkerVisibility();
     this.updateSectionVisibility();
+    this.updateSymVisibility();
+    this.refreshClipping(); // mesh view exempts the ghost STL from the cut
     this.applyPositions();
     this.applyColors();
   }
@@ -1376,6 +1677,32 @@ export class SceneManager {
     dot.renderOrder = 10;
     g.add(dot);
     return g;
+  }
+
+  /** Small screen-aligned value chip (canvas-rendered text on a light pill),
+   *  world-scaled to the part. Disposal goes through markerDisposables. */
+  private makeLabelSprite(text: string, color: number): THREE.Sprite {
+    const canvas = document.createElement("canvas");
+    const ctx = canvas.getContext("2d")!;
+    const font = "bold 28px 'B612 Mono', 'Barlow', system-ui, sans-serif";
+    ctx.font = font;
+    const w = Math.ceil(ctx.measureText(text).width) + 18;
+    canvas.width = w;
+    canvas.height = 40;
+    ctx.font = font;
+    ctx.fillStyle = "#fcfcfae8";
+    ctx.fillRect(0, 0, w, 40);
+    ctx.fillStyle = `#${color.toString(16).padStart(6, "0")}`;
+    ctx.textBaseline = "middle";
+    ctx.fillText(text, 9, 21);
+    const tex = new THREE.CanvasTexture(canvas);
+    const mat = new THREE.SpriteMaterial({ map: tex, depthTest: false, transparent: true });
+    this.markerDisposables.push(tex, mat);
+    const sprite = new THREE.Sprite(mat);
+    const hWorld = 0.035 * this.bboxDiag;
+    sprite.scale.set((hWorld * w) / 40, hWorld, 1);
+    sprite.renderOrder = 9;
+    return sprite;
   }
 
   private setMarkerLabel(group: THREE.Group, text: string, color: number) {

@@ -4,7 +4,7 @@
 // Functional smoke test of the wasm-bindgen Model API (the same calls the web
 // worker makes). Run: node smoke-wasm.mjs
 import { readFileSync } from "node:fs";
-import init, { Model } from "./web/src/wasm/sig_wasm.js";
+import init, { Model, set_cancel_flag } from "./web/src/wasm/sig_wasm.js";
 
 // --- build a binary STL box (matches sig-core primitives::boxx layout) ---
 function boxStl(lo, hi) {
@@ -247,20 +247,36 @@ model.add_force(sel(0, "max"), 0, 0, -5);
 
   // Voxel mesh with element density + voxel-true section cut: skin cells
   // carry 1.0, exposed interior cells the uniform infill ratio (25%).
-  const full = model.voxel_mesh_cut(false, 0, 0, 0, 0, 0.9, 25);
+  const full = model.voxel_mesh_cut(false, 0, 0, 0, 0, 0.9, 1.0, 25);
   const fullPos = full[0], fullDensity = full[1], fullEdges = full[2];
   assert(fullPos.length > 0 && fullPos.length % 9 === 0, "voxel mesh positions (9 floats/tri)");
   assert(fullDensity.length === fullPos.length / 3, "element density one value per vertex");
   assert(fullEdges.length > 0 && fullEdges.length % 6 === 0, "voxel mesh edges");
   assert(fullDensity.every((v) => v > 0.5), "uncut hull shows only skin cells (all faces touch the surface)");
   // Drop the half with x > 20 (three.js plane convention: keep n·p + c >= 0).
-  const cutArr = model.voxel_mesh_cut(true, -1, 0, 0, 20, 0.9, 25);
+  const cutArr = model.voxel_mesh_cut(true, -1, 0, 0, 20, 0.9, 1.0, 25);
   const cutPos = cutArr[0], cutDensity = cutArr[1];
   assert(cutPos.length > 0 && cutPos.length < fullPos.length, "cut mesh is a strict subset");
   const interior = cutDensity.reduce((a, v) => a + (Math.abs(v - 0.25) < 1e-6 ? 1 : 0), 0);
   const interiorShare = interior / cutDensity.length;
   assert(interiorShare > 0.02,
     `voxel cut exposes interior cells at the infill density (${(100 * interiorShare).toFixed(1)}% of cut-mesh vertices)`);
+
+  // Cooperative cancellation: a pre-set flag makes the next solve bail at
+  // its first CG iteration with "cancelled"; clearing it restores solving.
+  const cancelFlag = new Int32Array(new SharedArrayBuffer(4));
+  set_cancel_flag(cancelFlag);
+  Atomics.store(cancelFlag, 0, 1);
+  let cancelled = false;
+  try {
+    model.solve();
+  } catch (e) {
+    cancelled = /cancelled/i.test(String(e));
+  }
+  assert(cancelled, "pre-set cancel flag aborts the solve with 'cancelled'");
+  Atomics.store(cancelFlag, 0, 0);
+  const after = JSON.parse(model.solve());
+  assert(after.converged, "solving works again after the flag clears");
 
   // Smoothed stress display: same field nodal-averaged + surface-sampled —
   // same length, finite everywhere, and averaging never raises the peak.

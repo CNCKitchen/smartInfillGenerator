@@ -9,10 +9,12 @@ import { Inspector } from "./ui/Inspector";
 import { StatusStrip } from "./ui/StatusStrip";
 import { ViewportChips } from "./ui/ViewportChips";
 import { SettingsModal } from "./ui/Settings";
+import { ImprintModal } from "./ui/Imprint";
 import { Disclaimer } from "./ui/Disclaimer";
 import { NerdLog } from "./ui/NerdLog";
 import { Viewer } from "./viewer/Viewer";
 import { useStore } from "./store";
+import { engine } from "./engine/EngineClient";
 
 export function App() {
   const busy = useStore((s) => s.busy);
@@ -33,9 +35,14 @@ export function App() {
           {!model && <DropZone />}
           <NerdLog />
           {busy && (
-            <div className="busy">
+            <div className="busychip">
               <div className="spinner" />
               {busy}
+              {engine.canCancel && (
+                <button className="stopbtn" onClick={() => useStore.getState().cancelRun()}>
+                  ■ Stop
+                </button>
+              )}
             </div>
           )}
           {error && (
@@ -54,6 +61,7 @@ export function App() {
       </div>
       <StatusStrip />
       <SettingsModal />
+      <ImprintModal />
       <Disclaimer />
     </div>
   );

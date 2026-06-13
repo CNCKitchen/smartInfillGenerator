@@ -44,7 +44,17 @@ impl VoxelGrid {
     }
 
     /// Voxelize a triangle mesh at cell size `h`. The grid is sized to the mesh
-    /// bounds plus half a cell of slack so boundary cell centers stay interior.
+    /// bounds plus half a cell of slack.
+    ///
+    /// Cut cells use the Finite-Cell / ersatz convention: each cell's `scale`
+    /// is its 3×3×3 supersampled OCCUPANCY (the share inside the part), and the
+    /// occupancy also decides the solid SET — a cell is solid when occupancy
+    /// ≥ `BOUNDARY_FLOOR`. That INCLUDES cells whose center is outside but the
+    /// surface still cuts (so the part never protrudes past its mesh) and DROPS
+    /// sub-floor slivers (small-cut-cell guard). Stiffness, mass, the element-
+    /// density plot, and the hull display all scale by / follow occupancy.
+    /// Interior cells stay exactly 1. Chosen over center-inclusion by an 8-case
+    /// analytic benchmark — see `tests/meshbench.rs` and DESIGN.md.
     pub fn voxelize(mesh: &TriMesh, h: f64) -> Self {
         let (lo, hi) = mesh.bounds().expect("empty mesh");
         let nx = (((hi[0] - lo[0]) / h).ceil() as usize).max(1);
@@ -75,12 +85,69 @@ impl VoxelGrid {
                 0.0
             }
         });
+        // Finite-Cell occupancy pass. The center-inside result above is reused
+        // only to find boundary cells fast; occupancy decides the final SET and
+        // value. A cell whose center+all 6 neighbors agree is fully interior
+        // (1.0) or fully exterior (0.0) and skips the 27-sample supersample.
+        // Boundary cells (centers disagree) get occupancy and join the solid
+        // iff occupancy ≥ BOUNDARY_FLOOR — including center-outside cells the
+        // surface cuts (inflation) and dropping sub-floor slivers.
+        const BOUNDARY_FLOOR: f32 = 0.15;
+        let center_in = scale.clone();
+        let onz = nz;
+        par::map_indexed(&mut scale, |i| {
+            let cx = i % onx;
+            let cy = (i / onx) % ony;
+            let cz = i / (onx * ony);
+            let in_at = |x: i64, y: i64, z: i64| -> bool {
+                x >= 0
+                    && y >= 0
+                    && z >= 0
+                    && x < onx as i64
+                    && y < ony as i64
+                    && z < onz as i64
+                    && center_in[((z as usize) * ony + y as usize) * onx + x as usize] > 0.0
+            };
+            let (xi, yi, zi) = (cx as i64, cy as i64, cz as i64);
+            let self_in = center_in[i] > 0.0;
+            let all_same = in_at(xi - 1, yi, zi) == self_in
+                && in_at(xi + 1, yi, zi) == self_in
+                && in_at(xi, yi - 1, zi) == self_in
+                && in_at(xi, yi + 1, zi) == self_in
+                && in_at(xi, yi, zi - 1) == self_in
+                && in_at(xi, yi, zi + 1) == self_in;
+            if all_same {
+                return if self_in { 1.0 } else { 0.0 };
+            }
+            let mut inside = 0u32;
+            for a in 0..3 {
+                for b in 0..3 {
+                    for c in 0..3 {
+                        let q = [
+                            ox + (cx as f64 + (2 * a + 1) as f64 / 6.0) * h,
+                            oy + (cy as f64 + (2 * b + 1) as f64 / 6.0) * h,
+                            oz + (cz as f64 + (2 * c + 1) as f64 / 6.0) * h,
+                        ];
+                        if bvh.winding_number(q).abs() >= 0.5 {
+                            inside += 1;
+                        }
+                    }
+                }
+            }
+            let occ = inside as f32 / 27.0;
+            if occ >= BOUNDARY_FLOOR {
+                occ
+            } else {
+                0.0
+            }
+        });
         Self { nx, ny, nz, h, origin, scale }
     }
 
-    /// Solid volume in mm³.
+    /// Solid volume in mm³, occupancy-weighted (cut boundary cells count
+    /// their actual inside fraction).
     pub fn solid_volume(&self) -> f64 {
-        self.solid_count() as f64 * self.h * self.h * self.h
+        self.scale.iter().map(|&s| s as f64).sum::<f64>() * self.h * self.h * self.h
     }
 
     /// Exposed-face hull of the solid cells (the mesh the solver actually

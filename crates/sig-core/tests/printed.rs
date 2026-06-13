@@ -50,7 +50,7 @@ fn snapped_grid_resolves_skin_as_exact_layers() {
     let grid0 = VoxelGrid::voxelize(&beam, h);
     let settings = SolveSettings::default();
     let (grid, _levels) = pad_for_levels(&grid0, settings.max_levels);
-    let split = classify_cells(&grid, wall, false);
+    let split = classify_cells(&grid, wall, wall, wall, false);
     let (skin, design) = (split.skin, split.design);
     assert!(!design.is_empty());
 
@@ -95,7 +95,7 @@ fn printed_solve_matches_composite_sandwich() {
     let wall = 1.0; // exactly 2 cell layers at h = 0.5
     // Composite mode: at an integer wall/h it degenerates to the legacy
     // whole-layer split, so this also covers the production default.
-    let split = classify_cells(&grid, wall, true);
+    let split = classify_cells(&grid, wall, wall, wall, true);
     let (skin, design, frac) = (split.skin, split.design, split.skin_frac);
     assert!(!design.is_empty());
     assert!(frac.iter().all(|&f| f == 0.0), "integer wall/h: no composite cells");
@@ -160,7 +160,7 @@ fn composite_skin_tracks_subvoxel_wall() {
     let e_core = rho.powf(1.5);
 
     let solve_ratio = |composite: bool| -> f64 {
-        let s = classify_cells(&grid, wall, composite);
+        let s = classify_cells(&grid, wall, wall, wall, composite);
         let x_solid = vec![1.0; s.design.len()];
         let (_, d_solid, _) = evaluate(
             &grid, levels, &asm.problem, &settings, &s.skin, &s.design, &s.skin_frac, &x_solid,
@@ -182,18 +182,24 @@ fn composite_skin_tracks_subvoxel_wall() {
         (ratio_composite / ratio_true - 1.0).abs() < 0.12,
         "composite ratio {ratio_composite:.3} vs analytic {ratio_true:.3}"
     );
-    // ...while the legacy rounded skin behaves like a 1 mm wall (far too
-    // stiff: it underestimates the deflection ratio by tens of percent).
+    // ...while legacy rounding distorts BOTH directional bands: the 0.45 mm
+    // side walls round UP to one full cell and the 0.45 mm top/bottom shells
+    // round DOWN to zero layers. The error is tens of percent.
     let err_composite = (ratio_composite / ratio_true - 1.0).abs();
     let err_legacy = (ratio_legacy / ratio_true - 1.0).abs();
     assert!(
         err_legacy > 0.2 && err_composite < err_legacy,
         "legacy err {err_legacy:.3} should dwarf composite err {err_composite:.3}"
     );
-    // And the legacy result is explained by the rounded-up wall.
-    let ratio_rounded = sandwich_ratio(1.0, e_core);
+    // And the legacy result is explained by exactly that skewed model:
+    // two 1 mm side walls over the full height, NO top/bottom plates,
+    // everything else at the core stiffness.
+    let i_o = 8.0 * 8.0f64.powi(3) / 12.0;
+    let i_walls = 2.0 * 1.0 * 8.0f64.powi(3) / 12.0;
+    let i_core = (8.0 - 2.0) * 8.0f64.powi(3) / 12.0;
+    let ratio_legacy_analytic = i_o / (i_walls + e_core * i_core);
     assert!(
-        (ratio_legacy / ratio_rounded - 1.0).abs() < 0.12,
-        "legacy ratio {ratio_legacy:.3} vs rounded-wall analytic {ratio_rounded:.3}"
+        (ratio_legacy / ratio_legacy_analytic - 1.0).abs() < 0.12,
+        "legacy ratio {ratio_legacy:.3} vs walls-only analytic {ratio_legacy_analytic:.3}"
     );
 }

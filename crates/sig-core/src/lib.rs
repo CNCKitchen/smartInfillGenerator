@@ -12,6 +12,7 @@
 pub mod attach;
 pub mod bins;
 pub mod bvh;
+pub mod cancel;
 pub mod check;
 pub mod fem;
 pub mod mesh;

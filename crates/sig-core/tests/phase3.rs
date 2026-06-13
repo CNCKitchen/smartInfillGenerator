@@ -11,7 +11,7 @@ use sig_core::bins::{
     extract_region, taubin_smooth, RegionMesh,
 };
 use sig_core::mesh::primitives;
-use sig_core::simp::{classify_cells, evaluate, optimize, OptimizeParams};
+use sig_core::simp::{build_mirror_pairs, classify_cells, evaluate, optimize, OptimizeParams};
 use sig_core::solve::SolveSettings;
 use sig_core::threemf::{
     export_orca_3mf, export_prusa_3mf, export_stl_zip, import_3mf, weld, IndexedMesh,
@@ -337,7 +337,7 @@ fn orca_3mf_roundtrips_through_own_zip_and_import() {
         region([3.0; 3], [10.0, 10.0, 7.0], 0.50),
     ];
 
-    let bytes = export_orca_3mf("bracket & arm", &part, &regions, 0.12, 3, None);
+    let bytes = export_orca_3mf("bracket & arm", &part, &regions, 0.12, 3, 5, None);
 
     // Container structure.
     let entries = read_zip(&bytes).expect("read back own zip");
@@ -376,7 +376,7 @@ fn orca_3mf_roundtrips_through_own_zip_and_import() {
     // sparse_infill_pattern ON EACH MODIFIER, never as object-level
     // internal_solid_infill_pattern (newer Bambu Studio renamed that key's
     // "rectilinear" value to "zig-zag" and warns on every project load).
-    let bytes2 = export_orca_3mf("p", &part, &regions, 0.05, 2, Some("concentric"));
+    let bytes2 = export_orca_3mf("p", &part, &regions, 0.05, 2, 5, Some("concentric"));
     let entries2 = read_zip(&bytes2).unwrap();
     let cfg2 = entries2
         .iter()
@@ -392,7 +392,7 @@ fn orca_3mf_roundtrips_through_own_zip_and_import() {
     // PrusaSlicer flavor: ONE object, volumes as triangle ranges in
     // Slic3r_PE_model.config (part = ModelPart, regions = ParameterModifier
     // with fill_density; fill_pattern only when a solid pattern is chosen).
-    let bytes3 = export_prusa_3mf("bracket & arm", &part, &regions, 0.12, 3, Some("concentric"));
+    let bytes3 = export_prusa_3mf("bracket & arm", &part, &regions, 0.12, 3, 5, Some("concentric"));
     let entries3 = read_zip(&bytes3).unwrap();
     let names3: Vec<&str> = entries3.iter().map(|(n, _)| n.as_str()).collect();
     assert!(names3.contains(&"Metadata/Slic3r_PE_model.config"));
@@ -732,20 +732,81 @@ fn zip_writer_reader_roundtrip() {
 fn classify_cells_skin_vs_interior() {
     let grid0 = VoxelGrid::solid_box(10, 10, 10, 1.0);
     let (grid, _) = pad_for_levels(&grid0, 1);
-    let s = classify_cells(&grid, 1.0, false);
+    let s = classify_cells(&grid, 1.0, 1.0, 1.0, false);
     assert_eq!(s.skin.len() + s.design.len(), 1000);
     // 1-layer skin of a 10^3 box: 10^3 - 8^3 = 488.
     assert_eq!(s.skin.len(), 488, "one skin layer expected");
     assert!(s.skin_frac.iter().all(|&f| f == 0.0), "legacy mode: no fractions");
-    let s2 = classify_cells(&grid, 2.0, false);
+    let s2 = classify_cells(&grid, 2.0, 2.0, 2.0, false);
     assert_eq!(s2.skin.len(), 1000 - 6 * 6 * 6);
     assert_eq!(s2.design.len(), 216);
 
     // Composite mode at integer wall/h reproduces the legacy split exactly.
-    let c2 = classify_cells(&grid, 2.0, true);
+    let c2 = classify_cells(&grid, 2.0, 2.0, 2.0, true);
     assert_eq!(c2.skin, s2.skin);
     assert_eq!(c2.design, s2.design);
     assert!(c2.skin_frac.iter().all(|&f| f == 0.0));
+}
+
+#[test]
+fn mirror_pairs_involutive_on_aligned_plane() {
+    // 10^3 solid box, plane x = 5 (a cell boundary): every cell has an exact
+    // mirror cell, the pairing is an involution, and cx maps to 9 - cx.
+    let grid = VoxelGrid::solid_box(10, 10, 10, 1.0);
+    let design: Vec<u32> = (0..1000).collect();
+    let partner = build_mirror_pairs(&grid, &design, [1.0, 0.0, 0.0, 5.0]);
+    for (k, &j) in partner.iter().enumerate() {
+        assert_ne!(j, u32::MAX, "every cell of the box has a mirror");
+        assert_eq!(partner[j as usize], k as u32, "involution");
+        let cx = design[k] as usize % 10;
+        let mx = design[j as usize] as usize % 10;
+        assert_eq!(mx, 9 - cx, "x column mirrors");
+    }
+    // A plane outside the box pairs nothing.
+    let none = build_mirror_pairs(&grid, &design, [1.0, 0.0, 0.0, 50.0]);
+    assert!(none.iter().all(|&j| j == u32::MAX));
+}
+
+#[test]
+fn symmetry_constraint_yields_mirror_density() {
+    // Cantilever, symmetric about the beam's y mid-plane: with the
+    // constraint on, the optimized field must be EXACTLY mirror-symmetric
+    // for every paired cell (the final projection enforces it).
+    let beam = primitives::boxx([0.0; 3], [60.0, 10.0, 10.0]);
+    let grid0 = VoxelGrid::voxelize(&beam, 1.0);
+    let settings = SolveSettings { e0: 2400.0, nu: 0.35, tol: 1e-5, ..Default::default() };
+    let (grid, levels) = pad_for_levels(&grid0, settings.max_levels);
+    let bcs = vec![
+        BcSpec { kind: BcKind::Fixed, tris: face_tris(0) },
+        BcSpec { kind: BcKind::Force([0.0, 0.0, -30.0]), tris: face_tris(1) },
+    ];
+    let asm = assemble(&beam, &grid, &bcs, None, &settings).unwrap();
+    let plane = [0.0, 1.0, 0.0, 5.0]; // beam spans y in [0, 10]
+    let params = OptimizeParams {
+        budget: 0.35,
+        exponent: 1.5,
+        wall_mm: 1.0,
+        symmetry: Some(plane),
+        max_iter: 12,
+        ..Default::default()
+    };
+    let result =
+        optimize(&grid, levels, &asm.problem, &settings, &params, None, None, |_p, _x, _c| {})
+            .expect("optimize");
+    let partner = build_mirror_pairs(&grid, &result.design_cells, plane);
+    let paired = partner.iter().filter(|&&j| j != u32::MAX).count();
+    assert!(
+        paired as f64 > 0.9 * partner.len() as f64,
+        "most interior cells pair across the mid-plane ({paired}/{})",
+        partner.len()
+    );
+    for (k, &j) in partner.iter().enumerate() {
+        if j == u32::MAX {
+            continue;
+        }
+        let d = (result.x[k] - result.x[j as usize]).abs();
+        assert!(d < 1e-9, "mirror cells share their density (Δ = {d:.2e})");
+    }
 }
 
 #[test]
@@ -772,12 +833,71 @@ fn nodal_recovery_averages_adjacent_cells() {
 }
 
 #[test]
+fn voxelize_cut_cells_carry_occupancy() {
+    // A 9.5 mm box on a 1 mm grid: the grid centers on the bounds, so every
+    // outer cell is only 75% inside. The 3×3×3 supersample (local 1/6, 1/2,
+    // 5/6) sees 2 of 3 stations inside along each cut axis — exact fractions
+    // 18/27 (face), 12/27 (edge), 8/27 (corner), 1.0 interior.
+    let b = primitives::boxx([0.0; 3], [9.5, 9.5, 9.5]);
+    let grid = VoxelGrid::voxelize(&b, 1.0);
+    assert_eq!((grid.nx, grid.ny, grid.nz), (10, 10, 10));
+    let mut counts = [0usize; 4]; // face, edge, corner, interior
+    for cz in 0..10 {
+        for cy in 0..10 {
+            for cx in 0..10 {
+                let s = grid.scale[(cz * 10 + cy) * 10 + cx];
+                assert!(s > 0.0, "center-inside cells stay solid");
+                let cut = [cx, cy, cz].iter().filter(|&&c| c == 0 || c == 9).count();
+                let expect = [18.0 / 27.0, 12.0 / 27.0, 8.0 / 27.0, 1.0][if cut == 0 {
+                    3
+                } else {
+                    cut - 1
+                }];
+                assert!(
+                    (s - expect as f32).abs() < 1e-6,
+                    "cell ({cx},{cy},{cz}) occupancy {s} vs {expect}"
+                );
+                counts[if cut == 0 { 3 } else { cut - 1 }] += 1;
+            }
+        }
+    }
+    assert_eq!(counts, [6 * 8 * 8, 12 * 8, 8, 8 * 8 * 8]);
+    // Occupancy-weighted volume approaches the true 9.5³. The 3-station
+    // quantization reads 0.75-covered cells as 2/3, so this worst-case
+    // alignment lands ~5% low — far better than the +19% of counting cut
+    // cells as full.
+    let vol = grid.solid_volume();
+    assert!(
+        (vol / 9.5f64.powi(3) - 1.0).abs() < 0.07,
+        "occupancy volume {vol:.1} vs true {:.1}",
+        9.5f64.powi(3)
+    );
+}
+
+#[test]
+fn classify_cells_directional_shells() {
+    // 10^3 box, h = 1: walls follow each slice's outline, shells the columns.
+    let grid0 = VoxelGrid::solid_box(10, 10, 10, 1.0);
+    let (grid, _) = pad_for_levels(&grid0, 1);
+    // 1-layer walls + 2-layer shells: side ring (36/slice × 10) ∪ top 2 +
+    // bottom 2 of every column (4 × 100), overlap 36 × 4.
+    let s = classify_cells(&grid, 1.0, 2.0, 2.0, false);
+    assert_eq!(s.skin.len(), 360 + 400 - 144, "ring ∪ shells");
+    // Shells off (open-top showpiece): only the side ring stays solid —
+    // the infill runs right to the top/bottom surface.
+    let open = classify_cells(&grid, 1.0, 0.0, 0.0, false);
+    assert_eq!(open.skin.len(), 360, "walls only");
+    assert_eq!(open.design.len(), 640);
+    assert!(open.skin_frac.iter().all(|&f| f == 0.0));
+}
+
+#[test]
 fn classify_cells_composite_fractions() {
     // Wall = half a cell: no cell is fully skin; surface cells carry the
     // overlapping-slab fraction of the 0.5-cell band.
     let grid0 = VoxelGrid::solid_box(10, 10, 10, 1.0);
     let (grid, _) = pad_for_levels(&grid0, 1);
-    let c = classify_cells(&grid, 0.5, true);
+    let c = classify_cells(&grid, 0.5, 0.5, 0.5, true);
     assert!(c.skin.is_empty(), "no cell is fully inside a half-cell band");
     assert_eq!(c.design.len(), 1000);
     // Face cells: one void side -> f = 0.5. Edge cells: two orthogonal void
@@ -805,7 +925,7 @@ fn classify_cells_composite_fractions() {
     // one axis -> two slabs, f = 0.8 in the plate's face cells.
     let plate0 = VoxelGrid::solid_box(10, 10, 1, 1.0);
     let (plate, _) = pad_for_levels(&plate0, 1);
-    let p = classify_cells(&plate, 0.4, true);
+    let p = classify_cells(&plate, 0.4, 0.4, 0.4, true);
     let n_two_sided = p.skin_frac.iter().filter(|&&f| (f - 0.8).abs() < 1e-6).count();
     assert_eq!(n_two_sided, 8 * 8, "plate face cells count both walls");
 }

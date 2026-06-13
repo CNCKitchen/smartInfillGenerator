@@ -8,6 +8,10 @@ import type { Model } from "../wasm/sig_wasm.js";
 
 let model: Model | null = null;
 let ModelCtor: typeof Model;
+/** wasm hook installing the cancellation flag (thread-local checker). */
+let setCancelFlagFn: ((flag: Int32Array) => void) | null = null;
+/** Shared flag with the main thread: [0] != 0 = stop the running solve. */
+let cancelArr: Int32Array | null = null;
 
 // Pick the threaded module when the page is cross-origin isolated
 // (SharedArrayBuffer available); otherwise the single-threaded fallback.
@@ -25,17 +29,25 @@ const ready = (async () => {
     const threads = Math.max(1, navigator.hardwareConcurrency || 4);
     await mt.initThreadPool(threads);
     ModelCtor = mt.Model;
+    setCancelFlagFn = mt.set_cancel_flag;
     console.info(`engine: threaded wasm (${threads} threads)`);
   } else {
     const st = await import("../wasm/sig_wasm.js");
     await st.default();
     ModelCtor = st.Model;
+    setCancelFlagFn = st.set_cancel_flag;
     console.info("engine: single-threaded wasm (page not cross-origin isolated)");
   }
 })();
 
 type Req =
   | { id: number; op: "load"; bytes: ArrayBuffer; name: string }
+  | {
+      id: number;
+      op: "transform";
+      /** Rigid transform: [r00..r22 row-major, tx, ty, tz] in mm. */
+      matrix: number[];
+    }
   | { id: number; op: "resegment"; angle: number }
   | {
       id: number;
@@ -66,6 +78,8 @@ type Req =
       op: "voxelMeshCut";
       plane: { normal: [number, number, number]; constant: number } | null;
       wall: number;
+      /** Top/bottom shell thickness in mm (layers × layer height). */
+      topBottomMm: number;
       /** Uniform infill % for interior-cell density (optimized densities
        *  win when an optimization result exists). */
       infillPct: number;
@@ -75,6 +89,7 @@ type Req =
   | { id: number; op: "setSnapWall"; wall: number }
   | { id: number; op: "setCompositeSkin"; on: boolean }
   | { id: number; op: "setSmoothStress"; on: boolean }
+  | { id: number; op: "setCancelBuffer"; buf: SharedArrayBuffer }
   | {
       id: number;
       op: "solvePrinted";
@@ -135,6 +150,16 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
         ]);
         return;
       }
+      case "transform": {
+        const m = requireModel();
+        m.transform(new Float64Array(msg.matrix));
+        const positions = m.positions();
+        (self as unknown as Worker).postMessage(
+          { id: msg.id, ok: true, data: { positions, bbox: Array.from(m.bbox()) } },
+          [positions.buffer]
+        );
+        return;
+      }
       case "resegment": {
         requireModel().resegment(msg.angle);
         const patchIds = requireModel().patch_ids();
@@ -161,6 +186,10 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
         break;
       case "setSmoothStress":
         requireModel().set_smooth_stress(msg.on);
+        break;
+      case "setCancelBuffer":
+        cancelArr = new Int32Array(msg.buf);
+        setCancelFlagFn?.(cancelArr);
         break;
       case "setBcs": {
         const m = requireModel();
@@ -202,6 +231,7 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
           p?.normal[2] ?? 0,
           p?.constant ?? 0,
           msg.wall,
+          msg.topBottomMm,
           msg.infillPct
         );
         const hull = arr[0] as Float32Array;
@@ -220,6 +250,7 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
         return;
       }
       case "solve": {
+        if (cancelArr) Atomics.store(cancelArr, 0, 0); // arm fresh
         const t0 = performance.now();
         const stats = JSON.parse(requireModel().solve());
         const displacements = requireModel().vertex_displacements();
@@ -231,6 +262,7 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
         return;
       }
       case "solvePrinted": {
+        if (cancelArr) Atomics.store(cancelArr, 0, 0); // arm fresh
         const t0 = performance.now();
         const stats = JSON.parse(requireModel().solve_printed(JSON.stringify(msg.opts)));
         const displacements = requireModel().vertex_displacements();
@@ -242,6 +274,7 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
         return;
       }
       case "optimize": {
+        if (cancelArr) Atomics.store(cancelArr, 0, 0); // arm fresh
         const m = requireModel();
         const t0 = performance.now();
         const summary = JSON.parse(

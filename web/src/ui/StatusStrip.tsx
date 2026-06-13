@@ -67,6 +67,9 @@ export function StatusStrip() {
       )}
       <div className="grow" />
       <div>mm · MPa</div>
+      <button onClick={() => s.openImprint(true)} title="Impressum & Datenschutzerklärung">
+        § IMPRINT
+      </button>
       <button
         className={s.logOpen ? "on" : ""}
         onClick={() => s.setLogOpen(!s.logOpen)}

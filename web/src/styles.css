@@ -931,7 +931,7 @@ input[type="number"] {
 
 /* busy + toast */
 
-.busy {
+.busychip {
   position: absolute;
   top: 86px;
   left: 50%;
@@ -944,6 +944,20 @@ input[type="number"] {
   display: flex;
   gap: 10px;
   align-items: center;
+}
+
+.busychip .stopbtn {
+  margin-left: 4px;
+  padding: 3px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #b3261e;
+  border-color: #d9a09c;
+}
+
+.busychip .stopbtn:hover {
+  background: #fbeae9;
+  border-color: #b3261e;
 }
 
 .spinner {
@@ -1349,6 +1363,53 @@ input[type="number"] {
   padding: 8px 22px;
   font-weight: 600;
   margin-top: 2px;
+}
+
+/* Hover value probe: DRO-style readout riding next to the cursor. */
+.probe {
+  position: absolute;
+  z-index: 6;
+  pointer-events: none;
+  font-family: "B612 Mono", ui-monospace, monospace;
+  font-size: 11px;
+  line-height: 1;
+  padding: 4px 7px;
+  background: var(--panel);
+  border: 1px solid var(--line-strong);
+  border-radius: 3px;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.18);
+  white-space: nowrap;
+}
+
+/* ---------------- imprint & privacy ---------------- */
+
+.modal.imprint {
+  width: 620px;
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+
+.modal.imprint p {
+  margin: 0;
+}
+
+.modal.imprint h3 {
+  margin: 6px 0 0;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+
+.modal.imprint ul {
+  margin: 0;
+  padding-left: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.modal.imprint a {
+  color: var(--orange);
+  font-weight: 600;
 }
 
 /* Disclaimer escape hatch at the bottom of the nerd log. */
