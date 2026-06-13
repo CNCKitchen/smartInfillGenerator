@@ -11,6 +11,7 @@ import {
 import type {
   Bc,
   BcKind,
+  ForceMode,
   CheckReport,
   LoadedModel,
   Material,
@@ -22,7 +23,7 @@ import type {
 } from "./types";
 import { DEFAULT_CURVES, DEFAULT_MATERIALS, RESOLUTIONS, RESULT_FIELDS } from "./types";
 
-export type Tool = "orbit" | "select" | "brush" | "place";
+export type Tool = "orbit" | "select" | "brush" | "place" | "pickdir";
 export type ViewMode = "setup" | "mesh" | "deformed" | "density" | "infill";
 
 // ---- persisted user settings (materials + infill stiffness curves) ----
@@ -226,6 +227,9 @@ interface AppState {
   optProgress: { iteration: number; maxIter: number; pass?: number; passes?: number } | null;
   optSummary: OptSummary | null;
   viewMode: ViewMode;
+  /** Overlay the model's triangle mesh as a wireframe (Setup/Mesh views) so
+   *  the input mesh quality can be inspected. */
+  wireframe: boolean;
   deformScale: number;
   animateDeformed: boolean;
   /** Display autoscale chosen by the viewer (deformation exaggeration base). */
@@ -266,6 +270,9 @@ interface AppState {
   optSeries: OptIterSample[];
   /** MGCG residual history of the last plain solve (log-scale plot). */
   solveResiduals: number[];
+  /** Relative-residual convergence target of the last solve — the plot's
+   *  limit line. 0 until the first solve reports it. */
+  solveTol: number;
 
   setActiveStep(n: number): void;
   loadFile(name: string, bytes: ArrayBuffer): Promise<void>;
@@ -287,7 +294,36 @@ interface AppState {
   removeBc(id: string): void;
   setActiveBc(id: string | null): void;
   updateBcTris(id: string, tris: Uint32Array): void;
-  updateBcParams(id: string, params: Partial<Pick<Bc, "force" | "pressure" | "stiffness">>): void;
+  updateBcParams(
+    id: string,
+    params: Partial<
+      Pick<
+        Bc,
+        | "force"
+        | "pressure"
+        | "stiffness"
+        | "axes"
+        | "forceMode"
+        | "forceDir"
+        | "forceMag"
+        | "forceDirAuto"
+      >
+    >
+  ): void;
+  /** Toggle a single global axis of a displacement support. */
+  toggleBcAxis(id: string, axis: 0 | 1 | 2): void;
+  /** Switch a force load between component and direction definition. */
+  setForceMode(id: string, mode: ForceMode): void;
+  /** Set the magnitude (N) of a direction-mode force. */
+  setForceMag(id: string, mag: number): void;
+  /** Set the (un-normalized) direction of a force; clears auto-tracking. */
+  setForceDir(id: string, dir: [number, number, number]): void;
+  /** Reverse a force's direction (clears auto-tracking). */
+  flipForceDir(id: string): void;
+  /** Snap a force's direction back to the selection's average normal. */
+  resetForceDirToNormal(id: string): void;
+  /** Scene → store: the pick-direction tool clicked a triangle (its normal). */
+  applyPickedDir(normal: [number, number, number]): void;
   setMaterial(m: Material): void;
   updateMaterial(index: number, m: Material): void;
   addMaterial(): void;
@@ -339,6 +375,7 @@ interface AppState {
   downloadThreeMf(): Promise<void>;
   downloadStls(): Promise<void>;
   setViewMode(mode: ViewMode): Promise<void>;
+  setWireframe(on: boolean): void;
   setDeformScale(s: number): void;
   setAnimateDeformed(on: boolean): void;
   /** Stop the running solve/optimization at its next solver checkpoint. */
@@ -483,8 +520,9 @@ async function refreshMinSf(
 }
 
 /** Apply a rotation about the part's bbox center, then seat it on the build
- *  plate (z-min → 0). Patches and BC selections survive (index-based); the
- *  grid and every result drop on both sides. */
+ *  plate (z-min → 0) and re-center it over the plate origin in XY. Patches and
+ *  BC selections survive (index-based); the grid and every result drop on both
+ *  sides. */
 async function transformModel(set: SetState, get: () => AppState, r: number[]) {
   const st = get();
   if (!st.model || st.busy) return;
@@ -497,8 +535,14 @@ async function transformModel(set: SetState, get: () => AppState, r: number[]) {
   ];
   try {
     let out = await engine.transform([...r, ...t]);
-    if (Math.abs(out.bbox[2]) > 1e-6) {
-      out = await engine.transform([1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, -out.bbox[2]]);
+    // Seat on the plate (z-min → 0) and re-center the XY footprint over the
+    // plate origin, so a rotate / place-on-face never drifts the part off the
+    // build grid.
+    const cx = (out.bbox[0] + out.bbox[3]) / 2;
+    const cy = (out.bbox[1] + out.bbox[4]) / 2;
+    const dz = out.bbox[2];
+    if (Math.abs(cx) > 1e-6 || Math.abs(cy) > 1e-6 || Math.abs(dz) > 1e-6) {
+      out = await engine.transform([1, 0, 0, 0, 1, 0, 0, 0, 1, -cx, -cy, -dz]);
     }
     const bbox = out.bbox as LoadedModel["bbox"];
     set({ model: { ...get().model!, positions: out.positions, bbox } });
@@ -546,6 +590,19 @@ function appendLog(set: SetState, msg: string) {
   set((s) => ({
     logLines: [...s.logLines.slice(-(MAX_LOG_LINES - 1)), { t: logTime(), msg }],
   }));
+}
+
+/** Stream the live MGCG residual trace into the convergence plot while a solve
+ *  runs, by polling the engine's shared buffer a few times a second. Returns a
+ *  stop function. No-op (the plot fills in at the end, as before) when live
+ *  streaming isn't available (no cross-origin isolation). */
+function startResidualPoll(set: SetState): () => void {
+  if (engine.readSolveProgress() === null) return () => {};
+  const timer = setInterval(() => {
+    const live = engine.readSolveProgress();
+    if (live && live.length) set({ solveResiduals: live });
+  }, 120);
+  return () => clearInterval(timer);
 }
 
 /** Log the analysis grid when it (re)builds — entry of check/solve/optimize. */
@@ -598,6 +655,8 @@ export interface SceneEvents {
   onSymmetry?: (enabled: boolean, normal: [number, number, number], c: number) => void;
   /** Color mesh-view cells by element density. */
   onMeshDensity?: (on: boolean) => void;
+  /** Toggle the triangle-mesh wireframe overlay on the model. */
+  onWireframe?: (on: boolean) => void;
   /** Voxel-true section active: the scene must NOT plane-clip the voxel
    *  group (the cut already lives in the geometry) and hides its cap. */
   onVoxelCutActive?: (on: boolean) => void;
@@ -637,6 +696,54 @@ export const sceneEvents: SceneEvents = {};
 
 async function pushBcs(get: () => AppState) {
   await engine.setBcs(get().bcs);
+}
+
+/** Area-weighted average outward normal of a triangle selection (matches the
+ *  Rust `average_normal`: sum of area vectors, normalized). `positions` is the
+ *  triangle soup (9 floats/tri). Returns null for an empty/degenerate set. */
+function selectionNormal(
+  positions: Float32Array | undefined,
+  tris: Uint32Array
+): [number, number, number] | null {
+  if (!positions || tris.length === 0) return null;
+  let nx = 0;
+  let ny = 0;
+  let nz = 0;
+  for (const t of tris) {
+    const o = 9 * t;
+    const e1x = positions[o + 3] - positions[o];
+    const e1y = positions[o + 4] - positions[o + 1];
+    const e1z = positions[o + 5] - positions[o + 2];
+    const e2x = positions[o + 6] - positions[o];
+    const e2y = positions[o + 7] - positions[o + 1];
+    const e2z = positions[o + 8] - positions[o + 2];
+    nx += 0.5 * (e1y * e2z - e1z * e2y);
+    ny += 0.5 * (e1z * e2x - e1x * e2z);
+    nz += 0.5 * (e1x * e2y - e1y * e2x);
+  }
+  const len = Math.hypot(nx, ny, nz);
+  if (len < 1e-12) return null;
+  return [nx / len, ny / len, nz / len];
+}
+
+/** Resolved load vector of a force BC for the solver: the direction × the
+ *  magnitude in "direction" mode, the components verbatim otherwise. */
+function resolveForce(bc: Bc): [number, number, number] {
+  if (bc.forceMode === "direction" && bc.forceDir) {
+    const m = bc.forceMag ?? 0;
+    return [bc.forceDir[0] * m, bc.forceDir[1] * m, bc.forceDir[2] * m];
+  }
+  return bc.force ?? [0, 0, 0];
+}
+
+/** Magnitude a force should carry when switching into direction mode: the
+ *  explicit forceMag, else the length of the current component vector, else a
+ *  sensible 10 N default. */
+function forceMagFor(bc: Bc): number {
+  if (bc.forceMag != null) return bc.forceMag;
+  const f = bc.force;
+  const len = f ? Math.hypot(f[0], f[1], f[2]) : 0;
+  return len || 10;
 }
 
 /** Bounding-box volume of the loaded model (mm³), 0 without a model. */
@@ -785,6 +892,7 @@ export const useStore = create<AppState>((set, get) => ({
   optProgress: null,
   optSummary: null,
   viewMode: "setup",
+  wireframe: false,
   deformScale: 1,
   animateDeformed: false,
   autoScale: 1,
@@ -809,6 +917,7 @@ export const useStore = create<AppState>((set, get) => ({
   logLines: [],
   optSeries: [],
   solveResiduals: [],
+  solveTol: 0,
 
   setActiveStep(n) {
     set({ activeStep: Math.min(6, Math.max(1, Math.round(n))) });
@@ -833,8 +942,9 @@ export const useStore = create<AppState>((set, get) => ({
       set({
         fileName: name,
         model,
-        // a fresh model means fresh supports & loads — jump there
-        activeStep: 2,
+        // Land on the Model step so the print orientation can be set first;
+        // supports & loads (fresh for every model) come next.
+        activeStep: 1,
         bcs: [],
         activeBcId: null,
         tool: "orbit",
@@ -998,6 +1108,14 @@ export const useStore = create<AppState>((set, get) => ({
       pressure: kind === "pressure" ? 0.1 : undefined,
       // ~printed-plastic mount; bolted-to-steel would be >= 5000 (≈ fixed).
       stiffness: kind === "elastic" ? 100 : undefined,
+      // Displacement support: roller locking the vertical (Z) axis by default.
+      axes: kind === "displacement" ? [false, false, true] : undefined,
+      // Force: edit Fx/Fy/Fz by default; direction mode tracks the selection
+      // normal and lands on −10 N along it once switched.
+      forceMode: kind === "force" ? "components" : undefined,
+      forceDir: kind === "force" ? [0, 0, -1] : undefined,
+      forceMag: kind === "force" ? 10 : undefined,
+      forceDirAuto: kind === "force" ? true : undefined,
     };
     set({ bcs: [...get().bcs, bc], activeBcId: bc.id, tool: "select" });
     invalidateResults(set, get);
@@ -1022,7 +1140,23 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   updateBcTris(id, tris) {
-    set({ bcs: get().bcs.map((b) => (b.id === id ? { ...b, tris } : b)) });
+    const positions = get().model?.positions;
+    set({
+      bcs: get().bcs.map((b) => {
+        if (b.id !== id) return b;
+        const next: Bc = { ...b, tris };
+        // A direction-mode force that still auto-tracks re-aims along the new
+        // selection's average normal (magnitude preserved).
+        if (b.kind === "force" && b.forceMode === "direction" && b.forceDirAuto !== false) {
+          const n = selectionNormal(positions, tris);
+          if (n) {
+            next.forceDir = n;
+            next.force = resolveForce(next);
+          }
+        }
+        return next;
+      }),
+    });
     invalidateResults(set, get);
     sceneEvents.onBcsChanged?.(get().bcs, get().activeBcId);
     void pushBcs(get);
@@ -1033,6 +1167,99 @@ export const useStore = create<AppState>((set, get) => ({
     invalidateResults(set, get);
     sceneEvents.onBcsChanged?.(get().bcs, get().activeBcId);
     void pushBcs(get);
+  },
+
+  toggleBcAxis(id, axis) {
+    const bc = get().bcs.find((b) => b.id === id);
+    if (!bc) return;
+    const axes: [boolean, boolean, boolean] = [...(bc.axes ?? [false, false, false])];
+    axes[axis] = !axes[axis];
+    get().updateBcParams(id, { axes });
+  },
+
+  setForceMode(id, mode) {
+    const bc = get().bcs.find((b) => b.id === id);
+    if (!bc) return;
+    if (mode === "components") {
+      // Keep the resolved vector — the components editor picks it straight up.
+      get().updateBcParams(id, { forceMode: "components", force: resolveForce(bc) });
+      return;
+    }
+    // Direction mode: default the direction to the selection's average normal
+    // while it still auto-tracks; magnitude carries over from the components.
+    const auto = bc.forceDirAuto !== false;
+    let dir: [number, number, number] = bc.forceDir ?? [0, 0, -1];
+    if (auto) {
+      const n = selectionNormal(get().model?.positions, bc.tris);
+      if (n) dir = n;
+    }
+    const mag = forceMagFor(bc);
+    const next: Bc = { ...bc, forceMode: "direction", forceDir: dir, forceMag: mag, forceDirAuto: auto };
+    get().updateBcParams(id, {
+      forceMode: "direction",
+      forceDir: dir,
+      forceMag: mag,
+      forceDirAuto: auto,
+      force: resolveForce(next),
+    });
+  },
+
+  setForceMag(id, mag) {
+    const bc = get().bcs.find((b) => b.id === id);
+    if (!bc) return;
+    const next: Bc = { ...bc, forceMag: mag };
+    get().updateBcParams(id, { forceMag: mag, force: resolveForce(next) });
+  },
+
+  setForceDir(id, dir) {
+    const bc = get().bcs.find((b) => b.id === id);
+    if (!bc) return;
+    const len = Math.hypot(dir[0], dir[1], dir[2]);
+    if (len < 1e-12) return;
+    const unit: [number, number, number] = [dir[0] / len, dir[1] / len, dir[2] / len];
+    const mag = forceMagFor(bc);
+    const next: Bc = { ...bc, forceDir: unit, forceMag: mag };
+    get().updateBcParams(id, {
+      forceDir: unit,
+      forceMag: mag,
+      forceDirAuto: false,
+      force: resolveForce(next),
+    });
+  },
+
+  flipForceDir(id) {
+    const bc = get().bcs.find((b) => b.id === id);
+    if (!bc) return;
+    // Direction mode: reverse the unit direction. Components mode: negate the
+    // whole vector (so the button works either way).
+    if (bc.forceMode === "direction") {
+      const d = bc.forceDir ?? [0, 0, -1];
+      const flipped: [number, number, number] = [-d[0], -d[1], -d[2]];
+      const next: Bc = { ...bc, forceDir: flipped };
+      get().updateBcParams(id, { forceDir: flipped, forceDirAuto: false, force: resolveForce(next) });
+    } else {
+      const f = bc.force ?? [0, 0, 0];
+      get().updateBcParams(id, { force: [-f[0], -f[1], -f[2]] });
+    }
+  },
+
+  resetForceDirToNormal(id) {
+    const bc = get().bcs.find((b) => b.id === id);
+    if (!bc) return;
+    const n = selectionNormal(get().model?.positions, bc.tris);
+    if (!n) return;
+    const next: Bc = { ...bc, forceDir: n };
+    get().updateBcParams(id, { forceDir: n, forceDirAuto: true, force: resolveForce(next) });
+  },
+
+  applyPickedDir(normal) {
+    const id = get().activeBcId;
+    if (!id) return;
+    const bc = get().bcs.find((b) => b.id === id);
+    if (!bc || bc.kind !== "force") return;
+    // Switch to direction mode if needed, then point along the clicked face.
+    if (bc.forceMode !== "direction") get().setForceMode(id, "direction");
+    get().setForceDir(id, normal);
   },
 
   setMaterial(m) {
@@ -1342,6 +1569,7 @@ export const useStore = create<AppState>((set, get) => ({
     if (!get().model) return;
     set({ busy: "Solving…", error: null });
     sceneEvents.onAnimateMode?.(null);
+    let stopResidualPoll = () => {};
     try {
       await pushBcs(get);
       await logGridInfo(set);
@@ -1367,6 +1595,10 @@ export const useStore = create<AppState>((set, get) => ({
       let printedSummary: PrintedSummary | null = null;
       let stats: SolveStats;
       let displacements: Float32Array;
+      // Clear the old curve and stream the new one as the MGCG loop runs (the
+      // engine reset its shared buffer when the solve call below was issued).
+      set({ solveResiduals: [] });
+      stopResidualPoll = startResidualPoll(set);
       if (printed) {
         appendLog(
           set,
@@ -1409,6 +1641,9 @@ export const useStore = create<AppState>((set, get) => ({
         stats = out.stats;
         displacements = out.displacements;
       }
+      // Solve done — stop polling before publishing the exact final trace so a
+      // late poll can't overwrite it with the (possibly capped) live snapshot.
+      stopResidualPoll();
       fieldCache.clear(); // stress fields belong to the previous solution
       invalidateVoxelResult();
       sceneEvents.onLegendRange?.(null, null);
@@ -1422,6 +1657,7 @@ export const useStore = create<AppState>((set, get) => ({
         stats,
         printedStats: printedSummary,
         solveResiduals: stats.residuals ?? [],
+        solveTol: stats.tol ?? get().solveTol,
         hasResult: true,
         viewMode: "deformed",
         busy: null,
@@ -1471,6 +1707,8 @@ export const useStore = create<AppState>((set, get) => ({
         set({ busy: null, error: msg });
         appendLog(set, `Solve failed: ${msg}`);
       }
+    } finally {
+      stopResidualPoll(); // also covers the error/cancel paths
     }
   },
 
@@ -1713,6 +1951,11 @@ export const useStore = create<AppState>((set, get) => ({
           sceneEvents.onResultSurface?.("stl");
         });
     }
+  },
+
+  setWireframe(on) {
+    set({ wireframe: on });
+    sceneEvents.onWireframe?.(on);
   },
 
   setDeformScale(s) {

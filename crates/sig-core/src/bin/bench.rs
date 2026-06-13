@@ -126,6 +126,20 @@ fn bench_benchy() {
             ..SolveSettings::default()
         },
     };
+    // Opt-in (SIG_PROGRESS=1): install a residual-progress sink that mimics
+    // the web worker's copy into a shared buffer (a reused Vec, no allocation
+    // in the hot path) so the live-preview publish overhead is measurable
+    // natively. Without it the stride'd `publish` is just a thread-local
+    // None-check — what every normal solve pays.
+    if std::env::var("SIG_PROGRESS").is_ok() {
+        let buf = std::cell::RefCell::new(Vec::<f32>::with_capacity(1024));
+        sig_core::progress::set_sink(Some(Box::new(move |trace: &[f32]| {
+            let mut b = buf.borrow_mut();
+            b.clear();
+            b.extend_from_slice(trace);
+        })));
+        println!("benchy:   live-progress sink installed (measuring publish overhead)");
+    }
     let t0 = Instant::now();
     let sol = solve_static(&problem).expect("benchy solve");
     let dt = t0.elapsed();

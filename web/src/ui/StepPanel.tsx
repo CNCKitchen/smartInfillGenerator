@@ -19,6 +19,7 @@ const SLICER_NAMES = {
 const KIND_LABEL: Record<BcKind, string> = {
   fixed: "Fixed support",
   frictionless: "Frictionless support",
+  displacement: "Displacement support",
   elastic: "Elastic support",
   force: "Force",
   pressure: "Pressure",
@@ -28,6 +29,7 @@ const KIND_LABEL: Record<BcKind, string> = {
 const KIND_DOT: Record<BcKind, string> = {
   fixed: "#2563eb",
   frictionless: "#0e9cbf",
+  displacement: "#7c3aed",
   elastic: "#1f9d6b",
   force: "#d93025",
   pressure: "#c97b10",
@@ -186,7 +188,7 @@ function StepModel() {
 
 // ---------------- 2 · Boundary conditions ----------------
 
-const SUPPORT_KINDS: BcKind[] = ["fixed", "elastic", "frictionless"];
+const SUPPORT_KINDS: BcKind[] = ["fixed", "elastic", "frictionless", "displacement"];
 
 function StepBcs() {
   const s = useStore();
@@ -204,7 +206,8 @@ function StepBcs() {
         <div className="addrow">
           <button onClick={() => s.addBc("fixed")}>+ Fixed</button>
           <button onClick={() => s.addBc("elastic")}>+ Elastic</button>
-          <button onClick={() => s.addBc("frictionless")}>+ Slide</button>
+          <button onClick={() => s.addBc("frictionless")}>+ Frictionless</button>
+          <button onClick={() => s.addBc("displacement")}>+ Displacement</button>
         </div>
       </div>
 
@@ -282,10 +285,16 @@ function StepBcs() {
           </label>
         </>
       )}
-      {s.activeBcId && s.tool !== "orbit" && (
+      {s.activeBcId && (s.tool === "select" || s.tool === "brush") && (
         <div className="hint">
           Click surfaces to add to the highlighted condition (click again to remove, shift-click
           always removes). Esc or clicking another step returns to orbiting.
+        </div>
+      )}
+      {s.activeBcId && s.tool === "pickdir" && (
+        <div className="hint">
+          Pick-direction is armed — click a triangle to aim the force along its normal. Esc returns
+          to orbiting.
         </div>
       )}
       {s.activeBcId && s.tool === "orbit" && (
@@ -317,25 +326,8 @@ function BcRow({ bc }: { bc: Bc }) {
           ×
         </button>
       </div>
-      {bc.kind === "force" && bc.force && (
-        <div className="bcparams" onClick={(e) => e.stopPropagation()}>
-          {(["X", "Y", "Z"] as const).map((axis, i) => (
-            <label key={axis}>
-              F{axis}
-              <NumInput
-                value={bc.force![i]}
-                step={1}
-                onCommit={(v) => {
-                  const f = [...bc.force!] as [number, number, number];
-                  f[i] = v;
-                  s.updateBcParams(bc.id, { force: f });
-                }}
-              />
-            </label>
-          ))}
-          <span className="dim">N total</span>
-        </div>
-      )}
+      {bc.kind === "force" && <ForceEditor bc={bc} />}
+      {bc.kind === "displacement" && <DisplacementEditor bc={bc} />}
       {bc.kind === "pressure" && (
         <div className="bcparams" onClick={(e) => e.stopPropagation()}>
           <label>
@@ -369,6 +361,142 @@ function BcRow({ bc }: { bc: Bc }) {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+/** Force load editor: either Fx/Fy/Fz components, or a unit direction (which
+ *  defaults to the selection's average normal, pickable off the model) plus a
+ *  scalar magnitude. */
+function ForceEditor({ bc }: { bc: Bc }) {
+  const s = useStore();
+  const active = s.activeBcId === bc.id;
+  const mode = bc.forceMode ?? "components";
+  const force = bc.force ?? [0, 0, 0];
+  const dir = bc.forceDir ?? [0, 0, -1];
+  const picking = active && s.tool === "pickdir";
+  return (
+    <div onClick={(e) => e.stopPropagation()}>
+      <div className="seg" style={{ marginBottom: 6 }}>
+        <button
+          className={mode === "components" ? "on" : ""}
+          onClick={() => s.setForceMode(bc.id, "components")}
+          title="Define the load by its X/Y/Z components"
+        >
+          Components
+        </button>
+        <button
+          className={mode === "direction" ? "on" : ""}
+          onClick={() => s.setForceMode(bc.id, "direction")}
+          title="Define the load by a direction and a magnitude"
+        >
+          Direction
+        </button>
+      </div>
+      {mode === "components" ? (
+        <div className="bcparams">
+          {(["X", "Y", "Z"] as const).map((axis, i) => (
+            <label key={axis}>
+              F{axis}
+              <NumInput
+                value={force[i]}
+                step={1}
+                onCommit={(v) => {
+                  const f = [...force] as [number, number, number];
+                  f[i] = v;
+                  s.updateBcParams(bc.id, { force: f });
+                }}
+              />
+            </label>
+          ))}
+          <span className="dim">N total</span>
+        </div>
+      ) : (
+        <>
+          <div className="bcparams">
+            <label>
+              |F|
+              <NumInput value={bc.forceMag ?? 0} step={1} onCommit={(v) => s.setForceMag(bc.id, v)} />
+            </label>
+            <span className="dim">N total</span>
+          </div>
+          <div className="bcparams">
+            {(["X", "Y", "Z"] as const).map((axis, i) => (
+              <label key={axis}>
+                d{axis}
+                <NumInput
+                  value={dir[i]}
+                  step={0.1}
+                  onCommit={(v) => {
+                    const d = [...dir] as [number, number, number];
+                    d[i] = v;
+                    s.setForceDir(bc.id, d);
+                  }}
+                />
+              </label>
+            ))}
+          </div>
+          <div className="toolrow">
+            <button
+              className={picking ? "on" : ""}
+              onClick={() => {
+                s.setActiveBc(bc.id);
+                s.setTool(picking ? "orbit" : "pickdir");
+              }}
+              title="Click a triangle on the model to aim the force along its normal"
+            >
+              ⊹ Pick direction
+            </button>
+            <button
+              onClick={() => s.flipForceDir(bc.id)}
+              title="Reverse the force direction"
+            >
+              ⇄ Flip
+            </button>
+            <button
+              onClick={() => s.resetForceDirToNormal(bc.id)}
+              disabled={bc.tris.length === 0}
+              title="Aim along the selection's area-weighted average normal"
+            >
+              ↻ Surface normal
+            </button>
+          </div>
+          <div className="dim small">
+            {picking
+              ? "Click a triangle on the model — its normal becomes the force direction."
+              : bc.forceDirAuto !== false
+                ? "Direction follows the selection's average surface normal. Pick a face or edit d to override."
+                : "Custom direction — ‘Surface normal’ snaps it back to the selection."}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+/** Displacement support editor: which global axes are pinned to zero. */
+function DisplacementEditor({ bc }: { bc: Bc }) {
+  const s = useStore();
+  const axes = bc.axes ?? [false, false, true];
+  return (
+    <div onClick={(e) => e.stopPropagation()}>
+      <div className="bcparams" style={{ alignItems: "center", gap: 12 }}>
+        <span className="dim">Fix</span>
+        {(["X", "Y", "Z"] as const).map((axis, i) => (
+          <label key={axis} style={{ display: "flex", alignItems: "center", gap: 4 }}>
+            <input
+              type="checkbox"
+              checked={axes[i]}
+              onChange={() => s.toggleBcAxis(bc.id, i as 0 | 1 | 2)}
+            />
+            {axis}
+          </label>
+        ))}
+      </div>
+      <div className="dim small">
+        Locks the checked global axes to zero; unchecked axes slide free (a roller). All three ≈ a
+        fixed support.
+      </div>
     </div>
   );
 }

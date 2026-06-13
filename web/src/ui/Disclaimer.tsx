@@ -17,9 +17,11 @@ export function Disclaimer() {
     <div className="modalback disclaimerback">
       <div className="modal disclaimer" role="alertdialog" aria-modal="true">
         <h2>
-          Finite Element Analysis makes a good engineer better
-          <br />
-          and a bad engineer dangerous
+          <em>
+            “Finite Element Analysis makes a good engineer better
+            <br />
+            and a bad engineer dangerous”
+          </em>
         </h2>
         <ul>
           <li>

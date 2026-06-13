@@ -54,6 +54,9 @@ export function Viewer() {
       onPlaceFace: (normal) => {
         void useStore.getState().applyPlaceOnFace(normal);
       },
+      onPickDir: (normal) => {
+        useStore.getState().applyPickedDir(normal);
+      },
       onAutoScale: (autoScale) => {
         useStore.setState({ autoScale });
       },
@@ -75,6 +78,7 @@ export function Viewer() {
     sceneEvents.onViewState = (mode, scale) => scene.setViewState(mode, scale);
     sceneEvents.onVoxelMesh = (hull, edges, density) => scene.setVoxelMesh(hull, edges, density);
     sceneEvents.onMeshDensity = (on) => scene.setMeshDensity(on);
+    sceneEvents.onWireframe = (on) => scene.setWireframe(on);
     sceneEvents.onVoxelCutActive = (on) => scene.setVoxelCutActive(on);
     sceneEvents.onAnimateDeformed = (on) => scene.setDeformAnimate(on);
     sceneEvents.onOptShape = (p, i, d) => scene.setOptShape(p, i, d);

@@ -31,6 +31,18 @@ export function ViewportChips() {
         {s.optSummary && <ViewBtn mode="infill" label="Regions" />}
       </div>
 
+      {(s.viewMode === "setup" || s.viewMode === "mesh") && (
+        <div className="wirechip">
+          <button
+            className={s.wireframe ? "on" : ""}
+            onClick={() => s.setWireframe(!s.wireframe)}
+            title="Overlay the model's triangle mesh to inspect its quality"
+          >
+            Wireframe
+          </button>
+        </div>
+      )}
+
       {resultsView && (
         <div className="fieldchip">
           <div className="seg">

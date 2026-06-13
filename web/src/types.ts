@@ -1,19 +1,35 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
 
-export type BcKind = "fixed" | "frictionless" | "elastic" | "force" | "pressure";
+export type BcKind = "fixed" | "frictionless" | "displacement" | "elastic" | "force" | "pressure";
+
+/** How a force load is defined in the UI. "components" edits Fx/Fy/Fz
+ *  directly; "direction" edits a unit direction + a scalar magnitude. Either
+ *  way the resolved vector is stored in `force` for the solver. */
+export type ForceMode = "components" | "direction";
 
 export interface Bc {
   id: string;
   kind: BcKind;
   /** Selected triangle indices. */
   tris: Uint32Array;
-  /** Force vector in N (force only). */
+  /** Force vector in N (force only) — the resolved load the solver uses. */
   force?: [number, number, number];
   /** Pressure in MPa (pressure only). */
   pressure?: number;
   /** Foundation bedding modulus in N/mm³, σ = k·u (elastic only). */
   stiffness?: number;
+  /** Which global axes are pinned to zero (displacement support only). */
+  axes?: [boolean, boolean, boolean];
+  /** Force definition mode (force only); defaults to "components". */
+  forceMode?: ForceMode;
+  /** Unit direction for "direction" mode (force only). */
+  forceDir?: [number, number, number];
+  /** Magnitude in N for "direction" mode (force only). */
+  forceMag?: number;
+  /** True while the direction auto-tracks the selection's area-weighted
+   *  average normal; cleared once the user picks/edits a direction. */
+  forceDirAuto?: boolean;
 }
 
 export interface RbmMode {
@@ -46,6 +62,8 @@ export interface SolveStats {
   seconds: number;
   /** Relative residual per MGCG iteration (element 0 = initial residual). */
   residuals?: number[];
+  /** MGCG relative-residual convergence target — the plot's limit line. */
+  tol?: number;
 }
 
 export interface VoxelInfo {

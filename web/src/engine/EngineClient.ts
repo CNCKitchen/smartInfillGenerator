@@ -17,6 +17,11 @@ interface Pending {
   ) => void;
 }
 
+/** Capacity of the live residual buffer (f32 slots). Caps the streamed
+ *  preview length; the final exact trace comes back in the solve stats and is
+ *  not limited by this. 1024 ≫ the worst-case MGCG iteration count. */
+const PROGRESS_CAP = 1024;
+
 export class EngineClient {
   private worker: Worker;
   private nextId = 1;
@@ -25,6 +30,13 @@ export class EngineClient {
    *  is blocked inside a solve (a postMessage could never arrive mid-call).
    *  Needs cross-origin isolation (same requirement as threaded wasm). */
   private cancelFlag: Int32Array | null = null;
+  /** Live MGCG residual trace shared with the worker, written DURING a solve
+   *  (same mid-call constraint as the cancel flag). `progressCount[0]` is the
+   *  number of valid residuals; `progressData[0..count]` are the relative
+   *  residuals. Null without cross-origin isolation — the plot then just
+   *  appears at the end as before. */
+  private progressCount: Int32Array | null = null;
+  private progressData: Float32Array | null = null;
 
   constructor() {
     this.worker = new Worker(new URL("../worker/engine.worker.ts", import.meta.url), {
@@ -34,6 +46,12 @@ export class EngineClient {
       const buf = new SharedArrayBuffer(4);
       this.cancelFlag = new Int32Array(buf);
       void this.call({ op: "setCancelBuffer", buf });
+      // count (i32) + up to PROGRESS_CAP residuals (f32); the worst-case MGCG
+      // iteration count (~290 at the fine preset) fits with room to spare.
+      const pbuf = new SharedArrayBuffer(4 + PROGRESS_CAP * 4);
+      this.progressCount = new Int32Array(pbuf, 0, 1);
+      this.progressData = new Float32Array(pbuf, 4, PROGRESS_CAP);
+      void this.call({ op: "setProgressBuffer", buf: pbuf });
     }
     this.worker.onmessage = (ev) => {
       const { id, ok, data, error, progress, density, skelPositions, skelIndices, skelDensity } =
@@ -72,6 +90,22 @@ export class EngineClient {
    *  "cancelled". No-op outside cross-origin isolation. */
   cancel() {
     if (this.cancelFlag) Atomics.store(this.cancelFlag, 0, 1);
+  }
+
+  /** Clear the live residual trace. Called on the main thread just before a
+   *  solve starts (synchronously, before polling begins) so the plot never
+   *  shows the previous solve's curve. */
+  private resetProgress() {
+    if (this.progressCount) this.progressCount[0] = 0;
+  }
+
+  /** Snapshot of the residual trace streamed so far by the running solve, or
+   *  null when live streaming is unavailable (no cross-origin isolation).
+   *  Poll this while a solve is in flight to animate the convergence plot. */
+  readSolveProgress(): number[] | null {
+    if (!this.progressCount || !this.progressData) return null;
+    const n = Math.min(this.progressCount[0], this.progressData.length);
+    return n > 0 ? Array.from(this.progressData.subarray(0, n)) : [];
   }
 
   load(bytes: ArrayBuffer, name: string): Promise<LoadedModel> {
@@ -136,6 +170,7 @@ export class EngineClient {
       force: bc.force,
       pressure: bc.pressure,
       stiffness: bc.stiffness,
+      axes: bc.axes,
     }));
     return this.call(
       { op: "setBcs", bcs: payload },
@@ -152,6 +187,7 @@ export class EngineClient {
   }
 
   solve(): Promise<{ stats: SolveStats; displacements: Float32Array }> {
+    this.resetProgress();
     return this.call({ op: "solve" });
   }
 
@@ -160,6 +196,7 @@ export class EngineClient {
   solvePrinted(
     opts: PrintedOptions
   ): Promise<{ stats: PrintedStats; displacements: Float32Array }> {
+    this.resetProgress();
     return this.call({ op: "solvePrinted", opts: opts as unknown as Record<string, unknown> });
   }
 

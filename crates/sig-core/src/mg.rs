@@ -849,6 +849,11 @@ pub struct MgSolver {
 /// preconditioner hierarchy only. Exactness lives in `eps_exact`.
 const PC_EPS_FLOOR: f32 = 0.20;
 
+/// Stream the live residual trace every Nth MGCG iteration (see `progress`).
+/// 4 is dense enough for a smooth preview curve yet keeps the cross-thread
+/// publish to a few dozen copies even on the worst-case iteration counts.
+const PROGRESS_STRIDE: usize = 4;
+
 pub struct SolveStats {
     pub iterations: usize,
     pub rel_residual: f64,
@@ -945,6 +950,9 @@ impl MgSolver {
         }
         let res0 = par::norm2_64(&r) / norm_b;
         self.last_trace.push(res0 as f32);
+        // Stream the starting point so a live preview has something to draw
+        // before the first cycle finishes (a fine solve's iteration is slow).
+        crate::progress::publish(&self.last_trace);
         if res0 <= tol {
             return SolveStats { iterations: 0, rel_residual: res0, converged: true };
         }
@@ -975,6 +983,13 @@ impl MgSolver {
             self.last_trace.push(res as f32);
             if res <= tol {
                 return SolveStats { iterations: it + 1, rel_residual: res, converged: true };
+            }
+            // Live preview: stream the trace every few iterations (not every
+            // one — the UI repaints at frame cadence and the full, exact trace
+            // is returned at the end). No-op unless an embedder installed a
+            // sink, so native solves/benches pay only the modulo + a borrow.
+            if it % PROGRESS_STRIDE == 0 {
+                crate::progress::publish(&self.last_trace);
             }
             par::demote(&mut self.ws.r[0], &r);
             v_cycle(&self.levels, &mut self.ws, 0);

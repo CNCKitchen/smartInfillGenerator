@@ -4,7 +4,7 @@
 // Functional smoke test of the wasm-bindgen Model API (the same calls the web
 // worker makes). Run: node smoke-wasm.mjs
 import { readFileSync } from "node:fs";
-import init, { Model, set_cancel_flag } from "./web/src/wasm/sig_wasm.js";
+import init, { Model, set_cancel_flag, set_progress_buffer } from "./web/src/wasm/sig_wasm.js";
 
 // --- build a binary STL box (matches sig-core primitives::boxx layout) ---
 function boxStl(lo, hi) {
@@ -124,6 +124,24 @@ assert(stats.residuals[stats.residuals.length - 1] <= stats.residuals[0],
 
 const disp = model.vertex_displacements();
 assert(disp.length === nTri * 9, "per-vertex displacement buffer");
+
+// Live residual streaming: install the shared progress buffer the way the
+// worker does and re-solve. Regression guard — the sink copied the growing
+// trace into the full-capacity view, tripping copy_from's dest.len()==src.len()
+// assert and trapping as "unreachable". It must now fill without panicking.
+{
+  const CAP = 1024;
+  const psab = new SharedArrayBuffer(4 + CAP * 4);
+  const pcount = new Int32Array(psab, 0, 1);
+  const pdata = new Float32Array(psab, 4, CAP);
+  set_progress_buffer(pcount, pdata);
+  const ps = JSON.parse(model.solve());
+  assert(pcount[0] >= 1 && pcount[0] <= ps.iterations + 1,
+    `live residual trace streamed without panicking (${pcount[0]} points)`);
+  assert(pdata[0] > 0 && Number.isFinite(pdata[Math.max(0, pcount[0] - 1)]),
+    "streamed residuals finite, starting at the initial residual");
+}
+console.log("ok: live residual progress streaming (shared buffer)");
 
 // Stress/strain result fields.
 const fmax = (a) => a.reduce((m, v) => Math.max(m, v), -Infinity);

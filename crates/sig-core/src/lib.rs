@@ -18,6 +18,7 @@ pub mod fem;
 pub mod mesh;
 pub mod mg;
 pub mod par;
+pub mod progress;
 pub mod segment;
 pub mod simp;
 pub mod solve;

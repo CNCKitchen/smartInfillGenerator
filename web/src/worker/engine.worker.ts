@@ -12,6 +12,8 @@ let ModelCtor: typeof Model;
 let setCancelFlagFn: ((flag: Int32Array) => void) | null = null;
 /** Shared flag with the main thread: [0] != 0 = stop the running solve. */
 let cancelArr: Int32Array | null = null;
+/** wasm hook installing the live residual-progress buffer (thread-local). */
+let setProgressBufferFn: ((count: Int32Array, data: Float32Array) => void) | null = null;
 
 // Pick the threaded module when the page is cross-origin isolated
 // (SharedArrayBuffer available); otherwise the single-threaded fallback.
@@ -30,12 +32,14 @@ const ready = (async () => {
     await mt.initThreadPool(threads);
     ModelCtor = mt.Model;
     setCancelFlagFn = mt.set_cancel_flag;
+    setProgressBufferFn = mt.set_progress_buffer;
     console.info(`engine: threaded wasm (${threads} threads)`);
   } else {
     const st = await import("../wasm/sig_wasm.js");
     await st.default();
     ModelCtor = st.Model;
     setCancelFlagFn = st.set_cancel_flag;
+    setProgressBufferFn = st.set_progress_buffer;
     console.info("engine: single-threaded wasm (page not cross-origin isolated)");
   }
 })();
@@ -69,6 +73,7 @@ type Req =
         force?: number[];
         pressure?: number;
         stiffness?: number;
+        axes?: boolean[];
       }[];
     }
   | { id: number; op: "voxelInfo" }
@@ -90,6 +95,7 @@ type Req =
   | { id: number; op: "setCompositeSkin"; on: boolean }
   | { id: number; op: "setSmoothStress"; on: boolean }
   | { id: number; op: "setCancelBuffer"; buf: SharedArrayBuffer }
+  | { id: number; op: "setProgressBuffer"; buf: SharedArrayBuffer }
   | {
       id: number;
       op: "solvePrinted";
@@ -191,13 +197,25 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
         cancelArr = new Int32Array(msg.buf);
         setCancelFlagFn?.(cancelArr);
         break;
+      case "setProgressBuffer": {
+        // Layout: count (one i32) then the residual trace (f32). The solve
+        // loop fills it via the wasm sink; the main thread polls it to draw
+        // the live convergence plot.
+        const count = new Int32Array(msg.buf, 0, 1);
+        const data = new Float32Array(msg.buf, 4, (msg.buf.byteLength - 4) >> 2);
+        setProgressBufferFn?.(count, data);
+        break;
+      }
       case "setBcs": {
         const m = requireModel();
         m.clear_bcs();
         for (const bc of msg.bcs) {
           if (bc.kind === "fixed") m.add_fixed(bc.tris);
           else if (bc.kind === "frictionless") m.add_frictionless(bc.tris);
-          else if (bc.kind === "elastic") m.add_elastic(bc.tris, bc.stiffness ?? 100);
+          else if (bc.kind === "displacement") {
+            const a = bc.axes ?? [false, false, true];
+            m.add_displacement(bc.tris, !!a[0], !!a[1], !!a[2]);
+          } else if (bc.kind === "elastic") m.add_elastic(bc.tris, bc.stiffness ?? 100);
           else if (bc.kind === "force") {
             const f = bc.force ?? [0, 0, 0];
             m.add_force(bc.tris, f[0], f[1], f[2]);

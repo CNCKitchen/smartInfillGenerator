@@ -23,6 +23,10 @@ const ATTACH_DIST_CELLS: f64 = 0.9;
 pub enum BcKind {
     Fixed,
     Frictionless,
+    /// Displacement support: pin any subset of the GLOBAL axes (x/y/z) to zero
+    /// with stiff axis penalty springs — a roller/slider that locks only the
+    /// chosen world directions. `[true; 3]` behaves like Fixed (penalty form).
+    Displacement([bool; 3]),
     /// Elastic ("soft") support: Winkler foundation with bedding modulus k in
     /// N/mm³ (surface pressure per unit displacement, σ = k·u). Each attached
     /// node gets three axis springs of k × its tributary selection area —
@@ -148,6 +152,22 @@ pub fn assemble(
                 for &n in &nodes {
                     problem.springs.push((n, normal, k));
                     constraints.push(ConstraintDir { pos: node_pos(n), dir: normal });
+                }
+            }
+            BcKind::Displacement(axes) => {
+                // Stiff axis springs on the selected global directions only —
+                // the unselected axes stay free (roller/slider).
+                let k = SPRING_FACTOR * settings.e0 * h;
+                for &n in &nodes {
+                    let p = node_pos(n);
+                    for d in 0..3 {
+                        if axes[d] {
+                            let mut dir = [0f64; 3];
+                            dir[d] = 1.0;
+                            problem.springs.push((n, dir, k));
+                            constraints.push(ConstraintDir { pos: p, dir });
+                        }
+                    }
                 }
             }
             BcKind::Elastic(k_found) => {

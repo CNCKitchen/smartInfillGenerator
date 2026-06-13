@@ -20,6 +20,7 @@ const HOVER_TINT = new THREE.Color(0xffb224);
 const BC_COLORS: Record<string, THREE.Color> = {
   fixed: new THREE.Color(0x2563eb),
   frictionless: new THREE.Color(0x0e9cbf),
+  displacement: new THREE.Color(0x7c3aed),
   elastic: new THREE.Color(0x1f9d6b),
   force: new THREE.Color(0xd93025),
   pressure: new THREE.Color(0xc97b10),
@@ -32,6 +33,9 @@ export interface SceneCallbacks {
   onBrush?: (tris: Uint32Array, erase: boolean) => void;
   /** Place-on-face: the clicked triangle's outward normal (world). */
   onPlaceFace?: (normal: [number, number, number]) => void;
+  /** Pick-direction: the clicked triangle's outward normal (world) — used to
+   *  aim a direction-mode force load. */
+  onPickDir?: (normal: [number, number, number]) => void;
   /** Viewer picked a new deformation autoscale (display exaggeration base). */
   onAutoScale?: (autoScale: number) => void;
   /** Section plane changed (three.js convention: kept side is
@@ -51,6 +55,23 @@ export class SceneManager {
   private raycaster = new THREE.Raycaster();
   private pointer = new THREE.Vector2();
 
+  // bumpMesh-style navigation: left-drag orbits around the surface point
+  // under the cursor (free over the poles), wheel zooms toward the cursor.
+  // OrbitControls keeps only damping + right-drag pan; rotation and zoom are
+  // handled manually below.
+  private canvas!: HTMLCanvasElement;
+  private pivotMarker: THREE.Mesh | null = null;
+  private orbitPivot: THREE.Vector3 | null = null; // active drag pivot
+  private lastOrbitPivot: THREE.Vector3 | null = null; // fallback between drags
+  private orbitStart: { x: number; y: number } | null = null;
+  private orbitLast: { x: number; y: number } | null = null;
+  private orbiting = false;
+  private _oq1 = new THREE.Quaternion();
+  private _oq2 = new THREE.Quaternion();
+  private _oRight = new THREE.Vector3();
+  private _oTmp = new THREE.Vector3();
+  private _oTmp2 = new THREE.Vector3();
+
   private mesh: THREE.Mesh | null = null;
   private geometry: THREE.BufferGeometry | null = null;
   private basePositions: Float32Array | null = null;
@@ -59,6 +80,10 @@ export class SceneManager {
   private patchToTris = new Map<number, number[]>();
   private triCount = 0;
   private bboxDiag = 100;
+
+  /** Triangle-mesh wireframe overlay (inspect the input mesh) + its toggle. */
+  private wireframeOn = false;
+  private wireframeLines: THREE.LineSegments | null = null;
 
   private bcs: Bc[] = [];
   private activeBcId: string | null = null;
@@ -132,9 +157,18 @@ export class SceneManager {
   private extremesUnit = "";
   private extremeData: { minIdx: number; maxIdx: number; minVal: number; maxVal: number } | null =
     null;
-  private markerMin: THREE.Group | null = null;
-  private markerMax: THREE.Group | null = null;
-  private extremeDisposables: { dispose(): void }[] = [];
+  // Min/max value marks as DOM overlays projected each frame (see `tick`), so
+  // they keep a constant screen size and stay subtle — matching the hover
+  // probe — instead of world-scaled sprites that balloon as you zoom in.
+  private extremeEls: {
+    minDot: HTMLDivElement;
+    minChip: HTMLDivElement;
+    maxDot: HTMLDivElement;
+    maxChip: HTMLDivElement;
+  } | null = null;
+  private extremeWorld = { min: new THREE.Vector3(), max: new THREE.Vector3() };
+  private extremeVisible = false;
+  private extremeScratch = new THREE.Vector3();
 
   // Section plane: clipping + stencil caps + combined transform gizmo
   // (translate along the normal only + two rotation rings).
@@ -197,9 +231,16 @@ export class SceneManager {
     this.camera.position.set(120, -160, 110);
     this.camera.up.set(0, 0, 1); // printer convention: Z up
 
+    this.canvas = canvas;
     this.controls = new OrbitControls(this.camera, canvas);
     this.controls.enableDamping = true;
-    this.controls.dampingFactor = 0.12;
+    this.controls.dampingFactor = 0.08;
+    // "Move" pans in the screen plane (not along the ground).
+    this.controls.screenSpacePanning = true;
+    // Rotation + zoom are manual (pivot-on-cursor orbit, cursor-centric
+    // zoom — see installNavigation). OrbitControls keeps damping + R-drag pan.
+    this.controls.enableRotate = false;
+    this.controls.enableZoom = false;
 
     const hemi = new THREE.HemisphereLight(0xffffff, 0xb9b6ae, 1.0);
     this.scene.add(hemi);
@@ -226,6 +267,7 @@ export class SceneManager {
       if (this.probeEl) this.probeEl.style.display = "none";
       if (this.brushCursor) this.brushCursor.visible = false;
     });
+    this.installNavigation(canvas);
 
     // Hover value probe tooltip (sibling of the canvas, .viewer is relative).
     if (canvas.parentElement) {
@@ -233,6 +275,27 @@ export class SceneManager {
       this.probeEl.className = "probe";
       this.probeEl.style.display = "none";
       canvas.parentElement.appendChild(this.probeEl);
+
+      // Min/max marks: a small colored dot at the extreme point + a probe-style
+      // value chip beside it, both placed every frame from the 3D location.
+      const parent = canvas.parentElement;
+      const mk = (kind: "min" | "max") => {
+        const dot = document.createElement("div");
+        dot.className = `extreme-dot ${kind}`;
+        const chip = document.createElement("div");
+        chip.className = `probe extreme-chip ${kind}`;
+        dot.style.display = chip.style.display = "none";
+        parent.append(dot, chip);
+        return { dot, chip };
+      };
+      const lo = mk("min");
+      const hi = mk("max");
+      this.extremeEls = {
+        minDot: lo.dot,
+        minChip: lo.chip,
+        maxDot: hi.dot,
+        maxChip: hi.chip,
+      };
     }
 
     const loop = () => {
@@ -245,6 +308,15 @@ export class SceneManager {
 
   dispose() {
     this.disposed = true;
+    document.removeEventListener("pointermove", this.onOrbitMove);
+    document.removeEventListener("pointerup", this.onOrbitUp);
+    this.canvas?.removeEventListener("wheel", this.onWheel);
+    this.probeEl?.remove();
+    if (this.extremeEls) for (const el of Object.values(this.extremeEls)) el.remove();
+    if (this.wireframeLines) {
+      this.wireframeLines.geometry.dispose();
+      (this.wireframeLines.material as THREE.Material).dispose();
+    }
     this.renderer?.dispose();
   }
 
@@ -333,9 +405,14 @@ export class SceneManager {
       metalness: 0.05,
       roughness: 0.72,
       side: THREE.DoubleSide,
+      // Push the fill back a hair so the wireframe overlay never z-fights it.
+      polygonOffset: true,
+      polygonOffsetFactor: 1,
+      polygonOffsetUnits: 1,
     });
     this.mesh = new THREE.Mesh(this.geometry, material);
     this.scene.add(this.mesh);
+    this.buildWireframe();
 
     this.setPatchIds(model.patchIds);
     this.bcs = [];
@@ -398,6 +475,7 @@ export class SceneManager {
     this.bboxDiag = Math.hypot(hx - lx, hy - ly, hz - lz) || this.bboxDiag;
     this.controls.target.set((lx + hx) / 2, (ly + hy) / 2, (lz + hz) / 2);
     this.controls.update();
+    this.buildWireframe(); // re-derive from the moved geometry
     this.rebuildBcMarkers();
     this.repaint();
   }
@@ -425,6 +503,38 @@ export class SceneManager {
     this.activeBcId = activeBcId;
     this.repaint();
     this.rebuildBcMarkers();
+  }
+
+  /** Toggle the triangle-mesh wireframe overlay (mesh inspection). */
+  setWireframe(on: boolean) {
+    this.wireframeOn = on;
+    if (on && !this.wireframeLines) this.buildWireframe();
+    this.refreshView();
+  }
+
+  /** (Re)build the wireframe overlay from the current model geometry. Every
+   *  triangle edge is drawn (THREE.WireframeGeometry, not EdgesGeometry) so
+   *  the actual triangulation shows, not just the silhouette creases. */
+  private buildWireframe() {
+    if (this.wireframeLines) {
+      this.scene.remove(this.wireframeLines);
+      this.wireframeLines.geometry.dispose();
+      (this.wireframeLines.material as THREE.Material).dispose();
+      this.wireframeLines = null;
+    }
+    if (!this.geometry) return;
+    const wf = new THREE.WireframeGeometry(this.geometry);
+    const mat = new THREE.LineBasicMaterial({
+      color: 0x334155,
+      transparent: true,
+      opacity: 0.55,
+    });
+    this.wireframeLines = new THREE.LineSegments(wf, mat);
+    // Match the current toggle + view so a model loaded with wireframe already
+    // on shows immediately; refreshView keeps it in sync afterwards.
+    this.wireframeLines.visible =
+      this.wireframeOn && (this.viewMode === "setup" || this.viewMode === "mesh");
+    this.scene.add(this.wireframeLines);
   }
 
   /** Force arrows + classic support triangles (4-sided cones read as ▽). */
@@ -470,11 +580,22 @@ export class SceneManager {
         );
         label.position.set(0, -len * 0.02, 0);
         g.add(label);
-        // Local +Y becomes the force direction; the tip lands on the surface.
+        // Local +Y becomes the force direction (the head is the +Y end).
         g.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir);
-        g.position.copy(centroid.clone().sub(dir.clone().multiplyScalar(len)));
+        // Keep the WHOLE arrow outside the part. A pushing load (into the
+        // surface) keeps its head at the surface with the shaft trailing
+        // outward; a pulling load (away from the surface) sits tail-on-surface
+        // so the head is at the far, outer end — never driven into the part.
+        const n = this.selectionNormal(bc.tris);
+        const pulling = n ? f.dot(n) >= 0 : false;
+        g.position.copy(pulling ? centroid : centroid.clone().sub(dir.clone().multiplyScalar(len)));
         this.bcMarkers.add(g);
-      } else if (bc.kind === "fixed" || bc.kind === "frictionless" || bc.kind === "elastic") {
+      } else if (
+        bc.kind === "fixed" ||
+        bc.kind === "frictionless" ||
+        bc.kind === "displacement" ||
+        bc.kind === "elastic"
+      ) {
         this.buildSupportGlyphs(bc);
       }
     }
@@ -597,6 +718,25 @@ export class SceneManager {
     return n ? c.multiplyScalar(1 / n) : c;
   }
 
+  /** Area-weighted average outward normal of a triangle selection (null when
+   *  degenerate) — mirrors the engine's `average_normal`. */
+  private selectionNormal(tris: Uint32Array): THREE.Vector3 | null {
+    const p = this.basePositions;
+    if (!p) return null;
+    const acc = new THREE.Vector3();
+    const e1 = new THREE.Vector3();
+    const e2 = new THREE.Vector3();
+    const cr = new THREE.Vector3();
+    for (const t of tris) {
+      const o = 9 * t;
+      e1.set(p[o + 3] - p[o], p[o + 4] - p[o + 1], p[o + 5] - p[o + 2]);
+      e2.set(p[o + 6] - p[o], p[o + 7] - p[o + 1], p[o + 8] - p[o + 2]);
+      cr.crossVectors(e1, e2); // 2 × area × unit normal
+      acc.add(cr);
+    }
+    return acc.lengthSq() > 1e-20 ? acc.normalize() : null;
+  }
+
   /** Recompute the full per-triangle color buffer. */
   private repaint() {
     if (!this.colors || !this.geometry) return;
@@ -643,6 +783,7 @@ export class SceneManager {
   }
 
   private onPointerMove = (ev: PointerEvent) => {
+    if (this.orbiting) return; // camera drag in progress — skip hover/brush
     if (!this.mesh) return;
     this.updateProbe(ev);
     if (this.tool === "select" || this.tool === "place") {
@@ -665,6 +806,10 @@ export class SceneManager {
 
   private onPointerDown = (ev: PointerEvent) => {
     if (ev.button !== 0 || !this.mesh) return;
+    // Arm a pivot orbit on every left-press in a navigable tool. The camera
+    // only moves once the drag passes a threshold, so a plain click still
+    // selects/places without disturbing the view.
+    if (this.controls.enabled) this.beginOrbit(ev);
     if (this.tool === "select") {
       const hit = this.rayTri(ev);
       if (hit && hit.faceIndex != null && this.patchIds) {
@@ -672,7 +817,7 @@ export class SceneManager {
         const tris = this.patchToTris.get(patch);
         if (tris) this.callbacks.onPickPatch?.(new Uint32Array(tris), !ev.shiftKey);
       }
-    } else if (this.tool === "place") {
+    } else if (this.tool === "place" || this.tool === "pickdir") {
       const hit = this.rayTri(ev);
       if (hit && hit.faceIndex != null && this.basePositions) {
         // Outward geometric normal of the clicked triangle (soup winding).
@@ -683,7 +828,8 @@ export class SceneManager {
         const n = e1.cross(e2);
         if (n.lengthSq() > 1e-20) {
           n.normalize();
-          this.callbacks.onPlaceFace?.([n.x, n.y, n.z]);
+          if (this.tool === "place") this.callbacks.onPlaceFace?.([n.x, n.y, n.z]);
+          else this.callbacks.onPickDir?.([n.x, n.y, n.z]);
         }
       }
     } else if (this.tool === "brush") {
@@ -713,6 +859,140 @@ export class SceneManager {
     }
     if (hit.length) this.callbacks.onBrush?.(new Uint32Array(hit), this.brushErase);
   }
+
+  // ---------- navigation (orbit / move / zoom) ----------
+  // Faithful port of the bumpMesh (stlTexturizer) camera routine: left-drag
+  // orbits around the surface point under the cursor with no polar clamping,
+  // the wheel zooms toward the cursor, and right-drag pans in screen space.
+
+  private installNavigation(canvas: HTMLCanvasElement) {
+    // Small red sphere marking the live orbit centre (drawn over the part).
+    const marker = new THREE.Mesh(
+      new THREE.SphereGeometry(1, 16, 10),
+      new THREE.MeshBasicMaterial({ color: 0xff2222, depthTest: false })
+    );
+    marker.renderOrder = 10;
+    marker.visible = false;
+    this.pivotMarker = marker;
+    this.scene.add(marker);
+    // Move + release on document so a drag that leaves the canvas still tracks.
+    document.addEventListener("pointermove", this.onOrbitMove);
+    document.addEventListener("pointerup", this.onOrbitUp);
+    canvas.addEventListener("wheel", this.onWheel, { passive: false });
+  }
+
+  /** Visible meshes the orbit ray can land on (setup STL + every result
+   *  surface), so the pivot follows whatever the user is actually looking at. */
+  private orbitTargets(): THREE.Object3D[] {
+    const list: THREE.Object3D[] = [];
+    const add = (o: THREE.Object3D | null | undefined) => {
+      if (o && (o as THREE.Mesh).isMesh && o.visible) list.push(o);
+    };
+    if (this.mesh?.visible) list.push(this.mesh);
+    if (this.voxelGroup.visible) this.voxelGroup.children.forEach(add);
+    if (this.voxRes?.group.visible) this.voxRes.group.children.forEach(add);
+    add(this.optShapeMesh);
+    for (const m of this.regionMeshes) add(m);
+    return list;
+  }
+
+  /** Nearest surface point under the cursor, or null if the ray misses. */
+  private pickPoint(ev: PointerEvent): THREE.Vector3 | null {
+    const targets = this.orbitTargets();
+    if (!targets.length) return null;
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    this.pointer.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
+    this.pointer.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
+    this.raycaster.setFromCamera(this.pointer, this.camera);
+    const hits = this.raycaster.intersectObjects(targets, false);
+    return hits.length ? hits[0].point.clone() : null;
+  }
+
+  private beginOrbit(ev: PointerEvent) {
+    // Orbit about the surface under the cursor; fall back to the last pivot,
+    // then to the controls target, so a drag off the part still rotates.
+    const pivot = this.pickPoint(ev) ?? this.lastOrbitPivot ?? this.controls.target.clone();
+    this.orbitPivot = pivot.clone();
+    this.lastOrbitPivot = pivot.clone();
+    this.orbitStart = { x: ev.clientX, y: ev.clientY };
+    this.orbitLast = { x: ev.clientX, y: ev.clientY };
+    this.orbiting = false; // promoted once the drag passes the threshold
+  }
+
+  private showPivotMarker() {
+    const m = this.pivotMarker;
+    if (!m || !this.orbitPivot) return;
+    m.position.copy(this.orbitPivot);
+    // ~1.5% of the visible frustum height: same apparent size at any zoom.
+    m.scale.setScalar((this.camera.top / this.camera.zoom) * 0.015);
+    m.visible = true;
+  }
+
+  private onOrbitMove = (ev: PointerEvent) => {
+    if (!this.orbitPivot || !this.orbitLast || !this.controls.enabled) return;
+    if (!this.orbiting) {
+      const moved = Math.hypot(ev.clientX - this.orbitStart!.x, ev.clientY - this.orbitStart!.y);
+      if (moved < 3) return; // tolerate a click without flashing the marker
+      this.orbiting = true;
+      this.showPivotMarker();
+    }
+    const dx = ev.clientX - this.orbitLast.x;
+    const dy = ev.clientY - this.orbitLast.y;
+    this.orbitLast = { x: ev.clientX, y: ev.clientY };
+    if (dx === 0 && dy === 0) return;
+
+    const pivot = this.orbitPivot;
+    const rotSpeed = 0.005;
+    // Pure quaternion rotation: yaw about world Z, pitch about the camera's
+    // right axis. No polar clamp — the camera can swing over the poles.
+    this.camera.updateMatrixWorld();
+    this._oRight.setFromMatrixColumn(this.camera.matrixWorld, 0).normalize(); // camera right
+    this._oq1.setFromAxisAngle(this._oTmp.set(0, 0, 1), -dx * rotSpeed);
+    this._oq2.setFromAxisAngle(this._oRight, -dy * rotSpeed);
+    this._oq1.premultiply(this._oq2);
+
+    // Swing both the camera and the orbit target around the pivot so
+    // OrbitControls (which owns damping + pan) stays consistent.
+    this._oTmp.copy(this.camera.position).sub(pivot).applyQuaternion(this._oq1);
+    this.camera.position.copy(pivot).add(this._oTmp);
+    this._oTmp2.copy(this.controls.target).sub(pivot).applyQuaternion(this._oq1);
+    this.controls.target.copy(pivot).add(this._oTmp2);
+    this.camera.quaternion.premultiply(this._oq1);
+    this.camera.updateMatrixWorld();
+  };
+
+  private onOrbitUp = () => {
+    if (!this.orbitPivot) return;
+    this.orbitPivot = null;
+    this.orbitStart = null;
+    this.orbitLast = null;
+    if (this.orbiting) {
+      this.orbiting = false;
+      // Re-level: hand the up vector back to OrbitControls upright.
+      this.camera.up.set(0, 0, 1);
+      this.camera.lookAt(this.controls.target);
+    }
+    if (this.pivotMarker) this.pivotMarker.visible = false;
+  };
+
+  /** Cursor-centric zoom: keep the world point under the cursor pinned while
+   *  the orthographic frustum scales. */
+  private onWheel = (ev: WheelEvent) => {
+    if (!this.controls.enabled) return;
+    ev.preventDefault();
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    const ndcX = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
+    const ndcY = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
+    this._oTmp.set(ndcX, ndcY, 0).unproject(this.camera);
+    const factor = ev.deltaY > 0 ? 1 / 1.1 : 1.1;
+    this.camera.zoom = Math.max(0.05, Math.min(200, this.camera.zoom * factor));
+    this.camera.updateProjectionMatrix();
+    this._oTmp2.set(ndcX, ndcY, 0).unproject(this.camera);
+    this._oTmp.sub(this._oTmp2);
+    this.camera.position.add(this._oTmp);
+    this.controls.target.add(this._oTmp);
+    this.controls.update();
+  };
 
   // ---------- hover value probe ----------
 
@@ -1461,6 +1741,7 @@ export class SceneManager {
       }
     };
     apply(this.mesh?.material, partPlanes);
+    apply(this.wireframeLines?.material, partPlanes);
     for (const c of this.voxelGroup.children) apply((c as THREE.Mesh).material, voxelPlanes);
     for (const c of this.voxRes?.group.children ?? []) {
       apply((c as THREE.Mesh).material, planes);
@@ -1507,6 +1788,14 @@ export class SceneManager {
     this.mesh.visible = !voxResult;
     this.voxelGroup.visible = this.viewMode === "mesh";
     if (this.voxRes) this.voxRes.group.visible = voxResult;
+    // Wireframe overlay: undeformed model views only (its lines are built from
+    // the rest shape, so it would not track a deformed result).
+    if (this.wireframeLines) {
+      this.wireframeLines.visible =
+        this.wireframeOn &&
+        this.mesh.visible &&
+        (this.viewMode === "setup" || this.viewMode === "mesh");
+    }
     this.regionMeshes.forEach((m, i) => {
       m.visible = infill && this.regionVisible[i] !== false;
     });
@@ -1667,18 +1956,6 @@ export class SceneManager {
     return v === 0 ? "0" : v.toExponential(2);
   }
 
-  private makeExtremeMarker(color: number): THREE.Group {
-    const g = new THREE.Group();
-    const r = 0.011 * this.bboxDiag;
-    const geo = new THREE.SphereGeometry(r, 16, 12);
-    const mat = new THREE.MeshBasicMaterial({ color, depthTest: false });
-    this.extremeDisposables.push(geo, mat);
-    const dot = new THREE.Mesh(geo, mat);
-    dot.renderOrder = 10;
-    g.add(dot);
-    return g;
-  }
-
   /** Small screen-aligned value chip (canvas-rendered text on a light pill),
    *  world-scaled to the part. Disposal goes through markerDisposables. */
   private makeLabelSprite(text: string, color: number): THREE.Sprite {
@@ -1705,64 +1982,63 @@ export class SceneManager {
     return sprite;
   }
 
-  private setMarkerLabel(group: THREE.Group, text: string, color: number) {
-    // children[1] is the label sprite; rebuild it (values change rarely).
-    const old = group.children[1] as THREE.Sprite | undefined;
-    if (old) {
-      group.remove(old);
-      (old.material as THREE.SpriteMaterial).map?.dispose();
-      (old.material as THREE.Material).dispose();
-    }
-    const canvas = document.createElement("canvas");
-    const ctx = canvas.getContext("2d")!;
-    const font = "bold 28px 'B612 Mono', 'Barlow', system-ui, sans-serif";
-    ctx.font = font;
-    const w = Math.ceil(ctx.measureText(text).width) + 18;
-    canvas.width = w;
-    canvas.height = 40;
-    ctx.font = font;
-    ctx.fillStyle = "#fcfcfae8";
-    ctx.fillRect(0, 0, w, 40);
-    ctx.fillStyle = `#${color.toString(16).padStart(6, "0")}`;
-    ctx.textBaseline = "middle";
-    ctx.fillText(text, 9, 21);
-    const tex = new THREE.CanvasTexture(canvas);
-    const mat = new THREE.SpriteMaterial({ map: tex, depthTest: false, transparent: true });
-    const sprite = new THREE.Sprite(mat);
-    const hWorld = 0.045 * this.bboxDiag;
-    sprite.scale.set((hWorld * w) / 40, hWorld, 1);
-    sprite.position.set(0, 0, 0.05 * this.bboxDiag);
-    sprite.renderOrder = 11;
-    group.add(sprite);
-  }
-
-  /** Place (or hide) the min/max markers at the DISPLAYED vertex positions. */
+  /** Refresh the min/max marks: store the DISPLAYED extreme world positions
+   *  (projected to the screen each frame in `tick`) and update their value
+   *  chips. Visibility/placement of the DOM overlays happens in
+   *  `projectExtremes`. */
   private updateExtremeMarkers(positionsOnly = false) {
     const vox = this.voxResultActive();
     const geom = vox ? this.voxRes!.geo : this.geometry;
     const disp = vox ? this.voxRes!.disp : this.displacements;
-    const show =
+    this.extremeVisible =
       this.extremesOn &&
       this.viewMode === "deformed" &&
       !!this.extremeData &&
       !!geom &&
       !!disp;
-    if (!this.markerMin) {
-      this.markerMin = this.makeExtremeMarker(0x60a5fa);
-      this.markerMax = this.makeExtremeMarker(0xff5252);
-      this.scene.add(this.markerMin, this.markerMax!);
+    const els = this.extremeEls;
+    if (!this.extremeVisible || !this.extremeData || !els) {
+      this.projectExtremes(); // hide the overlays
+      return;
     }
-    this.markerMin.visible = show;
-    this.markerMax!.visible = show;
-    if (!show || !this.extremeData) return;
     const pos = (geom!.getAttribute("position") as THREE.BufferAttribute).array as Float32Array;
     const d = this.extremeData;
-    this.markerMin.position.set(pos[3 * d.minIdx], pos[3 * d.minIdx + 1], pos[3 * d.minIdx + 2]);
-    this.markerMax!.position.set(pos[3 * d.maxIdx], pos[3 * d.maxIdx + 1], pos[3 * d.maxIdx + 2]);
+    this.extremeWorld.min.set(pos[3 * d.minIdx], pos[3 * d.minIdx + 1], pos[3 * d.minIdx + 2]);
+    this.extremeWorld.max.set(pos[3 * d.maxIdx], pos[3 * d.maxIdx + 1], pos[3 * d.maxIdx + 2]);
     if (!positionsOnly) {
-      this.setMarkerLabel(this.markerMin, `min ${this.fmtExtreme(d.minVal)}`, 0x1d5fc4);
-      this.setMarkerLabel(this.markerMax!, `max ${this.fmtExtreme(d.maxVal)}`, 0xc2330e);
+      els.minChip.textContent = `min ${this.fmtExtreme(d.minVal)}`;
+      els.maxChip.textContent = `max ${this.fmtExtreme(d.maxVal)}`;
     }
+  }
+
+  /** Project the stored extreme positions to screen pixels and place the DOM
+   *  marks. Called every frame from `tick` (the camera may have moved). */
+  private projectExtremes() {
+    const els = this.extremeEls;
+    if (!els) return;
+    if (!this.extremeVisible) {
+      for (const el of [els.minDot, els.minChip, els.maxDot, els.maxChip]) {
+        el.style.display = "none";
+      }
+      return;
+    }
+    this.placeExtreme(els.minDot, els.minChip, this.extremeWorld.min);
+    this.placeExtreme(els.maxDot, els.maxChip, this.extremeWorld.max);
+  }
+
+  private placeExtreme(dot: HTMLDivElement, chip: HTMLDivElement, world: THREE.Vector3) {
+    const v = this.extremeScratch.copy(world).project(this.camera);
+    if (v.z < -1 || v.z > 1) {
+      dot.style.display = chip.style.display = "none"; // behind the camera
+      return;
+    }
+    const x = (v.x * 0.5 + 0.5) * this.viewW;
+    const y = (-v.y * 0.5 + 0.5) * this.viewH;
+    dot.style.display = chip.style.display = "block";
+    dot.style.left = `${x}px`;
+    dot.style.top = `${y}px`;
+    chip.style.left = `${x + 9}px`;
+    chip.style.top = `${y + 9}px`;
   }
 
   private applyPositions(rbmOffset?: number, deformFactor = 1) {
@@ -1847,6 +2123,8 @@ export class SceneManager {
     r.render(this.gizmoScene, this.gizmoCam);
     r.setScissorTest(false);
     r.setViewport(0, 0, this.viewW, this.viewH);
+    // Reproject the min/max marks now the camera matrices are settled.
+    this.projectExtremes();
   }
 }
 

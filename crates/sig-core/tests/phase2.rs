@@ -216,6 +216,50 @@ fn frictionless_springs_reproduce_roller_patch_test() {
 }
 
 #[test]
+fn displacement_axis_locks_reproduce_roller_patch_test() {
+    // Three displacement supports, each pinning ONLY the axis normal to its
+    // face, must reproduce the same uniaxial response as three frictionless
+    // rollers (statically determinate, axis-aligned) — and fully constrain.
+    let bar = primitives::boxx([0.0; 3], [4.0, 2.0, 2.0]);
+    let grid0 = VoxelGrid::voxelize(&bar, 1.0);
+    let settings = SolveSettings { e0: 1000.0, nu: 0.3, tol: 1e-9, ..Default::default() };
+    let (grid, levels) = pad_for_levels(&grid0, 1);
+
+    let bcs = vec![
+        BcSpec { kind: BcKind::Displacement([true, false, false]), tris: face_tris(0) }, // lock X on x=0
+        BcSpec { kind: BcKind::Displacement([false, true, false]), tris: face_tris(2) }, // lock Y on y=0
+        BcSpec { kind: BcKind::Displacement([false, false, true]), tris: face_tris(4) }, // lock Z on z=0
+        BcSpec { kind: BcKind::Force([40.0, 0.0, 0.0]), tris: face_tris(1) }, // sigma=10 MPa * 4 mm^2
+    ];
+    let asm = assemble(&bar, &grid, &bcs, None, &settings).unwrap();
+    let report = check_problem(&grid, &asm);
+    assert!(report.ok, "three axis locks should fully constrain: {report:?}");
+
+    let sol = solve_nodes(&grid, levels, &asm.problem, &settings).expect("solve");
+    let tip = sol.mean_displacement(&BoxRegion::new([3.9, -1.0, -1.0], [4.1, 3.0, 3.0])).unwrap();
+    let exact = 10.0 * 4.0 / 1000.0; // sigma L / E
+    let err = (tip[0] - exact).abs() / exact;
+    assert!(
+        err < 0.03,
+        "displacement patch test: ux {} vs exact {exact} ({:.2}% off)",
+        tip[0],
+        err * 100.0
+    );
+
+    // A lone single-axis lock must NOT fully constrain (Y/Z still free) —
+    // guards against the axis selection silently pinning everything.
+    let under = vec![
+        BcSpec { kind: BcKind::Displacement([true, false, false]), tris: face_tris(0) },
+        BcSpec { kind: BcKind::Force([40.0, 0.0, 0.0]), tris: face_tris(1) },
+    ];
+    let asm2 = assemble(&bar, &grid, &under, None, &settings).unwrap();
+    assert!(
+        !check_problem(&grid, &asm2).ok,
+        "a single X-lock leaves Y/Z rigid-body freedom — must be flagged"
+    );
+}
+
+#[test]
 fn gravity_self_weight_cantilever() {
     let beam = primitives::boxx([0.0; 3], [40.0, 6.0, 6.0]);
     let grid0 = VoxelGrid::voxelize(&beam, 1.0);

@@ -109,6 +109,7 @@ export function NerdLog() {
   const lines = useStore((s) => s.logLines);
   const optSeries = useStore((s) => s.optSeries);
   const solveResiduals = useStore((s) => s.solveResiduals);
+  const solveTol = useStore((s) => s.solveTol);
   const setLogOpen = useStore((s) => s.setLogOpen);
   const clearLog = useStore((s) => s.clearLog);
   const disclaimerSkipped = useStore((s) => s.disclaimerSkipped);
@@ -161,8 +162,9 @@ export function NerdLog() {
           yFmt={(v) => v.toFixed(0)}
         />
         <MiniChart
-          title="MGCG residual — last solve"
+          title="MGCG residual"
           logY
+          threshold={solveTol || undefined}
           series={[{ ys: solveResiduals, color: "#e06a13" }]}
           yFmt={(v) => v.toExponential(0)}
         />

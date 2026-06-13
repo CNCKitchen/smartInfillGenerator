@@ -19,7 +19,12 @@ const STEPS: { n: number; label: string; title: string }[] = [
 export function StepRail() {
   const s = useStore();
   const hasSupport = s.bcs.some(
-    (b) => (b.kind === "fixed" || b.kind === "elastic" || b.kind === "frictionless") && b.tris.length > 0
+    (b) =>
+      (b.kind === "fixed" ||
+        b.kind === "elastic" ||
+        b.kind === "frictionless" ||
+        b.kind === "displacement") &&
+      b.tris.length > 0
   );
   const hasLoad = s.bcs.some(
     (b) => (b.kind === "force" || b.kind === "pressure") && b.tris.length > 0
