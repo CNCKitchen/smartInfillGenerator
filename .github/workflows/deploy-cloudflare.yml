@@ -61,5 +61,9 @@ jobs:
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # wrangler-action defaults to wrangler 3.90.0, which can't deploy an
+          # assets-only Worker (no `main`) -> "Missing entry-point". Pin v4,
+          # which supports `assets` without an entry script.
+          wranglerVersion: "4.100.0"
           # wrangler.jsonc lives at the repo root and points `assets` at web/dist;
           # the default command is `deploy`.
