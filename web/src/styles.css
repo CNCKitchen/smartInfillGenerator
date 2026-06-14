@@ -630,6 +630,18 @@ input[type="number"] {
   color: var(--dim);
 }
 
+/* X/Y/Z triples: let the three fields divide the row evenly instead of
+   overflowing their fixed 68px width and crowding into each other. */
+.bcparams.triple label {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.bcparams.triple label input[type="number"] {
+  width: 100%;
+  min-width: 0;
+}
+
 /* check/solve status box */
 
 .status {

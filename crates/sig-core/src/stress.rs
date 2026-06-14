@@ -101,6 +101,29 @@ pub fn recover_nodal(grid: &VoxelGrid, cell_values: &[f32]) -> Vec<f32> {
     sum
 }
 
+/// Occupancy-decoupled (material) modulus/strength factor per cell.
+///
+/// The solve scales each cell's stiffness by `eps = occupancy × material
+/// density`, where `grid.scale` is the finite-cell geometric occupancy (for a
+/// plain solid solve `eps == grid.scale`). That occupancy scaling is correct
+/// for stiffness and mass, but a cut boundary cell is *fully dense material
+/// partially covering its cube* — scaling its stress by the occupancy
+/// under-reads the true material stress and paints the staircase stripes seen
+/// on curved skins. This returns `eps / occupancy` (clamped to 1): the material
+/// density factor alone (1 for solid/skin, rel(ρ) for graded infill), so a
+/// stress evaluated with it is the TRUE material / homogenized macro stress
+/// with the meshing artifact removed. Void cells (occupancy 0) stay 0.
+///
+/// Feed this to `cell_field` in place of `eps`. Using the SAME factor for the
+/// SF allowable leaves the safety factor unchanged (the factor cancels in
+/// allowable / stress).
+pub fn material_factor(grid: &VoxelGrid, eps: &[f32]) -> Vec<f32> {
+    eps.iter()
+        .zip(&grid.scale)
+        .map(|(&e, &occ)| if occ > 0.0 { (e / occ).min(1.0) } else { 0.0 })
+        .collect()
+}
+
 /// Selected scalar per cell (cell-center evaluation); 0.0 for void cells.
 /// `u` is the padded nodal displacement field (3 per node), `eps` the
 /// per-cell stiffness factors actually used in the solve.
@@ -198,4 +221,49 @@ pub fn cell_field(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A cut boundary cell is fully dense material partially filling its cube,
+    /// so under a uniform strain field its TRUE stress must equal a full cell's.
+    /// `material_factor` delivers that; raw `eps` under-reads it by the
+    /// occupancy — the curved-skin "stripe" bug, distilled to two cells
+    /// (quarter-cylinder in tension).
+    #[test]
+    fn material_factor_removes_occupancy_stripe() {
+        // 2×1×1 grid: cell 0 fully solid, cell 1 a 40%-occupancy cut cell.
+        let h = 2.0;
+        let mut grid = VoxelGrid::solid_box(2, 1, 1, h);
+        grid.scale[1] = 0.4;
+        let eps = grid.scale.clone(); // plain solid solve: eps == occupancy
+
+        // Linear field u_x = a·X (u_y = u_z = 0) ⇒ uniform ε_xx = a in BOTH
+        // cells, independent of occupancy.
+        let a = 0.01f32;
+        let (mx, my, mz) = (3usize, 2, 2);
+        let mut u = vec![0f32; 3 * mx * my * mz];
+        for nz in 0..mz {
+            for ny in 0..my {
+                for nx in 0..mx {
+                    let n = (nz * my + ny) * mx + nx;
+                    u[3 * n] = a * (nx as f32 * h as f32);
+                }
+            }
+        }
+
+        let (e0, nu) = (1000.0, 0.0);
+        let raw = cell_field(&grid, &u, e0, nu, &eps, FieldKind::Sxx);
+        let mat = cell_field(&grid, &u, e0, nu, &material_factor(&grid, &eps), FieldKind::Sxx);
+
+        // Raw: the cut cell under-reads by its occupancy (10 vs 4 MPa) — stripe.
+        assert!((raw[0] - 10.0).abs() < 1e-3, "raw full cell {}", raw[0]);
+        assert!((raw[1] - 4.0).abs() < 1e-3, "raw cut cell {}", raw[1]);
+        // Decoupled: both cells report the true material stress, uniform.
+        assert!((mat[0] - 10.0).abs() < 1e-3, "mat full cell {}", mat[0]);
+        assert!((mat[1] - 10.0).abs() < 1e-3, "mat cut cell {}", mat[1]);
+        assert!((mat[0] - mat[1]).abs() < 1e-4, "decoupled stress must be uniform");
+    }
 }

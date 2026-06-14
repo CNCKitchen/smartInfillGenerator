@@ -168,6 +168,14 @@ export class EngineClient {
     return this.call({ op: "setSmoothStress", on });
   }
 
+  /** Material (occupancy-decoupled) stress display: report the TRUE material
+   *  stress at finite-cell cut cells instead of the occupancy-scaled value —
+   *  removes the curved-skin staircase stripes. Pure post-processing; the
+   *  solution and the safety factor are untouched. */
+  setMaterialStress(on: boolean): Promise<void> {
+    return this.call({ op: "setMaterialStress", on });
+  }
+
   setBcs(bcs: Bc[]): Promise<void> {
     // Copy tri arrays: the originals stay with the UI.
     const payload = bcs.map((bc) => ({

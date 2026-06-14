@@ -71,6 +71,13 @@ export function ViewportChips() {
             }
           >
             <option value="u">Displacement |u|</option>
+            <optgroup label="Displacement (mm)">
+              {RESULT_FIELDS.filter((f) => ["ux", "uy", "uz"].includes(f.value)).map((f) => (
+                <option key={f.value} value={f.value}>
+                  {f.label}
+                </option>
+              ))}
+            </optgroup>
             <optgroup label="Safety factor">
               <option value="sf">Safety factor — worst case</option>
               <option value="sfm">Safety factor — material σₜ/σᵥᴹ</option>

@@ -18,7 +18,7 @@ use sig_core::simp::{evaluate_cached, optimize_cached as simp_optimize, Optimize
 use sig_core::solve::{
     active_nodes, pad_for_levels, solve_nodes_cached, SolveSettings, Solution, SolverCache,
 };
-use sig_core::stress::{cell_field, recover_nodal, FieldKind};
+use sig_core::stress::{cell_field, material_factor, recover_nodal, FieldKind};
 use sig_core::threemf::{export_orca_3mf, export_stl_zip, import_3mf, weld};
 use sig_core::voxel::VoxelGrid;
 use wasm_bindgen::prelude::*;
@@ -371,6 +371,14 @@ pub struct Model {
     /// each cell's center value flat. Removes the staircase checkerboard.
     /// Display-side only — the solution is untouched.
     smooth_stress: bool,
+    /// Material (occupancy-decoupled) stress display. The reported stress and
+    /// the SF allowable are evaluated with the cell's MATERIAL density factor
+    /// (`eps ÷ occupancy`) instead of the occupancy-scaled `eps`. A finite-cell
+    /// cut cell is fully dense material partially covering its cube; scaling its
+    /// stress by the geometric occupancy under-reads the true stress and paints
+    /// the staircase stripes seen on curved skins. Display-side only; the safety
+    /// factor is unchanged (the same factor cancels in allowable / stress).
+    material_stress: bool,
     grid: Option<(VoxelGrid, usize)>, // padded grid + level count
     /// Reused solver hierarchy + warm start across solves (self-validating:
     /// falls back to a cold rebuild when grid/material/BCs/topology change).
@@ -450,6 +458,7 @@ impl Model {
             snap_wall: 0.0,
             composite_skin: false,
             smooth_stress: false,
+            material_stress: true,
             grid: None,
             solver_cache: None,
             solution: None,
@@ -610,6 +619,13 @@ impl Model {
     /// recomputed on the next fetch.
     pub fn set_smooth_stress(&mut self, on: bool) {
         self.smooth_stress = on;
+    }
+
+    /// Material (occupancy-decoupled) stress display on/off (see the
+    /// `material_stress` field). Pure post-processing: the solution stays valid,
+    /// fields are recomputed on the next fetch; the safety factor is unaffected.
+    pub fn set_material_stress(&mut self, on: bool) {
+        self.material_stress = on;
     }
 
     pub fn clear_bcs(&mut self) {
@@ -1415,6 +1431,20 @@ impl Model {
                 &scale_eps
             }
         };
+        // Modulus / strength factor per cell. With `material_stress` on we strip
+        // the geometric occupancy out of eps (material_factor → eps ÷ occupancy),
+        // so a finite-cell cut cell reports its TRUE material stress instead of
+        // E0·occ·ε — killing the curved-skin staircase stripes. Off = legacy
+        // (eps exactly as the solve used it). The SAME factor feeds the SF
+        // allowable below, so the safety factor cancels and is identical either
+        // way — this toggle only ever moves the displayed stress magnitude.
+        let occ_free;
+        let factor: &[f32] = if self.material_stress {
+            occ_free = material_factor(grid, eps);
+            &occ_free
+        } else {
+            eps
+        };
         // Safety factors: allowable = strength × the SAME relative factor as
         // the stiffness (Gibson–Ashby, first order; the skin carries full
         // strength). "sfm" checks the material against σ_vM; "sfz" checks
@@ -1423,10 +1453,10 @@ impl Model {
         // both. All capped at 99.
         let sf_material = || -> Vec<f32> {
             let mut c = cell_field(
-                grid, &sol.u, self.settings.e0, self.settings.nu, eps, FieldKind::VonMises,
+                grid, &sol.u, self.settings.e0, self.settings.nu, factor, FieldKind::VonMises,
             );
             for (i, v) in c.iter_mut().enumerate() {
-                let allow = self.strength as f32 * eps[i];
+                let allow = self.strength as f32 * factor[i];
                 *v = (allow / v.max(1e-9)).min(99.0);
             }
             c
@@ -1434,9 +1464,9 @@ impl Model {
         let sf_layer = || -> Result<Vec<f32>, JsValue> {
             let szz = FieldKind::parse("szz").ok_or_else(|| err("szz field missing"))?;
             let mut c =
-                cell_field(grid, &sol.u, self.settings.e0, self.settings.nu, eps, szz);
+                cell_field(grid, &sol.u, self.settings.e0, self.settings.nu, factor, szz);
             for (i, v) in c.iter_mut().enumerate() {
-                let allow = self.strength_z as f32 * eps[i];
+                let allow = self.strength_z as f32 * factor[i];
                 *v = if *v <= 1e-9 { 99.0 } else { (allow / *v).min(99.0) };
             }
             Ok(c)
@@ -1454,7 +1484,7 @@ impl Model {
             }
             _ => {
                 let k = FieldKind::parse(kind).ok_or_else(|| err("unknown result field"))?;
-                cell_field(grid, &sol.u, self.settings.e0, self.settings.nu, eps, k)
+                cell_field(grid, &sol.u, self.settings.e0, self.settings.nu, factor, k)
             }
         })
     }

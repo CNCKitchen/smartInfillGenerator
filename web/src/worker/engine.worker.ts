@@ -95,6 +95,7 @@ type Req =
   | { id: number; op: "setSnapWall"; wall: number }
   | { id: number; op: "setCompositeSkin"; on: boolean }
   | { id: number; op: "setSmoothStress"; on: boolean }
+  | { id: number; op: "setMaterialStress"; on: boolean }
   | { id: number; op: "setCancelBuffer"; buf: SharedArrayBuffer }
   | { id: number; op: "setProgressBuffer"; buf: SharedArrayBuffer }
   | {
@@ -203,6 +204,9 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
         break;
       case "setSmoothStress":
         requireModel().set_smooth_stress(msg.on);
+        break;
+      case "setMaterialStress":
+        requireModel().set_material_stress(msg.on);
         break;
       case "setCancelBuffer":
         cancelArr = new Int32Array(msg.buf);

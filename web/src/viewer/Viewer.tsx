@@ -60,6 +60,10 @@ export function Viewer() {
       onAutoScale: (autoScale) => {
         useStore.setState({ autoScale });
       },
+      onResultRange: (min, max) => {
+        // Signed displacement component range → the legend's auto bounds.
+        useStore.setState({ fieldRange: { min, max } });
+      },
       onSectionMoved: (normal, constant) => {
         useStore.getState().onSectionPlaneMoved(normal, constant);
       },
@@ -84,6 +88,7 @@ export function Viewer() {
     sceneEvents.onOptShape = (p, i, d) => scene.setOptShape(p, i, d);
     sceneEvents.onRegionVisibility = (vis) => scene.setRegionVisibility(vis);
     sceneEvents.onScalarField = (v, flip) => scene.setScalarField(v, flip ?? false);
+    sceneEvents.onDispComponent = (comp) => scene.setDispComponent(comp);
     sceneEvents.onVoxelResult = (p, d, e, ed) => scene.setVoxelResult(p, d, e, ed);
     sceneEvents.onResultSurface = (s) => scene.setResultSurface(s);
     sceneEvents.onLegendRange = (min, max) => scene.setLegendRange(min, max);
@@ -120,7 +125,9 @@ export function Viewer() {
     if (!scene) return;
     let fmt: ((v: number) => string) | null = null;
     if (viewMode === "deformed") {
-      if (resultField === "u") {
+      const isDisp =
+        resultField === "u" || resultField === "ux" || resultField === "uy" || resultField === "uz";
+      if (isDisp) {
         fmt = (v) => fmtDisp(v);
       } else if (resultField.startsWith("sf")) {
         fmt = (v) => `${v.toFixed(2)}×`;
@@ -188,7 +195,10 @@ const RAMP_GRADIENT =
   "linear-gradient(to top, #264de6 0%, #26e4e6 33%, #f0e61c 66%, #f21519 100%)";
 
 function fmtDisp(mm: number): string {
-  if (mm >= 0.01) return `${mm.toFixed(2)} mm`;
+  // Sign-aware: displacement components can be negative; pick mm vs µm by
+  // magnitude so −0.34 mm never renders as "−340 µm".
+  const a = Math.abs(mm);
+  if (a >= 0.01) return `${mm.toFixed(2)} mm`;
   return `${(mm * 1000).toFixed(1)} µm`;
 }
 
@@ -267,24 +277,34 @@ function Legend() {
   const setLegendRange = useStore((s) => s.setLegendRange);
   const smoothStress = useStore((s) => s.smoothStress);
   const setSmoothStress = useStore((s) => s.setSmoothStress);
+  const materialStress = useStore((s) => s.materialStress);
+  const setMaterialStress = useStore((s) => s.setMaterialStress);
 
   if (viewMode === "deformed" && stats) {
     const total = autoScale * deformScale;
     const totalLabel = total >= 9.5 ? `×${Math.round(total)}` : `×${total.toFixed(1)}`;
     const def = RESULT_FIELDS.find((f) => f.value === resultField);
-    const isField = resultField !== "u" && !!def && !!fieldRange;
-    const unit = isField ? def!.unit : "mm";
-    const autoMin = isField ? fieldRange!.min : 0;
-    const autoMax = isField ? fieldRange!.max : stats.maxDisplacement;
+    const isDispComp = resultField === "ux" || resultField === "uy" || resultField === "uz";
+    // Engine-fetched stress/strain/safety field (NOT a displacement quantity).
+    const isField = resultField !== "u" && !isDispComp && !!def && !!fieldRange;
+    const isSf = resultField.startsWith("sf");
+    const unit = isField ? def!.unit : "mm"; // displacement (|u| or component) is mm
+    // A signed component takes its bounds from the reported field range; |u|
+    // anchors at 0 and uses the solve's max-displacement stat.
+    const autoMin = isField ? fieldRange!.min : isDispComp ? fieldRange?.min ?? 0 : 0;
+    const autoMax = isField
+      ? fieldRange!.max
+      : isDispComp
+        ? fieldRange?.max ?? stats.maxDisplacement
+        : stats.maxDisplacement;
     const effMin = legendMin ?? autoMin;
     const effMax = legendMax ?? autoMax;
     const overridden = legendMin !== null || legendMax !== null;
-    const isSf = resultField.startsWith("sf");
     const fmt = (v: number) => (isSf ? v.toFixed(2) : isField ? fmtField(v, unit) : fmtDisp(v));
     const hint = unit === "MPa" ? "MPa" : unit === "mm" ? "mm" : isSf ? "factor" : "strain";
     return (
       <div className="legend">
-        <div className="legendtitle">{isField ? def!.label : "Displacement |u|"}</div>
+        <div className="legendtitle">{isField || isDispComp ? def!.label : "Displacement |u|"}</div>
         <div className="legendbody">
           <div className="legendbar" style={{ background: isSf ? JET_GRADIENT_FLIP : JET_GRADIENT }} />
           <div className="legendlabels">
@@ -326,6 +346,19 @@ function Legend() {
             <span>smoothed (nodal average)</span>
           </label>
         )}
+        {isField && (
+          <label
+            className="legendcheck"
+            title="Report the true material stress at boundary (cut) cells instead of the occupancy-scaled value — removes the staircase stripes on curved skins. Safety factor unchanged."
+          >
+            <input
+              type="checkbox"
+              checked={materialStress}
+              onChange={(e) => setMaterialStress(e.target.checked)}
+            />
+            <span>material stress (decouple occupancy)</span>
+          </label>
+        )}
         {isSf && (
           <div className="legendnote">allowable scales with E(ρ) — red marks the critical low</div>
         )}
@@ -335,6 +368,9 @@ function Legend() {
               ? "nodal-averaged, evaluated on the surface"
               : "cell-center values — voxel-edge peaks are approximate"}
           </div>
+        )}
+        {isDispComp && (
+          <div className="legendnote">signed component — red = +, blue = −</div>
         )}
         <div className="legendnote">
           exaggerated{" "}

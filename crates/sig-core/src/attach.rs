@@ -8,7 +8,6 @@
 use crate::bvh::WindingBvh;
 use crate::check::{islands, rbm_check, ConstraintDir, RbmMode};
 use crate::mesh::TriMesh;
-use crate::segment::average_normal;
 use crate::solve::{boundary_nodes, NodeProblem, SolveSettings};
 use crate::voxel::VoxelGrid;
 
@@ -147,11 +146,27 @@ pub fn assemble(
                 }
             }
             BcKind::Frictionless => {
-                let normal = average_normal(mesh, &sel);
+                // Block motion along the LOCAL surface normal at each node.
+                // A single averaged normal over the whole selection is wrong
+                // when one frictionless support spans faces with different
+                // orientations (e.g. three sides of a cube): every node would
+                // be sprung along the same averaged direction (1,1,1)/√3,
+                // leaving the body free to slide and rotate in the plane
+                // perpendicular to it — a spurious rigid-body mode the user
+                // sees as drift. Use the nearest selected triangle's normal per
+                // node, so each node is constrained along the face it sits on.
+                // On a single flat face this equals the old average; on a
+                // curved selection it tracks the true local normal.
                 let k = SPRING_FACTOR * settings.e0 * h;
                 for &n in &nodes {
+                    let p = node_pos(n);
+                    let ti = sub_bvh.closest_triangle(p).0 as usize;
+                    let normal = unit_normal(&sub_mesh.tris[ti]);
+                    if normal == [0.0; 3] {
+                        continue; // degenerate triangle — no usable normal
+                    }
                     problem.springs.push((n, normal, k));
-                    constraints.push(ConstraintDir { pos: node_pos(n), dir: normal });
+                    constraints.push(ConstraintDir { pos: p, dir: normal });
                 }
             }
             BcKind::Displacement(axes) => {
@@ -341,6 +356,17 @@ fn sample_selection<F: FnMut(usize, u32, f64)>(
                 f(slot, ti, sa / nodes.len() as f64);
             }
         }
+    }
+}
+
+/// Unit outward normal of a triangle; zero vector when degenerate.
+fn unit_normal(t: &[f32; 9]) -> [f64; 3] {
+    let av = crate::mesh::triangle_area_vector(t);
+    let len = ((av[0] as f64).powi(2) + (av[1] as f64).powi(2) + (av[2] as f64).powi(2)).sqrt();
+    if len > 0.0 {
+        [av[0] as f64 / len, av[1] as f64 / len, av[2] as f64 / len]
+    } else {
+        [0.0; 3]
     }
 }
 

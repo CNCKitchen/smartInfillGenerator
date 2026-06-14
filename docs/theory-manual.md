@@ -631,10 +631,32 @@ but are **not present today** — do not assume them.
 
 Strains are evaluated at **cell centers**, the superconvergent point of the
 trilinear hex, where `dN_l/dx_i = s_li/(4h)` (`crates/sig-core/src/stress.rs`).
-Stresses use the isotropic law (§4.1) with the **cell's effective modulus**
-`E = E₀·eps` — so for a binned-infill cell the reported stress is the
-**homogenized (macro) stress** of the graded cell, and for a solid cell it is the
-solid-material stress.
+Strain is pure kinematics — it carries no `eps` factor and is therefore correct
+even on partially-filled boundary cells. Stresses use the isotropic law (§4.1)
+with a per-cell **effective modulus**.
+
+The solve's stiffness factor `eps` factors as `eps = occupancy × material
+density`, where `occupancy` is the finite-cell cut fraction (`grid.scale`, §4.5;
+`= 1` for interior cells) and the density factor is the Gibson–Ashby `rel(ρ)`
+(`= 1` for solid/skin). Two recovery modes follow:
+
+- **Material stress (default, occupancy-decoupled).** Stress uses
+  `E = E₀ · (eps ÷ occupancy)`, i.e. the material density factor alone. A cut
+  boundary cell is *fully dense material partially covering its cube*, so this
+  reports the **true material stress** there — for a solid part that is `E₀·ε`
+  everywhere, including the skin. This removes the staircase **stress stripes**
+  that otherwise appear wherever the visible surface is all cut cells (e.g. a
+  curved skin: every column has a different occupancy, so an occupancy-scaled
+  stress paints a different band per column even under a uniform strain).
+- **Legacy (occupancy-scaled).** Stress uses `E = E₀·eps`, i.e. the exact
+  modulus the solve used. Boundary cells then under-read by their occupancy.
+
+`material_factor` (`crates/sig-core/src/stress.rs`) builds the decoupled factor;
+the toggle is display-side only (`set_material_stress`). The **safety factor is
+identical in both modes** — the allowable scales by the *same* factor as the
+stress, so it cancels (§4.7). For a binned-infill cell either mode reports the
+**homogenized (macro) stress** of the graded cell, differing only by the cut-cell
+occupancy at the part boundary. Regression: `material_factor_removes_occupancy_stripe`.
 
 ### 11.2 Available fields
 
@@ -700,7 +722,10 @@ number.
   occupancy and nodal recovery temper but do not remove this. **Surface stress
   is the least trustworthy output**, especially with composite skin (it smears
   over the cell). **Deflection and global stiffness are the trustworthy
-  outputs.**
+  outputs.** Material-stress recovery (§11.1) removes the *occupancy-scaling*
+  stripe artifact, but the residual staircase strain error at the boundary
+  remains — and decoupling occupancy amplifies any such boundary noise by up to
+  `1 ÷ BOUNDARY_FLOOR` on the smallest cut cells, so pair it with smoothing.
 - **Shear locking** of the first-order hex ⇒ use ≥ 4–6 cells across bending
   members; heed the < 3-cell feature warning.
 - **Stress singularities** at re-entrant corners and point loads/supports do not

@@ -202,6 +202,11 @@ interface AppState {
   /** Smoothed stress display: fields nodal-averaged and evaluated on the
    *  true surface instead of flat per-cell (post-processing only). */
   smoothStress: boolean;
+  /** Material (occupancy-decoupled) stress display: report the true material
+   *  stress at finite-cell cut cells (eps ÷ occupancy) instead of the
+   *  occupancy-scaled value — removes the curved-skin staircase stripes.
+   *  Display-side only; the safety factor is unchanged. */
+  materialStress: boolean;
   // optimization inputs
   budget: number; // infill budget: target mean interior density in %
   smoothIters: number; // Taubin passes on modifier regions
@@ -356,6 +361,7 @@ interface AppState {
   setAnalyzeMode(m: "printed" | "solid"): void;
   setMeshDensity(on: boolean): void;
   setSmoothStress(on: boolean): void;
+  setMaterialStress(on: boolean): void;
   /** Scene → store: the section plane moved (three.js plane convention). */
   onSectionPlaneMoved(normal: [number, number, number], constant: number): void;
   setSmoothIters(v: number): void;
@@ -475,9 +481,15 @@ async function loadVoxelResult() {
  *  ("u" = displacement coloring straight from the displacement arrays). */
 async function pushScalarField(set: SetState, get: () => AppState) {
   const kind = get().resultField;
-  if (kind === "u") {
-    set({ fieldRange: null });
+  // Displacement fields are colored client-side from the displacement buffer:
+  // |u| magnitude (-1) or a signed X/Y/Z component (0/1/2). No engine fetch.
+  const dispComp = kind === "u" ? -1 : kind === "ux" ? 0 : kind === "uy" ? 1 : kind === "uz" ? 2 : null;
+  if (dispComp !== null) {
     sceneEvents.onScalarField?.(null);
+    // |u| uses the solve's max-displacement stat for the legend; a signed
+    // component's range comes back from the scene via onResultRange → fieldRange.
+    if (dispComp < 0) set({ fieldRange: null });
+    sceneEvents.onDispComponent?.(dispComp);
     return;
   }
   const vox = get().resultSurface === "voxel";
@@ -683,6 +695,9 @@ export interface SceneEvents {
   /** Stress/strain scalars for the deformed view (null = |u| colors).
    *  flip inverts the colormap (safety factor: red = critical LOW). */
   onScalarField?: (values: Float32Array | null, flip?: boolean) => void;
+  /** Color the deformed view by a displacement quantity: -1 = |u| magnitude,
+   *  0/1/2 = signed X/Y/Z component (computed from the displacement buffer). */
+  onDispComponent?: (comp: number) => void;
   /** Voxel-hull result geometry: hull soup + exact nodal displacements,
    *  cell-edge segments + their displacements (nulls clear it). */
   onVoxelResult?: (
@@ -886,6 +901,7 @@ export const useStore = create<AppState>((set, get) => ({
   printedStats: null,
   meshDensity: false,
   smoothStress: true,
+  materialStress: true,
   smoothIters: 15,
   nBins: 3,
   minMemberMm: null, // auto = 2× line width
@@ -952,6 +968,7 @@ export const useStore = create<AppState>((set, get) => ({
       );
       await engine.setCompositeSkin(get().compositeSkin);
       await engine.setSmoothStress(get().smoothStress);
+      await engine.setMaterialStress(get().materialStress);
       set({
         fileName: name,
         model,
@@ -1473,6 +1490,23 @@ export const useStore = create<AppState>((set, get) => ({
       await engine.setSmoothStress(on);
       // Pure post-processing: the solution stays valid — just re-fetch the
       // active field and the dock's min-SF under the new sampling.
+      fieldCache.clear();
+      voxFieldCache.clear();
+      if (get().hasResult) {
+        await pushScalarField(set, get);
+        await refreshMinSf(set, get);
+      }
+    })();
+  },
+
+  setMaterialStress(on) {
+    set({ materialStress: on });
+    if (!get().model) return;
+    void (async () => {
+      await engine.setMaterialStress(on);
+      // Pure post-processing: re-fetch the active field under the new modulus.
+      // (SF is unaffected — the same factor cancels — but refresh it anyway so
+      // the dock stays consistent if the user toggles mid-session.)
       fieldCache.clear();
       voxFieldCache.clear();
       if (get().hasResult) {
@@ -2077,5 +2111,8 @@ export const useStore = create<AppState>((set, get) => ({
 
   clearError() {
     set({ error: null, notice: null });
+    // The under-constrained toast drives the rigid-body-motion animation;
+    // dismissing the toast must stop the looping drift, not leave it running.
+    sceneEvents.onAnimateMode?.(null);
   },
 }));

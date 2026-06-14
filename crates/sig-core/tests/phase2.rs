@@ -216,6 +216,30 @@ fn frictionless_springs_reproduce_roller_patch_test() {
 }
 
 #[test]
+fn single_frictionless_bc_spanning_three_faces_constrains() {
+    // One frictionless support whose selection wraps the three orthogonal faces
+    // x=0, y=0, z=0 must fully constrain the body: each node is sprung along the
+    // local face normal it sits on (x, y, or z), killing all 6 rigid-body modes
+    // — exactly as three separate per-face rollers would. A single averaged
+    // normal (1,1,1)/√3 would leave two free modes and is the bug this guards.
+    let bar = primitives::boxx([0.0; 3], [4.0, 2.0, 2.0]);
+    let grid0 = VoxelGrid::voxelize(&bar, 1.0);
+    let settings = SolveSettings { e0: 1000.0, nu: 0.3, tol: 1e-9, ..Default::default() };
+    let (grid, _levels) = pad_for_levels(&grid0, 1);
+
+    let mut tris = face_tris(0); // x=0
+    tris.extend(face_tris(2)); // y=0
+    tris.extend(face_tris(4)); // z=0
+    let bcs = vec![BcSpec { kind: BcKind::Frictionless, tris }];
+    let asm = assemble(&bar, &grid, &bcs, None, &settings).unwrap();
+    let report = check_problem(&grid, &asm);
+    assert!(
+        report.ok,
+        "one frictionless BC over 3 orthogonal faces must fully constrain: {report:?}"
+    );
+}
+
+#[test]
 fn displacement_axis_locks_reproduce_roller_patch_test() {
     // Three displacement supports, each pinning ONLY the axis normal to its
     // face, must reproduce the same uniaxial response as three frictionless

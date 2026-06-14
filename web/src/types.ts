@@ -129,8 +129,9 @@ export const RESOLUTIONS = {
 
 export type ResolutionKey = keyof typeof RESOLUTIONS;
 
-/** Result fields selectable in the Deformed view. `u` is computed client-side
- *  from the displacement buffer; the rest come from the engine. */
+/** Result fields selectable in the Deformed view. `u`/`ux`/`uy`/`uz` are
+ *  computed client-side from the displacement buffer; the rest come from the
+ *  engine. */
 export interface ResultFieldDef {
   value: string;
   label: string;
@@ -139,6 +140,9 @@ export interface ResultFieldDef {
 
 export const RESULT_FIELDS: ResultFieldDef[] = [
   { value: "u", label: "Displacement |u|", unit: "mm" },
+  { value: "ux", label: "Displacement ux", unit: "mm" },
+  { value: "uy", label: "Displacement uy", unit: "mm" },
+  { value: "uz", label: "Displacement uz", unit: "mm" },
   { value: "sf", label: "Safety factor — worst case", unit: "" },
   { value: "sfm", label: "Safety factor — material σₜ/σᵥᴹ", unit: "" },
   { value: "sfz", label: "Safety factor — layer adhesion", unit: "" },

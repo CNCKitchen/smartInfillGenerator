@@ -424,7 +424,7 @@ function ForceEditor({ bc }: { bc: Bc }) {
         </button>
       </div>
       {mode === "components" ? (
-        <div className="bcparams">
+        <div className="bcparams triple">
           {(["X", "Y", "Z"] as const).map((axis, i) => (
             <label key={axis}>
               F{axis}
@@ -450,7 +450,7 @@ function ForceEditor({ bc }: { bc: Bc }) {
             </label>
             <span className="dim">N total</span>
           </div>
-          <div className="bcparams">
+          <div className="bcparams triple">
             {(["X", "Y", "Z"] as const).map((axis, i) => (
               <label key={axis}>
                 d{axis}

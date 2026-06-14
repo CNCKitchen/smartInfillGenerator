@@ -38,6 +38,9 @@ export interface SceneCallbacks {
   onPickDir?: (normal: [number, number, number]) => void;
   /** Viewer picked a new deformation autoscale (display exaggeration base). */
   onAutoScale?: (autoScale: number) => void;
+  /** Auto min/max of the active displacement COMPONENT (signed), for the
+   *  legend. |u| magnitude reports nothing — the legend uses the solve stat. */
+  onResultRange?: (min: number, max: number) => void;
   /** Section plane changed (three.js convention: kept side is
    *  normal·p + constant ≥ 0) — the mesh view recuts its voxels from this. */
   onSectionMoved?: (normal: [number, number, number], constant: number) => void;
@@ -154,6 +157,13 @@ export class SceneManager {
   } | null = null;
   /** User override of the color-scale range (click-to-edit legend). */
   private legendRange: { min: number | null; max: number | null } = { min: null, max: null };
+  /** Displacement coloring quantity: -1 = |u| magnitude, 0/1/2 = signed
+   *  X/Y/Z component. Only consulted on the displacement fallback (a scalar
+   *  stress/strain field, when present, always takes precedence). */
+  private dispComponent = -1;
+  /** Last auto range reported for a displacement component — de-dupes the
+   *  store writes that feed the legend. */
+  private lastDispRange: { min: number; max: number } | null = null;
 
   // Min/max value markers for the active result plot.
   private extremesOn = false;
@@ -392,6 +402,8 @@ export class SceneManager {
     this.basePositions = new Float32Array(model.positions);
     this.colors = new Float32Array(this.triCount * 9);
     this.displacements = null;
+    this.dispComponent = -1;
+    this.lastDispRange = null;
     this.vertexDensity = null;
     this.rbmMode = null;
     this.viewMode = "setup";
@@ -1051,7 +1063,7 @@ export class SceneManager {
         return { mesh: m, valueAt: (i) => sf.values[i] };
       }
       const d = vr.disp;
-      return { mesh: m, valueAt: (i) => Math.hypot(d[3 * i], d[3 * i + 1], d[3 * i + 2]) };
+      return { mesh: m, valueAt: (i) => this.dispValueAt(d, i) };
     }
     if (this.viewMode === "deformed" && this.mesh && this.displacements) {
       const sf = this.scalarField;
@@ -1059,7 +1071,7 @@ export class SceneManager {
         return { mesh: this.mesh, valueAt: (i) => sf.values[i] };
       }
       const d = this.displacements;
-      return { mesh: this.mesh, valueAt: (i) => Math.hypot(d[3 * i], d[3 * i + 1], d[3 * i + 2]) };
+      return { mesh: this.mesh, valueAt: (i) => this.dispValueAt(d, i) };
     }
     if (
       (this.viewMode === "density" || this.viewMode === "infill") &&
@@ -1158,6 +1170,10 @@ export class SceneManager {
 
   setDisplacements(disp: Float32Array | null, stats: { maxDisplacement: number } | null) {
     this.displacements = disp;
+    // A new solution resets the field picker to |u| (store side); keep the
+    // coloring component in step so it never colors by a stale X/Y/Z choice.
+    this.dispComponent = -1;
+    this.lastDispRange = null;
     if (disp && stats && stats.maxDisplacement > 0) {
       this.autoScale = (0.08 * this.bboxDiag) / stats.maxDisplacement;
     } else {
@@ -1165,6 +1181,53 @@ export class SceneManager {
     }
     this.callbacks.onAutoScale?.(this.autoScale);
     this.refreshView();
+  }
+
+  /** Choose what the deformed view colors by: -1 = |u| magnitude, 0/1/2 =
+   *  signed X/Y/Z displacement component. */
+  setDispComponent(comp: number) {
+    if (this.dispComponent === comp) return;
+    this.dispComponent = comp;
+    this.lastDispRange = null; // force a fresh range report for the new field
+    this.refreshView();
+  }
+
+  /** Per-vertex scalar for the active displacement field: |u| magnitude or the
+   *  signed component. `d` is the surface's 3-per-vertex displacement buffer. */
+  private dispValueAt(d: Float32Array, i: number): number {
+    const c = this.dispComponent;
+    return c < 0 ? Math.hypot(d[3 * i], d[3 * i + 1], d[3 * i + 2]) : d[3 * i + c];
+  }
+
+  /** Build the per-vertex displacement scalar array and the color-scale bounds
+   *  for the active field, honoring any user legend override. Reports the auto
+   *  range to the legend for signed components (|u| uses the solve stat). */
+  private dispFieldValues(d: Float32Array): { values: Float32Array; lo: number; hi: number } {
+    const comp = this.dispComponent;
+    const n = d.length / 3;
+    const values = new Float32Array(n);
+    let dmin = Infinity;
+    let dmax = -Infinity;
+    for (let i = 0; i < n; i++) {
+      const v = comp < 0 ? Math.hypot(d[3 * i], d[3 * i + 1], d[3 * i + 2]) : d[3 * i + comp];
+      values[i] = v;
+      if (v < dmin) dmin = v;
+      if (v > dmax) dmax = v;
+    }
+    if (comp >= 0) this.reportDispRange(dmin, dmax);
+    // |u| anchors the scale at 0; a signed component spans its own min/max.
+    const autoLo = comp < 0 ? 0 : dmin;
+    const autoHi = comp < 0 ? Math.max(dmax, 1e-12) : dmax;
+    const lo = this.legendRange.min ?? autoLo;
+    const hi = this.legendRange.max ?? autoHi;
+    return { values, lo, hi };
+  }
+
+  private reportDispRange(min: number, max: number) {
+    const last = this.lastDispRange;
+    if (last && last.min === min && last.max === max) return;
+    this.lastDispRange = { min, max };
+    this.callbacks.onResultRange?.(min, max);
   }
 
   setVertexDensity(density: Float32Array | null) {
@@ -1878,24 +1941,15 @@ export class SceneManager {
       this.trackExtremes(sf.values, 1);
       return;
     }
-    const d = vr.disp;
-    const n = d.length / 3;
-    const mags = new Float32Array(n);
-    let maxMag = 1e-12;
-    for (let i = 0; i < n; i++) {
-      mags[i] = Math.hypot(d[3 * i], d[3 * i + 1], d[3 * i + 2]);
-      maxMag = Math.max(maxMag, mags[i]);
-    }
-    const lo = this.legendRange.min ?? 0;
-    const hi = this.legendRange.max ?? maxMag;
+    const { values, lo, hi } = this.dispFieldValues(vr.disp);
     const inv = hi - lo > 1e-30 ? 1 / (hi - lo) : 0;
-    for (let i = 0; i < n; i++) {
-      vr.uvs[2 * i] = Math.min(1, Math.max(0, (mags[i] - lo) * inv));
+    for (let i = 0; i < values.length; i++) {
+      vr.uvs[2 * i] = Math.min(1, Math.max(0, (values[i] - lo) * inv));
       vr.uvs[2 * i + 1] = 0.5;
     }
     uvAttr.array.set(vr.uvs);
     uvAttr.needsUpdate = true;
-    this.trackExtremes(mags, 1);
+    this.trackExtremes(values, 1);
   }
 
   private applyColors() {
@@ -1923,24 +1977,15 @@ export class SceneManager {
         this.trackExtremes(sf.values, 1);
         return;
       }
-      const d = this.displacements;
-      let maxMag = 1e-12;
-      const n = d.length / 3;
-      const mags = new Float32Array(n);
-      for (let i = 0; i < n; i++) {
-        mags[i] = Math.hypot(d[3 * i], d[3 * i + 1], d[3 * i + 2]);
-        maxMag = Math.max(maxMag, mags[i]);
-      }
-      const lo = this.legendRange.min ?? 0;
-      const hi = this.legendRange.max ?? maxMag;
+      const { values, lo, hi } = this.dispFieldValues(this.displacements);
       const inv = hi - lo > 1e-30 ? 1 / (hi - lo) : 0;
-      for (let i = 0; i < n; i++) {
-        this.uvs[2 * i] = Math.min(1, Math.max(0, (mags[i] - lo) * inv));
+      for (let i = 0; i < values.length; i++) {
+        this.uvs[2 * i] = Math.min(1, Math.max(0, (values[i] - lo) * inv));
         this.uvs[2 * i + 1] = 0.5;
       }
       uvAttr.needsUpdate = true;
       this.setSurfaceMaterialMode("jet");
-      this.trackExtremes(mags, 1);
+      this.trackExtremes(values, 1);
       return;
     }
     if (this.viewMode === "density" && this.vertexDensity) {
@@ -1982,7 +2027,8 @@ export class SceneManager {
 
   private fmtExtreme(v: number): string {
     if (this.extremesUnit === "mm") {
-      return v >= 0.01 || v === 0 ? `${v.toFixed(3)} mm` : `${(v * 1000).toFixed(1)} µm`;
+      const a = Math.abs(v);
+      return a >= 0.01 || a === 0 ? `${v.toFixed(3)} mm` : `${(v * 1000).toFixed(1)} µm`;
     }
     if (this.extremesUnit === "MPa") {
       return `${Math.abs(v) >= 0.01 || v === 0 ? v.toPrecision(3) : v.toExponential(1)} MPa`;
