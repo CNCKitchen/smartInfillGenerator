@@ -12,3 +12,10 @@ _sample_extracted/
 /web/repro-box.stl
 /web/repro-busy.png
 meshbench-out.txt
+
+# wrangler files
+.wrangler
+.dev.vars*
+!.dev.vars.example
+.env*
+!.env.example

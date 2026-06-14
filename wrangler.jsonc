@@ -1,0 +1,14 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "smartinfillgenerator",
+  "compatibility_date": "2026-06-14",
+  "observability": {
+    "enabled": true
+  },
+  "assets": {
+    "directory": "design-drafts"
+  },
+  "compatibility_flags": [
+    "nodejs_compat"
+  ]
+}
