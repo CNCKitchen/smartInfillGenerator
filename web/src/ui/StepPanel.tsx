@@ -36,7 +36,7 @@ const KIND_DOT: Record<BcKind, string> = {
 };
 
 const HEAD: Record<number, { title: string; sub: string }> = {
-  1: { title: "Model", sub: "Drop an STL, 3MF or STEP — units are mm." },
+  1: { title: "Model", sub: "Drop an STL or 3MF — units are mm." },
   2: { title: "Boundary conditions", sub: "Where the part is held, how it is loaded." },
   3: { title: "Properties", sub: "Material, print settings, analysis grid." },
   4: { title: "Verify setup", sub: "Check constraints, then analyze the print or the solid." },
@@ -162,12 +162,12 @@ function StepModel() {
       <input
         ref={fileRef}
         type="file"
-        accept=".stl,.3mf,.step,.stp"
+        accept=".stl,.3mf"
         hidden
         onChange={(e) => void onFile(e.target.files?.[0])}
       />
       <button className="primary" onClick={() => fileRef.current?.click()}>
-        {s.fileName ? "Replace model…" : "Open STL / 3MF / STEP…"}
+        {s.fileName ? "Replace model…" : "Open STL / 3MF…"}
       </button>
       {s.fileName ? (
         <div className="fileinfo">

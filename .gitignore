@@ -1,18 +1,55 @@
+# ===========================================================================
+# Build outputs & dependencies
+# ===========================================================================
 /target
-/web/node_modules
+node_modules/
 /web/dist
+
+# Generated WASM (wasm-pack): single-threaded + threaded solver builds
 /web/src/wasm/
 /web/public/wasm-mt/
+
+# STEP-import dev harness build (stepnode_test.mjs builds this pkg)
+/crates/sig-wasm/pkg-stepnode/
+
+# TypeScript incremental build cache (tsc -b)
+*.tsbuildinfo
+
+# ===========================================================================
+# 3D model files
+# Scratch test inputs dropped into the repo while working — large binaries we
+# don't version. The few that are real fixtures (used by tests / dev
+# harnesses) are re-included immediately below.
+# ===========================================================================
+*.stl
+*.3mf
+*.step
+*.stp
+
+# Keep these committed fixtures:
+#   3dbenchy.stl  -> web/bench + crates phase3 test
+#   Cube.3mf      -> crates phase3 import_3mf test
+#   hook5 v3.*    -> stepbench / stepnode_test default input + reference mesh
+!/3dbenchy.stl
+!/Cube.3mf
+!/hook5 v3.step
+!/hook5 v3.stl
+
+# ===========================================================================
+# Dev / bench scratch output
+# ===========================================================================
 /web/bench-out.txt
 /web/bench-err.txt
 /web/bench/*.png
-/testhook_*.3mf
-_sample_extracted/
-*.stl.tmp
-/web/repro-box.stl
 /web/repro-busy.png
 meshbench-out.txt
-# STEP-import dev harness artifacts (stepnode_test.mjs builds this pkg + STLs)
-/crates/sig-wasm/pkg-stepnode/
-/hook_truck_*.stl
-/hook_model_*.stl
+_sample_extracted/
+*.stl.tmp
+
+# ===========================================================================
+# OS / editor cruft
+# ===========================================================================
+.DS_Store
+Thumbs.db
+*.swp
+*~

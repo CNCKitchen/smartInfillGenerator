@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
+#
+# Cross-origin isolation unlocks SharedArrayBuffer -> the threaded WASM solver.
+# Cloudflare serves these headers natively, so the page is isolated on first
+# load (no reload). The bundled coi-serviceworker.js stays as the fallback for
+# hosts that cannot set headers (e.g. GitHub Pages).
+# Vite copies everything under web/public/ verbatim into web/dist/.
+/*
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: require-corp

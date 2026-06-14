@@ -1,0 +1,18 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
+//
+// Cloudflare Workers config for hosting the InFEAll web app as static assets.
+// The heavy Rust->WASM + Vite build runs in GitHub Actions
+// (.github/workflows/deploy-cloudflare.yml); this only serves the built
+// `web/dist` folder. Deployed with `npx wrangler deploy` from the repo root.
+{
+  "name": "smartinfillgenerator",
+  "compatibility_date": "2025-06-01",
+  "assets": {
+    // Built by the CI workflow before `wrangler deploy` runs.
+    "directory": "./web/dist",
+    // No client-side router today, but this safely serves index.html for any
+    // unmatched path instead of a 404.
+    "not_found_handling": "single-page-application"
+  }
+}

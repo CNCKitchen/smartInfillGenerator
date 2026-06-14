@@ -114,6 +114,91 @@ impl TriMesh {
         (TriMesh::from_triangles(out), parents)
     }
 
+    /// Refine via recursive **longest-edge bisection** (Rivara) until every
+    /// triangle is BOTH short enough (longest edge ≤ `target`) AND reasonably
+    /// shaped (longest edge ≤ `ASPECT` × shortest edge). Unlike
+    /// [`subdivided`](Self::subdivided)'s n×n barycentric split, it halves only
+    /// the LONGEST edge.
+    ///
+    /// The aspect criterion is the important one for STEP: a chord-tolerance
+    /// tessellator (truck) leaves developable faces (cylinders, cones,
+    /// extrusions — flat along one direction → no chord error → no split there)
+    /// as full-length slivers. Capping length alone turns one 98 mm sliver into
+    /// a stack of *short* slivers (still thin → looks broken in wireframe);
+    /// capping aspect splits the long edge until the triangles are ~square,
+    /// i.e. a clean grid. A `floor` (target/4) stops the aspect rule from
+    /// exploding on a genuinely tiny short edge.
+    ///
+    /// Non-conforming (T-junctions along shared edges), matching `subdivided`'s
+    /// convention — fine for winding-number voxelization and adequate for
+    /// display. Returns the ORIGINAL triangle index per output triangle, like
+    /// [`subdivided_with_parents`](Self::subdivided_with_parents).
+    pub fn capped_edges(&self, target: f64, max_tris: usize) -> (TriMesh, Vec<u32>) {
+        const ASPECT: f64 = 2.5; // split slivers until longest ≤ 2.5 × shortest
+        let t2 = target.max(1e-9).powi(2);
+        let aspect2 = ASPECT * ASPECT;
+        let floor2 = (target.max(1e-9) / 4.0).powi(2); // don't refine finer than this
+        let mut out: Vec<[f32; 9]> = Vec::with_capacity(self.tris.len());
+        let mut parents: Vec<u32> = Vec::new();
+        let mut stack: Vec<[f64; 3]> = Vec::new(); // flat verts, 3 per triangle
+        let len2 = |a: [f64; 3], b: [f64; 3]| {
+            (a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)
+        };
+        for (ti, t) in self.tris.iter().enumerate() {
+            stack.clear();
+            stack.push([t[0] as f64, t[1] as f64, t[2] as f64]);
+            stack.push([t[3] as f64, t[4] as f64, t[5] as f64]);
+            stack.push([t[6] as f64, t[7] as f64, t[8] as f64]);
+            while stack.len() >= 3 {
+                let c = stack.pop().unwrap();
+                let b = stack.pop().unwrap();
+                let a = stack.pop().unwrap();
+                let (lab, lbc, lca) = (len2(a, b), len2(b, c), len2(c, a));
+                let longest = lab.max(lbc).max(lca);
+                let shortest = lab.min(lbc).min(lca);
+                let median = lab + lbc + lca - longest - shortest; // middle value
+                // Size: cap the MEDIAN edge, not the longest. A target-sized
+                // square grid cell has a diagonal of target·√2 > target, so
+                // capping the longest edge would split that grid forever; capping
+                // the median makes a square grid stable. Aspect: split slivers
+                // until ~2.5:1, but never below the floor.
+                let too_big = median > t2;
+                let too_thin = longest > aspect2 * shortest && longest > floor2;
+                // Stop once acceptable OR the (approximate) budget is spent.
+                // Pending stacked triangles count toward the budget so the final
+                // total stays close to `max_tris` (it can't be exact — geometry
+                // already on the stack must still be emitted).
+                if (!too_big && !too_thin) || out.len() + stack.len() / 3 >= max_tris {
+                    out.push([
+                        a[0] as f32, a[1] as f32, a[2] as f32,
+                        b[0] as f32, b[1] as f32, b[2] as f32,
+                        c[0] as f32, c[1] as f32, c[2] as f32,
+                    ]);
+                    parents.push(ti as u32);
+                    continue;
+                }
+                // Bisect the longest edge; the opposite vertex is shared by both
+                // children (keeps the short direction intact).
+                let mid = |p: [f64; 3], q: [f64; 3]| {
+                    [(p[0] + q[0]) * 0.5, (p[1] + q[1]) * 0.5, (p[2] + q[2]) * 0.5]
+                };
+                let (t1, t2_) = if lab >= lbc && lab >= lca {
+                    let m = mid(a, b);
+                    ([a, m, c], [m, b, c])
+                } else if lbc >= lca {
+                    let m = mid(b, c);
+                    ([a, b, m], [a, m, c])
+                } else {
+                    let m = mid(c, a);
+                    ([a, b, m], [m, b, c])
+                };
+                stack.extend_from_slice(&t1);
+                stack.extend_from_slice(&t2_);
+            }
+        }
+        (TriMesh::from_triangles(out), parents)
+    }
+
     pub fn len(&self) -> usize {
         self.tris.len()
     }

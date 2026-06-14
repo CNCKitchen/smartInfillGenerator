@@ -582,6 +582,76 @@ fn subdivision_preserves_area_and_respects_cap() {
 }
 
 #[test]
+fn capped_edges_tames_slivers_without_needles() {
+    use sig_core::TriMesh;
+    // A developable-surface sliver like truck emits along a cylinder axis:
+    // 100 mm long, 1 mm wide. Barycentric n×n would shatter the 1 mm direction
+    // into needles; longest-edge bisection must split ONLY the long edges.
+    let sliver = TriMesh::from_triangles(vec![[
+        0.0, 0.0, 0.0, 100.0, 0.0, 0.0, 100.0, 1.0, 0.0,
+    ]]);
+    let area = |mm: &TriMesh| -> f64 {
+        mm.tris
+            .iter()
+            .map(|t| {
+                let e1 = [(t[3] - t[0]) as f64, (t[4] - t[1]) as f64, (t[5] - t[2]) as f64];
+                let e2 = [(t[6] - t[0]) as f64, (t[7] - t[1]) as f64, (t[8] - t[2]) as f64];
+                let c = [
+                    e1[1] * e2[2] - e1[2] * e2[1],
+                    e1[2] * e2[0] - e1[0] * e2[2],
+                    e1[0] * e2[1] - e1[1] * e2[0],
+                ];
+                0.5 * (c[0] * c[0] + c[1] * c[1] + c[2] * c[2]).sqrt()
+            })
+            .sum()
+    };
+    // Fraction of "thin" triangles (aspect > 5). The bulk should refine to
+    // ~square; only the unavoidable sharp-corner slivers of this single 0.57°
+    // wedge stay thin (a real developable face tiles into a clean grid).
+    let thin_frac = |mm: &TriMesh| -> f64 {
+        let n = mm.tris.len().max(1) as f64;
+        let thin = mm
+            .tris
+            .iter()
+            .filter(|t| {
+                let d = |a: usize, b: usize| {
+                    (((t[3 * a] - t[3 * b]) as f64).powi(2)
+                        + ((t[3 * a + 1] - t[3 * b + 1]) as f64).powi(2)
+                        + ((t[3 * a + 2] - t[3 * b + 2]) as f64).powi(2))
+                    .sqrt()
+                };
+                let (e0, e1, e2) = (d(0, 1), d(1, 2), d(2, 0));
+                let lo = e0.min(e1).min(e2).max(1e-12);
+                e0.max(e1).max(e2) / lo > 5.0
+            })
+            .count() as f64;
+        thin / n
+    };
+
+    let target = 2.0;
+    let (capped, parents) = sliver.capped_edges(target, 1_000_000);
+    // The point: slivers are split until MOST are ~square — no field of needles.
+    assert!(thin_frac(&capped) < 0.30, "slivers tamed (thin frac {})", thin_frac(&capped));
+    assert!((area(&capped) - area(&sliver)).abs() / area(&sliver) < 1e-4, "area preserved");
+    // ...and it stays far smaller than the n×n barycentric split, which
+    // subdivides the 1 mm direction as hard as the 100 mm one (~2500 tris).
+    let bary = sliver.subdivided(target, 1_000_000);
+    assert!(
+        capped.len() < bary.len() / 2,
+        "LEB ({}) must beat barycentric ({})",
+        capped.len(),
+        bary.len()
+    );
+    assert_eq!(parents.len(), capped.len());
+    assert!(parents.iter().all(|&p| p == 0), "single source triangle");
+
+    // Budget cap honored (approximate — pending geometry must still be emitted,
+    // so allow a small overshoot rather than dropping triangles).
+    let (small, _) = sliver.capped_edges(0.05, 200);
+    assert!(small.len() <= 230, "budget ~respected ({} tris)", small.len());
+}
+
+#[test]
 fn column_compression_stress_matches_nominal() {
     use sig_core::solve::{solve_nodes, NodeProblem};
     use sig_core::stress::{cell_field, FieldKind};

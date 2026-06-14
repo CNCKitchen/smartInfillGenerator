@@ -78,12 +78,12 @@ function DropZone() {
   return (
     <div className="dropzone">
       <div className="dz-card">
-        <b>Drop an STL, 3MF or STEP here</b>
+        <b>Drop an STL or 3MF here</b>
         <div className="small">Units mm — the file never leaves your browser.</div>
         <input
           ref={fileRef}
           type="file"
-          accept=".stl,.3mf,.step,.stp"
+          accept=".stl,.3mf"
           hidden
           onChange={(e) => void onFile(e.target.files?.[0])}
         />

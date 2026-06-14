@@ -49,7 +49,13 @@ impl Default for StepTessellation {
     fn default() -> Self {
         Self {
             surface_deviation: None,
-            auto_deviation_frac: 0.00025, // 0.025% of the diagonal — fine base
+            // 0.02% of the diagonal. Surface deviation sets CURVE resolution
+            // (how many facets go around a cylinder/fillet) — the downstream
+            // refinement can't recover curvature. ~40-50 facets on a typical
+            // cylinder: smooth silhouette without over-tessellating (finer than
+            // this blows the working-mesh triangle budget; the aspect-aware
+            // refinement, not extra facets, is what removes the sliver look).
+            auto_deviation_frac: 0.0002,
         }
     }
 }
@@ -116,11 +122,15 @@ pub fn import_step(bytes: &[u8], settings: &StepTessellation) -> Result<StepImpo
     let table = Table::from_data_section(&exchange.data[0]);
 
     // Convert every BREP shell to truck's compressed form; skip ones truck can't
-    // handle rather than failing the whole import.
-    let cshells: Vec<_> = table
-        .shell
-        .values()
-        .filter_map(|shell| table.to_compressed_shell(shell).ok())
+    // handle rather than failing the whole import. Iterate shells in a STABLE
+    // order (by entity id): `table.shell` is a HashMap, so its iteration order is
+    // otherwise nondeterministic, which would shuffle the BREP face ids between
+    // imports and make CAD-face selection inconsistent run-to-run.
+    let mut shells: Vec<_> = table.shell.iter().collect();
+    shells.sort_by(|a, b| a.0.cmp(b.0));
+    let cshells: Vec<_> = shells
+        .into_iter()
+        .filter_map(|(_, shell)| table.to_compressed_shell(shell).ok())
         .collect();
     if cshells.is_empty() {
         return Err(StepError::NoShells);
@@ -157,6 +167,17 @@ pub fn import_step(bytes: &[u8], settings: &StepTessellation) -> Result<StepImpo
     let mut face_of_tri: Vec<u32> = Vec::new();
     let mut face_id: u32 = 0;
     for cs in &cshells {
+        // KNOWN LIMITATION (truck 0.4, latest as of 2026-06): `robust_triangulation`
+        // can TWIST trimmed periodic faces — it connects a cylinder's top edge-ring
+        // to its bottom ring with an angular offset, producing spiral strips (an
+        // isolated cylinder-with-cutout measured 13% of edges spanning the full
+        // height AND up to 177° around; the CAD's own STL of the same face: 0%). The
+        // non-robust `triangulation` avoids it but FAILS outright (no triangles) on
+        // those faces, so robust is the only option. The geometry truck PARSES is
+        // exact (vertices sit on the true surface), and the twisted mesh stays
+        // closed + area-correct, so winding-number voxelization — hence the FEA — is
+        // unaffected; the twist is a DISPLAY artifact. Accepted for now; fixing it
+        // means re-tessellating analytic faces ourselves. See DESIGN.md §9.
         let poly = cs.robust_triangulation(tol);
         for face in &poly.faces {
             if let Some(mesh) = &face.surface {

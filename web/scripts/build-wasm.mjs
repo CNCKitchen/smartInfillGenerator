@@ -31,13 +31,19 @@ function run(cmd, env = {}) {
 
 const which = process.argv[2] ?? "both";
 
+// STEP import is DEACTIVATED (2026-06): truck's tessellation is unreliable on
+// trimmed periodic surfaces (it twists cylinders — see DESIGN.md §9). The code
+// stays behind the `step` cargo feature. To RE-ENABLE: add `step` back to the
+// `--features` list in BOTH builds below, and restore the `.step,.stp` accept
+// lists + labels in web/src/App.tsx and web/src/ui/StepPanel.tsx.
+
 if (which === "st" || which === "both") {
   // simd128 comes from .cargo/config.toml; keep RUSTFLAGS unset so the
   // config applies.
   const env = { ...process.env };
   delete env.RUSTFLAGS;
   console.log("\n=== single-threaded build -> web/src/wasm ===");
-  execSync("wasm-pack build --target web --out-dir ../../web/src/wasm -- --features step", {
+  execSync("wasm-pack build --target web --out-dir ../../web/src/wasm", {
     cwd: crate,
     stdio: "inherit",
     env,
@@ -47,7 +53,7 @@ if (which === "st" || which === "both") {
 if (which === "mt" || which === "both") {
   console.log("\n=== threaded build -> web/public/wasm-mt ===");
   run(
-    "wasm-pack build --target web --out-dir ../../web/public/wasm-mt -- --features parallel,step -Z build-std=panic_abort,std",
+    "wasm-pack build --target web --out-dir ../../web/public/wasm-mt -- --features parallel -Z build-std=panic_abort,std",
     {
       RUSTUP_TOOLCHAIN: "nightly",
       // RUSTFLAGS overrides .cargo/config.toml, so simd128 must be repeated.

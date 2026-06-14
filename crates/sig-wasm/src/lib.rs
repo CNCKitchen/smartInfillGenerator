@@ -92,6 +92,77 @@ pub fn step_import_info(bytes: &[u8], surface_deviation: f64) -> Result<String, 
     ))
 }
 
+/// Per-BREP-face tessellation report (dev/debug), JSON array of
+/// `{id, tris, area, dim:[dx,dy,dz], maxEdge}`. A real face reduced to a couple
+/// of triangles, or with a `maxEdge` near its whole `dim`, is a truck failure.
+#[cfg(feature = "step")]
+#[wasm_bindgen]
+pub fn step_face_report(bytes: &[u8], surface_deviation: f64) -> Result<String, JsError> {
+    let imp = step_import_inner(bytes, surface_deviation)?;
+    let nf = imp.face_count;
+    let mut tris = vec![0u32; nf];
+    let mut area = vec![0f64; nf];
+    let mut max_edge = vec![0f64; nf];
+    let mut lo = vec![[f64::INFINITY; 3]; nf];
+    let mut hi = vec![[f64::NEG_INFINITY; 3]; nf];
+    for (t, &f) in imp.mesh.tris.iter().zip(&imp.face_of_tri) {
+        let f = f as usize;
+        tris[f] += 1;
+        let p = |k: usize| [t[3 * k] as f64, t[3 * k + 1] as f64, t[3 * k + 2] as f64];
+        let (a, b, c) = (p(0), p(1), p(2));
+        for v in [a, b, c] {
+            for d in 0..3 {
+                lo[f][d] = lo[f][d].min(v[d]);
+                hi[f][d] = hi[f][d].max(v[d]);
+            }
+        }
+        let e = |u: [f64; 3], w: [f64; 3]| {
+            ((u[0] - w[0]).powi(2) + (u[1] - w[1]).powi(2) + (u[2] - w[2]).powi(2)).sqrt()
+        };
+        max_edge[f] = max_edge[f].max(e(a, b)).max(e(b, c)).max(e(c, a));
+        let cr = [
+            (b[1] - a[1]) * (c[2] - a[2]) - (b[2] - a[2]) * (c[1] - a[1]),
+            (b[2] - a[2]) * (c[0] - a[0]) - (b[0] - a[0]) * (c[2] - a[2]),
+            (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]),
+        ];
+        area[f] += 0.5 * (cr[0] * cr[0] + cr[1] * cr[1] + cr[2] * cr[2]).sqrt();
+    }
+    let mut out = String::from("[");
+    let mut first = true;
+    for f in 0..nf {
+        if tris[f] == 0 {
+            continue;
+        }
+        let dim = [hi[f][0] - lo[f][0], hi[f][1] - lo[f][1], hi[f][2] - lo[f][2]];
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        out.push_str(&format!(
+            "{{\"id\":{},\"tris\":{},\"area\":{:.2},\"dim\":[{:.2},{:.2},{:.2}],\"maxEdge\":{:.2}}}",
+            f, tris[f], area[f], dim[0], dim[1], dim[2], max_edge[f]
+        ));
+    }
+    out.push(']');
+    Ok(out)
+}
+
+/// Dev/debug: the base triangles of ONE BREP face, as a binary STL.
+#[cfg(feature = "step")]
+#[wasm_bindgen]
+pub fn step_face_stl(bytes: &[u8], surface_deviation: f64, face_id: u32) -> Result<Vec<u8>, JsError> {
+    let imp = step_import_inner(bytes, surface_deviation)?;
+    let tris: Vec<[f32; 9]> = imp
+        .mesh
+        .tris
+        .iter()
+        .zip(&imp.face_of_tri)
+        .filter(|(_, &f)| f == face_id)
+        .map(|(t, _)| *t)
+        .collect();
+    Ok(sig_core::mesh::TriMesh::from_triangles(tris).to_stl_binary())
+}
+
 #[cfg(feature = "step")]
 fn step_import_inner(
     bytes: &[u8],
@@ -334,7 +405,7 @@ impl Model {
     pub fn new(bytes: &[u8], name: &str) -> Result<Model, JsValue> {
         let (mesh_orig, mesh_objects, cad_face_of_orig) = import_any(bytes)?;
         // Refine the display/analysis tessellation: edges capped at ~1/60 of
-        // the diagonal so deflection curves are visible on coarse STLs.
+        // the diagonal so deflection curves are visible on coarse meshes.
         // Dense meshes pass through unchanged (160k-triangle budget).
         let (mesh, parents) = match mesh_orig.bounds() {
             Some((lo, hi)) => {
@@ -342,7 +413,16 @@ impl Model {
                     + (hi[1] - lo[1]).powi(2)
                     + (hi[2] - lo[2]).powi(2))
                 .sqrt();
-                mesh_orig.subdivided_with_parents(diag / 60.0, 160_000)
+                let target = diag / 60.0;
+                if cad_face_of_orig.is_some() {
+                    // STEP: longest-edge bisection. truck under-tessellates
+                    // developable faces (cylinders/extrusions) into full-length
+                    // slivers; a barycentric split would shatter those into
+                    // needles, so split only the long edge.
+                    mesh_orig.capped_edges(target, 160_000)
+                } else {
+                    mesh_orig.subdivided_with_parents(target, 160_000)
+                }
             }
             None => (mesh_orig.clone(), (0..mesh_orig.len() as u32).collect()),
         };

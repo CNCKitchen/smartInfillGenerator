@@ -24,7 +24,7 @@ Reference points:
 |---|-------|----------|
 | 1 | Architecture | **All compute in-browser (WASM).** Zero hosting cost, models never leave the machine, works offline. No server compute path in v1. |
 | 2 | Discretization | **Voxel grid** from **fast winding-number voxelization** (robust to triangle soup: holes, self-intersections, non-manifold). Matrix-free FEA with geometric multigrid. No tet meshing. |
-| 3 | Input formats | **STL + 3MF in v1.** STEP in v1.x via lazy-loaded OpenCASCADE WASM module (BREP faces become selectable surfaces). |
+| 3 | Input formats | **STL + 3MF in v1. STEP added 2026-06 via the `truck` CAD kernel** (Apache-2.0, pure-Rust → wasm-clean; OpenCASCADE was rejected — LGPL breaks the commercial-exception model, see #14). truck parses the BREP exactly and tessellates it; BREP faces are preserved as one-click selectable surfaces (the segmentation "CAD faces" source). **Known truck limitation:** its tessellation can TWIST trimmed periodic faces (cylinders) and emits developable-surface slivers — display artifacts only (the mesh is voxelized, so analysis is unaffected). We mitigate the slivers with longest-edge/aspect refinement, but the twist made it unshippable, so **STEP import is DEACTIVATED in the build as of 2026-06** — all code stays behind the `step` cargo feature; re-enable via `web/scripts/build-wasm.mjs` (add `step` to `--features`) + restore the `.step/.stp` accept lists in the UI. See §9. |
 | 4 | Surface selection | **Auto-segmentation** (region-growing across edges with dihedral angle < ~30°, slider-adjustable) makes CAD-derived patches one-click selectable. **Brush/lasso + click-to-grow fallback** for organic meshes. |
 | 5 | Loads & BCs (v1) | Fixed support, **elastic support** (Winkler foundation, bedding modulus k in N/mm³, σ = k·u — area-consistent axis springs per node; added 2026-06 because rigid Fixed patches artificially stiffen the part and produce edge stress singularities), **displacement support** (pin any subset of the global X/Y/Z axes to zero via stiff axis penalty springs — a roller/slider; `[true;3]` ≈ Fixed; added 2026-06), surface force (total N over patch, defined as **X/Y/Z components OR a direction + magnitude**; the direction defaults to the selection's area-weighted average normal and is re-aimable by clicking a triangle on the model), pressure, gravity/self-weight, **frictionless support** (renamed 2026-06 from "slide"). *Note: frictionless on arbitrary (non-axis-aligned) patches via penalty/transformed constraints along averaged patch normal.* |
 | 6 | Under-constraint check | Pre-solve: rank test of the 6 rigid-body modes against the constraint set + connected-component (floating island) check. On failure: **block the run and animate the offending rigid-body motion** so the user sees what's unconstrained. |
@@ -366,6 +366,26 @@ panel. Fallback pattern law: conservative generic n = 2.
 - [ ] **Name/branding** for the tool.
 - [ ] Minimal `project_settings.config` experiment (what Orca tolerates) — Phase 4.
 - [ ] Orca/Bambu/Prusa version test matrix definition.
+- [ ] **STEP tessellation quality (truck limitation, 2026-06).** truck parses
+  geometry exactly but its tessellation is weak: (a) developable faces
+  (cylinders/extrusions) come out as full-length slivers — mitigated by the
+  aspect-aware longest-edge refinement in `mesh.rs::capped_edges`; (b) trimmed
+  periodic faces can come out TWISTED (spiral strips connecting top/bottom rings
+  with an angular offset; an isolated cylinder-with-cutout: 13% of edges spiral
+  up to 177°, vs 0% in the CAD's own STL). Both are DISPLAY-only — the mesh is
+  voxelized so analysis is correct — but the twist looks broken. truck's
+  non-robust `triangulation` avoids the twist but fails outright on those faces;
+  we're on the latest truck (0.4/0.6/0.3). **DEACTIVATED in the build (2026-06)**
+  because the twist is too visible to ship — all code stays behind the `step`
+  cargo feature (not enabled by `build-wasm.mjs`); a STEP file now hits the
+  "STEP import unavailable in this build" guard in `mesh.rs::from_stl`. Re-enable
+  = add `step` to the `--features` in `build-wasm.mjs` (both ST + MT builds) and
+  restore the `.step/.stp` accept lists + labels in `App.tsx`/`StepPanel.tsx`.
+  Real fix before re-enabling = re-tessellate analytic
+  faces (cylinder/cone/plane) ourselves in their natural 2D parameter space from
+  truck's correct BREP + boundary polylines (the surface vertices truck emits are
+  exactly on the true surface). Dev scaffolding kept: `sig-wasm` debug exports
+  `step_face_report` / `step_face_stl`, harness `stepnode_test.mjs`.
 - Self-weight: engine supports it, UI hides it (negligible for desktop plastic prints; revisit for large/heavy parts).
 
 ## 10. Future simulation types (requested 2026-06, not scheduled)

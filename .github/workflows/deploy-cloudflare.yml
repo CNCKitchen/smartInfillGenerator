@@ -1,0 +1,65 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
+#
+# Builds the app (same Rust->WASM + Vite pipeline as the GitHub Pages workflow)
+# and deploys web/dist to the Cloudflare Worker `smartinfillgenerator`, which
+# serves infeall.com. Build base is '/' (root domain) -- note VITE_BASE is
+# intentionally NOT set here, unlike the GitHub Pages workflow.
+name: Deploy to Cloudflare
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+# Don't cancel an in-flight production deploy; just queue the next one.
+concurrency:
+  group: cloudflare-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable + wasm32 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install Rust nightly + wasm32 target + rust-src (for MT build)
+        run: rustup toolchain install nightly --target wasm32-unknown-unknown -c rust-src --no-self-update
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install npm dependencies
+        run: npm ci
+        working-directory: web
+
+      - name: Build WASM (ST + MT)
+        run: node scripts/build-wasm.mjs
+        working-directory: web
+
+      - name: Build Vite (base = / for the infeall.com root domain)
+        run: npm run build
+        working-directory: web
+
+      - name: Deploy to Cloudflare Workers
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          # wrangler.jsonc lives at the repo root and points `assets` at web/dist;
+          # the default command is `deploy`.
