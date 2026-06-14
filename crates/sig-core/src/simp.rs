@@ -46,6 +46,12 @@ pub struct OptimizeParams {
     /// averaged each iteration (field and sensitivities), so the optimized
     /// density comes out symmetric about the plane.
     pub symmetry: Option<[f64; 4]>,
+    /// Minimum member size in mm (printability length scale). Drives the
+    /// density-filter radius (`r = min_member/2`, clamped to a cell range);
+    /// members narrower than this blur below the bin threshold and drop out.
+    /// 0 = off ⇒ only the numerical anti-checkerboard floor applies. Advisory,
+    /// not a hard guarantee (see `filter_radius_cells`).
+    pub min_member_mm: f64,
     pub max_iter: usize,
 }
 
@@ -62,6 +68,7 @@ impl Default for OptimizeParams {
             bottom_mm: 1.0,
             composite_skin: false,
             symmetry: None,
+            min_member_mm: 0.0,
             max_iter: 40,
         }
     }
@@ -354,6 +361,25 @@ fn symmetrize(values: &mut [f64], partner: &[u32], buf: &mut Vec<f64>) {
     }
 }
 
+/// Anti-checkerboard / anti-sliver floor for the density-filter radius (cells).
+/// The OC update relies on at least this much smoothing; `min_member = 0` keeps
+/// exactly this radius, so it reproduces the pre-feature-size behavior.
+const MIN_FILTER_RADIUS_CELLS: f64 = 1.6;
+/// Upper bound on the explicit filter radius (cells). The stencil cost grows as
+/// (2r+1)³, so cap it; a minimum member size that would need a larger radius on
+/// a very fine mesh is honored only up to `2 · MAX · h` (the UI warns).
+const MAX_FILTER_RADIUS_CELLS: f64 = 8.0;
+
+/// Density-filter radius in CELLS for a physical minimum member size (mm).
+/// A linear (conic) density filter of radius `r` suppresses solid members
+/// narrower than roughly its diameter `2r`, so `r = min_member / 2`, then to
+/// cells via the voxel size `h`, clamped to `[MIN, MAX]`. Expressing the length
+/// scale in mm (not cells) makes it mesh-independent: refining the mesh no
+/// longer shrinks the protected feature size.
+fn filter_radius_cells(min_member_mm: f64, h: f64) -> f64 {
+    (min_member_mm / (2.0 * h)).clamp(MIN_FILTER_RADIUS_CELLS, MAX_FILTER_RADIUS_CELLS)
+}
+
 /// Linear density filter over interior cells (conic weights, radius in cells).
 struct DensityFilter {
     /// For each design cell: (neighbor slot, weight) pairs and the row sum.
@@ -364,9 +390,11 @@ struct DensityFilter {
 impl DensityFilter {
     fn build(grid: &VoxelGrid, design_cells: &[u32], radius_cells: f64) -> Self {
         let (nx, ny) = (grid.nx, grid.ny);
-        let mut slot_of: std::collections::HashMap<u32, u32> = Default::default();
+        // Dense cell→slot lookup (sentinel u32::MAX): O(1) indexing instead of
+        // hashing keeps the (2r+1)³ neighbour sweep affordable at large radii.
+        let mut slot_of = vec![u32::MAX; grid.cell_count()];
         for (i, &c) in design_cells.iter().enumerate() {
-            slot_of.insert(c, i as u32);
+            slot_of[c as usize] = i as u32;
         }
         let r = radius_cells;
         let ri = r.ceil() as i64;
@@ -393,8 +421,9 @@ impl DensityFilter {
                         if x >= nx || y >= ny || z >= grid.nz {
                             continue;
                         }
-                        let nc = ((z * ny + y) * nx + x) as u32;
-                        if let Some(&slot) = slot_of.get(&nc) {
+                        let nc = (z * ny + y) * nx + x;
+                        let slot = slot_of[nc];
+                        if slot != u32::MAX {
                             let w = (1.0 - d / r) as f32;
                             neighbors[i].push((slot, w));
                             row_sum[i] += w;
@@ -580,7 +609,8 @@ pub fn optimize_cached(
     let target_mean = params.budget.clamp(params.floor, params.cap);
     let effective_budget = target_mean;
 
-    let filter = DensityFilter::build(grid, &design_cells, 1.6);
+    let filter =
+        DensityFilter::build(grid, &design_cells, filter_radius_cells(params.min_member_mm, grid.h));
     let ke64 = ke_hex(settings.e0, settings.nu, grid.h);
     let b = build_rhs(grid, problem);
 
@@ -889,4 +919,72 @@ pub fn solve_with_eps_cached(
         },
         r.compliance,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn radius_off_is_the_floor() {
+        // min_member = 0 ⇒ exactly the pre-feature-size radius (today's value),
+        // independent of mesh size.
+        assert_eq!(filter_radius_cells(0.0, 0.5), MIN_FILTER_RADIUS_CELLS);
+        assert_eq!(filter_radius_cells(0.0, 0.1), MIN_FILTER_RADIUS_CELLS);
+    }
+
+    #[test]
+    fn radius_grows_on_fine_meshes_and_caps() {
+        // r = min_member / (2h): a fixed physical size needs a bigger cell
+        // radius as the mesh refines, until the perf cap bites.
+        let coarse = filter_radius_cells(2.0, 1.0); // 2/(2·1) = 1.0 → floored to 1.6
+        let fine = filter_radius_cells(2.0, 0.25); // 2/(2·0.25) = 4.0
+        assert_eq!(coarse, MIN_FILTER_RADIUS_CELLS);
+        assert!((fine - 4.0).abs() < 1e-12);
+        // Huge request on a fine mesh is clamped to the cap.
+        assert_eq!(filter_radius_cells(50.0, 0.1), MAX_FILTER_RADIUS_CELLS);
+    }
+
+    #[test]
+    fn radius_is_mesh_independent_in_mm() {
+        // The protected size in mm (≈ 2·r·h) is the same at h and h/2 while
+        // the radius is in the unclamped band.
+        let mm_a = 2.0 * filter_radius_cells(3.0, 0.5) * 0.5;
+        let mm_b = 2.0 * filter_radius_cells(3.0, 0.25) * 0.25;
+        assert!((mm_a - 3.0).abs() < 1e-12);
+        assert!((mm_b - 3.0).abs() < 1e-12);
+        assert!((mm_a - mm_b).abs() < 1e-12);
+    }
+
+    /// Filtered peak of a one-cell-thick high-density wall (a thin member):
+    /// a large minimum member size must blur it below a mid threshold, while
+    /// the off (floor) radius leaves it standing.
+    fn thin_wall_filtered_peak(min_member_mm: f64) -> f64 {
+        let (nx, ny, nz, h) = (25usize, 5usize, 5usize, 0.5);
+        let grid = VoxelGrid::solid_box(nx, ny, nz, h);
+        let design: Vec<u32> = (0..grid.cell_count() as u32).collect();
+        let filter = DensityFilter::build(&grid, &design, filter_radius_cells(min_member_mm, h));
+        // Floor 0.1 everywhere; a single x-plane (cx = 12) at 1.0 — a thin wall.
+        let wall_cx = 12usize;
+        let mut x = vec![0.1f64; design.len()];
+        for (slot, &c) in design.iter().enumerate() {
+            if (c as usize) % nx == wall_cx {
+                x[slot] = 1.0;
+            }
+        }
+        let mut x_phys = vec![0.0f64; design.len()];
+        filter.apply(&x, &mut x_phys);
+        // Sample an interior wall cell (full stencil in every direction).
+        let sample = grid.cell_index(wall_cx, ny / 2, nz / 2) as usize;
+        x_phys[sample]
+    }
+
+    #[test]
+    fn min_member_blurs_out_a_thin_wall() {
+        let off = thin_wall_filtered_peak(0.0); // r = 1.6
+        let big = thin_wall_filtered_peak(50.0); // r = 8 (capped)
+        assert!(off > 0.5, "thin wall should survive with min_member off, got {off}");
+        assert!(big < 0.5, "thin wall should blur out under a large min_member, got {big}");
+        assert!(big < off, "more smoothing must lower the thin feature's peak");
+    }
 }

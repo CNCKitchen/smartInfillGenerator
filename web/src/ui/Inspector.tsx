@@ -28,6 +28,17 @@ function PrintedResults() {
         <span>as printed</span>
       </div>
 
+      {!stats.converged && (
+        <div className="warnbanner">
+          ⚠ <b>Solve did not converge.</b> It stopped at the {stats.iterations}-iteration cap with
+          relative residual {stats.relResidual.toExponential(1)} (target{" "}
+          {(stats.tol ?? 1e-5).toExponential(0)}). The deflection, stress and safety-factor numbers
+          below are an <b>unconverged approximation</b> — treat them as indicative only. A coarser
+          mesh (Preview / Normal) converges reliably and is usually just as accurate for homogenized
+          infill.
+        </div>
+      )}
+
       <div className="dro">
         <div className="dro-label">
           <span>Mass</span>
@@ -120,6 +131,21 @@ function OptResults() {
         <span>Results</span>
         <span>{isMatch ? "match goal" : "budget goal"}</span>
       </div>
+
+      {/* o.converged is the optimizer's DESIGN-stationarity signal (mean |Δρ|
+          settled before the iteration cap). It does NOT yet reflect the
+          binned VERIFICATION solve's MGCG convergence — that is hardcoded
+          converged:true in the wasm layer (see crates/sig-wasm/src/lib.rs,
+          the Solution built after the optimize loop). Surfacing the real
+          verification-solve residual here is the deferred follow-up. */}
+      {!o.converged && (
+        <div className="warnbanner">
+          ⚠ <b>Optimization did not converge.</b> The design was still changing when it hit the{" "}
+          {o.iterations}-iteration cap, so the layout and the stiffness / mass figures below are{" "}
+          <b>preliminary</b>. Re-run — a coarser analysis resolution converges more reliably — before
+          trusting these numbers.
+        </div>
+      )}
 
       {isMatch ? (
         <div className="dro hero">

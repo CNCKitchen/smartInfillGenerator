@@ -141,6 +141,28 @@ Reference points:
   Asymmetric loads with symmetry ON are allowed — the result is then
   symmetric-but-suboptimal by design (the usual reason: two mirrored load cases, one
   printed part).
+- **Minimum member size (2026-06, Optimize step):** a printability length-scale
+  control, like the "minimum member size" knob in commercial topology optimizers.
+  The optimizer's density filter (the anti-checkerboard/anti-sliver smoother) is the
+  mechanism: a linear conic filter of radius `r` suppresses members narrower than
+  ~its diameter `2r`, so the user's minimum member size `d` (mm) maps to
+  `radius_cells = clamp(d / (2·h), 1.6, 8)` (`filter_radius_cells` in simp.rs). The
+  key fix is that the radius was previously a fixed **1.6 cells** — a mesh-relative
+  size, so refining the mesh shrank the protected feature and fine meshes went thin;
+  expressing it in mm makes it **mesh-independent**. The 1.6-cell floor preserves the
+  prior numerical behavior (`d = 0`/off ≡ before, and coarse meshes where `2r < 1.6`
+  cells are unchanged); the 8-cell cap bounds the explicit filter's `(2r+1)³` stencil
+  cost (the filter build uses a dense cell→slot array so even the capped radius stays
+  cheap). **Default `d` = 2× line width** (a true smallest printable rib), exposed as
+  an editable mm value with an "auto" reset; the panel warns when a fine mesh hits the
+  8-cell cap (enforced size then ≈ `16·h`). This is **advisory**, not a hard
+  guarantee — members below the size blur below the bin threshold and drop out, the
+  same honest framing as the tool's other approximations. Heaviside/robust
+  (eroded–dilated) projection would give a near-hard guarantee but pushes the field
+  black/white, which fights graded infill's whole point (intermediate densities are
+  printable); it stays a noted future lever for **binary** mode, alongside a
+  PDE/Helmholtz `O(n)` filter for cheap large length scales. Applies to both graded
+  and binary passes (same filter), and is constant across the stiffness-match secant.
 - **Directional skin: top/bottom shells (2026-06):** `classify_cells` models the printed
   shell structure the way a slicer builds it. WALLS (perimeters × line width) are an
   IN-PLANE band from each layer's outline (per-slice 2D BFS — no leaking through

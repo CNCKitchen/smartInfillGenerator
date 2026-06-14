@@ -95,6 +95,9 @@ export class SceneManager {
   private brushErase = false;
   private brushing = false;
   private brushCursor: THREE.Mesh | null = null;
+  /** Crosshair shown at the hovered surface point in the "pick direction" tool,
+   *  to signal that a click here sets the force direction. */
+  private pickCursor: THREE.LineSegments | null = null;
 
   /** Force arrows + support glyphs (classic FEA triangles), setup view only. */
   private bcMarkers = new THREE.Group();
@@ -266,6 +269,7 @@ export class SceneManager {
       this.setHover(null);
       if (this.probeEl) this.probeEl.style.display = "none";
       if (this.brushCursor) this.brushCursor.visible = false;
+      if (this.pickCursor) this.pickCursor.visible = false;
     });
     this.installNavigation(canvas);
 
@@ -343,6 +347,9 @@ export class SceneManager {
     this.brushErase = brushErase;
     this.controls.enabled = tool !== "brush";
     if (this.brushCursor) this.brushCursor.visible = tool === "brush";
+    // pickCursor follows the pointer (shown on hover in onPointerMove); just
+    // clear it when leaving the tool.
+    if (this.pickCursor && tool !== "pickdir") this.pickCursor.visible = false;
     if (tool !== "select" && tool !== "place") this.setHover(null);
   }
 
@@ -446,6 +453,26 @@ export class SceneManager {
       this.brushCursor = new THREE.Mesh(geo, mat);
       this.brushCursor.visible = false;
       this.scene.add(this.brushCursor);
+    }
+
+    if (!this.pickCursor) {
+      // A small 3-axis crosshair, drawn on top (depthTest off) so it reads as a
+      // "click here" marker regardless of viewing angle. Scaled per-frame to the
+      // part size when shown.
+      const pts = new Float32Array([
+        -1, 0, 0, 1, 0, 0, 0, -1, 0, 0, 1, 0, 0, 0, -1, 0, 0, 1,
+      ]);
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute("position", new THREE.BufferAttribute(pts, 3));
+      const mat = new THREE.LineBasicMaterial({
+        color: 0xf76707, // CNC-orange accent — "actionable"
+        depthTest: false,
+        transparent: true,
+      });
+      this.pickCursor = new THREE.LineSegments(geo, mat);
+      this.pickCursor.renderOrder = 999;
+      this.pickCursor.visible = false;
+      this.scene.add(this.pickCursor);
     }
 
     // Section plane follows the new part.
@@ -801,6 +828,16 @@ export class SceneManager {
         this.brushCursor.visible = false;
       }
       if (this.brushing && hit) this.applyBrush(hit.point);
+    } else if (this.tool === "pickdir") {
+      const hit = this.rayTri(ev);
+      if (hit && this.pickCursor) {
+        this.pickCursor.visible = true;
+        this.pickCursor.position.copy(hit.point);
+        // ~4% of the part diagonal: visible but unobtrusive on any model.
+        this.pickCursor.scale.setScalar(this.bboxDiag * 0.04);
+      } else if (this.pickCursor) {
+        this.pickCursor.visible = false;
+      }
     }
   };
 

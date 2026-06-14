@@ -21,7 +21,7 @@ export interface Bc {
   stiffness?: number;
   /** Which global axes are pinned to zero (displacement support only). */
   axes?: [boolean, boolean, boolean];
-  /** Force definition mode (force only); defaults to "components". */
+  /** Force definition mode (force only); defaults to "direction". */
   forceMode?: ForceMode;
   /** Unit direction for "direction" mode (force only). */
   forceDir?: [number, number, number];
@@ -81,6 +81,9 @@ export interface LoadedModel {
   patchCount: number;
   triCount: number;
   bbox: [number, number, number, number, number, number];
+  /** True when imported from STEP: exact BREP faces are available as a
+   *  surface-patch source (see store `segSource`). */
+  hasCadFaces: boolean;
 }
 
 export interface Material {

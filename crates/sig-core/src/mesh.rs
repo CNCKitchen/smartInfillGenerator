@@ -148,6 +148,17 @@ impl TriMesh {
         if data.len() < 15 {
             return Err(MeshError::TooShort);
         }
+        // Guard: STEP is ASCII text, not an STL. Without this the binary fallback
+        // below reinterprets the text bytes as f32 coordinates and yields absurd
+        // geometry (e.g. ~1e34 mm). Fail clearly. (When the `step` feature is on,
+        // callers route STEP to truck before reaching here; this protects builds
+        // that lack it.)
+        if data[..data.len().min(256)].windows(12).any(|w| w == b"ISO-10303-21") {
+            return Err(MeshError::Malformed(
+                "input looks like a STEP file, not an STL (STEP import unavailable in this build)"
+                    .into(),
+            ));
+        }
         // Binary check first: header(80) + count(4) + 50*count == len is decisive.
         if data.len() >= 84 {
             let n = u32::from_le_bytes([data[80], data[81], data[82], data[83]]) as usize;

@@ -36,13 +36,68 @@ const KIND_DOT: Record<BcKind, string> = {
 };
 
 const HEAD: Record<number, { title: string; sub: string }> = {
-  1: { title: "Model", sub: "Drop an STL or 3MF — units are mm." },
+  1: { title: "Model", sub: "Drop an STL, 3MF or STEP — units are mm." },
   2: { title: "Boundary conditions", sub: "Where the part is held, how it is loaded." },
   3: { title: "Properties", sub: "Material, print settings, analysis grid." },
   4: { title: "Verify setup", sub: "Check constraints, then analyze the print or the solid." },
   5: { title: "Optimize infill", sub: "Distribute density where the loads need it." },
   6: { title: "View & export", sub: "Inspect the result, hand off to the slicer." },
 };
+
+/** Surface-patch source: dihedral crease angle (the slider) or, for STEP
+ *  imports, the exact BREP faces. Shared by the Model and BC steps so the
+ *  "Pick surface" tool selects whole CAD faces when chosen. */
+function SurfacePatchControl() {
+  const s = useStore();
+  if (!s.model) return null;
+  const cad = s.model.hasCadFaces;
+  return (
+    <>
+      <div className="g-label">
+        <span>Surface detection</span>
+        {s.segSource === "angle" && <b>{s.segAngle}°</b>}
+      </div>
+      {cad && (
+        <div className="toolrow">
+          <button
+            className={s.segSource === "cad" ? "on" : ""}
+            onClick={() => void s.setSegSource("cad")}
+            title="One pickable surface per CAD face from the STEP file"
+          >
+            CAD faces
+          </button>
+          <button
+            className={s.segSource === "angle" ? "on" : ""}
+            onClick={() => void s.setSegSource("angle")}
+            title="Group triangles into surfaces by crease angle"
+          >
+            Crease angle
+          </button>
+        </div>
+      )}
+      {s.segSource === "angle" ? (
+        <>
+          <input
+            type="range"
+            min={5}
+            max={80}
+            value={s.segAngle}
+            onChange={(e) => void s.setSegAngle(Number(e.target.value))}
+          />
+          <div className="dim small">
+            Splits the skin into pickable surfaces — lower the angle if patches merge, raise it if
+            they shatter.
+          </div>
+        </>
+      ) : (
+        <div className="dim small">
+          Picking whole CAD faces from the STEP file. Switch to crease angle for a custom grouping
+          (e.g. to merge a filleted region).
+        </div>
+      )}
+    </>
+  );
+}
 
 export function StepPanel() {
   const s = useStore();
@@ -107,12 +162,12 @@ function StepModel() {
       <input
         ref={fileRef}
         type="file"
-        accept=".stl,.3mf"
+        accept=".stl,.3mf,.step,.stp"
         hidden
         onChange={(e) => void onFile(e.target.files?.[0])}
       />
       <button className="primary" onClick={() => fileRef.current?.click()}>
-        {s.fileName ? "Replace model…" : "Open STL / 3MF…"}
+        {s.fileName ? "Replace model…" : "Open STL / 3MF / STEP…"}
       </button>
       {s.fileName ? (
         <div className="fileinfo">
@@ -161,21 +216,7 @@ function StepModel() {
             </div>
           </div>
           <div className="group">
-            <div className="g-label">
-              <span>Surface detection</span>
-              <b>{s.segAngle}°</b>
-            </div>
-            <input
-              type="range"
-              min={5}
-              max={80}
-              value={s.segAngle}
-              onChange={(e) => void s.setSegAngle(Number(e.target.value))}
-            />
-            <div className="dim small">
-              Splits the skin into pickable surfaces — lower the angle if patches merge, raise it
-              if they shatter.
-            </div>
+            <SurfacePatchControl />
           </div>
         </>
       )}
@@ -243,19 +284,8 @@ function StepBcs() {
               Brush
             </button>
           </div>
-          <div className="g-label" style={{ marginTop: 4 }}>
-            <span>Surface detection</span>
-            <b>{s.segAngle}°</b>
-          </div>
-          <input
-            type="range"
-            min={5}
-            max={80}
-            value={s.segAngle}
-            onChange={(e) => void s.setSegAngle(Number(e.target.value))}
-          />
-          <div className="dim small">
-            Lower the angle if pickable patches merge, raise it if they shatter.
+          <div style={{ marginTop: 4 }}>
+            <SurfacePatchControl />
           </div>
         </div>
       )}
@@ -950,6 +980,45 @@ function StepOptimize() {
         )}
       </div>
 
+      <div className="group">
+        <div className="g-label">
+          <span>Minimum member size</span>
+          <b>{s.minMemberMm == null ? `auto · ${(2 * s.lineWidth).toFixed(2)} mm` : "mm"}</b>
+        </div>
+        <div className="toolrow">
+          <NumInput
+            value={s.minMemberMm ?? 2 * s.lineWidth}
+            step={0.1}
+            min={0}
+            max={10}
+            onCommit={(v) => s.setMinMemberMm(v)}
+          />
+          <button
+            className={s.minMemberMm == null ? "on" : ""}
+            onClick={() => s.setMinMemberMm(null)}
+            title="Back to auto (2× line width)"
+          >
+            auto
+          </button>
+        </div>
+        {(() => {
+          const eff = s.minMemberMm ?? 2 * s.lineWidth;
+          const h = s.voxelInfo?.h ?? 0;
+          const capped = h > 0 && eff / (2 * h) > 8;
+          return (
+            <div className="dim small">
+              Thicker members print more reliably; thinner ones blur away during
+              optimization (≈ the filter diameter). Defaults to 2× your line width.
+              {eff <= 1e-9 && " Off — only the numerical anti-checkerboard floor applies."}
+              {capped &&
+                ` At this resolution (h=${h.toFixed(2)} mm) the filter is capped — the` +
+                  ` enforced size tops out near ${(16 * h).toFixed(2)} mm; use a coarser mesh` +
+                  ` for larger members.`}
+            </div>
+          );
+        })()}
+      </div>
+
       <button className="primary" onClick={() => void s.runOptimize()} disabled={!!s.busy}>
         Optimize infill
       </button>
@@ -1042,6 +1111,13 @@ function StepExport() {
         <div className="dim small">
           Result review lives on the viewport: field picker under the view tabs, playback at the
           bottom, min/max markers and click-to-edit scale & exaggeration in the legend.
+        </div>
+      )}
+      {s.optSummary && !s.optSummary.converged && (
+        <div className="warnbanner">
+          ⚠ <b>Exporting an unconverged result.</b> The optimization stopped at its iteration cap
+          before the design settled, so these densities are preliminary. Re-run to convergence before
+          printing anything load-bearing.
         </div>
       )}
       {s.optSummary && (

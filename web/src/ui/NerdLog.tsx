@@ -131,7 +131,9 @@ export function NerdLog() {
       <div className="nl-head">
         <b>Log for nerds</b>
         <span className="dim small">
-          MGCG solver & SIMP optimizer telemetry — convergence when mean |Δρ| &lt; 0.005 twice
+          MGCG solver & SIMP optimizer telemetry — convergence when mean |Δρ| &lt; 0.005 twice.
+          bᵀu is an inexact lower bound (capped, warm-started CG); it climbs as the solve tightens,
+          so it is not the convergence signal.
         </span>
         <span style={{ flex: 1 }} />
         <button onClick={clearLog}>Clear</button>
@@ -139,7 +141,7 @@ export function NerdLog() {
       </div>
       <div className="nl-charts">
         <MiniChart
-          title="Compliance C [N·mm]"
+          title="Objective bᵀu [N·mm]"
           xs={its}
           logY
           series={[{ ys: optSeries.map((p) => p.compliance), color: "#e06a13" }]}

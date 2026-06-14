@@ -1126,6 +1126,24 @@ input[type="number"] {
   line-height: 1.45;
 }
 
+/* Non-convergence caution: stronger than .warnrow (red, accented left edge),
+   and deliberately NOT dismissible — it lives with the result it warns about. */
+.warnbanner {
+  font-size: 11.5px;
+  color: #8c2f18;
+  background: #f6e7e3;
+  border: 1px solid #ddb4a8;
+  border-left: 3px solid #c0492b;
+  border-radius: var(--r);
+  padding: 7px 10px;
+  line-height: 1.45;
+  margin-bottom: 10px;
+}
+
+.warnbanner b {
+  color: #8c2f18;
+}
+
 /* ---------------- machine status strip ---------------- */
 
 .strip {
@@ -1153,6 +1171,12 @@ input[type="number"] {
 .strip b {
   color: #eceeef;
   font-weight: 400;
+}
+
+/* Persistent non-convergence marker on the status strip (always visible). */
+.strip .warn {
+  color: #f0a58a;
+  font-weight: 600;
 }
 
 .strip .grow {

@@ -116,6 +116,12 @@ export class EngineClient {
     return this.call({ op: "resegment", angle });
   }
 
+  /** Switch surface patches to the STEP file's exact BREP faces. No-op (returns
+   *  the current patches) for STL/3MF models. */
+  useCadFaces(): Promise<{ patchIds: Uint32Array; patchCount: number }> {
+    return this.call({ op: "useCadFaces" });
+  }
+
   /** Rigid-transform the part (matrix = [r00..r22 row-major, tx, ty, tz]).
    *  Patches and BCs survive; grid/results drop. Returns the moved display
    *  mesh and its new bbox. */
@@ -338,6 +344,10 @@ export interface OptimizeOptions {
   /** Solid top/bottom shells: layers × layer height; 0 = none. */
   topBottomLayers: number;
   layerHeight: number;
+  /** Minimum member size in mm (printability length scale) driving the
+   *  density-filter radius; 0 = off (numerical floor only). Resolved from the
+   *  store's auto/override before the call. */
+  minMemberMm: number;
 }
 
 export interface OptProgress {

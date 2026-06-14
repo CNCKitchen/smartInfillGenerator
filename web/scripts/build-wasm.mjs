@@ -37,7 +37,7 @@ if (which === "st" || which === "both") {
   const env = { ...process.env };
   delete env.RUSTFLAGS;
   console.log("\n=== single-threaded build -> web/src/wasm ===");
-  execSync("wasm-pack build --target web --out-dir ../../web/src/wasm", {
+  execSync("wasm-pack build --target web --out-dir ../../web/src/wasm -- --features step", {
     cwd: crate,
     stdio: "inherit",
     env,
@@ -47,7 +47,7 @@ if (which === "st" || which === "both") {
 if (which === "mt" || which === "both") {
   console.log("\n=== threaded build -> web/public/wasm-mt ===");
   run(
-    "wasm-pack build --target web --out-dir ../../web/public/wasm-mt -- --features parallel -Z build-std=panic_abort,std",
+    "wasm-pack build --target web --out-dir ../../web/public/wasm-mt -- --features parallel,step -Z build-std=panic_abort,std",
     {
       RUSTUP_TOOLCHAIN: "nightly",
       // RUSTFLAGS overrides .cargo/config.toml, so simd128 must be repeated.

@@ -55,12 +55,13 @@ export function StatusStrip() {
                 </>
               )}{" "}
               · <b>{s.stats.seconds.toFixed(1)} s</b>
+              {!s.stats.converged && <span className="warn"> · ⚠ NOT CONVERGED</span>}
             </div>
           )}
           {s.optSummary && (
             <div>
               OPT <b>{s.optSummary.iterations} it</b> ·{" "}
-              {s.optSummary.converged ? "converged" : "at cap"}
+              {s.optSummary.converged ? "converged" : <span className="warn">⚠ at cap</span>}
             </div>
           )}
         </>

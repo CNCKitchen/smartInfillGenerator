@@ -157,6 +157,9 @@ interface AppState {
   fileName: string | null;
   model: LoadedModel | null;
   segAngle: number;
+  /** Where surface patches come from: dihedral crease angle, or (STEP only)
+   *  exact BREP faces. Defaults to "cad" when the import provides faces. */
+  segSource: "angle" | "cad";
   // interaction
   tool: Tool;
   brushRadius: number;
@@ -203,6 +206,10 @@ interface AppState {
   budget: number; // infill budget: target mean interior density in %
   smoothIters: number; // Taubin passes on modifier regions
   nBins: number;
+  /** Minimum member size in mm (printability length scale); null = auto
+   *  (2× line width). Drives the optimizer's density-filter radius so thin,
+   *  unprintable members are smoothed away — mesh-independent. */
+  minMemberMm: number | null;
   /** Optimization goal: stiffest at a mass budget, or lightest at a
    *  target stiffness ("as stiff as uniform X%"). */
   goal: "budget" | "match";
@@ -277,6 +284,8 @@ interface AppState {
   setActiveStep(n: number): void;
   loadFile(name: string, bytes: ArrayBuffer): Promise<void>;
   setSegAngle(angle: number): Promise<void>;
+  /** Switch the surface-patch source (crease angle vs CAD faces). */
+  setSegSource(src: "angle" | "cad"): Promise<void>;
   setTool(tool: Tool): void;
   /** Print-orientation tools (Model step): rotate 90° about a world axis,
    *  or place the clicked face on the build plate (face normal → −Z). */
@@ -351,6 +360,8 @@ interface AppState {
   onSectionPlaneMoved(normal: [number, number, number], constant: number): void;
   setSmoothIters(v: number): void;
   setNBins(v: number): void;
+  /** Minimum member size in mm; null restores auto (2× line width). */
+  setMinMemberMm(v: number | null): void;
   setGoal(g: "budget" | "match"): void;
   setOptMode(m: "graded" | "binary"): void;
   setSolidPattern(p: "default" | "rectilinear" | "concentric"): void;
@@ -851,6 +862,7 @@ export const useStore = create<AppState>((set, get) => ({
   fileName: null,
   model: null,
   segAngle: 10,
+  segSource: "angle",
   tool: "orbit",
   brushRadius: 3,
   brushErase: false,
@@ -876,6 +888,7 @@ export const useStore = create<AppState>((set, get) => ({
   smoothStress: true,
   smoothIters: 15,
   nBins: 3,
+  minMemberMm: null, // auto = 2× line width
   goal: "budget",
   symOn: false,
   symNormal: [1, 0, 0],
@@ -928,7 +941,7 @@ export const useStore = create<AppState>((set, get) => ({
   async loadFile(name, bytes) {
     set({ busy: "Parsing & segmenting…", error: null, notice: null });
     try {
-      const model = await engine.load(bytes, name.replace(/\.(stl|3mf)$/i, ""));
+      const model = await engine.load(bytes, name.replace(/\.(stl|3mf|step|stp)$/i, ""));
       const m = get().material;
       await engine.setMaterial(m.e0, m.nu, m.density, m.strength, m.strengthZ);
       await engine.setResolution(resolutionCells(get()));
@@ -942,6 +955,9 @@ export const useStore = create<AppState>((set, get) => ({
       set({
         fileName: name,
         model,
+        // STEP arrives already segmented by its BREP faces (Model::new default),
+        // so reflect that; STL/3MF use the crease-angle slider.
+        segSource: model.hasCadFaces ? "cad" : "angle",
         // Land on the Model step so the print orientation can be set first;
         // supports & loads (fresh for every model) come next.
         activeStep: 1,
@@ -1002,11 +1018,27 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   async setSegAngle(angle) {
-    set({ segAngle: angle });
+    // Adjusting the crease angle implies the dihedral source.
+    set({ segAngle: angle, segSource: "angle" });
     if (!get().model) return;
     set({ busy: "Re-segmenting…" });
     try {
       const { patchIds, patchCount } = await engine.resegment(angle);
+      const model = get().model!;
+      set({ model: { ...model, patchIds, patchCount }, busy: null });
+      sceneEvents.onPatchIdsChanged?.(patchIds);
+    } catch (e) {
+      set({ busy: null, error: e instanceof Error ? e.message : String(e) });
+    }
+  },
+
+  async setSegSource(src) {
+    set({ segSource: src });
+    if (!get().model) return;
+    set({ busy: src === "cad" ? "Loading CAD faces…" : "Re-segmenting…" });
+    try {
+      const { patchIds, patchCount } =
+        src === "cad" ? await engine.useCadFaces() : await engine.resegment(get().segAngle);
       const model = get().model!;
       set({ model: { ...model, patchIds, patchCount }, busy: null });
       sceneEvents.onPatchIdsChanged?.(patchIds);
@@ -1110,9 +1142,11 @@ export const useStore = create<AppState>((set, get) => ({
       stiffness: kind === "elastic" ? 100 : undefined,
       // Displacement support: roller locking the vertical (Z) axis by default.
       axes: kind === "displacement" ? [false, false, true] : undefined,
-      // Force: edit Fx/Fy/Fz by default; direction mode tracks the selection
-      // normal and lands on −10 N along it once switched.
-      forceMode: kind === "force" ? "components" : undefined,
+      // Force: default to DIRECTION mode — the direction auto-tracks the
+      // selection's average normal (forceDirAuto) and the magnitude is 10 N,
+      // which is what most users want (push/pull on a face). Switch to
+      // components to edit Fx/Fy/Fz directly.
+      forceMode: kind === "force" ? "direction" : undefined,
       forceDir: kind === "force" ? [0, 0, -1] : undefined,
       forceMag: kind === "force" ? 10 : undefined,
       forceDirAuto: kind === "force" ? true : undefined,
@@ -1478,6 +1512,10 @@ export const useStore = create<AppState>((set, get) => ({
   setNBins(v) {
     set({ nBins: v });
   },
+  setMinMemberMm(v) {
+    // null = auto (2× line width); otherwise clamp to a sane printable range.
+    set({ minMemberMm: v == null ? null : Math.min(10, Math.max(0, v)) });
+  },
 
   setGoal(g) {
     set({ goal: g });
@@ -1669,7 +1707,7 @@ export const useStore = create<AppState>((set, get) => ({
           ? printedSummary && !printedSummary.compositeSkin && printedSummary.skinLayers === 1
             ? "The wall is only one voxel layer thick at this resolution — printed-mode results are coarse. Raise the resolution in Properties, or enable composite skin."
             : null
-          : `Solver stopped at the iteration cap (residual ${stats.relResidual.toExponential(1)}) — the shown result is a close approximation. Preview resolution converges faster.`,
+          : `Solver did NOT converge (stopped at the iteration cap, residual ${stats.relResidual.toExponential(1)}) — the results are unconverged and only indicative. See the caution in the results panel; a coarser resolution converges reliably.`,
       });
       sceneEvents.onScalarField?.(null);
       sceneEvents.onDisplacements?.(displacements, stats);
@@ -1763,6 +1801,8 @@ export const useStore = create<AppState>((set, get) => ({
           symmetry: st.symOn ? [...st.symNormal, st.symC] : null,
           topBottomLayers: st.topBottomLayers,
           layerHeight: st.layerHeight,
+          // Auto = 2× line width (a true smallest printable rib); 0 disables.
+          minMemberMm: st.minMemberMm ?? 2 * st.lineWidth,
         },
         (p, density, skelPositions, skelIndices, skelDensity) => {
           set((s) => ({
@@ -1799,7 +1839,7 @@ export const useStore = create<AppState>((set, get) => ({
           }
           appendLog(
             set,
-            `  ${p.passes > 1 ? `p${p.pass} ` : ""}it ${String(p.iteration).padStart(2)}: C ${p.compliance.toExponential(3)} N·mm · ` +
+            `  ${p.passes > 1 ? `p${p.pass} ` : ""}it ${String(p.iteration).padStart(2)}: bᵀu ${p.compliance.toExponential(3)} N·mm · ` +
               `infill ${(p.meanInfill * 100).toFixed(1)}% · Δmax ${p.change.toFixed(3)} · ` +
               `Δmean ${p.meanChange.toFixed(4)} · CG ${p.innerIters}@${p.innerRes.toExponential(1)}`
           );
@@ -1845,6 +1885,11 @@ export const useStore = create<AppState>((set, get) => ({
         optProgress: null,
         busy: null,
         viewMode: "density",
+        // converged:true here is the OPTIMIZER's design-stationarity, not the
+        // binned verification solve's MGCG convergence (the engine hardcodes
+        // that — see crates/sig-wasm/src/lib.rs Solution after the opt loop).
+        // The dock keys its non-convergence banner off optSummary.converged;
+        // surfacing the verification residual needs the deferred wasm change.
         stats: {
           iterations: out.summary.iterations,
           relResidual: 0,

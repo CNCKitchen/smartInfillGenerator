@@ -10,6 +10,12 @@ crate-type = ["cdylib"]
 
 [features]
 default = []
+# STEP import (truck CAD kernel). OPT-IN, enabled by the wasm build script
+# (build-wasm.mjs passes `--features step`). NOT default so a host-target
+# `cargo build`/`cargo test` of this crate doesn't drag truck onto the native
+# windows-gnu toolchain, which can't build its raw-dylib deps (no MinGW
+# assembler). The wasm32 target compiles truck cleanly.
+step = ["sig-core/step"]
 # Threaded build (rayon on wasm): requires nightly + build-std with
 # atomics/bulk-memory and a cross-origin-isolated page (SharedArrayBuffer).
 # Built as a SEPARATE module (web/src/wasm-mt); the plain build stays the

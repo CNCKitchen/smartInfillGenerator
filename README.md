@@ -7,6 +7,7 @@ surfaces, run a structural analysis and density optimization **entirely in the
 browser**, and export an OrcaSlicer/Bambu Studio project 3MF where each region
 of the part gets the infill density the loads actually demand.
 
+- [docs/](docs/README.md) — **technical documentation**: [Theory & Engineering Reference](docs/theory-manual.md) and [Verification & Validation Manual](docs/verification-manual.md)
 - [DESIGN.md](DESIGN.md) — full design decisions and build plan
 - [PHASE1_RESULTS.md](PHASE1_RESULTS.md) — solver engine benchmarks/validation
 

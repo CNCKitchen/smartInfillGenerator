@@ -12,3 +12,7 @@ _sample_extracted/
 /web/repro-box.stl
 /web/repro-busy.png
 meshbench-out.txt
+# STEP-import dev harness artifacts (stepnode_test.mjs builds this pkg + STLs)
+/crates/sig-wasm/pkg-stepnode/
+/hook_truck_*.stl
+/hook_model_*.stl

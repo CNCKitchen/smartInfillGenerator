@@ -53,6 +53,7 @@ type Req =
       matrix: number[];
     }
   | { id: number; op: "resegment"; angle: number }
+  | { id: number; op: "useCadFaces" }
   | {
       id: number;
       op: "setMaterial";
@@ -149,6 +150,7 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
           triCount: model.triangle_count(),
           bbox: Array.from(model.bbox()),
           meshObjects: model.mesh_object_count(),
+          hasCadFaces: model.has_cad_faces(),
         };
         (self as unknown as Worker).postMessage({ id: msg.id, ok: true, data }, [
           positions.buffer,
@@ -168,6 +170,15 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
       }
       case "resegment": {
         requireModel().resegment(msg.angle);
+        const patchIds = requireModel().patch_ids();
+        (self as unknown as Worker).postMessage(
+          { id: msg.id, ok: true, data: { patchIds, patchCount: requireModel().patch_count() } },
+          [patchIds.buffer]
+        );
+        return;
+      }
+      case "useCadFaces": {
+        requireModel().use_cad_faces();
         const patchIds = requireModel().patch_ids();
         (self as unknown as Worker).postMessage(
           { id: msg.id, ok: true, data: { patchIds, patchCount: requireModel().patch_count() } },
