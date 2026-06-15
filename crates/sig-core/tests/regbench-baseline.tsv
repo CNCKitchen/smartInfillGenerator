@@ -1,0 +1,22 @@
+# regbench baseline — name\tvalue\tQ|I
+vox_sphere_volerr_pct	-0.6369163814699567	Q
+vox_time_ms	96.2795	I
+vox_mcells_per_s	0.6647313290991332	I
+solve_small_tip_uz	-2.477917479880062	Q
+solve_small_timo_ratio	0.983642129660125	Q
+solve_small_iters	7	I
+solve_small_residual	0.0000011537783728916826	I
+solve_small_time_ms	143.57049999999998	I
+solve_mid_tip_uz	-2.495815179752231	Q
+solve_mid_timo_ratio	0.9907468584338734	Q
+solve_mid_iters	7	I
+solve_mid_residual	0.0000019770061378536335	I
+solve_mid_time_ms	195.3076	I
+opt_c_continuous	41.96683372332566	Q
+opt_c_binned	42.126611303509236	Q
+opt_c_uniform	48.498497863597294	Q
+opt_gain_vs_uniform	1.151255616412642	Q
+opt_mean_infill	0.3499985940213291	Q
+opt_maxd	1.4163274649407875	Q
+opt_iters	8	I
+opt_time_ms	1543.4225000000001	I

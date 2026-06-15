@@ -34,6 +34,10 @@ name = "bench"
 path = "src/bin/bench.rs"
 
 [[bin]]
+name = "regbench"
+path = "src/bin/regbench.rs"
+
+[[bin]]
 name = "stepbench"
 path = "src/bin/stepbench.rs"
 required-features = ["step"]
