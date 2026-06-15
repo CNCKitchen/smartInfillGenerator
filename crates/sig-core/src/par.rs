@@ -9,36 +9,52 @@
 use rayon::prelude::*;
 
 /// Chunk size for vector ops: large enough to amortize task overhead.
+/// (Only referenced by the threaded helpers below.)
+#[cfg(feature = "parallel")]
 const CHUNK: usize = 1 << 14;
+
+// The native-vs-wasm threading split lives in exactly these two drivers; every
+// element-wise vector op routes through them instead of repeating the
+// `#[cfg(parallel)]` pair. Each op's closure is element-wise within its chunk,
+// so splitting into parallel chunks and running over the whole slice once
+// (sequential) produce identical results — no reductions go through here.
+
+/// Apply `f` to each chunk of `a` (parallel chunks when threaded; the whole
+/// slice as one chunk otherwise).
+#[inline]
+fn each_chunk_mut<A: Send, F: Fn(&mut [A]) + Sync>(a: &mut [A], f: F) {
+    #[cfg(feature = "parallel")]
+    a.par_chunks_mut(CHUNK).for_each(|c| f(c));
+    #[cfg(not(feature = "parallel"))]
+    f(a);
+}
+
+/// Like `each_chunk_mut` but zips a second, read-only slice in lockstep.
+#[inline]
+fn zip_chunks_mut<A: Send, B: Sync, F: Fn(&mut [A], &[B]) + Sync>(a: &mut [A], b: &[B], f: F) {
+    debug_assert_eq!(a.len(), b.len());
+    #[cfg(feature = "parallel")]
+    a.par_chunks_mut(CHUNK).zip(b.par_chunks(CHUNK)).for_each(|(ac, bc)| f(ac, bc));
+    #[cfg(not(feature = "parallel"))]
+    f(a, b);
+}
 
 /// y[i] += a * x[i]
 pub fn axpy(y: &mut [f32], a: f32, x: &[f32]) {
-    debug_assert_eq!(y.len(), x.len());
-    #[cfg(feature = "parallel")]
-    y.par_chunks_mut(CHUNK).zip(x.par_chunks(CHUNK)).for_each(|(yc, xc)| {
+    zip_chunks_mut(y, x, |yc, xc| {
         for (yi, xi) in yc.iter_mut().zip(xc) {
             *yi += a * xi;
         }
     });
-    #[cfg(not(feature = "parallel"))]
-    for (yi, xi) in y.iter_mut().zip(x) {
-        *yi += a * xi;
-    }
 }
 
 /// y[i] = x[i] + b * y[i]  (xpby, used for CG direction update)
 pub fn xpby(y: &mut [f32], x: &[f32], b: f32) {
-    debug_assert_eq!(y.len(), x.len());
-    #[cfg(feature = "parallel")]
-    y.par_chunks_mut(CHUNK).zip(x.par_chunks(CHUNK)).for_each(|(yc, xc)| {
+    zip_chunks_mut(y, x, |yc, xc| {
         for (yi, xi) in yc.iter_mut().zip(xc) {
             *yi = xi + b * *yi;
         }
     });
-    #[cfg(not(feature = "parallel"))]
-    for (yi, xi) in y.iter_mut().zip(x) {
-        *yi = xi + b * *yi;
-    }
 }
 
 /// Dot product with f64 accumulation (keeps CG orthogonality honest in f32).
@@ -102,51 +118,30 @@ pub fn sub(out: &mut [f32], a: &[f32], b: &[f32]) {
 
 /// y[i] = a * y[i] + b * x[i]  (Chebyshev direction update)
 pub fn axpby(y: &mut [f32], a: f32, b: f32, x: &[f32]) {
-    debug_assert_eq!(y.len(), x.len());
-    #[cfg(feature = "parallel")]
-    y.par_chunks_mut(CHUNK).zip(x.par_chunks(CHUNK)).for_each(|(yc, xc)| {
+    zip_chunks_mut(y, x, |yc, xc| {
         for (yi, xi) in yc.iter_mut().zip(xc) {
             *yi = a * *yi + b * xi;
         }
     });
-    #[cfg(not(feature = "parallel"))]
-    for (yi, xi) in y.iter_mut().zip(x) {
-        *yi = a * *yi + b * xi;
-    }
 }
 
 pub fn fill(y: &mut [f32], v: f32) {
-    #[cfg(feature = "parallel")]
-    y.par_chunks_mut(CHUNK).for_each(|c| c.fill(v));
-    #[cfg(not(feature = "parallel"))]
-    y.fill(v);
+    each_chunk_mut(y, |c| c.fill(v));
 }
 
 pub fn copy(dst: &mut [f32], src: &[f32]) {
-    debug_assert_eq!(dst.len(), src.len());
-    #[cfg(feature = "parallel")]
-    dst.par_chunks_mut(CHUNK).zip(src.par_chunks(CHUNK)).for_each(|(d, s)| d.copy_from_slice(s));
-    #[cfg(not(feature = "parallel"))]
-    dst.copy_from_slice(src);
+    zip_chunks_mut(dst, src, |d, s| d.copy_from_slice(s));
 }
 
 /// Zero entries where mask is true.
 pub fn mask_zero(y: &mut [f32], mask: &[bool]) {
-    debug_assert_eq!(y.len(), mask.len());
-    #[cfg(feature = "parallel")]
-    y.par_chunks_mut(CHUNK).zip(mask.par_chunks(CHUNK)).for_each(|(yc, mc)| {
+    zip_chunks_mut(y, mask, |yc, mc| {
         for (yi, m) in yc.iter_mut().zip(mc) {
             if *m {
                 *yi = 0.0;
             }
         }
     });
-    #[cfg(not(feature = "parallel"))]
-    for (yi, m) in y.iter_mut().zip(mask) {
-        if *m {
-            *yi = 0.0;
-        }
-    }
 }
 
 /// Parallel iteration over equal-size chunks of `data`; the callback receives
@@ -163,17 +158,11 @@ pub fn chunks_mut_indexed<F: Fn(usize, &mut [f32]) + Sync>(data: &mut [f32], chu
 // ---- f64 variants for the outer (mixed-precision) CG loop ----
 
 pub fn axpy64(y: &mut [f64], a: f64, x: &[f64]) {
-    debug_assert_eq!(y.len(), x.len());
-    #[cfg(feature = "parallel")]
-    y.par_chunks_mut(CHUNK).zip(x.par_chunks(CHUNK)).for_each(|(yc, xc)| {
+    zip_chunks_mut(y, x, |yc, xc| {
         for (yi, xi) in yc.iter_mut().zip(xc) {
             *yi += a * xi;
         }
     });
-    #[cfg(not(feature = "parallel"))]
-    for (yi, xi) in y.iter_mut().zip(x) {
-        *yi += a * xi;
-    }
 }
 
 pub fn dot64(a: &[f64], b: &[f64]) -> f64 {
@@ -213,45 +202,27 @@ pub fn dot_mixed(a: &[f64], b: &[f32]) -> f64 {
 
 /// p = z + beta * p with f32 z promoted into the f64 direction vector.
 pub fn xpby_mixed(p: &mut [f64], z: &[f32], beta: f64) {
-    debug_assert_eq!(p.len(), z.len());
-    #[cfg(feature = "parallel")]
-    p.par_chunks_mut(CHUNK).zip(z.par_chunks(CHUNK)).for_each(|(pc, zc)| {
+    zip_chunks_mut(p, z, |pc, zc| {
         for (pi, zi) in pc.iter_mut().zip(zc) {
             *pi = *zi as f64 + beta * *pi;
         }
     });
-    #[cfg(not(feature = "parallel"))]
-    for (pi, zi) in p.iter_mut().zip(z) {
-        *pi = *zi as f64 + beta * *pi;
-    }
 }
 
 pub fn demote(dst: &mut [f32], src: &[f64]) {
-    debug_assert_eq!(dst.len(), src.len());
-    #[cfg(feature = "parallel")]
-    dst.par_chunks_mut(CHUNK).zip(src.par_chunks(CHUNK)).for_each(|(dc, sc)| {
+    zip_chunks_mut(dst, src, |dc, sc| {
         for (d, s) in dc.iter_mut().zip(sc) {
             *d = *s as f32;
         }
     });
-    #[cfg(not(feature = "parallel"))]
-    for (d, s) in dst.iter_mut().zip(src) {
-        *d = *s as f32;
-    }
 }
 
 pub fn promote(dst: &mut [f64], src: &[f32]) {
-    debug_assert_eq!(dst.len(), src.len());
-    #[cfg(feature = "parallel")]
-    dst.par_chunks_mut(CHUNK).zip(src.par_chunks(CHUNK)).for_each(|(dc, sc)| {
+    zip_chunks_mut(dst, src, |dc, sc| {
         for (d, s) in dc.iter_mut().zip(sc) {
             *d = *s as f64;
         }
     });
-    #[cfg(not(feature = "parallel"))]
-    for (d, s) in dst.iter_mut().zip(src) {
-        *d = *s as f64;
-    }
 }
 
 /// Shared mutable slice for scatter writes that are disjoint BY CONSTRUCTION
