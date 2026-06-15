@@ -10,6 +10,7 @@ import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
 import type { Bc, LoadedModel } from "../types";
 import type { Tool, ViewMode } from "../store";
+import { jet, ramp, type RGB } from "./colormaps";
 import type { OptRegion } from "../engine/EngineClient";
 
 const BASE_COLOR = new THREE.Color(0x9aa3ad);
@@ -1389,7 +1390,7 @@ export class SceneManager {
     const c = new THREE.Color();
     for (let v = 0; v < arr.length / 3; v++) {
       if (this.meshDensity && density) {
-        ramp(Math.min(1, Math.max(0, density[v])), c);
+        c.setRGB(...ramp(Math.min(1, Math.max(0, density[v]))));
         arr[3 * v] = c.r;
         arr[3 * v + 1] = c.g;
         arr[3 * v + 2] = c.b;
@@ -1525,7 +1526,7 @@ export class SceneManager {
       geo.setAttribute("position", new THREE.BufferAttribute(r.positions, 3));
       geo.setIndex(new THREE.BufferAttribute(r.indices, 1));
       geo.computeVertexNormals();
-      ramp(Math.min(1, r.density / 0.8), c);
+      c.setRGB(...ramp(Math.min(1, r.density / 0.8)));
       // Part Topo body: opaque single surface (no nested modifiers to see
       // through). Infill modifiers stay translucent so the nesting is visible.
       const mat = new THREE.MeshStandardMaterial({
@@ -2331,33 +2332,16 @@ function makeTextSprite(text: string, color: number): THREE.Sprite {
   return sprite;
 }
 
-/** Compact blue→cyan→yellow→red ramp (density + region colors). */
-function ramp(x: number, out: THREE.Color) {
-  const t = Math.min(1, Math.max(0, x));
-  if (t < 0.33) out.setRGB(0.15, 0.3 + 1.8 * t, 0.9);
-  else if (t < 0.66) out.setRGB(0.15 + 2.4 * (t - 0.33), 0.9, 0.9 - 2.4 * (t - 0.33));
-  else out.setRGB(0.95, 0.9 - 2.4 * (t - 0.66), 0.1);
-}
-
-/** Classic jet colormap (displacement view). */
-function jet(x: number, out: THREE.Color) {
-  const t = Math.min(1, Math.max(0, x));
-  const r = Math.min(1, Math.max(0, 1.5 - Math.abs(4 * t - 3)));
-  const g = Math.min(1, Math.max(0, 1.5 - Math.abs(4 * t - 2)));
-  const b = Math.min(1, Math.max(0, 1.5 - Math.abs(4 * t - 1)));
-  out.setRGB(r, g, b);
-}
-
-/** Bake a colormap into a 1D texture, sampled per-fragment via uv.x. */
-function makeLut(fn: (t: number, out: THREE.Color) => void): THREE.DataTexture {
+/** Bake a colormap (see ./colormaps) into a 1D texture, sampled per-fragment
+ * via uv.x. The same `jet`/`ramp` feed the legend bars, so they stay in sync. */
+function makeLut(fn: (t: number) => RGB): THREE.DataTexture {
   const n = 256;
   const data = new Uint8Array(n * 4);
-  const c = new THREE.Color();
   for (let i = 0; i < n; i++) {
-    fn(i / (n - 1), c);
-    data[4 * i] = Math.round(255 * c.r);
-    data[4 * i + 1] = Math.round(255 * c.g);
-    data[4 * i + 2] = Math.round(255 * c.b);
+    const [r, g, b] = fn(i / (n - 1));
+    data[4 * i] = Math.round(255 * r);
+    data[4 * i + 1] = Math.round(255 * g);
+    data[4 * i + 2] = Math.round(255 * b);
     data[4 * i + 3] = 255;
   }
   const tex = new THREE.DataTexture(data, n, 1, THREE.RGBAFormat);

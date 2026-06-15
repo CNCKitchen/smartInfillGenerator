@@ -5,6 +5,7 @@ import { useEffect, useRef, useState } from "react";
 import { SceneManager } from "./SceneManager";
 import { sceneEvents, useStore } from "../store";
 import { RESULT_FIELDS } from "../types";
+import { cssGradient, jet, ramp } from "./colormaps";
 
 function union(a: Uint32Array, b: Uint32Array): Uint32Array {
   const s = new Set<number>(a as unknown as number[]);
@@ -176,25 +177,12 @@ export function Viewer() {
 
 // ---- color-scale legend overlay ----
 
-function jetCss(flip = false): string {
-  const stops: string[] = [];
-  for (let i = 0; i <= 8; i++) {
-    const pos = i / 8;
-    const t = flip ? 1 - pos : pos;
-    const r = Math.round(255 * Math.min(1, Math.max(0, 1.5 - Math.abs(4 * t - 3))));
-    const g = Math.round(255 * Math.min(1, Math.max(0, 1.5 - Math.abs(4 * t - 2))));
-    const b = Math.round(255 * Math.min(1, Math.max(0, 1.5 - Math.abs(4 * t - 1))));
-    stops.push(`rgb(${r},${g},${b}) ${(100 * pos).toFixed(1)}%`);
-  }
-  return `linear-gradient(to top, ${stops.join(", ")})`;
-}
-
-const JET_GRADIENT = jetCss();
+// Legend bars derive from the SAME colormaps that paint the surface and the
+// GPU LUT (see ./colormaps) — they can't drift apart.
+const JET_GRADIENT = cssGradient(jet);
 // Safety factor: red marks the LOW (critical) end of the scale.
-const JET_GRADIENT_FLIP = jetCss(true);
-// Matches ramp() in SceneManager (density + region colors).
-const RAMP_GRADIENT =
-  "linear-gradient(to top, #264de6 0%, #26e4e6 33%, #f0e61c 66%, #f21519 100%)";
+const JET_GRADIENT_FLIP = cssGradient(jet, true);
+const RAMP_GRADIENT = cssGradient(ramp);
 
 function fmtDisp(mm: number): string {
   // Sign-aware: displacement components can be negative; pick mm vs µm by
