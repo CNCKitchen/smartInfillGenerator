@@ -8,6 +8,7 @@ import {
   type OptSummary,
   type SlicerFlavor,
 } from "./engine/EngineClient";
+import { EngineSession } from "./engine/EngineSession";
 import type {
   Bc,
   BcKind,
@@ -476,27 +477,12 @@ function disclaimerSkippedInit(): boolean {
   }
 }
 
-/** Per-kind cache of fetched stress/strain fields (cleared on invalidation). */
-const fieldCache = new Map<string, Float32Array>();
-/** Same, sized for the voxel-hull surface; plus whether the hull geometry
- *  (positions + nodal displacements) for the CURRENT solution is in the scene. */
-const voxFieldCache = new Map<string, Float32Array>();
-let voxelResultLoaded = false;
-
-/** New solution / model: voxel-result geometry + field caches are stale. */
-function invalidateVoxelResult() {
-  voxelResultLoaded = false;
-  voxFieldCache.clear();
-  sceneEvents.onVoxelResult?.(null, null, null, null);
-}
-
-/** Fetch the voxel hull + nodal displacements once per solution. */
-async function loadVoxelResult() {
-  if (voxelResultLoaded) return;
-  const r = await engine.voxelResults();
-  sceneEvents.onVoxelResult?.(r.positions, r.displacements, r.edges, r.edgeDisplacements);
-  voxelResultLoaded = true;
-}
+/** Owns the per-solution engine-session state (field caches, voxel-result
+ *  geometry, residual poll). The `onVoxelResult` sink forwards to the scene at
+ *  call time (sceneEvents is populated by the viewer on mount). */
+const session = new EngineSession((p, d, e, ed) =>
+  sceneEvents.onVoxelResult?.(p, d, e, ed)
+);
 
 /** Push the active result field, sized for the active result surface
  *  ("u" = displacement coloring straight from the displacement arrays). */
@@ -514,11 +500,10 @@ async function pushScalarField(set: SetState, get: () => AppState) {
     return;
   }
   const vox = get().resultSurface === "voxel";
-  const cache = vox ? voxFieldCache : fieldCache;
-  let values = cache.get(kind);
+  let values = session.fieldOf(kind, vox);
   if (!values) {
     values = vox ? await engine.voxelResultField(kind) : await engine.resultField(kind);
-    cache.set(kind, values);
+    session.setField(kind, vox, values);
   }
   if (get().resultField !== kind) return; // user moved on mid-fetch
   let min = Infinity;
@@ -545,8 +530,8 @@ async function refreshMinSf(
       engine.resultField("sfm"),
       engine.resultField("sfz"),
     ]);
-    fieldCache.set("sfm", sfm);
-    fieldCache.set("sfz", sfz);
+    session.setField("sfm", false, sfm);
+    session.setField("sfz", false, sfz);
     let minM = Infinity;
     let minZ = Infinity;
     for (let i = 0; i < sfm.length; i++) minM = Math.min(minM, sfm[i]);
@@ -634,19 +619,6 @@ function appendLog(set: SetState, msg: string) {
   set((s) => ({
     logLines: [...s.logLines.slice(-(MAX_LOG_LINES - 1)), { t: logTime(), msg }],
   }));
-}
-
-/** Stream the live MGCG residual trace into the convergence plot while a solve
- *  runs, by polling the engine's shared buffer a few times a second. Returns a
- *  stop function. No-op (the plot fills in at the end, as before) when live
- *  streaming isn't available (no cross-origin isolation). */
-function startResidualPoll(set: SetState): () => void {
-  if (engine.readSolveProgress() === null) return () => {};
-  const timer = setInterval(() => {
-    const live = engine.readSolveProgress();
-    if (live && live.length) set({ solveResiduals: live });
-  }, 120);
-  return () => clearInterval(timer);
 }
 
 /** Log the analysis grid when it (re)builds — entry of check/solve/optimize. */
@@ -864,8 +836,7 @@ function invalidateResults(set: (p: Partial<AppState>) => void, get: () => AppSt
     legendMin: null,
     legendMax: null,
   });
-  fieldCache.clear();
-  invalidateVoxelResult();
+  session.invalidateSolution();
   sceneEvents.onLegendRange?.(null, null);
   sceneEvents.onScalarField?.(null);
   sceneEvents.onRegions?.(null);
@@ -1047,8 +1018,7 @@ export const useStore = create<AppState>((set, get) => ({
             ? "3MF contained multiple meshes — analyzing the largest body only."
             : null,
       });
-      fieldCache.clear();
-      invalidateVoxelResult();
+      session.invalidateSolution();
       // Clear stale overlays BEFORE the model swap so nothing survives even
       // if a later step fails.
       sceneEvents.onScalarField?.(null);
@@ -1532,8 +1502,7 @@ export const useStore = create<AppState>((set, get) => ({
       await engine.setSmoothStress(on);
       // Pure post-processing: the solution stays valid — just re-fetch the
       // active field and the dock's min-SF under the new sampling.
-      fieldCache.clear();
-      voxFieldCache.clear();
+      session.clearAllFields();
       if (get().hasResult) {
         await pushScalarField(set, get);
         await refreshMinSf(set, get);
@@ -1549,8 +1518,7 @@ export const useStore = create<AppState>((set, get) => ({
       // Pure post-processing: re-fetch the active field under the new modulus.
       // (SF is unaffected — the same factor cancels — but refresh it anyway so
       // the dock stays consistent if the user toggles mid-session.)
-      fieldCache.clear();
-      voxFieldCache.clear();
+      session.clearAllFields();
       if (get().hasResult) {
         await pushScalarField(set, get);
         await refreshMinSf(set, get);
@@ -1739,7 +1707,7 @@ export const useStore = create<AppState>((set, get) => ({
       // Clear the old curve and stream the new one as the MGCG loop runs (the
       // engine reset its shared buffer when the solve call below was issued).
       set({ solveResiduals: [] });
-      stopResidualPoll = startResidualPoll(set);
+      stopResidualPoll = session.startResidualPoll((r) => set({ solveResiduals: r }));
       if (printed) {
         appendLog(
           set,
@@ -1785,8 +1753,7 @@ export const useStore = create<AppState>((set, get) => ({
       // Solve done — stop polling before publishing the exact final trace so a
       // late poll can't overwrite it with the (possibly capped) live snapshot.
       stopResidualPoll();
-      fieldCache.clear(); // stress fields belong to the previous solution
-      invalidateVoxelResult();
+      session.invalidateSolution(); // stress fields + voxel result belong to the previous solution
       sceneEvents.onLegendRange?.(null, null);
       appendLog(
         set,
@@ -1818,7 +1785,7 @@ export const useStore = create<AppState>((set, get) => ({
       // Voxel result surface active: reload its hull for the new solution.
       if (get().resultSurface === "voxel") {
         try {
-          await loadVoxelResult();
+          await session.loadVoxelResult();
         } catch {
           set({ resultSurface: "stl" });
           sceneEvents.onResultSurface?.("stl");
@@ -1995,8 +1962,7 @@ export const useStore = create<AppState>((set, get) => ({
         );
       }
       const vis = out.regions.map(() => true);
-      fieldCache.clear(); // stress fields belong to the previous solution
-      invalidateVoxelResult();
+      session.invalidateSolution(); // stress fields + voxel result belong to the previous solution
       sceneEvents.onLegendRange?.(null, null);
       set({
         resultField: "u",
@@ -2127,8 +2093,9 @@ export const useStore = create<AppState>((set, get) => ({
     sceneEvents.onViewState?.(mode, get().deformScale);
     // Entering results with the voxel surface chosen: (re)load lazily —
     // an optimize lands on the density view, so the hull may be stale.
-    if (mode === "deformed" && get().resultSurface === "voxel" && !voxelResultLoaded) {
-      loadVoxelResult()
+    if (mode === "deformed" && get().resultSurface === "voxel" && !session.isVoxelLoaded) {
+      session
+        .loadVoxelResult()
         .then(() => pushScalarField(set, get))
         .catch(() => {
           set({ resultSurface: "stl" });
@@ -2170,7 +2137,7 @@ export const useStore = create<AppState>((set, get) => ({
     set({ resultSurface: surface });
     try {
       if (surface === "voxel") {
-        await loadVoxelResult();
+        await session.loadVoxelResult();
       }
       sceneEvents.onResultSurface?.(surface);
       // The scalar field is sized per surface — re-push for the active one.
