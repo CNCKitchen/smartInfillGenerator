@@ -406,7 +406,7 @@ assert(iso.length === 3 && iso[0].length > 0 && iso[1].length % 3 === 0,
   `density isosurface at 30% (${iso[1].length / 3} tris)`);
 assert(iso[2].length * 3 === iso[0].length, "cutaway carries per-vertex density");
 
-const threeMf = optModel.export_3mf("orca");
+const threeMf = optModel.export_3mf("orca", new Uint8Array());
 assert(threeMf.length > 500 && threeMf[0] === 0x50 && threeMf[1] === 0x4b, "3MF export is a zip");
 // The part carries the perimeter count from the optimize call (2 above);
 // modifiers override ONLY the infill density — walls inherit from the part.
@@ -422,7 +422,7 @@ assert(threeMf.length > 500 && threeMf[0] === 0x50 && threeMf[1] === 0x4b, "3MF 
 // PrusaSlicer flavor: one object, volumes by triangle range in
 // Slic3r_PE_model.config, perimeters + base fill_density at object scope.
 {
-  const prusaMf = optModel.export_3mf("prusa");
+  const prusaMf = optModel.export_3mf("prusa", new Uint8Array());
   const raw = new TextDecoder("latin1").decode(prusaMf);
   assert(raw.includes("Slic3r_PE_model.config"), "prusa export carries the PE model config");
   assert(raw.includes("slic3rpe:Version3mf"), "prusa flavor marker present");
@@ -465,14 +465,17 @@ assert(Math.abs(binSummary.bins[1].density - 1.0) < 1e-9, "top level = solid");
 assert(Math.abs(binSummary.meanInfill - 0.3) < 0.05, `binary mean tracks budget (${binSummary.meanInfill})`);
 assert(binSummary.gainVsUniform > 0.0, "binary core beats uniform infill");
 {
-  const binMf = binModel.export_3mf("orca");
+  const binMf = binModel.export_3mf("orca", new Uint8Array());
   const raw = new TextDecoder("latin1").decode(binMf);
   assert(raw.includes('sparse_infill_pattern" value="concentric"'),
     "binary export carries the solid-fill pattern on the modifier");
   assert(!raw.includes("internal_solid_infill_pattern"),
     "deprecated object-level key never written (Bambu renamed rectilinear -> zig-zag)");
-  assert(raw.indexOf("<part ") < raw.indexOf("sparse_infill_pattern"),
-    "pattern inside a modifier part, not at object level");
+  // DESIGN.md #10 (2026-06): the pattern is pinned at BOTH the object level
+  // (the GENERAL sparse_infill_pattern, so the whole part prints in it) AND on
+  // the solid-region modifier — so the key appears at least twice.
+  assert((raw.split("sparse_infill_pattern").length - 1) >= 2,
+    "pattern pinned at object level and on the modifier (whole part prints in it)");
   assert(raw.includes('sparse_infill_density" value="100%"'), "solid region modifier at 100%");
   assert(raw.includes('sparse_infill_density" value="5%"'), "base density 5%");
 }
