@@ -1648,7 +1648,7 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   async runCheck() {
-    if (!get().model) return;
+    if (!get().model || !session.beginRun()) return;
     set({ busy: "Voxelizing & checking constraints…", error: null });
     try {
       await pushBcs(get);
@@ -1671,11 +1671,13 @@ export const useStore = create<AppState>((set, get) => ({
       const msg = e instanceof Error ? e.message : String(e);
       set({ busy: null, error: msg });
       appendLog(set, `Check failed: ${msg}`);
+    } finally {
+      session.endRun();
     }
   },
 
   async runSolve() {
-    if (!get().model) return;
+    if (!get().model || !session.beginRun()) return;
     set({ busy: "Solving…", error: null });
     sceneEvents.onAnimateMode?.(null);
     let stopResidualPoll = () => {};
@@ -1817,12 +1819,13 @@ export const useStore = create<AppState>((set, get) => ({
       }
     } finally {
       stopResidualPoll(); // also covers the error/cancel paths
+      session.endRun();
     }
   },
 
   async runOptimize() {
     const st = get();
-    if (!st.model) return;
+    if (!st.model || !session.beginRun()) return;
     set({
       busy: st.optMode === "solid" ? "Optimizing shape…" : "Optimizing infill…",
       error: null,
@@ -2019,6 +2022,8 @@ export const useStore = create<AppState>((set, get) => ({
         appendLog(set, `Optimize failed: ${msg}`);
       }
       pushSymmetry(get);
+    } finally {
+      session.endRun();
     }
   },
 

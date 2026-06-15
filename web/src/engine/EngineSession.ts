@@ -92,4 +92,27 @@ export class EngineSession {
     }, 120);
     return () => clearInterval(timer);
   }
+
+  // ---- run re-entrancy lock ----
+
+  /** The heavy runs (check / solve / optimize) drive ONE worker holding ONE Rust
+   *  model through a sequence of stateful calls (pushBcs → solve …), so letting
+   *  two overlap interleaves those messages and corrupts the model. The
+   *  busy-disabled buttons race a render frame and miss programmatic callers,
+   *  and `busy` clears before the result tail (voxel hull, safety factors)
+   *  finishes — so the run orchestrations take this lock instead. */
+  private running = false;
+
+  /** Claim the run lock; returns false if a run is already in flight so the
+   *  caller bails without starting a second one. */
+  beginRun(): boolean {
+    if (this.running) return false;
+    this.running = true;
+    return true;
+  }
+
+  /** Release the run lock. Call from a `finally` so every exit path frees it. */
+  endRun() {
+    this.running = false;
+  }
 }
