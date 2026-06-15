@@ -17,6 +17,34 @@ const BASE_COLOR = new THREE.Color(0x9aa3ad);
 // Hover highlight: saturated amber, unmistakable against the gray part and
 // every BC color (a light gray tint was too close to the base material).
 const HOVER_TINT = new THREE.Color(0xffb224);
+
+/** A fixed value callout pinned to a surface point in a contour view. Its 3D
+ *  anchor is recomputed each frame from the (possibly deformed) source mesh:
+ *  `point` callouts from a face + barycentric coords, `max`/`min` from a soup
+ *  vertex index. The value itself is captured once (it doesn't move). */
+interface Callout {
+  kind: "point" | "max" | "min";
+  mesh: THREE.Mesh;
+  faceIndex: number; // point: hit face; max/min: -1
+  bary: THREE.Vector3; // point only
+  vertexIndex: number; // max/min: soup vertex; point: -1
+  value: number;
+  dot: HTMLDivElement;
+  chip: HTMLDivElement;
+  line: SVGLineElement;
+}
+
+const SVG_NS = "http://www.w3.org/2000/svg";
+
+/** PNG bytes of a 2D canvas (decode the data URL to a Uint8Array). */
+function pngBytesFromCanvas(c: HTMLCanvasElement): Uint8Array | null {
+  const url = c.toDataURL("image/png");
+  const b64 = url.slice(url.indexOf(",") + 1);
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
 // Deepened for the light Werkbank stage; KIND_DOT in StepPanel.tsx must match.
 const BC_COLORS: Record<string, THREE.Color> = {
   fixed: new THREE.Color(0x2563eb),
@@ -50,6 +78,8 @@ export interface SceneCallbacks {
   /** WebGL context was lost (true) or restored (false) — for a user notice
    *  while the GPU resets and the viewport is briefly blank. */
   onContextLost?: (lost: boolean) => void;
+  /** A line for the nerd log (e.g. a placed value callout). */
+  onLog?: (msg: string) => void;
 }
 
 export class SceneManager {
@@ -108,6 +138,15 @@ export class SceneManager {
    *  pending full rewrite (three uploads partially whenever updateRanges is set). */
   private colorsDirtyFull = false;
   private _hoverCol = new THREE.Color();
+
+  // ---- fixed value callouts (contour views) ----
+  private callouts: Callout[] = [];
+  /** In-progress modifier gesture: ctrl = point, shift = max-in-box, alt = min. */
+  private annoDrag: { mode: "point" | "max" | "min"; x0: number; y0: number; x1: number; y1: number } | null =
+    null;
+  private annoRectEl: HTMLDivElement | null = null; // rubber-band for box drags
+  private annoSvg: SVGSVGElement | null = null; // leader-line layer
+  private _calloutWorld = new THREE.Vector3();
 
   private tool: Tool = "orbit";
   private brushRadius = 3;
@@ -336,6 +375,22 @@ export class SceneManager {
         maxDot: hi.dot,
         maxChip: hi.chip,
       };
+
+      // Fixed value callouts: a leader-line SVG layer (behind the chips) and a
+      // rubber-band rectangle for the shift/alt box drags.
+      const svg = document.createElementNS(SVG_NS, "svg");
+      svg.setAttribute("class", "callout-lines");
+      svg.style.cssText =
+        "position:absolute;inset:0;width:100%;height:100%;pointer-events:none;overflow:visible;";
+      parent.insertBefore(svg, this.probeEl); // under the probe/chips/dots
+      this.annoSvg = svg;
+
+      const rect = document.createElement("div");
+      rect.className = "callout-rubber";
+      rect.style.cssText =
+        "position:absolute;display:none;border:1px dashed #2b2f36;background:rgba(255,178,36,.12);pointer-events:none;";
+      parent.appendChild(rect);
+      this.annoRectEl = rect;
     }
 
     const loop = () => {
@@ -350,10 +405,16 @@ export class SceneManager {
     this.disposed = true;
     document.removeEventListener("pointermove", this.onOrbitMove);
     document.removeEventListener("pointerup", this.onOrbitUp);
+    document.removeEventListener("pointermove", this.onAnnoMove);
+    document.removeEventListener("pointerup", this.onAnnoUp);
+    document.removeEventListener("keydown", this.onAnnoKey);
+    this.clearCallouts();
     this.canvas?.removeEventListener("wheel", this.onWheel);
     this.canvas?.removeEventListener("webglcontextlost", this.onGlLost);
     this.canvas?.removeEventListener("webglcontextrestored", this.onGlRestored);
     this.probeEl?.remove();
+    this.annoSvg?.remove();
+    this.annoRectEl?.remove();
     if (this.extremeEls) for (const el of Object.values(this.extremeEls)) el.remove();
     if (this.wireframeLines) {
       this.wireframeLines.geometry.dispose();
@@ -924,6 +985,15 @@ export class SceneManager {
 
   private onPointerDown = (ev: PointerEvent) => {
     if (ev.button !== 0 || !this.mesh) return;
+    // Modifier-gated value callouts (contour views only): Ctrl = annotate the
+    // clicked point, Shift = max in a dragged box, Alt = min. Claim the gesture
+    // before orbit so the camera stays put while annotating.
+    const annoMode = ev.ctrlKey ? "point" : ev.shiftKey ? "max" : ev.altKey ? "min" : null;
+    if (annoMode && this.probeFormat && this.probeSource()) {
+      ev.preventDefault();
+      this.annoDrag = { mode: annoMode, x0: ev.clientX, y0: ev.clientY, x1: ev.clientX, y1: ev.clientY };
+      return;
+    }
     // Arm a pivot orbit on every left-press in a navigable tool. The camera
     // only moves once the drag passes a threshold, so a plain click still
     // selects/places without disturbing the view.
@@ -996,6 +1066,9 @@ export class SceneManager {
     // Move + release on document so a drag that leaves the canvas still tracks.
     document.addEventListener("pointermove", this.onOrbitMove);
     document.addEventListener("pointerup", this.onOrbitUp);
+    document.addEventListener("pointermove", this.onAnnoMove);
+    document.addEventListener("pointerup", this.onAnnoUp);
+    document.addEventListener("keydown", this.onAnnoKey);
     canvas.addEventListener("wheel", this.onWheel, { passive: false });
   }
 
@@ -1246,6 +1319,205 @@ export class SceneManager {
     el.style.top = `${ev.clientY - rect.top + 14}px`;
   }
 
+  // ---------- fixed value callouts (contour views) ----------
+
+  private onAnnoMove = (ev: PointerEvent) => {
+    if (!this.annoDrag) return;
+    this.annoDrag.x1 = ev.clientX;
+    this.annoDrag.y1 = ev.clientY;
+    if (this.annoDrag.mode !== "point") this.drawAnnoRect();
+  };
+
+  private onAnnoUp = () => {
+    const drag = this.annoDrag;
+    if (!drag) return;
+    this.annoDrag = null;
+    if (this.annoRectEl) this.annoRectEl.style.display = "none";
+    if (drag.mode === "point") {
+      this.addPointCallout(drag.x1, drag.y1);
+    } else if (Math.abs(drag.x1 - drag.x0) > 3 && Math.abs(drag.y1 - drag.y0) > 3) {
+      this.addExtremeCallout(drag.mode, drag);
+    }
+  };
+
+  private onAnnoKey = (ev: KeyboardEvent) => {
+    if (ev.key === "Escape" && this.callouts.length) this.clearCallouts();
+  };
+
+  private drawAnnoRect() {
+    const r = this.annoRectEl;
+    const d = this.annoDrag;
+    if (!r || !d) return;
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    r.style.display = "block";
+    r.style.left = `${Math.min(d.x0, d.x1) - rect.left}px`;
+    r.style.top = `${Math.min(d.y0, d.y1) - rect.top}px`;
+    r.style.width = `${Math.abs(d.x1 - d.x0)}px`;
+    r.style.height = `${Math.abs(d.y1 - d.y0)}px`;
+  }
+
+  /** Ctrl-click: the field value interpolated at the clicked surface point. */
+  private addPointCallout(clientX: number, clientY: number) {
+    const src = this.probeSource();
+    if (!src || !src.mesh.visible) return;
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    this.pointer.x = ((clientX - rect.left) / rect.width) * 2 - 1;
+    this.pointer.y = -((clientY - rect.top) / rect.height) * 2 + 1;
+    this.raycaster.setFromCamera(this.pointer, this.camera);
+    const hits = this.raycaster.intersectObject(src.mesh, false);
+    const hit = hits.length ? hits[0] : null;
+    if (!hit || hit.faceIndex == null) return;
+    const pos = (src.mesh.geometry.getAttribute("position") as THREE.BufferAttribute)
+      .array as Float32Array;
+    const f = hit.faceIndex;
+    const tri = new THREE.Triangle(
+      new THREE.Vector3(pos[9 * f], pos[9 * f + 1], pos[9 * f + 2]),
+      new THREE.Vector3(pos[9 * f + 3], pos[9 * f + 4], pos[9 * f + 5]),
+      new THREE.Vector3(pos[9 * f + 6], pos[9 * f + 7], pos[9 * f + 8])
+    );
+    const bary = new THREE.Vector3();
+    tri.getBarycoord(hit.point, bary);
+    const value =
+      bary.x * src.valueAt(3 * f) + bary.y * src.valueAt(3 * f + 1) + bary.z * src.valueAt(3 * f + 2);
+    this.createCallout({ kind: "point", mesh: src.mesh, faceIndex: f, bary, vertexIndex: -1, value });
+  }
+
+  /** Shift/Alt box drag: the highest (max) / lowest (min) field value among the
+   *  surface points whose projection falls inside the dragged box. */
+  private addExtremeCallout(
+    mode: "max" | "min",
+    d: { x0: number; y0: number; x1: number; y1: number }
+  ) {
+    const src = this.probeSource();
+    if (!src || !src.mesh.visible) return;
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    const ndc = (cx: number, cy: number): [number, number] => [
+      ((cx - rect.left) / rect.width) * 2 - 1,
+      -((cy - rect.top) / rect.height) * 2 + 1,
+    ];
+    const [ax, ay] = ndc(d.x0, d.y0);
+    const [bx, by] = ndc(d.x1, d.y1);
+    const loX = Math.min(ax, bx);
+    const hiX = Math.max(ax, bx);
+    const loY = Math.min(ay, by);
+    const hiY = Math.max(ay, by);
+    const pos = (src.mesh.geometry.getAttribute("position") as THREE.BufferAttribute)
+      .array as Float32Array;
+    const mw = src.mesh.matrixWorld;
+    const p = this._calloutWorld;
+    const n = (pos.length / 3) | 0;
+    let bestI = -1;
+    let bestV = mode === "max" ? -Infinity : Infinity;
+    for (let i = 0; i < n; i++) {
+      p.set(pos[3 * i], pos[3 * i + 1], pos[3 * i + 2]).applyMatrix4(mw).project(this.camera);
+      if (p.z < -1 || p.z > 1 || p.x < loX || p.x > hiX || p.y < loY || p.y > hiY) continue;
+      const v = src.valueAt(i);
+      if (mode === "max" ? v > bestV : v < bestV) {
+        bestV = v;
+        bestI = i;
+      }
+    }
+    if (bestI < 0) return;
+    this.createCallout({
+      kind: mode,
+      mesh: src.mesh,
+      faceIndex: -1,
+      bary: new THREE.Vector3(),
+      vertexIndex: bestI,
+      value: bestV,
+    });
+  }
+
+  private createCallout(c: Omit<Callout, "dot" | "chip" | "line">) {
+    const parent = this.canvas?.parentElement;
+    if (!parent || !this.annoSvg) return;
+    const label = this.probeFormat ? this.probeFormat(c.value) : `${c.value}`;
+    const prefix = c.kind === "max" ? "max " : c.kind === "min" ? "min " : "";
+    const dot = document.createElement("div");
+    dot.style.cssText =
+      "position:absolute;width:9px;height:9px;margin:-5px 0 0 -5px;border-radius:50%;" +
+      "background:#ffb224;border:1.5px solid #2b2f36;box-shadow:0 0 0 1px rgba(255,255,255,.7);" +
+      "pointer-events:none;z-index:5;";
+    const chip = document.createElement("div");
+    chip.className = "probe";
+    chip.style.position = "absolute";
+    chip.style.pointerEvents = "none";
+    chip.style.zIndex = "5";
+    chip.textContent = prefix + label;
+    const line = document.createElementNS(SVG_NS, "line");
+    line.setAttribute("stroke", "#2b2f36");
+    line.setAttribute("stroke-width", "1.25");
+    this.annoSvg.appendChild(line);
+    parent.append(dot, chip);
+    const callout: Callout = { ...c, dot, chip, line };
+    this.callouts.push(callout);
+    this.projectCallout(callout);
+    const w = this.calloutWorld(callout);
+    if (w) {
+      this.callbacks.onLog?.(
+        `callout ${prefix}${label} @ (${w.x.toFixed(1)}, ${w.y.toFixed(1)}, ${w.z.toFixed(1)}) mm`
+      );
+    }
+  }
+
+  /** Current world anchor of a callout from the (possibly deformed) mesh. */
+  private calloutWorld(c: Callout): THREE.Vector3 | null {
+    const attr = c.mesh.geometry.getAttribute("position") as THREE.BufferAttribute | undefined;
+    const pos = attr?.array as Float32Array | undefined;
+    if (!pos) return null;
+    const out = this._calloutWorld;
+    if (c.kind === "point") {
+      const f = c.faceIndex;
+      if (9 * f + 8 >= pos.length) return null;
+      out.set(
+        c.bary.x * pos[9 * f] + c.bary.y * pos[9 * f + 3] + c.bary.z * pos[9 * f + 6],
+        c.bary.x * pos[9 * f + 1] + c.bary.y * pos[9 * f + 4] + c.bary.z * pos[9 * f + 7],
+        c.bary.x * pos[9 * f + 2] + c.bary.y * pos[9 * f + 5] + c.bary.z * pos[9 * f + 8]
+      );
+    } else {
+      const i = c.vertexIndex;
+      if (3 * i + 2 >= pos.length) return null;
+      out.set(pos[3 * i], pos[3 * i + 1], pos[3 * i + 2]);
+    }
+    return out.applyMatrix4(c.mesh.matrixWorld);
+  }
+
+  private projectCallout(c: Callout) {
+    const w = this.calloutWorld(c);
+    const hide = () => {
+      c.dot.style.display = c.chip.style.display = "none";
+      c.line.style.display = "none";
+    };
+    if (!w || !c.mesh.visible) return hide();
+    const v = w.project(this.camera); // mutates the shared scratch in place
+    if (v.z < -1 || v.z > 1) return hide();
+    const x = (v.x * 0.5 + 0.5) * this.viewW;
+    const y = (-v.y * 0.5 + 0.5) * this.viewH;
+    c.dot.style.display = c.chip.style.display = c.line.style.display = "block";
+    c.dot.style.left = `${x}px`;
+    c.dot.style.top = `${y}px`;
+    c.chip.style.left = `${x + 14}px`;
+    c.chip.style.top = `${y + 12}px`;
+    c.line.setAttribute("x1", `${x}`);
+    c.line.setAttribute("y1", `${y}`);
+    c.line.setAttribute("x2", `${x + 14}`);
+    c.line.setAttribute("y2", `${y + 12}`);
+  }
+
+  private updateCallouts() {
+    for (const c of this.callouts) this.projectCallout(c);
+  }
+
+  /** Drop all callouts — a new result field / view / surface invalidates them. */
+  private clearCallouts() {
+    for (const c of this.callouts) {
+      c.dot.remove();
+      c.chip.remove();
+      c.line.remove();
+    }
+    this.callouts.length = 0;
+  }
+
   // ---------- rigid-body-mode animation ----------
 
   setRbmMode(mode: { t: number[]; r: number[]; center: number[] } | null) {
@@ -1300,6 +1572,7 @@ export class SceneManager {
    *  signed X/Y/Z displacement component. */
   setDispComponent(comp: number) {
     if (this.dispComponent === comp) return;
+    this.clearCallouts(); // values belong to the previous field
     this.dispComponent = comp;
     this.lastDispRange = null; // force a fresh range report for the new field
     this.refreshView();
@@ -1455,6 +1728,7 @@ export class SceneManager {
   /** Switch the deformed view between the smooth STL and the voxel hull. */
   setResultSurface(surface: "stl" | "voxel") {
     if (this.resultSurface === surface) return;
+    this.clearCallouts(); // pinned to the previous surface's vertices
     this.resultSurface = surface;
     this.refreshView();
   }
@@ -1580,7 +1854,114 @@ export class SceneManager {
    *  before the readback (the WebGL context has no preserveDrawingBuffer).
    *  Returns the PNG bytes, or null on any failure (export falls back to a
    *  placeholder). */
+  /** Thumbnail for the 3MF: frame the optimized result alone, from the app's
+   *  default isometric direction, filling a square — independent of wherever
+   *  the user's live camera happens to be. Renders OFF-SCREEN (its own square
+   *  target + temp camera, only the result meshes + lights visible) so the
+   *  on-screen view never flickers and nothing has to be saved/restored on the
+   *  live camera. Falls back to a square grab of the live view if there's no
+   *  result to frame. */
   captureThumbnail(size = 512): Uint8Array | null {
+    const r = this.renderer;
+    if (!r) return null;
+    // Bounding box of the (visible) result meshes in world space.
+    const box = new THREE.Box3();
+    const tmp = new THREE.Box3();
+    this.regionMeshes.forEach((m, i) => {
+      if (this.regionVisible[i] === false) return;
+      m.geometry.computeBoundingBox();
+      if (m.geometry.boundingBox) {
+        tmp.copy(m.geometry.boundingBox).applyMatrix4(m.matrixWorld);
+        box.union(tmp);
+      }
+    });
+    if (box.isEmpty()) return this.captureViewportSquare(size);
+
+    const center = box.getCenter(new THREE.Vector3());
+    const sphere = box.getBoundingSphere(new THREE.Sphere());
+    const dir = new THREE.Vector3(120, -160, 110).normalize(); // app default view
+    const cam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.01, sphere.radius * 8 + 10);
+    cam.up.set(0, 0, 1);
+    cam.position.copy(center).addScaledVector(dir, sphere.radius * 4 + 1);
+    cam.lookAt(center);
+    cam.updateMatrixWorld();
+    // Fit a SQUARE frustum to the projected bbox so the part fills the frame.
+    const right = new THREE.Vector3().setFromMatrixColumn(cam.matrixWorld, 0);
+    const up = new THREE.Vector3().setFromMatrixColumn(cam.matrixWorld, 1);
+    const corner = new THREE.Vector3();
+    let half = 1e-6;
+    for (let xi = 0; xi < 2; xi++)
+      for (let yi = 0; yi < 2; yi++)
+        for (let zi = 0; zi < 2; zi++) {
+          corner
+            .set(xi ? box.max.x : box.min.x, yi ? box.max.y : box.min.y, zi ? box.max.z : box.min.z)
+            .sub(center);
+          half = Math.max(half, Math.abs(corner.dot(right)), Math.abs(corner.dot(up)));
+        }
+    half *= 1.08; // small margin
+    cam.left = -half;
+    cam.right = half;
+    cam.top = half;
+    cam.bottom = -half;
+    cam.updateProjectionMatrix();
+
+    // Show only the result meshes + lights; the scene background still paints.
+    const snap = this.scene.children.map((o) => o.visible);
+    for (const o of this.scene.children) {
+      o.visible = o instanceof THREE.Light || this.regionMeshes.includes(o as THREE.Mesh);
+    }
+    this.regionMeshes.forEach((m, i) => {
+      if (this.regionVisible[i] === false) m.visible = false;
+    });
+
+    const rt = new THREE.WebGLRenderTarget(size, size);
+    let bytes: Uint8Array | null = null;
+    try {
+      const prev = r.getRenderTarget();
+      r.setScissorTest(false);
+      r.setRenderTarget(rt);
+      r.setViewport(0, 0, size, size);
+      r.clear();
+      r.render(this.scene, cam);
+      const rgba = new Uint8Array(size * size * 4);
+      r.readRenderTargetPixels(rt, 0, 0, size, size, rgba);
+      r.setRenderTarget(prev);
+      bytes = this.rgbaToPng(rgba, size);
+    } catch {
+      bytes = null;
+    } finally {
+      rt.dispose();
+      this.scene.children.forEach((o, i) => (o.visible = snap[i]));
+    }
+    return bytes;
+  }
+
+  /** Encode a bottom-up RGBA buffer (WebGL read) into PNG bytes, flipping rows
+   *  to top-down and forcing opaque. */
+  private rgbaToPng(rgba: Uint8Array, size: number): Uint8Array | null {
+    const c = document.createElement("canvas");
+    c.width = size;
+    c.height = size;
+    const ctx = c.getContext("2d");
+    if (!ctx) return null;
+    const img = ctx.createImageData(size, size);
+    const row = size * 4;
+    for (let y = 0; y < size; y++) {
+      const s = (size - 1 - y) * row;
+      const d = y * row;
+      for (let x = 0; x < row; x += 4) {
+        img.data[d + x] = rgba[s + x];
+        img.data[d + x + 1] = rgba[s + x + 1];
+        img.data[d + x + 2] = rgba[s + x + 2];
+        img.data[d + x + 3] = 255;
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+    return pngBytesFromCanvas(c);
+  }
+
+  /** Fallback: center-square crop of the live on-screen render. */
+  private captureViewportSquare(size: number): Uint8Array | null {
     try {
       const r = this.renderer;
       if (!r || this.viewW <= 0 || this.viewH <= 0) return null;
@@ -1589,7 +1970,6 @@ export class SceneManager {
       r.clear();
       r.render(this.scene, this.camera);
       const src = r.domElement;
-      // Center-crop the largest square of the drawing buffer, scale to `size`.
       const side = Math.min(src.width, src.height);
       const sx = (src.width - side) / 2;
       const sy = (src.height - side) / 2;
@@ -1601,12 +1981,7 @@ export class SceneManager {
       ctx.fillStyle = "#dedcd6"; // match the scene background
       ctx.fillRect(0, 0, size, size);
       ctx.drawImage(src, sx, sy, side, side, 0, 0, size, size);
-      const url = c.toDataURL("image/png");
-      const b64 = url.slice(url.indexOf(",") + 1);
-      const bin = atob(b64);
-      const bytes = new Uint8Array(bin.length);
-      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-      return bytes;
+      return pngBytesFromCanvas(c);
     } catch {
       return null;
     }
@@ -1659,6 +2034,7 @@ export class SceneManager {
   }
 
   setViewState(mode: ViewMode, deformScale: number) {
+    if (this.viewMode !== mode) this.clearCallouts(); // callouts are per-view
     this.viewMode = mode;
     this.deformScale = deformScale;
     this.refreshView();
@@ -1667,6 +2043,7 @@ export class SceneManager {
   /** Stress/strain scalars per soup vertex; null reverts to |u| coloring.
    *  `flip` inverts the colormap (safety factor: red = the critical LOW). */
   setScalarField(values: Float32Array | null, flip = false) {
+    this.clearCallouts(); // values belong to the previous field
     if (values && values.length) {
       let min = Infinity;
       let max = -Infinity;
@@ -2423,8 +2800,9 @@ export class SceneManager {
     r.render(this.gizmoScene, this.gizmoCam);
     r.setScissorTest(false);
     r.setViewport(0, 0, this.viewW, this.viewH);
-    // Reproject the min/max marks now the camera matrices are settled.
+    // Reproject the min/max marks + fixed callouts now the camera is settled.
     this.projectExtremes();
+    this.updateCallouts();
   }
 }
 

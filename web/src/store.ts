@@ -406,6 +406,8 @@ interface AppState {
   setSectionAxis(axis: "x" | "y" | "z"): void;
   setLogOpen(open: boolean): void;
   clearLog(): void;
+  /** Append a line to the nerd log (e.g. a placed value callout from the viewer). */
+  logNote(msg: string): void;
   runCheck(): Promise<void>;
   runSolve(): Promise<void>;
   runOptimize(): Promise<void>;
@@ -1645,6 +1647,10 @@ export const useStore = create<AppState>((set, get) => ({
 
   clearLog() {
     set({ logLines: [] });
+  },
+
+  logNote(msg) {
+    appendLog(set, msg);
   },
 
   async runCheck() {

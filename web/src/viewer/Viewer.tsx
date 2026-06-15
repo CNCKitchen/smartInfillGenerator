@@ -79,6 +79,9 @@ export function Viewer() {
         if (lost) useStore.setState({ notice: msg });
         else if (useStore.getState().notice === msg) useStore.setState({ notice: null });
       },
+      onLog: (msg) => {
+        useStore.getState().logNote(msg);
+      },
     });
 
     sceneEvents.onModelLoaded = (m) => scene.setModel(m);
