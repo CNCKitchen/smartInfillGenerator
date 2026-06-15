@@ -1521,7 +1521,7 @@ export class SceneManager {
       return;
     }
     const c = new THREE.Color();
-    for (const r of regions) {
+    regions.forEach((r, i) => {
       const geo = new THREE.BufferGeometry();
       geo.setAttribute("position", new THREE.BufferAttribute(r.positions, 3));
       geo.setIndex(new THREE.BufferAttribute(r.indices, 1));
@@ -1539,10 +1539,17 @@ export class SceneManager {
         side: THREE.DoubleSide,
       });
       const mesh = new THREE.Mesh(geo, mat);
+      // Regions are strictly nested (each denser region sits INSIDE the sparser
+      // one) so they share a centroid; three.js' distance-based transparency
+      // sort then flips as the camera orbits, and the outer hull overdraws the
+      // inner ones — the "only one region visible" bug. Pin the painter's order
+      // by density rank: regions arrive outer→inner (ascending density), so draw
+      // outer first and the dense core last (on top). Stable from every angle.
+      mesh.renderOrder = i;
       mesh.visible = false;
       this.scene.add(mesh);
       this.regionMeshes.push(mesh);
-    }
+    });
     this.refreshClipping();
     this.refreshView();
   }
