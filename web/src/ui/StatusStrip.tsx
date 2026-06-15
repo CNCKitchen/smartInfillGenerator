@@ -4,10 +4,23 @@
 // Machine status strip: ready-lamp, grid / solver / optimizer telemetry,
 // units, and the "Log for nerds" drawer toggle.
 
+import { useShallow } from "zustand/shallow";
 import { useStore } from "../store";
 
 export function StatusStrip() {
-  const s = useStore();
+  const s = useStore(
+    useShallow((s) => ({
+      error: s.error,
+      busy: s.busy,
+      voxelInfo: s.voxelInfo,
+      optProgress: s.optProgress,
+      stats: s.stats,
+      optSummary: s.optSummary,
+      openImprint: s.openImprint,
+      logOpen: s.logOpen,
+      setLogOpen: s.setLogOpen,
+    }))
+  );
   const lamp = s.error ? "lamp err" : s.busy ? "lamp busy" : "lamp";
   const state = s.busy ? s.busy.replace(/…$/, "").toUpperCase() : s.error ? "ERROR" : "READY";
   const v = s.voxelInfo;

@@ -5,6 +5,7 @@
 // one carried by the orange carriage. Done-states are derived from results,
 // not from "visited" flags, so they stay honest when inputs change.
 
+import { useShallow } from "zustand/shallow";
 import { useStore } from "../store";
 
 const STEPS: { n: number; label: string; title: string }[] = [
@@ -17,7 +18,17 @@ const STEPS: { n: number; label: string; title: string }[] = [
 ];
 
 export function StepRail() {
-  const s = useStore();
+  const s = useStore(
+    useShallow((s) => ({
+      bcs: s.bcs,
+      model: s.model,
+      check: s.check,
+      hasResult: s.hasResult,
+      optSummary: s.optSummary,
+      activeStep: s.activeStep,
+      setActiveStep: s.setActiveStep,
+    }))
+  );
   const hasSupport = s.bcs.some(
     (b) =>
       (b.kind === "fixed" ||

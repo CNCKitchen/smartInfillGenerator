@@ -5,6 +5,7 @@
 // all-at-once sidebar offered is still here, just shown one step at a time.
 
 import { useEffect, useRef } from "react";
+import { useShallow } from "zustand/shallow";
 import { budgetBounds, symLabel, useStore } from "../store";
 import { NumInput } from "./NumInput";
 import type { Bc, BcKind, PatternKey } from "../types";
@@ -48,7 +49,15 @@ const HEAD: Record<number, { title: string; sub: string }> = {
  *  imports, the exact BREP faces. Shared by the Model and BC steps so the
  *  "Pick surface" tool selects whole CAD faces when chosen. */
 function SurfacePatchControl() {
-  const s = useStore();
+  const s = useStore(
+    useShallow((s) => ({
+      model: s.model,
+      segSource: s.segSource,
+      segAngle: s.segAngle,
+      setSegSource: s.setSegSource,
+      setSegAngle: s.setSegAngle,
+    }))
+  );
   if (!s.model) return null;
   const cad = s.model.hasCadFaces;
   return (
@@ -100,7 +109,9 @@ function SurfacePatchControl() {
 }
 
 export function StepPanel() {
-  const s = useStore();
+  const s = useStore(
+    useShallow((s) => ({ model: s.model, activeStep: s.activeStep }))
+  );
   const step = s.model ? s.activeStep : 1;
 
   // Leaving the boundary-conditions workspace (clicking another step) or
@@ -151,7 +162,16 @@ export function StepPanel() {
 // ---------------- 1 · Model ----------------
 
 function StepModel() {
-  const s = useStore();
+  const s = useStore(
+    useShallow((s) => ({
+      fileName: s.fileName,
+      model: s.model,
+      loadFile: s.loadFile,
+      tool: s.tool,
+      setTool: s.setTool,
+      rotateModel: s.rotateModel,
+    }))
+  );
   const fileRef = useRef<HTMLInputElement>(null);
   const onFile = async (f: File | undefined) => {
     if (!f) return;
@@ -232,7 +252,19 @@ function StepModel() {
 const SUPPORT_KINDS: BcKind[] = ["fixed", "elastic", "frictionless", "displacement"];
 
 function StepBcs() {
-  const s = useStore();
+  const s = useStore(
+    useShallow((s) => ({
+      bcs: s.bcs,
+      addBc: s.addBc,
+      tool: s.tool,
+      setTool: s.setTool,
+      brushRadius: s.brushRadius,
+      setBrushRadius: s.setBrushRadius,
+      brushErase: s.brushErase,
+      setBrushErase: s.setBrushErase,
+      activeBcId: s.activeBcId,
+    }))
+  );
   const supports = s.bcs.filter((bc) => SUPPORT_KINDS.includes(bc.kind));
   const loads = s.bcs.filter((bc) => !SUPPORT_KINDS.includes(bc.kind));
   return (
@@ -338,7 +370,14 @@ function StepBcs() {
 }
 
 function BcRow({ bc }: { bc: Bc }) {
-  const s = useStore();
+  const s = useStore(
+    useShallow((s) => ({
+      activeBcId: s.activeBcId,
+      setActiveBc: s.setActiveBc,
+      removeBc: s.removeBc,
+      updateBcParams: s.updateBcParams,
+    }))
+  );
   const active = s.activeBcId === bc.id;
   return (
     <div className={active ? "bc active" : "bc"} onClick={() => s.setActiveBc(active ? null : bc.id)}>
@@ -399,7 +438,20 @@ function BcRow({ bc }: { bc: Bc }) {
  *  defaults to the selection's average normal, pickable off the model) plus a
  *  scalar magnitude. */
 function ForceEditor({ bc }: { bc: Bc }) {
-  const s = useStore();
+  const s = useStore(
+    useShallow((s) => ({
+      activeBcId: s.activeBcId,
+      tool: s.tool,
+      setForceMode: s.setForceMode,
+      updateBcParams: s.updateBcParams,
+      setForceMag: s.setForceMag,
+      setForceDir: s.setForceDir,
+      setActiveBc: s.setActiveBc,
+      setTool: s.setTool,
+      flipForceDir: s.flipForceDir,
+      resetForceDirToNormal: s.resetForceDirToNormal,
+    }))
+  );
   const active = s.activeBcId === bc.id;
   const mode = bc.forceMode ?? "components";
   const force = bc.force ?? [0, 0, 0];
@@ -506,7 +558,7 @@ function ForceEditor({ bc }: { bc: Bc }) {
 
 /** Displacement support editor: which global axes are pinned to zero. */
 function DisplacementEditor({ bc }: { bc: Bc }) {
-  const s = useStore();
+  const s = useStore(useShallow((s) => ({ toggleBcAxis: s.toggleBcAxis })));
   const axes = bc.axes ?? [false, false, true];
   return (
     <div onClick={(e) => e.stopPropagation()}>
@@ -534,7 +586,36 @@ function DisplacementEditor({ bc }: { bc: Bc }) {
 // ---------------- 3 · Properties ----------------
 
 function StepProperties() {
-  const s = useStore();
+  const s = useStore(
+    useShallow((s) => ({
+      perimeters: s.perimeters,
+      lineWidth: s.lineWidth,
+      voxelInfo: s.voxelInfo,
+      material: s.material,
+      materials: s.materials,
+      setMaterial: s.setMaterial,
+      openSettings: s.openSettings,
+      setPerimeters: s.setPerimeters,
+      setLineWidth: s.setLineWidth,
+      topBottomLayers: s.topBottomLayers,
+      setTopBottomLayers: s.setTopBottomLayers,
+      layerHeight: s.layerHeight,
+      setLayerHeight: s.setLayerHeight,
+      pattern: s.pattern,
+      setPattern: s.setPattern,
+      printInfill: s.printInfill,
+      setPrintInfill: s.setPrintInfill,
+      resolution: s.resolution,
+      setResolution: s.setResolution,
+      model: s.model,
+      customH: s.customH,
+      setCustomH: s.setCustomH,
+      snapVoxel: s.snapVoxel,
+      setSnapVoxel: s.setSnapVoxel,
+      compositeSkin: s.compositeSkin,
+      setCompositeSkin: s.setCompositeSkin,
+    }))
+  );
   const wall = s.perimeters * s.lineWidth;
   const k = s.voxelInfo ? Math.max(1, Math.round(wall / s.voxelInfo.h)) : null;
   return (
@@ -740,7 +821,24 @@ function StepProperties() {
 // ---------------- 4 · Verify setup ----------------
 
 function StepVerify() {
-  const s = useStore();
+  const s = useStore(
+    useShallow((s) => ({
+      analyzeMode: s.analyzeMode,
+      setAnalyzeMode: s.setAnalyzeMode,
+      perimeters: s.perimeters,
+      lineWidth: s.lineWidth,
+      printInfill: s.printInfill,
+      pattern: s.pattern,
+      runCheck: s.runCheck,
+      busy: s.busy,
+      runSolve: s.runSolve,
+      check: s.check,
+      stats: s.stats,
+      hasResult: s.hasResult,
+      optSummary: s.optSummary,
+      printedStats: s.printedStats,
+    }))
+  );
   return (
     <>
       <div className="group">
@@ -806,7 +904,44 @@ function StepVerify() {
 // ---------------- 5 · Optimize infill ----------------
 
 function StepOptimize() {
-  const s = useStore();
+  const s = useStore(
+    useShallow((s) => ({
+      optMode: s.optMode,
+      goal: s.goal,
+      setGoal: s.setGoal,
+      budget: s.budget,
+      setBudget: s.setBudget,
+      levelSettings: s.levelSettings,
+      setOptMode: s.setOptMode,
+      solidPattern: s.solidPattern,
+      setSolidPattern: s.setSolidPattern,
+      selfSupport: s.selfSupport,
+      overhangDeg: s.overhangDeg,
+      setSelfSupport: s.setSelfSupport,
+      setOverhangDeg: s.setOverhangDeg,
+      retainBc: s.retainBc,
+      setRetainBc: s.setRetainBc,
+      perimeters: s.perimeters,
+      lineWidth: s.lineWidth,
+      pattern: s.pattern,
+      setActiveStep: s.setActiveStep,
+      nBins: s.nBins,
+      setNBins: s.setNBins,
+      symOn: s.symOn,
+      symNormal: s.symNormal,
+      symC: s.symC,
+      toggleSymmetry: s.toggleSymmetry,
+      setSymAxis: s.setSymAxis,
+      centerSymmetry: s.centerSymmetry,
+      minMemberMm: s.minMemberMm,
+      setMinMemberMm: s.setMinMemberMm,
+      voxelInfo: s.voxelInfo,
+      runOptimize: s.runOptimize,
+      busy: s.busy,
+      optProgress: s.optProgress,
+      optSummary: s.optSummary,
+    }))
+  );
   return (
     <>
       {s.optMode !== "solid" && (
@@ -1105,7 +1240,25 @@ function StepOptimize() {
 // ---------------- 6 · View & export ----------------
 
 function StepExport() {
-  const s = useStore();
+  const s = useStore(
+    useShallow((s) => ({
+      hasResult: s.hasResult,
+      optSummary: s.optSummary,
+      viewMode: s.viewMode,
+      densityThreshold: s.densityThreshold,
+      setDensityThreshold: s.setDensityThreshold,
+      regionInfos: s.regionInfos,
+      regionVisible: s.regionVisible,
+      setRegionVisible: s.setRegionVisible,
+      smoothIters: s.smoothIters,
+      setSmoothIters: s.setSmoothIters,
+      downloadShape: s.downloadShape,
+      exportSlicer: s.exportSlicer,
+      setExportSlicer: s.setExportSlicer,
+      downloadThreeMf: s.downloadThreeMf,
+      downloadStls: s.downloadStls,
+    }))
+  );
   return (
     <>
       {!s.hasResult && !s.optSummary && (

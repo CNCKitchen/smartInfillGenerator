@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
 
 import { useEffect, useState } from "react";
+import { useShallow } from "zustand/shallow";
 import { useStore } from "../store";
 import { NumInput } from "./NumInput";
 import type { PatternKey } from "../types";
@@ -13,7 +14,22 @@ const PATTERN_LABEL: Record<PatternKey, string> = {
 };
 
 export function SettingsModal() {
-  const s = useStore();
+  const s = useStore(
+    useShallow((s) => ({
+      settingsOpen: s.settingsOpen,
+      openSettings: s.openSettings,
+      materials: s.materials,
+      updateMaterial: s.updateMaterial,
+      removeMaterial: s.removeMaterial,
+      addMaterial: s.addMaterial,
+      resetMaterials: s.resetMaterials,
+      curves: s.curves,
+      setCurve: s.setCurve,
+      resetCurves: s.resetCurves,
+      levelSettings: s.levelSettings,
+      updateLevelSettings: s.updateLevelSettings,
+    }))
+  );
   if (!s.settingsOpen) return null;
   return (
     <div className="modalback" onClick={() => s.openSettings(false)}>
@@ -262,7 +278,12 @@ export function SettingsModal() {
 
 /** Comma-separated manual level list, parsed/validated on commit. */
 function ManualLevelsInput() {
-  const s = useStore();
+  const s = useStore(
+    useShallow((s) => ({
+      levelSettings: s.levelSettings,
+      updateLevelSettings: s.updateLevelSettings,
+    }))
+  );
   const [text, setText] = useState(s.levelSettings.manual.join(", "));
   useEffect(() => {
     setText(s.levelSettings.manual.join(", "));

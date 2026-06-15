@@ -5,11 +5,19 @@
 // precedence; an as-printed verify solve gets its own readouts (mass at the
 // print settings, deflection, min safety factor). Empty instrument = hidden.
 
+import { useShallow } from "zustand/shallow";
 import { useStore } from "../store";
 import { fmtDispParts } from "./fmt";
 
 export function Inspector() {
-  const s = useStore();
+  const s = useStore(
+    useShallow((s) => ({
+      optSummary: s.optSummary,
+      printedStats: s.printedStats,
+      stats: s.stats,
+      hasResult: s.hasResult,
+    }))
+  );
   if (s.optSummary) return <OptResults />;
   if (s.printedStats && s.stats && s.hasResult) return <PrintedResults />;
   return null;
@@ -17,7 +25,13 @@ export function Inspector() {
 
 /** Dock after "Solve once · As printed": the part at today's print settings. */
 function PrintedResults() {
-  const s = useStore();
+  const s = useStore(
+    useShallow((s) => ({
+      printedStats: s.printedStats,
+      stats: s.stats,
+      material: s.material,
+    }))
+  );
   const p = s.printedStats!;
   const stats = s.stats!;
   const [defl, deflUnit] = fmtDispParts(stats.maxDisplacement);
@@ -116,7 +130,9 @@ function PrintedResults() {
 }
 
 function OptResults() {
-  const s = useStore();
+  const s = useStore(
+    useShallow((s) => ({ optSummary: s.optSummary, budget: s.budget }))
+  );
   const o = s.optSummary!;
   const solid = o.solid;
   const stiff = Math.round(o.stiffnessVsSolid * 100);

@@ -1,13 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
 
+import { useShallow } from "zustand/shallow";
 import { useStore } from "../store";
 import { fmtLen } from "./fmt";
 
 const GITHUB_URL = "https://github.com/CNCKitchen/smartInfillGenerator";
 
 export function TopBar() {
-  const s = useStore();
+  const s = useStore(
+    useShallow((s) => ({
+      model: s.model,
+      fileName: s.fileName,
+      openSettings: s.openSettings,
+    }))
+  );
   const m = s.model;
   return (
     <header className="top">

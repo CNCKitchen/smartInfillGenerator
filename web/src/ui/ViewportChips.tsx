@@ -5,11 +5,14 @@
 // result-field picker right beneath them, deflection playback bottom center,
 // the section plane bottom left. Result review happens ON the result.
 
+import { useShallow } from "zustand/shallow";
 import { useStore, type ViewMode } from "../store";
 import { RESULT_FIELDS } from "../types";
 
 function ViewBtn({ mode, label }: { mode: ViewMode; label: string }) {
-  const s = useStore();
+  const s = useStore(
+    useShallow((s) => ({ viewMode: s.viewMode, setViewMode: s.setViewMode }))
+  );
   return (
     <button className={s.viewMode === mode ? "on" : ""} onClick={() => void s.setViewMode(mode)}>
       {label}
@@ -18,7 +21,26 @@ function ViewBtn({ mode, label }: { mode: ViewMode; label: string }) {
 }
 
 export function ViewportChips() {
-  const s = useStore();
+  const s = useStore(
+    useShallow((s) => ({
+      model: s.model,
+      viewMode: s.viewMode,
+      hasResult: s.hasResult,
+      optSummary: s.optSummary,
+      wireframe: s.wireframe,
+      setWireframe: s.setWireframe,
+      resultSurface: s.resultSurface,
+      setResultSurface: s.setResultSurface,
+      resultField: s.resultField,
+      setResultField: s.setResultField,
+      animateDeformed: s.animateDeformed,
+      setAnimateDeformed: s.setAnimateDeformed,
+      sectionOn: s.sectionOn,
+      toggleSection: s.toggleSection,
+      flipSection: s.flipSection,
+      setSectionAxis: s.setSectionAxis,
+    }))
+  );
   if (!s.model) return null;
   const resultsView = s.viewMode === "deformed" && s.hasResult;
   return (
