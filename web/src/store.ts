@@ -224,6 +224,9 @@ interface AppState {
   /** Optimization mode: graded infill densities, binary (hollow/solid core),
    *  or solid topology (material removal — a new optimized shape). */
   optMode: "graded" | "binary" | "solid";
+  /** Part Topo: keep the cells under loads/supports solid (default on). Off =
+   *  pure topology optimization that may carve those regions too. */
+  retainBc: boolean;
   /** Solid-mode self-supporting overhang filter (prints without supports). */
   selfSupport: boolean;
   /** Overhang angle from horizontal (degrees) for the self-supporting filter. */
@@ -234,7 +237,7 @@ interface AppState {
   symNormal: [number, number, number];
   symC: number;
   /** Solid-fill pattern written to the 3MF in binary mode. */
-  solidPattern: "default" | "rectilinear" | "concentric";
+  solidPattern: "rectilinear" | "concentric";
   /** Density-level configuration (persisted with materials/curves). */
   levelSettings: LevelSettings;
   // run state
@@ -381,9 +384,10 @@ interface AppState {
   setMinMemberMm(v: number | null): void;
   setGoal(g: "budget" | "match"): void;
   setOptMode(m: "graded" | "binary" | "solid"): void;
+  setRetainBc(on: boolean): void;
   setSelfSupport(on: boolean): void;
   setOverhangDeg(deg: number): void;
-  setSolidPattern(p: "default" | "rectilinear" | "concentric"): void;
+  setSolidPattern(p: "rectilinear" | "concentric"): void;
   updateLevelSettings(p: Partial<LevelSettings>): void;
   setRegionVisible(index: number, on: boolean): void;
   /** Isosurface density: display cutaway in all modes, AND (Part Topo / binary)
@@ -683,6 +687,11 @@ export interface SceneEvents {
   onDisplacements?: (disp: Float32Array | null, stats: { maxDisplacement: number } | null) => void;
   onVertexDensity?: (density: Float32Array | null) => void;
   onRegions?: (regions: OptRegion[] | null) => void;
+  /** Result is a Part Topo body (solid): hide the original envelope hull in the
+   *  result views and render the body opaque. */
+  onResultSolid?: (solid: boolean) => void;
+  /** Snapshot the current view to a square PNG for the 3MF plate thumbnail. */
+  captureThumbnail?: () => Uint8Array | null;
   onViewState?: (mode: ViewMode, deformScale: number) => void;
   onVoxelMesh?: (
     hull: Float32Array | null,
@@ -860,6 +869,7 @@ function invalidateResults(set: (p: Partial<AppState>) => void, get: () => AppSt
   sceneEvents.onLegendRange?.(null, null);
   sceneEvents.onScalarField?.(null);
   sceneEvents.onRegions?.(null);
+  sceneEvents.onResultSolid?.(false);
   sceneEvents.onVertexDensity?.(null);
   sceneEvents.onDisplacements?.(null, null);
   sceneEvents.onOptShape?.(null, null);
@@ -927,9 +937,10 @@ export const useStore = create<AppState>((set, get) => ({
   symNormal: [1, 0, 0],
   symC: 0,
   optMode: "graded",
+  retainBc: true,
   selfSupport: false,
   overhangDeg: 45,
-  solidPattern: "default",
+  solidPattern: "rectilinear",
   levelSettings: initialSettings.levels,
   busy: null,
   error: null,
@@ -1594,6 +1605,9 @@ export const useStore = create<AppState>((set, get) => ({
     get().setBudget(get().budget); // re-clamp to the mode's band
   },
 
+  setRetainBc(on) {
+    set({ retainBc: on });
+  },
   setSelfSupport(on) {
     set({ selfSupport: on });
   },
@@ -1894,9 +1908,12 @@ export const useStore = create<AppState>((set, get) => ({
           levelsPct: binary ? [ls.binaryFloorPct, 100] : manual ? ls.manual : null,
           binary,
           solid,
+          retainBc: st.retainBc,
           selfSupport: st.selfSupport,
           overhangDeg: st.overhangDeg,
-          solidPattern: binary && st.solidPattern !== "default" ? st.solidPattern : null,
+          // Binary mode always pins the pattern (rectilinear/concentric) on the
+          // modifiers AND the object-level general infill.
+          solidPattern: binary ? st.solidPattern : null,
           goal: solid ? "budget" : st.goal,
           symmetry: st.symOn ? [...st.symNormal, st.symC] : null,
           topBottomLayers: st.topBottomLayers,
@@ -1989,7 +2006,9 @@ export const useStore = create<AppState>((set, get) => ({
         optSummary: out.summary,
         optProgress: null,
         busy: null,
-        viewMode: "density",
+        // Jump straight to the Export step with the Regions view active.
+        activeStep: 6,
+        viewMode: "infill",
         // converged:true here is the OPTIMIZER's design-stationarity, not the
         // binned verification solve's MGCG convergence (the engine hardcodes
         // that — see crates/sig-wasm/src/lib.rs Solution after the opt loop).
@@ -2011,11 +2030,14 @@ export const useStore = create<AppState>((set, get) => ({
       sceneEvents.onDisplacements?.(out.displacements, {
         maxDisplacement: out.summary.maxDisplacement,
       });
+      // Part Topo: the body IS the result — drop the original envelope hull in
+      // the result views so it doesn't moiré against the coincident body.
+      sceneEvents.onResultSolid?.(out.summary.solid);
       sceneEvents.onRegions?.(out.regions);
       sceneEvents.onRegionVisibility?.(vis);
-      // Land in the density view. Part Topo / binary seed the isosurface
-      // density at 50% (the export level); graded shows a 25% cutaway.
-      sceneEvents.onViewState?.("density", get().deformScale);
+      // Land in the Regions view. Part Topo / binary seed the isosurface density
+      // at 50% (the export level); graded seeds a 25% cutaway for the density view.
+      sceneEvents.onViewState?.("infill", get().deformScale);
       get().setDensityThreshold(out.summary.solid || out.summary.binary ? 50 : 25);
       // Re-arm the plane state (still hidden in result views; it shows again
       // when the user returns to a setup view on this step).
@@ -2054,7 +2076,9 @@ export const useStore = create<AppState>((set, get) => ({
 
   async downloadThreeMf() {
     try {
-      const bytes = await engine.exportThreeMf(get().exportSlicer);
+      // Snapshot the current view as the plate thumbnail (null → placeholder).
+      const thumbnail = sceneEvents.captureThumbnail?.() ?? null;
+      const bytes = await engine.exportThreeMf(get().exportSlicer, thumbnail);
       const base = (get().fileName ?? "part").replace(/\.(stl|3mf)$/i, "");
       download(bytes, `${base}_smart_infill.3mf`, "model/3mf");
     } catch (e) {

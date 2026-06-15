@@ -268,6 +268,9 @@ struct OptimizeOpts {
     /// void lower bound, linear eval law, output is one optimized shape. The
     /// budget is the retained volume fraction. Takes precedence over `binary`.
     solid: bool,
+    /// Solid mode: keep the cells under loads/supports solid (default true).
+    /// Off ⇒ pure topology optimization that may carve those regions too.
+    retain_bc: bool,
     /// Self-supporting (AM) overhang filter — only used in solid mode.
     self_support: bool,
     /// Overhang angle from horizontal for the self-supporting filter (degrees).
@@ -306,6 +309,7 @@ impl Default for OptimizeOpts {
             levels_pct: None,
             binary: false,
             solid: false,
+            retain_bc: true,
             self_support: false,
             overhang_deg: 45.0,
             solid_pattern: None,
@@ -1025,11 +1029,13 @@ impl Model {
             // infill modes it shapes the dense regions; unsupported cells fall
             // to the floor density instead of void).
             solid_mode: solid,
+            retain_bc: opts.retain_bc,
             self_support: opts.self_support,
             overhang_deg: opts.overhang_deg.clamp(0.0, 90.0),
             // Cap is a safety net; the change-based convergence criterion
-            // normally stops the loop earlier.
-            max_iter: 40,
+            // normally stops the loop earlier. Raised from 40 — complex parts
+            // can still be moving at 40.
+            max_iter: 80,
             ..Default::default()
         };
 
@@ -1439,27 +1445,33 @@ impl Model {
         let opt = self.opt.as_mut().ok_or_else(|| err("no optimization result"))?;
         let t = threshold.clamp(0.05, 0.95);
         let n = grid.cell_count();
-        let mut val = vec![0f64; n];
+        // Build a BINARY keep indicator, then extract its watertight surface —
+        // the same robust path the run uses (`extract_region` on a set, iso 0.4).
+        // Extracting the CONTINUOUS field at an arbitrary level instead produces
+        // sliver/degenerate triangles wherever the level grazes the flat
+        // boundary nodes (≈0.5), which Taubin then tears into holes/spikes.
+        let mut inside = vec![false; n];
         if opt.solid {
             for &c in &opt.anchor_cells {
-                val[c as usize] = 1.0;
+                inside[c as usize] = true;
             }
             let kept =
                 solid_keep_bins(grid, &opt.anchor_cells, &opt.design_cells, &opt.x_cont, t);
             for (i, &c) in opt.design_cells.iter().enumerate() {
                 if kept[i] == 1 {
-                    val[c as usize] = opt.x_cont[i];
+                    inside[c as usize] = true;
                 }
             }
         } else {
-            // Binary: dense modifier = isosurface of the continuous field. The
-            // base bin stays the part's own infill; no connected-keep (sparse
-            // infill supports interior dense islands).
+            // Binary: dense modifier = the design cells denser than the level.
+            // No connected-keep (sparse infill supports interior dense islands).
             for (i, &c) in opt.design_cells.iter().enumerate() {
-                val[c as usize] = opt.x_cont[i];
+                if opt.x_cont[i] >= t {
+                    inside[c as usize] = true;
+                }
             }
         }
-        let mut r = extract_iso(grid, &|ci| val[ci], t);
+        let mut r = extract_region(grid, &|ci| inside[ci], 0.4);
         r.density = 1.0; // solid body / dense modifier
         opt.regions_raw = vec![r];
         opt.regions = smooth_regions(&opt.regions_raw, (smooth_iters as usize).min(60));
@@ -1479,10 +1491,14 @@ impl Model {
         for (i, &c) in opt.design_cells.iter().enumerate() {
             field.insert(c, opt.x_cont[i]);
         }
-        // Frozen load/support cells (Part Topo) are solid — show them in the
-        // cutaway so the preview matches the exported body.
-        for &c in &opt.anchor_cells {
-            field.insert(c, 1.0);
+        // Part Topo: the frozen load/support cells are solid — show them in the
+        // cutaway so the preview matches the exported body. NOT in infill modes,
+        // where `anchor_cells` is the whole wall skin (it would hide the
+        // interior — the cutaway must stay the dense core only).
+        if opt.solid {
+            for &c in &opt.anchor_cells {
+                field.insert(c, 1.0);
+            }
         }
         let t = threshold.clamp(0.0, 1.0);
         // Continuous level set of the filtered field — smooth by nature.
@@ -1680,11 +1696,14 @@ impl Model {
     /// (>= 2.06) renamed the "rectilinear" pattern value to "zig-zag"
     /// (still displayed as Rectilinear), so the bambu flavor maps it —
     /// otherwise every project load pops a "values replaced" dialog.
-    pub fn export_3mf(&self, slicer: &str) -> Result<Vec<u8>, JsValue> {
+    /// `thumbnail` are PNG bytes for the plate preview (empty = embedded
+    /// placeholder). Only the Orca/Bambu flavor carries a plate thumbnail.
+    pub fn export_3mf(&self, slicer: &str, thumbnail: &[u8]) -> Result<Vec<u8>, JsValue> {
         let opt = self.opt.as_ref().ok_or_else(|| err("no optimization result — run optimize first"))?;
         let part = weld(&self.mesh_orig);
         let name = if self.name.is_empty() { "part" } else { &self.name };
         let pattern = opt.solid_pattern.as_deref();
+        let thumb = if thumbnail.is_empty() { None } else { Some(thumbnail) };
         Ok(match slicer {
             "prusa" => sig_core::threemf::export_prusa_3mf(
                 name,
@@ -1703,6 +1722,7 @@ impl Model {
                 opt.perimeters,
                 opt.top_bottom_layers,
                 pattern.map(|p| if s == "bambu" && p == "rectilinear" { "zig-zag" } else { p }),
+                thumb,
             ),
         })
     }

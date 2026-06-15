@@ -337,7 +337,7 @@ fn orca_3mf_roundtrips_through_own_zip_and_import() {
         region([3.0; 3], [10.0, 10.0, 7.0], 0.50),
     ];
 
-    let bytes = export_orca_3mf("bracket & arm", &part, &regions, 0.12, 3, 5, None);
+    let bytes = export_orca_3mf("bracket & arm", &part, &regions, 0.12, 3, 5, None, None);
 
     // Container structure.
     let entries = read_zip(&bytes).expect("read back own zip");
@@ -349,9 +349,29 @@ fn orca_3mf_roundtrips_through_own_zip_and_import() {
         "3D/_rels/3dmodel.model.rels",
         "3D/Objects/object_1.model",
         "Metadata/model_settings.config",
+        // Bambu/Orca project-recognition markers (without these the loader warns
+        // "not from Bambu Lab" and drops the modifiers).
+        "Metadata/slice_info.config",
+        "Metadata/plate_1.png",
+        "Metadata/plate_1_small.png",
     ] {
         assert!(names.contains(&required), "missing {required}");
     }
+    let rels = entries
+        .iter()
+        .find(|(n, _)| n == "_rels/.rels")
+        .map(|(_, d)| String::from_utf8_lossy(d).into_owned())
+        .unwrap();
+    assert!(
+        rels.contains("schemas.bambulab.com/package/2021/cover-thumbnail"),
+        "the bambulab cover-thumbnail relationship is what flips is_bbl_3mf"
+    );
+    let model = entries
+        .iter()
+        .find(|(n, _)| n == "3D/3dmodel.model")
+        .map(|(_, d)| String::from_utf8_lossy(d).into_owned())
+        .unwrap();
+    assert!(model.contains("Application\">BambuStudio"), "recognized vendor string");
     let cfg = entries
         .iter()
         .find(|(n, _)| n == "Metadata/model_settings.config")
@@ -376,7 +396,7 @@ fn orca_3mf_roundtrips_through_own_zip_and_import() {
     // sparse_infill_pattern ON EACH MODIFIER, never as object-level
     // internal_solid_infill_pattern (newer Bambu Studio renamed that key's
     // "rectilinear" value to "zig-zag" and warns on every project load).
-    let bytes2 = export_orca_3mf("p", &part, &regions, 0.05, 2, 5, Some("concentric"));
+    let bytes2 = export_orca_3mf("p", &part, &regions, 0.05, 2, 5, Some("concentric"), None);
     let entries2 = read_zip(&bytes2).unwrap();
     let cfg2 = entries2
         .iter()
@@ -384,10 +404,30 @@ fn orca_3mf_roundtrips_through_own_zip_and_import() {
         .map(|(_, d)| String::from_utf8_lossy(d).into_owned())
         .unwrap();
     assert!(!cfg2.contains("internal_solid_infill_pattern"), "deprecated key never written");
-    assert_eq!(cfg2.matches("sparse_infill_pattern").count(), 2, "pattern on each modifier");
+    // Pattern is pinned on the object-level GENERAL sparse infill AND on each
+    // modifier (object + 2 modifiers = 3). The deprecated key above stays unused.
+    assert_eq!(
+        cfg2.matches("sparse_infill_pattern").count(),
+        3,
+        "pattern on the object + each modifier"
+    );
     assert!(cfg2.contains("sparse_infill_pattern\" value=\"concentric\""));
     let obj2 = &cfg2[..cfg2.find("<part").unwrap()];
-    assert!(!obj2.contains("sparse_infill_pattern"), "pattern in modifiers, not object level");
+    assert!(
+        obj2.contains("sparse_infill_pattern\" value=\"concentric\""),
+        "general pattern set at object level"
+    );
+
+    // A supplied plate thumbnail (PNG bytes) replaces the placeholder verbatim.
+    let custom_png: &[u8] = &[1, 2, 3, 4, 5];
+    let bytes_t = export_orca_3mf("p", &part, &regions, 0.05, 2, 5, None, Some(custom_png));
+    let entries_t = read_zip(&bytes_t).unwrap();
+    let plate = entries_t
+        .iter()
+        .find(|(n, _)| n == "Metadata/plate_1.png")
+        .map(|(_, d)| d.clone())
+        .unwrap();
+    assert_eq!(plate, custom_png, "supplied thumbnail is embedded as the plate preview");
 
     // PrusaSlicer flavor: ONE object, volumes as triangle ranges in
     // Slic3r_PE_model.config (part = ModelPart, regions = ParameterModifier
@@ -418,7 +458,7 @@ fn orca_3mf_roundtrips_through_own_zip_and_import() {
     assert!(cfg3.contains("fill_density\" value=\"50%\""));
     assert!(cfg3.contains("fill_density\" value=\"12%\""), "base density on the object");
     assert!(cfg3.contains("perimeters\" value=\"3\""));
-    assert_eq!(cfg3.matches("fill_pattern").count(), 2, "pattern per modifier");
+    assert_eq!(cfg3.matches("fill_pattern").count(), 3, "pattern on the object + each modifier");
     assert!(cfg3.contains("fill_pattern\" value=\"concentric\""));
 
     // Geometry comes back via the import path (largest bbox = the part).

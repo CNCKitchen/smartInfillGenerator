@@ -95,6 +95,23 @@ fn region_to_indexed(r: &RegionMesh) -> IndexedMesh {
 /// inherit from the part (a modifier wall key strips/changes perimeters
 /// wherever it touches the surface). Regions must be sorted ascending by
 /// density (slicer modifier order resolves the nesting).
+/// Minimal valid 1×1 PNG used as the plate thumbnail. Bambu Studio / OrcaSlicer
+/// only treat a 3MF as one of THEIR projects (and therefore load
+/// `model_settings.config` — our modifiers) when `_rels/.rels` carries a
+/// `schemas.bambulab.com/.../cover-thumbnail-*` relationship; that relationship
+/// must point at a real image, so we ship this tiny placeholder. Without it the
+/// loader warns "The 3mf is not from Bambu Lab, load geometry data only" and
+/// drops the modifiers.
+const THUMB_PNG: &[u8] = &[
+    137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0,
+    0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 218, 99, 252, 207, 192, 80, 15, 0, 4,
+    133, 1, 128, 132, 169, 140, 33, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+];
+
+/// Bambu-flavored `slice_info.config` (the `X-BBL-Client` header is part of how
+/// the loader recognizes its own files).
+const SLICE_INFO: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<config>\n  <header>\n    <header_item key=\"X-BBL-Client-Type\" value=\"slicer\"/>\n    <header_item key=\"X-BBL-Client-Version\" value=\"02.07.00.00\"/>\n  </header>\n</config>\n";
+
 pub fn export_orca_3mf(
     part_name: &str,
     part: &IndexedMesh,
@@ -103,6 +120,7 @@ pub fn export_orca_3mf(
     wall_loops: u32,
     top_bottom_layers: u32,
     solid_pattern: Option<&str>,
+    thumbnail: Option<&[u8]>,
 ) -> Vec<u8> {
     let n_objects = 1 + regions.len();
 
@@ -142,7 +160,10 @@ pub fn export_orca_3mf(
     let mut root = String::new();
     root.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     root.push_str("<model unit=\"millimeter\" xml:lang=\"en-US\" xmlns=\"http://schemas.microsoft.com/3dmanufacturing/core/2015/02\" xmlns:BambuStudio=\"http://schemas.bambulab.com/package/2021\" xmlns:p=\"http://schemas.microsoft.com/3dmanufacturing/production/2015/06\" requiredextensions=\"p\">\n");
-    root.push_str(" <metadata name=\"Application\">InFEAll-0.1.0</metadata>\n");
+    // Vendor string the loader recognizes as one of its own projects. (Real
+    // OrcaSlicer exports also write "BambuStudio-…"; ours is InFEAll under the
+    // hood — the Title metadata carries the part name.)
+    root.push_str(" <metadata name=\"Application\">BambuStudio-02.07.00.00</metadata>\n");
     root.push_str(" <metadata name=\"BambuStudio:3mfVersion\">1</metadata>\n");
     root.push_str(&format!(" <metadata name=\"Title\">{}</metadata>\n", xml_escape(part_name)));
     root.push_str(" <resources>\n");
@@ -170,6 +191,14 @@ pub fn export_orca_3mf(
         "    <metadata key=\"sparse_infill_density\" value=\"{}%\"/>\n",
         (base_density * 100.0).round() as u32
     ));
+    // Binary mode: set the OBJECT-level (general) infill pattern too, so the
+    // base/sparse infill prints in the chosen pattern, not just the modifiers.
+    if let Some(p) = solid_pattern {
+        cfg.push_str(&format!(
+            "    <metadata key=\"sparse_infill_pattern\" value=\"{}\"/>\n",
+            xml_escape(p)
+        ));
+    }
     cfg.push_str(&format!("    <metadata key=\"wall_loops\" value=\"{wall_loops}\"/>\n"));
     // Top/bottom shells the analysis assumed (0 = open infill showpieces).
     cfg.push_str(&format!(
@@ -206,6 +235,7 @@ pub fn export_orca_3mf(
     cfg.push_str("    <metadata key=\"plater_id\" value=\"1\"/>\n");
     cfg.push_str("    <metadata key=\"plater_name\" value=\"\"/>\n");
     cfg.push_str("    <metadata key=\"locked\" value=\"false\"/>\n");
+    cfg.push_str("    <metadata key=\"thumbnail_file\" value=\"Metadata/plate_1.png\"/>\n");
     cfg.push_str("    <model_instance>\n");
     cfg.push_str(&format!("      <metadata key=\"object_id\" value=\"{assembly_id}\"/>\n"));
     cfg.push_str("      <metadata key=\"instance_id\" value=\"0\"/>\n");
@@ -218,7 +248,11 @@ pub fn export_orca_3mf(
 
     // ---- container plumbing ----
     let content_types = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\n <Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\n <Default Extension=\"model\" ContentType=\"application/vnd.ms-package.3dmanufacturing-3dmodel+xml\"/>\n <Default Extension=\"png\" ContentType=\"image/png\"/>\n</Types>\n";
-    let rels = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\n <Relationship Target=\"/3D/3dmodel.model\" Id=\"rel-1\" Type=\"http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel\"/>\n</Relationships>\n";
+    // The bambulab.com cover-thumbnail relationships are what flips the loader's
+    // `is_bbl_3mf` flag — without them Bambu/Orca treat the file as a foreign
+    // 3MF and drop the modifiers. The plain `metadata/thumbnail` relationship is
+    // the generic OPC preview.
+    let rels = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\n <Relationship Target=\"/3D/3dmodel.model\" Id=\"rel-1\" Type=\"http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel\"/>\n <Relationship Target=\"/Metadata/plate_1.png\" Id=\"rel-2\" Type=\"http://schemas.openxmlformats.org/package/2006/relationships/metadata/thumbnail\"/>\n <Relationship Target=\"/Metadata/plate_1.png\" Id=\"rel-4\" Type=\"http://schemas.bambulab.com/package/2021/cover-thumbnail-middle\"/>\n <Relationship Target=\"/Metadata/plate_1_small.png\" Id=\"rel-5\" Type=\"http://schemas.bambulab.com/package/2021/cover-thumbnail-small\"/>\n</Relationships>\n";
     let model_rels = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\n <Relationship Target=\"/3D/Objects/object_1.model\" Id=\"rel-1\" Type=\"http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel\"/>\n</Relationships>\n";
 
     let mut zip = ZipWriter::new();
@@ -228,6 +262,14 @@ pub fn export_orca_3mf(
     zip.add("3D/_rels/3dmodel.model.rels", model_rels.as_bytes());
     zip.add("3D/Objects/object_1.model", obj.as_bytes());
     zip.add("Metadata/model_settings.config", cfg.as_bytes());
+    // Bambu-project markers (see THUMB_PNG / SLICE_INFO): the cover thumbnails
+    // the relationships point at, plus the slicer header. The plate thumbnail is
+    // a snapshot of the optimized part when the caller supplies one, else the
+    // 1×1 placeholder (still enough to flip the is_bbl_3mf flag).
+    let thumb = thumbnail.filter(|t| !t.is_empty()).unwrap_or(THUMB_PNG);
+    zip.add("Metadata/slice_info.config", SLICE_INFO.as_bytes());
+    zip.add("Metadata/plate_1.png", thumb);
+    zip.add("Metadata/plate_1_small.png", thumb);
     zip.finish()
 }
 
@@ -309,6 +351,13 @@ pub fn export_prusa_3mf(
         "  <metadata type=\"object\" key=\"fill_density\" value=\"{}%\"/>\n",
         (base_density * 100.0).round() as u32
     ));
+    // Binary mode: set the general object-level fill pattern too.
+    if let Some(p) = solid_pattern {
+        cfg.push_str(&format!(
+            "  <metadata type=\"object\" key=\"fill_pattern\" value=\"{}\"/>\n",
+            xml_escape(p)
+        ));
+    }
     cfg.push_str(&format!(
         "  <metadata type=\"object\" key=\"perimeters\" value=\"{perimeters}\"/>\n"
     ));

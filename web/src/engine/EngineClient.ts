@@ -284,9 +284,10 @@ export class EngineClient {
     return this.call({ op: "voxelResultField", kind });
   }
 
-  /** Project 3MF in the chosen slicer's flavor. */
-  exportThreeMf(slicer: SlicerFlavor): Promise<Uint8Array> {
-    return this.call({ op: "exportThreeMf", slicer });
+  /** Project 3MF in the chosen slicer's flavor. `thumbnail` (PNG bytes) becomes
+   *  the plate preview; null falls back to an embedded placeholder. */
+  exportThreeMf(slicer: SlicerFlavor, thumbnail?: Uint8Array | null): Promise<Uint8Array> {
+    return this.call({ op: "exportThreeMf", slicer, thumbnail: thumbnail ?? null });
   }
 
   exportStls(): Promise<Uint8Array> {
@@ -355,7 +356,9 @@ export interface OptimizeOptions {
   /** Solid topology mode — material removal (no skin); budget = retained
    *  volume fraction; output is one optimized shape. Overrides `binary`. */
   solid: boolean;
-  /** Self-supporting overhang filter (solid mode only). */
+  /** Solid mode: keep the cells under loads/supports solid (default true). */
+  retainBc: boolean;
+  /** Self-supporting overhang filter. */
   selfSupport: boolean;
   /** Overhang angle from horizontal in degrees for the self-supporting filter. */
   overhangDeg: number;

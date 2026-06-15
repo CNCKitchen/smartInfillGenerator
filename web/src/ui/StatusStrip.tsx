@@ -40,7 +40,7 @@ export function StatusStrip() {
           )}
           it{" "}
           <b>
-            {p.iteration}/{p.maxIter}
+            {p.iteration} of ≤{p.maxIter}
           </b>
         </div>
       ) : (

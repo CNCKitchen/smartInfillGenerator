@@ -59,6 +59,12 @@ pub struct OptimizeParams {
     /// cell is a design cell, and the lower bound is ersatz void. The caller
     /// sets the penalized optimizer law (p=3) and linear eval law.
     pub solid_mode: bool,
+    /// Solid mode: force the cells under loads/supports to stay solid (the
+    /// "keep regions" of a commercial topology optimizer) and anchor the
+    /// connected-keep there. Off ⇒ those cells are free design cells the
+    /// optimizer may remove (pure topology optimization). Ignored unless
+    /// `solid_mode`.
+    pub retain_bc: bool,
     /// Self-supporting (AM) filter: constrain the printed field to overhang at
     /// most `overhang_deg` from the build plate (global +Z). Off = no
     /// constraint. See `crate::selfsupport`.
@@ -83,6 +89,7 @@ impl Default for OptimizeParams {
             symmetry: None,
             min_member_mm: 0.0,
             solid_mode: false,
+            retain_bc: true,
             self_support: false,
             overhang_deg: 45.0,
             max_iter: 40,
@@ -709,7 +716,11 @@ pub fn optimize_cached(
     // other solid cell is a free design cell. Infill modes keep the wall/shell
     // skin model.
     let SkinSplit { skin, design: design_cells, skin_frac } = if params.solid_mode {
-        build_solid_split(grid, &frozen_cells_from_problem(grid, problem))
+        // Retain ON: freeze the load/support cells solid (keep regions). OFF:
+        // no frozen cells — the whole part is free to be carved.
+        let frozen =
+            if params.retain_bc { frozen_cells_from_problem(grid, problem) } else { Vec::new() };
+        build_solid_split(grid, &frozen)
     } else {
         classify_cells(
             grid,

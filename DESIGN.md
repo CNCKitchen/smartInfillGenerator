@@ -31,7 +31,7 @@ Reference points:
 | 7 | Material model | **Walls + infill core.** Boundary voxels get solid-material skin stiffness (wall count × line width; defaults 2 × 0.45 mm, plus top/bottom shells). Interior voxels get per-pattern Gibson-Ashby law **E(ρ) = E₀ · c · ρⁿ**. |
 | 8 | Optimization | **Continuous SIMP-style compliance minimization** under mass constraint using the *physical* E(ρ) (no artificial penalization — graded infill is the one case where intermediate density is printable). Optimality-criteria updates, ~50–100 multigrid solves. Then discretize to bins → **final verification solve** with binned densities + walls → report. |
 | 9 | User control | **Infill-budget slider** ("X %" = target MEAN INTERIOR infill density, 10–70 — same scale as a slicer's uniform infill setting; the solid skin comes on top; revised 2026-06 from a total-mass % so low values make sense and the reference comparison is honest) + **comparison card**: "vs X% uniform infill at the same weight: +Y% stiffer", stiffness retained vs solid (%), mass, max displacement. **Goal "match uniform stiffness"** (2026-06, the dual problem): lightest design as stiff as a uniform X% print — one uniform solve sets the target compliance, then a guarded secant on the budget (warm-started passes, ≤5) lands the BINNED design within 2%; card leads with "same stiffness as X% uniform: −N% weight" (measured −28% on the smoke beam at 35%). v1.x: "solve for target displacement" (same mechanism, displacement target). |
-| 10 | Density bins | **3 bins by default, values auto-placed** (revised 2026-06): the bottom level is PINNED at the 10 % printability floor ("just so it prints" — gyroid top surfaces sag below ~10 %), upper levels by strain-energy-weighted 1-D clustering in stiffness space E(ρ), and assignment is anchored at the optimizer's field with a bisected mass multiplier so the budget survives quantization. Rationale: E(ρ)=c·ρⁿ with n>1 is convex → stiffness per gram grows with density (the SIMP bang-bang argument), so load-bearing levels belong high, not at the histogram mean. Measured on the cantilever fixture: +15.2 % vs uniform at equal mass (was +13.9 % with plain density-space k-means). Cap 70 % (+ "consider solid here" flag for capped hot spots). Floor/cap and a manual level list are user-editable in ⚙ Settings (manual levels let calibrated densities be used verbatim; the mass-true assignment works for any level set). **Binary mode** (2026-06): interior is either the binary floor (default 5 %, printability) or 100 % solid — the optimizer runs SIMP-penalized (p = 3) so the field converges to black/white before quantization, while verification uses the calibrated pattern law (exact at both endpoints); export can pin the dense regions via per-modifier `sparse_infill_pattern` (rectilinear/concentric; deliberately NOT object-level `internal_solid_infill_pattern` — newer Bambu Studio renames its `rectilinear` value to `zig-zag` and warns on every load). Measured on the smoke beam at 30 %: +40 % stiffer than uniform at equal mass. Part's own infill setting = lowest bin; modifiers = higher bins. |
+| 10 | Density bins | **3 bins by default, values auto-placed** (revised 2026-06): the bottom level is PINNED at the 10 % printability floor ("just so it prints" — gyroid top surfaces sag below ~10 %), upper levels by strain-energy-weighted 1-D clustering in stiffness space E(ρ), and assignment is anchored at the optimizer's field with a bisected mass multiplier so the budget survives quantization. Rationale: E(ρ)=c·ρⁿ with n>1 is convex → stiffness per gram grows with density (the SIMP bang-bang argument), so load-bearing levels belong high, not at the histogram mean. Measured on the cantilever fixture: +15.2 % vs uniform at equal mass (was +13.9 % with plain density-space k-means). Cap 70 % (+ "consider solid here" flag for capped hot spots). Floor/cap and a manual level list are user-editable in ⚙ Settings (manual levels let calibrated densities be used verbatim; the mass-true assignment works for any level set). **Binary mode** (2026-06): interior is either the binary floor (default 5 %, printability) or 100 % solid — the optimizer runs SIMP-penalized (p = 3) so the field converges to black/white before quantization, while verification uses the calibrated pattern law (exact at both endpoints); export pins the pattern via per-modifier `sparse_infill_pattern` AND the object-level GENERAL `sparse_infill_pattern` (2026-06: the whole part prints in the chosen pattern, not just the modifiers); the UI offers only **rectilinear/concentric** (no profile-default). This is the SPARSE-infill pattern key — deliberately NOT object-level `internal_solid_infill_pattern` (newer Bambu Studio renames THAT key's `rectilinear` value to `zig-zag` and warns on every load; the `bambu` flavor maps rectilinear→zig-zag for the sparse key instead). Measured on the smoke beam at 30 %: +40 % stiffer than uniform at equal mass. Part's own infill setting = lowest bin; modifiers = higher bins. |
 | 11 | Slicer output | **OrcaSlicer project 3MF + Bambu Studio** (shared dialect, pinned from sample — see §5) and **PrusaSlicer flavor** (`Slic3r_PE_model_config`). **Per-bin STL export always available** as universal fallback. Cura deferred. |
 | 12 | Infill patterns | Calibrated E(ρ) for **gyroid (default), cubic, grid**. All other patterns: generic Gibson-Ashby fallback + warning. Grid's anisotropy documented as limitation. |
 | 13 | Validation bar | **Solver unit tests vs analytic solutions (CI) + golden comparisons vs established FEA (CalculiX/Fusion) on ~5 representative parts.** Physical testing is post-launch content, not a release gate. |
@@ -172,6 +172,9 @@ Reference points:
   `skin_frac = 0`. **Frozen cells** are derived inside the optimizer from the assembled
   `NodeProblem` (the `fixed` ∪ spring ∪ force nodes → their incident solid cells, one-cell
   dilated), so no plumbing of a separate keep-set is needed and every BC type is covered.
+  **`retain_bc` toggle (2026-06, default on):** off ⇒ no frozen cells, the whole part is
+  free to be carved (pure topology optimization, load/support regions included); the
+  connected-keep then has no anchors and falls back to the largest component.
   The wasm layer sets `floor ≈ 1e-3` (void), `cap = 1`, optimizer law p = 3 / coeff 1
   (penalization → black/white), eval law linear (exp 1 / coeff 1, exact at 0 and 1). The
   bins/clustering/modifier-3MF tail is skipped; instead the continuous field is
@@ -186,15 +189,33 @@ Reference points:
   the CONTINUOUS optimized field is user-tunable AFTER the run (separate from the budget /
   density target — this is the iso level, not the mass goal), for **Part Topo and binary**.
   `Model::set_iso_threshold(t, smooth_iters)` re-extracts from `x_cont`: Part Topo re-runs
-  the connected-keep (anchored to the frozen load/support cells, stored as `anchor_cells`)
-  and isosurfaces the masked field at `t`; binary re-extracts the dense modifier at `t`
-  (no keep — sparse infill supports interior islands). Re-smoothed, regions replaced; lower
+  the connected-keep (anchored to the frozen load/support cells, stored as `anchor_cells`);
+  binary keeps the design cells denser than `t` (no keep — sparse infill supports interior
+  islands). **Both extract via `extract_region` on the BINARY keep indicator (iso 0.4) — the
+  same watertight path the run uses (2026-06 fix).** Extracting the CONTINUOUS field at an
+  arbitrary level instead produced sliver/degenerate triangles wherever the level grazed the
+  flat boundary nodes (≈0.5), which the smoother then tore into holes/spikes on the exported
+  STL. Relatedly, the aggressive Taubin λ/μ (0.63/−0.65) was reverted to the STABLE textbook
+  0.5/−0.53 — the aggressive pair folded thin features; strength now comes from the pass
+  count (`SMOOTH_PASS_MULT`) on the clean base mesh, not from pushing λ/μ. Re-smoothed, regions replaced; lower
   `t` keeps more material (chunkier), higher trims it leaner. **Unified with the density
   cutaway (2026-06):** for Part Topo/binary this is ONE `densityThreshold` slider —
-  previewing the cutaway AND setting the export level (the display cutaway `density_isosurface`
-  now includes the frozen cells as solid so it matches the body); graded keeps a display-only
-  cutaway (its regions are bin sets, no single iso level). The Region-smoothing slider lives
-  in the Export step.
+  previewing the cutaway AND setting the export level (for Part Topo the cutaway
+  `density_isosurface` injects the frozen cells as solid so it matches the body; in infill
+  modes that injection is SKIPPED — `anchor_cells` there is the whole wall skin and would hide
+  the interior, so the cutaway stays the dense core only); graded keeps a display-only cutaway
+  (its regions are bin sets, no single iso level). The Region-smoothing slider lives in the
+  Export step. Iteration cap raised 40 → 80 (complex parts can still be moving at 40); the
+  progress UI reads "iteration X of max N" since convergence usually stops it earlier.
+- **Result presentation polish (2026-06):** finishing an optimization jumps straight to the
+  Export step with the Regions view active. The slider is renamed **"Fine-tune surface"** and
+  INVERTED (left = retain less, right = retain more) since a lower iso level keeps more material
+  — `value = 100 − densityThreshold`. **Part Topo render fix:** the optimized body coincides
+  with the original envelope on retained faces, so the ghosted envelope hull moiréd against it
+  (z-fight between two differently-tessellated coincident surfaces — only near iso levels that
+  sit on the envelope plane). Fixed by dropping the envelope hull in the density/regions views
+  for a solid result (`SceneManager.setResultSolid`), rendering the body opaque, and a small
+  `polygonOffset` on the cutaway; infill modes keep the ghost hull + translucent modifiers.
 - **Aggressive region smoothing (2026-06):** Taubin λ/μ moved from 0.5/−0.53 (pass-band
   kPB ≈ 0.11) to 0.63/−0.65 (kPB ≈ 0.048 — a tighter band removes more), and `smooth_regions`
   runs `SMOOTH_PASS_MULT` (= 4) Taubin passes per slider unit, so the 0–40 slider tops out
@@ -364,9 +385,22 @@ Key facts to reproduce:
     `<assemble>` transform for plate placement.
 - We emit modifier meshes in part-local coordinates with identity matrices (sample's
   non-identity matrices come from its reused cylinder primitive — not needed for us).
-- `project_settings.config` in the sample is a full 30 KB print profile. **Open question
-  for testing:** find the minimal subset Orca accepts without complaining (or template a
-  lean default profile). Test matrix across Orca 2.x and Bambu Studio versions.
+- `project_settings.config` in the sample is a full 30 KB print profile. We deliberately do
+  NOT embed it — that would force a print profile over the user's selected printer/filament.
+- **Project recognition (2026-06, RESOLVED by diffing a Bambu re-save).** Without it the
+  loader pops *"The 3mf is not from Bambu Lab, load geometry data and color data only"* and
+  **drops the modifiers**. The discriminator that flips the loader's `is_bbl_3mf` flag is a
+  **`schemas.bambulab.com/package/2021/cover-thumbnail-*` relationship in `_rels/.rels`**.
+  Our writer now emits: that relationship (+ the generic OPC `metadata/thumbnail`) pointing
+  at `plate_1.png`/`plate_1_small.png` — **a real square snapshot of the optimized part
+  rendered from the live three.js view** (`SceneManager.captureThumbnail` → bytes threaded
+  through `export_3mf`), falling back to a tiny embedded 1×1 placeholder if the capture
+  fails — `Application = "BambuStudio-…"`
+  (real OrcaSlicer exports claim BambuStudio too), and a `Metadata/slice_info.config` with
+  the `X-BBL-Client` header — all WITHOUT a `project_settings.config`, so the user's profiles
+  stay intact. The modifier encoding itself was already correct (a Bambu re-save preserved
+  our `sparse_infill_pattern=concentric` modifier verbatim). Still a test matrix across Orca
+  2.x / Bambu versions to confirm.
 
 Extracted sample lives in `_sample_extracted/` for reference during development.
 

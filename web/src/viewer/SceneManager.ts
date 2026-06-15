@@ -149,6 +149,9 @@ export class SceneManager {
 
   // Live optimization skeleton / density-threshold cutaway.
   private optShapeMesh: THREE.Mesh | null = null;
+  // Result is a Part Topo body: hide the original envelope hull in result views
+  // and render the body opaque (no moiré against the coincident envelope).
+  private resultSolid = false;
 
   // Scalar result field (stress/strain) overriding displacement colors.
   // flip = inverted colormap (safety factor: red marks the LOW values).
@@ -1431,6 +1434,11 @@ export class SceneManager {
           roughness: 0.55,
           metalness: 0.05,
           side: THREE.DoubleSide,
+          // Bias the body slightly toward the camera so a coincident ghost hull
+          // loses the depth test cleanly (no z-fight moiré) where they overlap.
+          polygonOffset: true,
+          polygonOffsetFactor: -1,
+          polygonOffsetUnits: -1,
         });
       } else {
         mat = new THREE.MeshStandardMaterial({
@@ -1438,6 +1446,9 @@ export class SceneManager {
           roughness: 0.55,
           metalness: 0.05,
           side: THREE.DoubleSide,
+          polygonOffset: true,
+          polygonOffsetFactor: -1,
+          polygonOffsetUnits: -1,
         });
       }
       this.optShapeMesh = new THREE.Mesh(geo, mat);
@@ -1450,6 +1461,50 @@ export class SceneManager {
   setRegionVisibility(vis: boolean[]) {
     this.regionVisible = vis;
     this.refreshView();
+  }
+
+  /** Part Topo result: the body replaces the part, so hide the envelope hull in
+   *  the density/regions views and render the body opaque. */
+  setResultSolid(solid: boolean) {
+    this.resultSolid = solid;
+    this.refreshView();
+  }
+
+  /** Render the CURRENT view (just the main scene — no axis gizmo) to a square
+   *  PNG for the 3MF plate thumbnail. The render must run synchronously right
+   *  before the readback (the WebGL context has no preserveDrawingBuffer).
+   *  Returns the PNG bytes, or null on any failure (export falls back to a
+   *  placeholder). */
+  captureThumbnail(size = 512): Uint8Array | null {
+    try {
+      const r = this.renderer;
+      if (!r || this.viewW <= 0 || this.viewH <= 0) return null;
+      r.setScissorTest(false);
+      r.setViewport(0, 0, this.viewW, this.viewH);
+      r.clear();
+      r.render(this.scene, this.camera);
+      const src = r.domElement;
+      // Center-crop the largest square of the drawing buffer, scale to `size`.
+      const side = Math.min(src.width, src.height);
+      const sx = (src.width - side) / 2;
+      const sy = (src.height - side) / 2;
+      const c = document.createElement("canvas");
+      c.width = size;
+      c.height = size;
+      const ctx = c.getContext("2d");
+      if (!ctx) return null;
+      ctx.fillStyle = "#dedcd6"; // match the scene background
+      ctx.fillRect(0, 0, size, size);
+      ctx.drawImage(src, sx, sy, side, side, 0, 0, size, size);
+      const url = c.toDataURL("image/png");
+      const b64 = url.slice(url.indexOf(",") + 1);
+      const bin = atob(b64);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      return bytes;
+    } catch {
+      return null;
+    }
   }
 
   setRegions(regions: OptRegion[] | null) {
@@ -1471,13 +1526,15 @@ export class SceneManager {
       geo.setIndex(new THREE.BufferAttribute(r.indices, 1));
       geo.computeVertexNormals();
       ramp(Math.min(1, r.density / 0.8), c);
+      // Part Topo body: opaque single surface (no nested modifiers to see
+      // through). Infill modifiers stay translucent so the nesting is visible.
       const mat = new THREE.MeshStandardMaterial({
         color: c.clone(),
-        transparent: true,
-        opacity: 0.62,
+        transparent: !this.resultSolid,
+        opacity: this.resultSolid ? 1.0 : 0.62,
         roughness: 0.6,
         metalness: 0.0,
-        depthWrite: false,
+        depthWrite: this.resultSolid,
         side: THREE.DoubleSide,
       });
       const mesh = new THREE.Mesh(geo, mat);
@@ -1926,7 +1983,12 @@ export class SceneManager {
     mat.depthWrite = !ghost;
     mat.needsUpdate = true;
     const voxResult = this.voxResultActive();
-    this.mesh.visible = !voxResult;
+    // Part Topo: the optimized body IS the result — drop the original envelope
+    // hull in the density/regions views so it doesn't moiré against the
+    // coincident body surface (the carved regions sit inside it; the retained
+    // faces sit exactly on it).
+    const hideHull = this.resultSolid && (this.viewMode === "density" || infill);
+    this.mesh.visible = !voxResult && !hideHull;
     this.voxelGroup.visible = this.viewMode === "mesh";
     if (this.voxRes) this.voxRes.group.visible = voxResult;
     // Wireframe overlay: undeformed model views only (its lines are built from

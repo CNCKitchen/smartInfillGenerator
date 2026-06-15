@@ -293,16 +293,16 @@ function StepBcs() {
         <>
           <div className="group">
             <div className="g-label">
-              <span>Brush radius</span>
-              <b>{s.brushRadius.toFixed(1)} mm</b>
+              <span>Brush diameter</span>
+              <b>{(s.brushRadius * 2).toFixed(1)} mm</b>
             </div>
             <input
               type="range"
-              min={0.5}
-              max={25}
-              step={0.5}
-              value={s.brushRadius}
-              onChange={(e) => s.setBrushRadius(Number(e.target.value))}
+              min={1}
+              max={50}
+              step={1}
+              value={s.brushRadius * 2}
+              onChange={(e) => s.setBrushRadius(Number(e.target.value) / 2)}
             />
           </div>
           <label className="rowcheck">
@@ -905,11 +905,8 @@ function StepOptimize() {
           </div>
           <select
             value={s.solidPattern}
-            onChange={(e) =>
-              s.setSolidPattern(e.target.value as "default" | "rectilinear" | "concentric")
-            }
+            onChange={(e) => s.setSolidPattern(e.target.value as "rectilinear" | "concentric")}
           >
-            <option value="default">Profile default</option>
             <option value="rectilinear">Rectilinear</option>
             <option value="concentric">Concentric</option>
           </select>
@@ -957,9 +954,20 @@ function StepOptimize() {
       </div>
 
       {s.optMode === "solid" ? (
-        <div className="row">
-          <div className="dim small" style={{ flex: 1 }}>
-            Outer shape is optimized — no walls/infill. Load &amp; support regions stay solid.
+        <div className="group">
+          <label className="rowcheck">
+            <input
+              type="checkbox"
+              checked={s.retainBc}
+              onChange={(e) => s.setRetainBc(e.target.checked)}
+            />
+            <span>Keep load &amp; support regions solid</span>
+          </label>
+          <div className="dim small">
+            Outer shape is optimized — no walls/infill.{" "}
+            {s.retainBc
+              ? "Material under every load and support is forced to stay (recommended)."
+              : "Load/support regions can also be removed — pure topology optimization; the result may carve under a load."}
           </div>
         </div>
       ) : (
@@ -1083,7 +1091,7 @@ function StepOptimize() {
             {(s.optProgress.passes ?? 1) > 1
               ? `pass ${s.optProgress.pass}/${s.optProgress.passes} · `
               : ""}
-            iteration {s.optProgress.iteration}/{s.optProgress.maxIter}
+            iteration {s.optProgress.iteration} of max {s.optProgress.maxIter}
           </span>
         </div>
       )}
@@ -1118,21 +1126,24 @@ function StepExport() {
       {s.optSummary && (s.optSummary.solid || s.optSummary.binary) && (
         <div className="group">
           <div className="g-label">
-            <span>Isosurface density</span>
-            <b>{s.densityThreshold} %</b>
+            <span>Fine-tune surface</span>
           </div>
           <input
             type="range"
             min={20}
             max={80}
             step={1}
-            value={s.densityThreshold}
-            onChange={(e) => s.setDensityThreshold(Number(e.target.value))}
+            value={100 - s.densityThreshold}
+            onChange={(e) => s.setDensityThreshold(100 - Number(e.target.value))}
           />
+          <div className="row" style={{ justifyContent: "space-between" }}>
+            <span className="dim small">retain less</span>
+            <span className="dim small">retain more</span>
+          </div>
           <div className="dim small">
-            The density level the exported {s.optSummary.solid ? "shape" : "dense region"} is cut
-            from the optimized field — <b>not</b> the budget. Lower keeps more material (chunkier),
-            higher trims it leaner. The view updates live and exports use what you see.
+            Moves the exported {s.optSummary.solid ? "surface" : "dense region"} in or out by
+            re-cutting the optimized field — <b>not</b> the budget. Updates live; exports use what
+            you see.
           </div>
         </div>
       )}
@@ -1163,7 +1174,7 @@ function StepExport() {
       {s.viewMode === "infill" && s.regionInfos.length > 0 && (
         <div className="group">
           <div className="g-label">
-            <span>Modifier regions</span>
+            <span>{s.optSummary?.solid ? "Optimized body" : "Modifier regions"}</span>
           </div>
           <div className="regionlist">
             {s.regionInfos.map((r, i) => (
@@ -1175,13 +1186,17 @@ function StepExport() {
                 />
                 <span className="dot" style={{ background: rampCss(r.density / 0.8) }} />
                 <span>
-                  Modifier {i + 1} — infill {Math.round(r.density * 100)}%
+                  {s.optSummary?.solid
+                    ? "Optimized body (kept material)"
+                    : `Modifier ${i + 1} — infill ${Math.round(r.density * 100)}%`}
                 </span>
               </label>
             ))}
-            <div className="dim small">
-              Regions nest (denser inside sparser) — toggle to inspect one at a time.
-            </div>
+            {!s.optSummary?.solid && (
+              <div className="dim small">
+                Regions nest (denser inside sparser) — toggle to inspect one at a time.
+              </div>
+            )}
           </div>
         </div>
       )}

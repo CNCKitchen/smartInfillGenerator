@@ -116,7 +116,7 @@ type Req =
   | { id: number; op: "resultField"; kind: string }
   | { id: number; op: "voxelResults" }
   | { id: number; op: "voxelResultField"; kind: string }
-  | { id: number; op: "exportThreeMf"; slicer: string }
+  | { id: number; op: "exportThreeMf"; slicer: string; thumbnail: Uint8Array | null }
   | { id: number; op: "exportStls" }
   | { id: number; op: "exportSolidStl" };
 
@@ -407,7 +407,8 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
         return;
       }
       case "exportThreeMf": {
-        const bytes = requireModel().export_3mf(msg.slicer);
+        const thumb = msg.thumbnail ?? new Uint8Array(0);
+        const bytes = requireModel().export_3mf(msg.slicer, thumb);
         (self as unknown as Worker).postMessage({ id: msg.id, ok: true, data: bytes }, [
           bytes.buffer,
         ]);

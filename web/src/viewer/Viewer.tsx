@@ -86,6 +86,8 @@ export function Viewer() {
     sceneEvents.onVoxelCutActive = (on) => scene.setVoxelCutActive(on);
     sceneEvents.onAnimateDeformed = (on) => scene.setDeformAnimate(on);
     sceneEvents.onOptShape = (p, i, d) => scene.setOptShape(p, i, d);
+    sceneEvents.onResultSolid = (solid) => scene.setResultSolid(solid);
+    sceneEvents.captureThumbnail = () => scene.captureThumbnail();
     sceneEvents.onRegionVisibility = (vis) => scene.setRegionVisibility(vis);
     sceneEvents.onScalarField = (v, flip) => scene.setScalarField(v, flip ?? false);
     sceneEvents.onDispComponent = (comp) => scene.setDispComponent(comp);
