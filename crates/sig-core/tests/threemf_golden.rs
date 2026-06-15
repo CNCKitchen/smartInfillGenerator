@@ -71,11 +71,16 @@ fn assert_golden(flavor: &str, snapshot: &str) {
         std::fs::write(&path, snapshot).unwrap();
         return;
     }
-    let want = std::fs::read_to_string(&path).unwrap_or_else(|_| {
-        panic!("missing golden {path:?} — run `SIG_UPDATE_GOLDEN=1 cargo test` to create it")
-    });
+    let want = std::fs::read_to_string(&path)
+        .unwrap_or_else(|_| {
+            panic!("missing golden {path:?} — run `SIG_UPDATE_GOLDEN=1 cargo test` to create it")
+        })
+        // The writer emits '\n' only; tolerate CRLF the fixture may pick up from
+        // git autocrlf on checkout so the pin stays portable (Windows / CI).
+        .replace("\r\n", "\n");
     assert_eq!(
-        snapshot, want,
+        snapshot,
+        want.as_str(),
         "{flavor} 3MF output drifted from {path:?}; if intentional, regenerate with SIG_UPDATE_GOLDEN=1"
     );
 }
