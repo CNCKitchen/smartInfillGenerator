@@ -145,6 +145,12 @@ pub enum OptimizeError {
     Cancelled,
 }
 
+impl From<crate::solve::SolveError> for OptimizeError {
+    fn from(e: crate::solve::SolveError) -> Self {
+        OptimizeError::Solve(e)
+    }
+}
+
 impl std::fmt::Display for OptimizeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

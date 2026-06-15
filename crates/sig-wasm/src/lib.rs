@@ -8,15 +8,11 @@
 //! the boundary as typed arrays; small results as JSON strings.
 
 use sig_core::attach::{assemble, check_problem, BcKind, BcSpec};
-use sig_core::bins::{
-    assign_bins_mass, cleanup_small_regions, cluster_levels, extract_iso, extract_region,
-    taubin_smooth, RegionMesh,
-};
+use sig_core::bins::{extract_iso, extract_region, taubin_smooth, RegionMesh};
 use sig_core::mesh::TriMesh;
+use sig_core::pipeline::{smooth_regions, solid_keep_bins};
 use sig_core::segment::{segment, Segmentation};
-use sig_core::simp::{
-    evaluate_cached, evaluate_cached_stats, optimize_cached as simp_optimize, OptimizeParams,
-};
+use sig_core::simp::OptimizeParams;
 use sig_core::solve::{
     active_nodes, pad_for_levels, solve_nodes_cached, SolveSettings, Solution, SolverCache,
 };
@@ -1041,361 +1037,139 @@ impl Model {
             ..Default::default()
         };
 
-        let mesh = &self.mesh;
-        let max_iter = params.max_iter;
-        // Borrow self fields disjointly for the progress closure.
-        let tris = &mesh.tris;
-        // Isosurface threshold for the live "shape emerging" view.
-        const SKEL_DENSITY: f64 = 0.4;
-
-        // ---- goal handling ----
-        // "match": find the LIGHTEST design as stiff as a uniform print at
-        // the reference percentage. One tight uniform solve sets the target
-        // compliance; a guarded secant then walks the budget (each pass
-        // warm-started from the previous design) until the BINNED design
-        // lands within tolerance. Compliance is smooth and monotone in the
-        // budget, so a handful of passes suffice.
-        // Match-stiffness goal is an infill concept (lightest design as stiff
-        // as a uniform print); solid topology uses the volume-fraction budget.
+        // ---- pipeline (core) ----
+        // The orchestration — goal-match budget secant, binning, the binned
+        // verification + uniform/solid reference solves, and region extraction —
+        // lives in sig_core::pipeline::run_optimization. This adapter resolves
+        // params (above), marshals the per-iteration callback to JS, and
+        // serializes the outcome. The grid/mesh borrows are disjoint fields from
+        // the &mut solver_cache the pipeline takes.
         let goal_match = opts.goal == "match" && !solid;
-        const MATCH_TOL: f64 = 0.02;
-        let max_passes: usize = if goal_match { 5 } else { 1 };
         let ref_frac = (budget_pct / 100.0).clamp(params.floor, params.cap);
-        let mut c_target = 0.0f64;
-        if goal_match {
-            let split_t = sig_core::simp::classify_cells(
-                grid,
-                params.wall_mm,
-                params.top_mm,
-                params.bottom_mm,
-                params.composite_skin,
-            );
-            if split_t.design.is_empty() {
-                return Err(err(
-                    "part is thinner than the wall thickness everywhere — nothing to optimize (it prints solid)",
-                ));
-            }
-            let x_ref = vec![ref_frac; split_t.design.len()];
-            let (c_ref, _, _) = evaluate_cached(
-                &mut self.solver_cache, grid, *levels, &asm.problem, &self.settings, &split_t.skin,
-                &split_t.design, &split_t.skin_frac, &x_ref, eval_exp, eval_coeff,
-            )
-            .map_err(err)?;
-            c_target = c_ref;
-        }
-
-        let pass_no = std::cell::Cell::new(1usize);
-        let mut budget_k = if goal_match {
-            // Optimized designs typically match uniform stiffness at
-            // ~70–85% of the mass — start the search there.
-            (ref_frac * 0.8).max(params.floor)
-        } else {
-            (budget_pct / 100.0).clamp(0.01, 1.0)
-        };
-        let (mut lo_b, mut hi_b) = (params.floor, ref_frac);
-        let mut warm_x: Option<Vec<f64>> = None;
-        let mut warm_u: Option<Vec<f64>> = None;
-        let mut pass_trace: Vec<(f64, f64)> = Vec::new();
-        let mut total_iters = 0usize;
-        let (result, centers, bins, x_binned, c_binned, u_binned, verify_stats) = loop {
-            let params_k = OptimizeParams { budget: budget_k, ..params };
-            let result = simp_optimize(
-                &mut self.solver_cache,
-                grid,
-                *levels,
-                &asm.problem,
-                &self.settings,
-                &params_k,
-                warm_x.as_deref(),
-                warm_u.as_deref(),
-                |p, x_phys, design_cells| {
-                    let mut field: std::collections::HashMap<u32, f64> =
-                        std::collections::HashMap::with_capacity(design_cells.len());
-                    for (k, &c) in design_cells.iter().enumerate() {
-                        field.insert(c, x_phys[k]);
-                    }
-                    // Inline vertex sampling (cannot call &self methods here).
-                    let vd = sample_field_static(tris, grid, &field);
-                    // Evolving dense-core isosurface so the user watches the
-                    // optimized shape gain detail iteration by iteration.
-                    // Built on the CONTINUOUS filtered field — the level set
-                    // is smooth; a binary per-cell indicator grows tent
-                    // spikes wherever a single cell crosses the threshold.
-                    let value = |ci: usize| field.get(&(ci as u32)).copied().unwrap_or(0.0);
-                    let mut skel = extract_iso(grid, &value, SKEL_DENSITY);
-                    taubin_smooth(&mut skel.positions, &skel.indices, 3);
-                    let skel_density = sample_points_static(&skel.positions, grid, &field);
-                    let json = serde_json::json!({
-                        "iteration": p.iteration,
-                        "maxIter": max_iter,
-                        "pass": pass_no.get(),
-                        "passes": max_passes,
-                        "budgetNow": params_k.budget,
-                        "compliance": p.compliance,
-                        "massFrac": p.mass_frac,
-                        "meanInfill": p.mean_infill,
-                        "change": p.change,
-                        "meanChange": p.mean_change,
-                        "innerIters": p.inner_iters,
-                        "innerRes": p.inner_residual,
-                    })
-                    .to_string();
-                    let args = js_sys::Array::of5(
-                        &JsValue::from_str(&json),
-                        &js_sys::Float32Array::from(vd.as_slice()),
-                        &js_sys::Float32Array::from(skel.positions.as_slice()),
-                        &js_sys::Uint32Array::from(skel.indices.as_slice()),
-                        &js_sys::Float32Array::from(skel_density.as_slice()),
-                    );
-                    let _ = progress.apply(&JsValue::NULL, &args);
-                },
-            )
-            .map_err(err)?;
-            total_iters += result.iterations;
-
-            // ---- bins ----
-            // Level placement: manual override (user levels / binary
-            // {floor, 1}) when given, otherwise auto — floor pinned ("just
-            // so it prints"), upper levels from strain-energy-weighted
-            // clustering in stiffness space (the convex infill law makes
-            // dense infill more efficient per gram, so load-bearing levels
-            // land high). Assignment re-meets the budget via the anchored
-            // bisection.
-            // SOLID topology: two levels {void, solid}, the layout thresholded
-            // at ρ = 0.5, then floating islands (material not connected to a
-            // frozen load/support cell) dropped. Infill modes cluster levels.
-            let (centers, bins): (Vec<f64>, Vec<u8>) = if solid {
-                (
-                    vec![0.0, 1.0],
-                    solid_keep_bins(grid, &result.skin_cells, &result.design_cells, &result.x, 0.5),
-                )
+        // Manual level override (binary {floor,1} or user densities): clamp,
+        // sort, dedup once here; the pipeline takes the list verbatim.
+        let levels_clean: Option<Vec<f64>> = opts.levels_pct.as_ref().and_then(|user| {
+            if user.is_empty() {
+                None
             } else {
-                let centers: Vec<f64> = match &opts.levels_pct {
-                    Some(user) if !user.is_empty() => {
-                        let mut l: Vec<f64> =
-                            user.iter().map(|&p| (p / 100.0).clamp(0.01, 1.0)).collect();
-                        l.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                        l.dedup_by(|a, b| (*a - *b).abs() < 0.005);
-                        l
-                    }
-                    _ => cluster_levels(
-                        &result.x, &result.se, n_bins, eval_exp, eval_coeff, params.floor,
-                        params.cap,
-                    ),
-                };
-                let target_mean = result.x.iter().sum::<f64>() / result.x.len().max(1) as f64;
-                let mut bins = assign_bins_mass(
-                    &result.x, &result.se, &centers, eval_exp, eval_coeff, target_mean,
-                );
-                let min_cells = (result.design_cells.len() / 500).max(30);
-                cleanup_small_regions(grid, &result.design_cells, &mut bins, centers.len(), min_cells);
-                (centers, bins)
-            };
-            let x_binned: Vec<f64> = bins.iter().map(|&b| centers[b as usize]).collect();
-
-            // Verification solve of the binned design (calibrated law);
-            // warm-started from the optimizer's displacement via the cache.
-            let (c_b, _maxd, u_b, stats_b) = evaluate_cached_stats(
-                &mut self.solver_cache, grid, *levels, &asm.problem, &self.settings,
-                &result.skin_cells, &result.design_cells, &result.skin_frac, &x_binned, eval_exp,
-                eval_coeff,
-            )
-            .map_err(err)?;
-            pass_trace.push((budget_k, c_b));
-
-            if !goal_match {
-                break (result, centers, bins, x_binned, c_b, u_b, stats_b);
+                let mut l: Vec<f64> = user.iter().map(|&p| (p / 100.0).clamp(0.01, 1.0)).collect();
+                l.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                l.dedup_by(|a, b| (*a - *b).abs() < 0.005);
+                Some(l)
             }
-            // dev > 0: too compliant (needs more material); < 0: too stiff.
-            let dev = c_b / c_target - 1.0;
-            if dev.abs() <= MATCH_TOL || pass_no.get() >= max_passes || hi_b - lo_b < 0.005 {
-                break (result, centers, bins, x_binned, c_b, u_b, stats_b);
-            }
-            if dev > 0.0 {
-                lo_b = lo_b.max(budget_k);
-            } else {
-                hi_b = hi_b.min(budget_k);
-            }
-            // Guarded secant on the last two passes; bisection fallback.
-            let n = pass_trace.len();
-            let mut next = if n >= 2 {
-                let (b1, c1) = pass_trace[n - 2];
-                let (b2, c2) = pass_trace[n - 1];
-                if (c1 - c2).abs() > 1e-12 {
-                    b2 + (c_target - c2) * (b1 - b2) / (c1 - c2)
-                } else {
-                    0.5 * (lo_b + hi_b)
-                }
-            } else {
-                0.5 * (lo_b + hi_b)
-            };
-            if !(next > lo_b + 0.002 && next < hi_b - 0.002) {
-                next = 0.5 * (lo_b + hi_b);
-            }
-            budget_k = next.clamp(params.floor, params.cap);
-            warm_x = Some(result.x.clone());
-            warm_u = Some(result.u.clone());
-            pass_no.set(pass_no.get() + 1);
-        };
-
-        // Infill volume share per design cell — occupancy × (1 − wall-band
-        // fraction) — means and masses weight by it.
-        let w_inf: Vec<f64> = result
-            .design_cells
-            .iter()
-            .zip(&result.skin_frac)
-            .map(|(&c, &f)| grid.scale[c as usize] as f64 * (1.0 - f as f64))
-            .collect();
-        let w_sum: f64 = w_inf.iter().sum();
-        let sum_f: f64 = result
-            .design_cells
-            .iter()
-            .zip(&result.skin_frac)
-            .map(|(&c, &f)| grid.scale[c as usize] as f64 * f as f64)
-            .sum();
-        let sum_wx = |x: &[f64]| w_inf.iter().zip(x).map(|(&w, &v)| w * v).sum::<f64>();
-        let mean_binned = sum_wx(&x_binned) / w_sum.max(1e-12);
-        let x_uniform = vec![mean_binned; x_binned.len()];
-        // The uniform/solid baselines only feed the comparison card — a
-        // relaxed tolerance is plenty (compliance converges much faster than
-        // the residual) and removes most of the post-convergence wait. The
-        // solver cache doesn't key on tol, so reuse/warm starts are kept.
-        let ref_settings =
-            SolveSettings { tol: self.settings.tol.max(5e-4), ..self.settings };
-        let (c_uniform, _, _) = evaluate_cached(
-            &mut self.solver_cache, grid, *levels, &asm.problem, &ref_settings,
-            &result.skin_cells, &result.design_cells, &result.skin_frac, &x_uniform, eval_exp,
-            eval_coeff,
-        )
-        .map_err(err)?;
-        let x_solid = vec![1.0; x_binned.len()];
-        let (c_solid, _, _) = evaluate_cached(
-            &mut self.solver_cache, grid, *levels, &asm.problem, &ref_settings,
-            &result.skin_cells, &result.design_cells, &result.skin_frac, &x_solid, eval_exp,
-            eval_coeff,
-        )
-        .map_err(err)?;
-
-        // Solution object for the deformed view.
-        let (mx, my, mz) = (grid.nx + 1, grid.ny + 1, grid.nz + 1);
-        let mut max_disp = 0f64;
-        for n in 0..mx * my * mz {
-            let m = u_binned[3 * n] * u_binned[3 * n]
-                + u_binned[3 * n + 1] * u_binned[3 * n + 1]
-                + u_binned[3 * n + 2] * u_binned[3 * n + 2];
-            max_disp = max_disp.max(m);
-        }
-        max_disp = max_disp.sqrt();
-        // Stress evaluation needs the eps the verification solve used.
-        self.solution_eps = Some(sig_core::simp::build_eps(
-            grid,
-            &result.skin_cells,
-            &result.design_cells,
-            &result.skin_frac,
-            &x_binned,
-            eval_exp,
-            eval_coeff,
-        ));
-        self.solution = Some(Solution {
-            u: u_binned.iter().map(|&v| v as f32).collect(),
-            mx,
-            my,
-            mz,
-            h: grid.h,
-            origin: grid.origin,
-            active: active_nodes(grid),
-            iterations: result.iterations,
-            // Real stats from the binned verification solve (the final pass of
-            // the goal-match loop). On a fine mesh that solve can hit the MGCG
-            // cap while the DESIGN converged — now it surfaces instead of being
-            // hard-coded to success. `iterations` stays the optimizer's outer
-            // count (what the progress UI reports); the residual/converged are
-            // the verification solve's.
-            rel_residual: verify_stats.rel_residual,
-            converged: verify_stats.converged,
-            residuals: Vec::new(),
         });
+        let cfg = sig_core::pipeline::PipelineCfg {
+            eval: sig_core::pipeline::EvalLaw { exp: eval_exp, coeff: eval_coeff },
+            goal_match,
+            ref_frac,
+            n_bins,
+            levels_pct: levels_clean.as_deref(),
+            smooth_iters,
+        };
+        let tris = &self.mesh.tris;
+        let max_iter = params.max_iter;
+        // Isosurface threshold for the live "shape emerging" preview.
+        const SKEL_DENSITY: f64 = 0.4;
+        let oc = sig_core::pipeline::run_optimization(
+            &mut self.solver_cache,
+            grid,
+            *levels,
+            &asm.problem,
+            &self.settings,
+            &params,
+            &cfg,
+            |upd, x_phys, design_cells| {
+                let mut field: std::collections::HashMap<u32, f64> =
+                    std::collections::HashMap::with_capacity(design_cells.len());
+                for (k, &c) in design_cells.iter().enumerate() {
+                    field.insert(c, x_phys[k]);
+                }
+                // Inline vertex sampling (cannot call &self methods here).
+                let vd = sample_field_static(tris, grid, &field);
+                // Evolving dense-core isosurface on the CONTINUOUS filtered field
+                // (smooth level set; a per-cell binary indicator grows tent spikes
+                // wherever a single cell crosses the threshold).
+                let value = |ci: usize| field.get(&(ci as u32)).copied().unwrap_or(0.0);
+                let mut skel = extract_iso(grid, &value, SKEL_DENSITY);
+                taubin_smooth(&mut skel.positions, &skel.indices, 3);
+                let skel_density = sample_points_static(&skel.positions, grid, &field);
+                let json = serde_json::json!({
+                    "iteration": upd.progress.iteration,
+                    "maxIter": max_iter,
+                    "pass": upd.pass,
+                    "passes": upd.passes,
+                    "budgetNow": upd.budget,
+                    "compliance": upd.progress.compliance,
+                    "massFrac": upd.progress.mass_frac,
+                    "meanInfill": upd.progress.mean_infill,
+                    "change": upd.progress.change,
+                    "meanChange": upd.progress.mean_change,
+                    "innerIters": upd.progress.inner_iters,
+                    "innerRes": upd.progress.inner_residual,
+                })
+                .to_string();
+                let args = js_sys::Array::of5(
+                    &JsValue::from_str(&json),
+                    &js_sys::Float32Array::from(vd.as_slice()),
+                    &js_sys::Float32Array::from(skel.positions.as_slice()),
+                    &js_sys::Uint32Array::from(skel.indices.as_slice()),
+                    &js_sys::Float32Array::from(skel_density.as_slice()),
+                );
+                let _ = progress.apply(&JsValue::NULL, &args);
+            },
+        )
+        .map_err(err)?;
 
-        // ---- regions (bins above base) ----
-        let mut bin_of_cell: std::collections::HashMap<u32, u8> = Default::default();
-        for (i, &c) in result.design_cells.iter().enumerate() {
-            bin_of_cell.insert(c, bins[i]);
-        }
-        // SOLID mode: the frozen load/support cells are part of the optimized
-        // body — count them as kept so the extracted shape includes them.
-        if solid {
-            for &c in &result.skin_cells {
-                bin_of_cell.insert(c, 1);
-            }
-        }
-        let mut regions_raw = Vec::new();
-        for level in 1..centers.len() {
-            let inside = |ci: usize| -> bool {
-                bin_of_cell.get(&(ci as u32)).map_or(false, |&b| b as usize >= level)
-            };
-            let mut r = extract_region(grid, &inside, 0.4);
-            if r.indices.is_empty() {
-                continue;
-            }
-            r.density = centers[level];
-            regions_raw.push(r);
-        }
-        let regions = smooth_regions(&regions_raw, smooth_iters);
-
-        // ---- mass + summary ----
-        // Composite cells: their wall-band fraction is always solid; only
-        // the infill share follows the density field. All volumes weighted
-        // by cell occupancy (cut boundary cells).
+        // ---- mass + summary (gram conversion needs the material density) ----
         let cell_vol = grid.h * grid.h * grid.h;
-        let vol_skin: f64 =
-            result.skin_cells.iter().map(|&c| grid.scale[c as usize] as f64).sum();
-        let n_solid = vol_skin + sum_f + w_sum;
         let grams =
-            |infill_vol: f64| (vol_skin + sum_f + infill_vol) * cell_vol * self.density * 1e6;
-        let mass_part = grams(sum_wx(&x_binned));
-        let mass_solid = grams(w_sum);
-        let mass_frac = (vol_skin + sum_f + sum_wx(&x_binned)) / n_solid;
+            |infill_vol: f64| (oc.vol_skin + oc.sum_f + infill_vol) * cell_vol * self.density * 1e6;
+        let mass_part = grams(oc.infill_vol_binned);
+        let mass_solid = grams(oc.w_sum);
+        let n_solid = oc.vol_skin + oc.sum_f + oc.w_sum;
+        let mass_frac = (oc.vol_skin + oc.sum_f + oc.infill_vol_binned) / n_solid;
 
-        let bin_counts: Vec<usize> =
-            (0..centers.len()).map(|c| bins.iter().filter(|&&b| b as usize == c).count()).collect();
+        let bin_counts: Vec<usize> = (0..oc.centers.len())
+            .map(|c| oc.bins.iter().filter(|&&b| b as usize == c).count())
+            .collect();
         let mut summary_v = serde_json::json!({
-            "iterations": total_iters,
-            "converged": result.converged,
-            "bins": centers.iter().zip(&bin_counts).map(|(&d, &n)| serde_json::json!({
+            "iterations": oc.total_iters,
+            "converged": oc.design_converged,
+            "bins": oc.centers.iter().zip(&bin_counts).map(|(&d, &n)| serde_json::json!({
                 "density": d, "cells": n,
             })).collect::<Vec<_>>(),
-            "baseDensity": centers[0],
-            "regionCount": regions.len(),
+            "baseDensity": oc.centers[0],
+            "regionCount": oc.regions.len(),
             "massGrams": mass_part,
             "massSolidGrams": mass_solid,
             "massFrac": mass_frac,
             // Achieved mean infill of the binned layout — the uniform-print
             // percentage the comparison card references ("vs X% uniform").
-            "meanInfill": mean_binned,
+            "meanInfill": oc.mean_binned,
             // Requested budget after printable-floor/cap clamping.
-            "targetInfill": result.effective_budget,
-            "stiffnessVsSolid": c_solid / c_binned,
-            "gainVsUniform": c_uniform / c_binned - 1.0,
-            "maxDisplacement": max_disp,
+            "targetInfill": oc.effective_budget,
+            "stiffnessVsSolid": oc.c_solid / oc.c_binned,
+            "gainVsUniform": oc.c_uniform / oc.c_binned - 1.0,
+            "maxDisplacement": oc.max_disp,
             "binary": opts.binary,
             "solid": solid,
             "goal": if goal_match { "match" } else { "budget" },
-            "passes": pass_trace.len(),
+            "passes": oc.pass_trace.len(),
         });
         if goal_match {
             let o = summary_v.as_object_mut().unwrap();
             o.insert("refUniformPct".into(), serde_json::json!(ref_frac * 100.0));
-            o.insert("targetCompliance".into(), serde_json::json!(c_target));
-            o.insert("achievedCompliance".into(), serde_json::json!(c_binned));
-            o.insert("matchDeviation".into(), serde_json::json!(c_binned / c_target - 1.0));
+            o.insert("targetCompliance".into(), serde_json::json!(oc.c_target));
+            o.insert("achievedCompliance".into(), serde_json::json!(oc.c_binned));
+            o.insert("matchDeviation".into(), serde_json::json!(oc.c_binned / oc.c_target - 1.0));
             // Mass of the uniform reference print (same skin, ref% interior).
             o.insert(
                 "massUniformRefGrams".into(),
-                serde_json::json!(grams(ref_frac * result.design_cells.len() as f64)),
+                serde_json::json!(grams(ref_frac * oc.design_cells.len() as f64)),
             );
             o.insert(
                 "passTrace".into(),
-                serde_json::json!(pass_trace
+                serde_json::json!(oc.pass_trace
                     .iter()
                     .map(|&(b, c)| serde_json::json!({"budget": b, "compliance": c}))
                     .collect::<Vec<_>>()),
@@ -1403,23 +1177,43 @@ impl Model {
         }
         let summary = summary_v.to_string();
 
+        // ---- deformed-view Solution + stress eps ----
+        let (mx, my, mz) = (grid.nx + 1, grid.ny + 1, grid.nz + 1);
+        self.solution_eps = Some(oc.solution_eps);
+        self.solution = Some(Solution {
+            u: oc.u_binned.iter().map(|&v| v as f32).collect(),
+            mx,
+            my,
+            mz,
+            h: grid.h,
+            origin: grid.origin,
+            active: active_nodes(grid),
+            // The optimizer's outer count of the final pass (what the progress UI
+            // reports); residual/converged are the binned verification solve's.
+            iterations: oc.design_iters,
+            rel_residual: oc.verify_residual,
+            converged: oc.verify_converged,
+            residuals: Vec::new(),
+        });
+
+        // ---- store the optimization result ----
         let mut field: std::collections::HashMap<u32, f64> = Default::default();
-        for (i, &c) in result.design_cells.iter().enumerate() {
-            field.insert(c, x_binned[i]);
+        for (i, &c) in oc.design_cells.iter().enumerate() {
+            field.insert(c, oc.x_binned[i]);
         }
         self.opt = Some(OptOutput {
-            regions,
-            regions_raw,
-            base_density: centers[0],
+            regions: oc.regions,
+            regions_raw: oc.regions_raw,
+            base_density: oc.centers[0],
             cell_density: field,
-            design_cells: result.design_cells,
-            x_cont: result.x,
+            design_cells: oc.design_cells,
+            x_cont: oc.x_cont,
             perimeters,
             top_bottom_layers: opts.top_bottom_layers.min(20),
             solid_pattern: opts.solid_pattern.clone(),
             summary: summary.clone(),
             solid,
-            anchor_cells: result.skin_cells,
+            anchor_cells: oc.skin_cells,
             iso_threshold: 0.5,
         });
         Ok(summary)
@@ -1839,109 +1633,6 @@ impl Model {
         }
         Ok(TriMesh::from_triangles(tris).to_stl_binary())
     }
-}
-
-/// SOLID topology mode: threshold the optimized field at `thresh` and keep
-/// only material connected (6-neighbour) to a frozen load/support cell, so
-/// floating islands are dropped. Returns 1 (kept solid) / 0 (void) per design
-/// slot. With no frozen anchors, keeps the single largest component. The
-/// threshold is the export "isosurface density" — lower keeps more material.
-fn solid_keep_bins(grid: &VoxelGrid, skin: &[u32], design: &[u32], x: &[f64], thresh: f64) -> Vec<u8> {
-    let (nx, ny, nz) = (grid.nx, grid.ny, grid.nz);
-    let n = grid.cell_count();
-    let mut member = vec![false; n];
-    let mut anchor = vec![false; n];
-    for &c in skin {
-        member[c as usize] = true;
-        anchor[c as usize] = true;
-    }
-    for (i, &c) in design.iter().enumerate() {
-        if x[i] >= thresh {
-            member[c as usize] = true;
-        }
-    }
-    // 6-connected components over member cells.
-    let mut comp = vec![u32::MAX; n];
-    let mut comp_keep: Vec<bool> = Vec::new();
-    let mut comp_size: Vec<usize> = Vec::new();
-    let mut stack: Vec<usize> = Vec::new();
-    for start in 0..n {
-        if !member[start] || comp[start] != u32::MAX {
-            continue;
-        }
-        let id = comp_keep.len() as u32;
-        let mut has_anchor = false;
-        let mut size = 0usize;
-        comp[start] = id;
-        stack.push(start);
-        while let Some(c) = stack.pop() {
-            size += 1;
-            if anchor[c] {
-                has_anchor = true;
-            }
-            let (cx, cy, cz) = (c % nx, (c / nx) % ny, c / (nx * ny));
-            let visit = |x: i64, y: i64, z: i64, comp: &mut [u32], stack: &mut Vec<usize>| {
-                if x < 0 || y < 0 || z < 0 || x >= nx as i64 || y >= ny as i64 || z >= nz as i64 {
-                    return;
-                }
-                let d = (z as usize * ny + y as usize) * nx + x as usize;
-                if member[d] && comp[d] == u32::MAX {
-                    comp[d] = id;
-                    stack.push(d);
-                }
-            };
-            let (xi, yi, zi) = (cx as i64, cy as i64, cz as i64);
-            visit(xi - 1, yi, zi, &mut comp, &mut stack);
-            visit(xi + 1, yi, zi, &mut comp, &mut stack);
-            visit(xi, yi - 1, zi, &mut comp, &mut stack);
-            visit(xi, yi + 1, zi, &mut comp, &mut stack);
-            visit(xi, yi, zi - 1, &mut comp, &mut stack);
-            visit(xi, yi, zi + 1, &mut comp, &mut stack);
-        }
-        comp_keep.push(has_anchor);
-        comp_size.push(size);
-    }
-    // No anchors (no BCs reached the grid): fall back to the largest component.
-    if !anchor.iter().any(|&a| a) {
-        if let Some((bi, _)) = comp_size.iter().enumerate().max_by_key(|(_, &s)| s) {
-            comp_keep.iter_mut().for_each(|k| *k = false);
-            comp_keep[bi] = true;
-        }
-    }
-    design
-        .iter()
-        .map(|&c| {
-            let c = c as usize;
-            let id = comp[c];
-            if member[c] && id != u32::MAX && comp_keep[id as usize] {
-                1
-            } else {
-                0
-            }
-        })
-        .collect()
-}
-
-/// How many Taubin passes one slider unit buys. The slider tops out at 40, so
-/// the max is 40·SMOOTH_PASS_MULT passes — enough, with the aggressive λ/μ in
-/// `taubin_smooth`, to fully melt the voxel staircase at the top of the range.
-const SMOOTH_PASS_MULT: usize = 4;
-
-/// Taubin-smooth copies of the raw regions (0 passes = verbatim copy).
-fn smooth_regions(raw: &[RegionMesh], iters: usize) -> Vec<RegionMesh> {
-    raw.iter()
-        .map(|r| {
-            let mut rr = RegionMesh {
-                density: r.density,
-                positions: r.positions.clone(),
-                indices: r.indices.clone(),
-            };
-            if iters > 0 {
-                taubin_smooth(&mut rr.positions, &rr.indices, iters * SMOOTH_PASS_MULT);
-            }
-            rr
-        })
-        .collect()
 }
 
 /// Sample a per-cell density field at arbitrary points (xyz triples),
