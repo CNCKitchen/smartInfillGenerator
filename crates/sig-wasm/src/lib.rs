@@ -28,6 +28,26 @@ pub use wasm_bindgen_rayon::init_thread_pool;
 
 const GRAVITY_MM_S2: [f64; 3] = [0.0, 0.0, -9810.0];
 
+/// Printable-geometry clamp bands — the single engine-side authority the
+/// optimize and solve-printed paths derive the analyzed solid wall from (and
+/// the floor for the standalone clamp in `voxel_mesh_cut`). The TS UI mirrors
+/// these for display and is allowed to be STRICTER — e.g. it requires at least
+/// a 10-point floor↔cap band where the engine only needs 5 for a non-degenerate
+/// band. The UI being the tighter side is deliberate: a user can never pick a
+/// value the engine then silently widens. Keeping the engine bands here keeps
+/// the three call sites from drifting from each other.
+const PERIMETERS_RANGE: (u32, u32) = (1, 8);
+const LINE_WIDTH_MM: (f64, f64) = (0.1, 1.5);
+const WALL_MM: (f64, f64) = (0.2, 5.0);
+
+/// Analyzed solid-wall thickness (mm) from the print settings, clamping once.
+/// Returns the clamped perimeter count alongside it.
+fn resolve_wall(perimeters: u32, line_width: f64) -> (u32, f64) {
+    let p = perimeters.clamp(PERIMETERS_RANGE.0, PERIMETERS_RANGE.1);
+    let lw = line_width.clamp(LINE_WIDTH_MM.0, LINE_WIDTH_MM.1);
+    (p, (p as f64 * lw).clamp(WALL_MM.0, WALL_MM.1))
+}
+
 /// Install the cooperative cancellation flag: an Int32Array over a
 /// SharedArrayBuffer whose element 0 the UI thread sets to nonzero while
 /// this worker is blocked inside a solve (a postMessage could never arrive
@@ -615,7 +635,7 @@ impl Model {
     /// (h = wall/k) so the printed skin is exactly k cell layers on flat
     /// faces. 0 disables. Changing the value invalidates grid and results.
     pub fn set_snap_wall(&mut self, wall_mm: f64) {
-        let w = if wall_mm > 0.0 { wall_mm.clamp(0.2, 5.0) } else { 0.0 };
+        let w = if wall_mm > 0.0 { wall_mm.clamp(WALL_MM.0, WALL_MM.1) } else { 0.0 };
         if (w - self.snap_wall).abs() > 1e-9 {
             self.snap_wall = w;
             self.grid = None;
@@ -810,8 +830,7 @@ impl Model {
         }
         let eval_exp = opts.exponent.clamp(1.0, 3.5);
         let eval_coeff = opts.coeff.clamp(0.05, 2.0);
-        let perimeters = opts.perimeters.clamp(1, 8);
-        let wall_mm = (perimeters as f64 * opts.line_width.clamp(0.1, 1.5)).clamp(0.2, 5.0);
+        let (_, wall_mm) = resolve_wall(opts.perimeters, opts.line_width);
         let tb_mm =
             (opts.top_bottom_layers.min(20) as f64 * opts.layer_height.clamp(0.04, 0.6)).min(5.0);
         let infill = (opts.infill_pct / 100.0).clamp(0.01, 1.0);
@@ -982,8 +1001,7 @@ impl Model {
         let floor = if solid { 1e-3 } else { (opts.floor_pct / 100.0).clamp(0.01, 0.5) };
         let cap = if solid { 1.0 } else { (opts.cap_pct / 100.0).clamp(floor + 0.05, 1.0) };
         let budget_pct = opts.budget_pct;
-        let perimeters = opts.perimeters.clamp(1, 8);
-        let wall_mm = perimeters as f64 * opts.line_width.clamp(0.1, 1.5);
+        let (perimeters, wall_mm) = resolve_wall(opts.perimeters, opts.line_width);
         let smooth_iters = (opts.smooth_iters as usize).min(60);
         let n_bins = (opts.n_bins as usize).clamp(2, 4);
 
@@ -1004,7 +1022,7 @@ impl Model {
             coeff: opt_coeff,
             floor,
             cap,
-            wall_mm: wall_mm.clamp(0.2, 5.0),
+            wall_mm,
             top_mm: (opts.top_bottom_layers.min(20) as f64
                 * opts.layer_height.clamp(0.04, 0.6))
             .min(5.0),
@@ -1547,7 +1565,7 @@ impl Model {
         let tb = top_bottom_mm.clamp(0.0, 5.0);
         let split = sig_core::simp::classify_cells(
             grid,
-            wall_mm.clamp(0.2, 5.0),
+            wall_mm.clamp(WALL_MM.0, WALL_MM.1),
             tb,
             tb,
             self.composite_skin,
