@@ -103,6 +103,11 @@ export class SceneManager {
   private activeBcId: string | null = null;
   private triBcColor: (THREE.Color | null)[] = [];
   private hoverPatch: number | null = null;
+  /** Set by repaint() (full color rewrite), cleared after the next render. While
+   *  set, setHover uploads in full too, so its partial range can't shadow a
+   *  pending full rewrite (three uploads partially whenever updateRanges is set). */
+  private colorsDirtyFull = false;
+  private _hoverCol = new THREE.Color();
 
   private tool: Tool = "orbit";
   private brushRadius = 3;
@@ -825,13 +830,52 @@ export class SceneManager {
         this.colors[9 * t + 3 * v + 2] = c.b;
       }
     }
-    (this.geometry.getAttribute("color") as THREE.BufferAttribute).needsUpdate = true;
+    const attr = this.geometry.getAttribute("color") as THREE.BufferAttribute;
+    attr.clearUpdateRanges(); // a full rewrite supersedes any pending hover range
+    this.colorsDirtyFull = true;
+    attr.needsUpdate = true;
   }
 
+  /** Hover is only ever a 2-patch delta, so don't rebuild the whole color buffer
+   *  (a ~1.8M-float rewrite + full VBO upload on a big STL). Restore the tris of
+   *  the previously-hovered patch to their base color, tint the newly-hovered
+   *  patch, and upload only the touched span. Base colors live in `triBcColor`,
+   *  kept current by repaint(). */
   private setHover(patch: number | null) {
     if (patch === this.hoverPatch) return;
+    const prev = this.hoverPatch;
     this.hoverPatch = patch;
-    this.repaint();
+    if (!this.colors || !this.geometry) return;
+    let lo = Infinity;
+    let hi = -Infinity;
+    const paint = (t: number, c: THREE.Color) => {
+      const o = 9 * t;
+      for (let v = 0; v < 3; v++) {
+        this.colors![o + 3 * v] = c.r;
+        this.colors![o + 3 * v + 1] = c.g;
+        this.colors![o + 3 * v + 2] = c.b;
+      }
+      if (t < lo) lo = t;
+      if (t > hi) hi = t;
+    };
+    if (prev !== null) {
+      const tris = this.patchToTris.get(prev);
+      if (tris) for (const t of tris) paint(t, this.triBcColor[t] ?? BASE_COLOR);
+    }
+    if (patch !== null) {
+      const tris = this.patchToTris.get(patch);
+      if (tris)
+        for (const t of tris) {
+          const base = this.triBcColor[t];
+          paint(t, base ? this._hoverCol.copy(base).lerp(HOVER_TINT, 0.65) : HOVER_TINT);
+        }
+    }
+    if (hi < lo) return; // both patches empty / unknown
+    const attr = this.geometry.getAttribute("color") as THREE.BufferAttribute;
+    // A full rewrite is already queued this frame: don't add a partial range, or
+    // three would upload only it and drop the rest of the rewrite.
+    if (!this.colorsDirtyFull) attr.addUpdateRange(9 * lo, 9 * (hi - lo + 1));
+    attr.needsUpdate = true;
   }
 
   // ---------- picking ----------
@@ -2361,6 +2405,7 @@ export class SceneManager {
     r.setViewport(0, 0, this.viewW, this.viewH);
     r.clear();
     r.render(this.scene, this.camera);
+    this.colorsDirtyFull = false; // the color buffer (if any) was just uploaded
     // Axis gizmo inset, bottom-right.
     const s = 104;
     const m = 10;
