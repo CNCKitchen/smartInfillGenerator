@@ -985,15 +985,6 @@ impl MgSolver {
         let mut rz = par::dot_mixed(&r, &self.ws.z[0]);
 
         let mut res = f64::INFINITY;
-        // Stagnation watchdog: the residual on a resolution-limited problem
-        // (thin features below the grid scale — the documented Benchy plateau)
-        // stops improving while still paying full V-cycle cost. Track the best
-        // residual; if it doesn't improve by even 0.01% for STAGNATION_LIMIT
-        // iterations, stop early with the best iterate (a finite residual, so
-        // the caller treats it as a benign cap hit, not divergence).
-        const STAGNATION_LIMIT: usize = 30;
-        let mut best_res = res0;
-        let mut stall = 0usize;
         for it in 0..max_iter {
             // Cooperative cancel: bail like an iteration-cap hit; the caller
             // checks `cancel::requested()` and raises the Cancelled error.
@@ -1018,15 +1009,6 @@ impl MgSolver {
             }
             if res <= tol {
                 return SolveStats { iterations: it + 1, rel_residual: res, converged: true };
-            }
-            if res < best_res * (1.0 - 1e-4) {
-                best_res = res;
-                stall = 0;
-            } else {
-                stall += 1;
-                if stall >= STAGNATION_LIMIT {
-                    return SolveStats { iterations: it + 1, rel_residual: res, converged: false };
-                }
             }
             // Live preview: stream the trace every few iterations (not every
             // one — the UI repaints at frame cadence and the full, exact trace
