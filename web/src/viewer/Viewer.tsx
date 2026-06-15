@@ -71,6 +71,14 @@ export function Viewer() {
       onSymmetryMoved: (normal, c) => {
         useStore.getState().onSymmetryPlaneMoved(normal, c);
       },
+      onContextLost: (lost) => {
+        // The GPU reset (driver hiccup, power event) blanks the viewport for a
+        // moment; three.js auto-recovers, so just explain the flash and clear it
+        // once back. Guard the clear so a notice raised meanwhile isn't stomped.
+        const msg = "Graphics were reset — restoring the 3D view (reload the page if it stays blank).";
+        if (lost) useStore.setState({ notice: msg });
+        else if (useStore.getState().notice === msg) useStore.setState({ notice: null });
+      },
     });
 
     sceneEvents.onModelLoaded = (m) => scene.setModel(m);

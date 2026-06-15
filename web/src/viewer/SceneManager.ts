@@ -47,6 +47,9 @@ export interface SceneCallbacks {
   onSectionMoved?: (normal: [number, number, number], constant: number) => void;
   /** Symmetry plane moved/rotated: plane n·p = c (n unit, world mm). */
   onSymmetryMoved?: (normal: [number, number, number], c: number) => void;
+  /** WebGL context was lost (true) or restored (false) — for a user notice
+   *  while the GPU resets and the viewport is briefly blank. */
+  onContextLost?: (lost: boolean) => void;
 }
 
 export class SceneManager {
@@ -297,6 +300,8 @@ export class SceneManager {
       if (this.brushCursor) this.brushCursor.visible = false;
       if (this.pickCursor) this.pickCursor.visible = false;
     });
+    canvas.addEventListener("webglcontextlost", this.onGlLost);
+    canvas.addEventListener("webglcontextrestored", this.onGlRestored);
     this.installNavigation(canvas);
 
     // Hover value probe tooltip (sibling of the canvas, .viewer is relative).
@@ -341,6 +346,8 @@ export class SceneManager {
     document.removeEventListener("pointermove", this.onOrbitMove);
     document.removeEventListener("pointerup", this.onOrbitUp);
     this.canvas?.removeEventListener("wheel", this.onWheel);
+    this.canvas?.removeEventListener("webglcontextlost", this.onGlLost);
+    this.canvas?.removeEventListener("webglcontextrestored", this.onGlRestored);
     this.probeEl?.remove();
     if (this.extremeEls) for (const el of Object.values(this.extremeEls)) el.remove();
     if (this.wireframeLines) {
@@ -1080,6 +1087,29 @@ export class SceneManager {
     this.camera.position.add(this._oTmp);
     this.controls.target.add(this._oTmp);
     this.controls.update();
+  };
+
+  // ---------- WebGL context loss ----------
+
+  /** True between `webglcontextlost` and `webglcontextrestored`. three.js
+   *  already preventDefaults, no-ops its own render(), and rebuilds the GL
+   *  backend on restore (resources re-upload on the next render). We add the
+   *  app layer: skip our own GL calls during the gap (so nothing touches the
+   *  dead context) and surface a notice; the rAF loop keeps running and repaints
+   *  itself once the context is back. */
+  private contextLost = false;
+
+  private onGlLost = (e: Event) => {
+    e.preventDefault(); // ensure the browser will fire webglcontextrestored
+    this.contextLost = true;
+    this.callbacks.onContextLost?.(true);
+  };
+
+  private onGlRestored = () => {
+    this.contextLost = false;
+    this.callbacks.onContextLost?.(false);
+    // three re-initialized the GL backend (its listener ran first); the loop's
+    // next tick re-uploads geometry/materials and repaints. Nothing to rebuild.
   };
 
   // ---------- hover value probe ----------
@@ -2315,6 +2345,7 @@ export class SceneManager {
   }
 
   private tick() {
+    if (this.contextLost) return; // GPU is mid-reset — don't touch the dead context
     if (this.rbmMode) {
       const t = this.clock.getElapsedTime();
       this.applyPositions(Math.sin(t * 2.0 * Math.PI * 0.66));
