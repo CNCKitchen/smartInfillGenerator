@@ -6,7 +6,17 @@
 
 use miniz_oxide::inflate::decompress_to_vec_with_limit;
 
-const MAX_ENTRY: usize = 512 * 1024 * 1024;
+// Untrusted-input guards (read_zip is the entry point for user 3MF uploads,
+// decompressed inside a browser worker where a few hundred MB risks an OOM).
+/// Per-entry decompressed ceiling. A 3MF's largest member is the model XML
+/// (verbose vertex lists) — tens of MB even for dense meshes; 256 MiB is
+/// generous headroom while still bounding a single-entry inflation bomb.
+const MAX_ENTRY: usize = 256 * 1024 * 1024;
+/// Aggregate decompressed budget across ALL entries — the many-entry zip-bomb
+/// guard the per-entry cap misses.
+const MAX_TOTAL: usize = 768 * 1024 * 1024;
+/// Hard ceiling on entry count (a real 3MF has a handful of parts).
+const MAX_ENTRIES: usize = 4096;
 
 pub struct ZipWriter {
     data: Vec<u8>,
@@ -86,6 +96,9 @@ pub enum ZipError {
     NotAZip,
     Corrupt(&'static str),
     Unsupported(&'static str),
+    /// An entry, the entry count, or the aggregate decompressed size exceeds
+    /// the safety caps for untrusted input — likely a zip bomb.
+    TooLarge(&'static str),
 }
 
 impl std::fmt::Display for ZipError {
@@ -94,6 +107,7 @@ impl std::fmt::Display for ZipError {
             ZipError::NotAZip => write!(f, "not a zip archive"),
             ZipError::Corrupt(s) => write!(f, "corrupt zip: {s}"),
             ZipError::Unsupported(s) => write!(f, "unsupported zip feature: {s}"),
+            ZipError::TooLarge(s) => write!(f, "zip exceeds safe size limit: {s}"),
         }
     }
 }
@@ -121,6 +135,9 @@ pub fn read_zip(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, ZipError> {
     }
     let eocd = eocd.ok_or(ZipError::NotAZip)?;
     let count = u16::from_le_bytes([bytes[eocd + 10], bytes[eocd + 11]]) as usize;
+    if count > MAX_ENTRIES {
+        return Err(ZipError::TooLarge("entry count"));
+    }
     let cd_offset = u32::from_le_bytes([
         bytes[eocd + 16],
         bytes[eocd + 17],
@@ -129,6 +146,7 @@ pub fn read_zip(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, ZipError> {
     ]) as usize;
 
     let mut out = Vec::with_capacity(count);
+    let mut total = 0usize;
     let mut p = cd_offset;
     for _ in 0..count {
         if p + 46 > bytes.len() || &bytes[p..p + 4] != b"PK\x01\x02" {
@@ -167,6 +185,10 @@ pub fn read_zip(bytes: &[u8]) -> Result<Vec<(String, Vec<u8>)>, ZipError> {
                 .map_err(|_| ZipError::Corrupt("deflate stream"))?,
             _ => return Err(ZipError::Unsupported("compression method")),
         };
+        total = total.saturating_add(data.len());
+        if total > MAX_TOTAL {
+            return Err(ZipError::TooLarge("total decompressed size"));
+        }
         out.push((name, data));
     }
     Ok(out)

@@ -818,6 +818,10 @@ pub fn optimize_cached(
         }
     }
 
+    // Reused across outer iterations — every entry is rewritten by the OC
+    // update before it is read, so a per-iteration alloc (up to max_iter ×
+    // design_cells f64) is pure waste.
+    let mut x_new = vec![0f64; x.len()];
     for it in 0..params.max_iter {
         iterations = it + 1;
         project(&filter, ss.as_ref(), &x, &mut x_tilde, &mut x_phys, params.floor, params.cap);
@@ -868,7 +872,6 @@ pub fn optimize_cached(
         let move_limit =
             if it < 10 { 0.15 } else { (0.15 * 0.92f64.powi(it as i32 - 9)).max(0.05) };
         let (mut lo, mut hi) = (1e-12f64, 1e12f64);
-        let mut x_new = vec![0f64; x.len()];
         for _ in 0..60 {
             let lambda = (lo * hi).sqrt();
             let mut mean_phys = 0f64;
@@ -1020,11 +1023,38 @@ pub fn evaluate_cached(
     exponent: f64,
     coeff: f64,
 ) -> Result<(f64, f64, Vec<f64>), crate::solve::SolveError> {
+    let (c, maxd, u, _) = evaluate_cached_stats(
+        slot, grid, levels, problem, settings, skin, design_cells, skin_frac, x, exponent, coeff,
+    )?;
+    Ok((c, maxd, u))
+}
+
+/// Like `evaluate_cached`, but also returns the solve's convergence stats so a
+/// verification solve can report its REAL residual/`converged` instead of
+/// assuming success — on a fine mesh the binned solve can hit the MGCG cap
+/// while the design itself converged, and that must surface. The solve is
+/// identical to `evaluate_cached` (this is the body; `evaluate_cached` drops
+/// the stats).
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_cached_stats(
+    slot: &mut Option<SolverCache>,
+    grid: &VoxelGrid,
+    levels: usize,
+    problem: &NodeProblem,
+    settings: &SolveSettings,
+    skin: &[u32],
+    design_cells: &[u32],
+    skin_frac: &[f32],
+    x: &[f64],
+    exponent: f64,
+    coeff: f64,
+) -> Result<(f64, f64, Vec<f64>, crate::mg::SolveStats), crate::solve::SolveError> {
     let eps = build_eps(grid, skin, design_cells, skin_frac, x, exponent, coeff);
     // Hitting the cap is acceptable here: the verification/baseline solves
     // only feed the comparison card, and the warm-started iterate at the cap
     // is accurate to ~1e-4 — aborting a finished optimization over the last
-    // decimals would be far worse UX.
+    // decimals would be far worse UX. But the caller should still SEE that it
+    // capped (it no longer assumes converged=true).
     let r = solve_cached(slot, grid, levels, problem, settings, eps, settings.tol, 600)?;
     let mut max2 = 0f64;
     for n in 0..r.u.len() / 3 {
@@ -1033,7 +1063,7 @@ pub fn evaluate_cached(
             + r.u[3 * n + 2] * r.u[3 * n + 2];
         max2 = max2.max(m);
     }
-    Ok((r.compliance, max2.sqrt(), r.u))
+    Ok((r.compliance, max2.sqrt(), r.u, r.stats))
 }
 
 /// Solve with an explicit per-cell stiffness field and return a full
@@ -1144,5 +1174,100 @@ mod tests {
         assert!(off > 0.5, "thin wall should survive with min_member off, got {off}");
         assert!(big < 0.5, "thin wall should blur out under a large min_member, got {big}");
         assert!(big < off, "more smoothing must lower the thin feature's peak");
+    }
+
+    #[test]
+    fn density_filter_transpose_is_exact_adjoint() {
+        // The density-filter gradient flows through W^T (`apply_t`), which
+        // assumes the unnormalized-weight symmetry. If apply_t ever drifts from
+        // apply the optimizer still "converges" — to a worse layout — so anchor
+        // the transpose with the exact adjoint identity <W x, g> == <x, Wᵀ g>.
+        let grid = VoxelGrid::solid_box(6, 5, 4, 1.0);
+        let design: Vec<u32> = (0..grid.cell_count() as u32).collect();
+        let filter = DensityFilter::build(&grid, &design, 2.3);
+        let n = design.len();
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        let mut rng = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as f64 / (1u64 << 31) as f64 - 1.0
+        };
+        let x: Vec<f64> = (0..n).map(|_| rng()).collect();
+        let g: Vec<f64> = (0..n).map(|_| rng()).collect();
+        let mut wx = vec![0f64; n];
+        let mut wtg = vec![0f64; n];
+        filter.apply(&x, &mut wx);
+        filter.apply_t(&g, &mut wtg);
+        let lhs: f64 = wx.iter().zip(&g).map(|(a, b)| a * b).sum();
+        let rhs: f64 = x.iter().zip(&wtg).map(|(a, b)| a * b).sum();
+        assert!(
+            (lhs - rhs).abs() <= 1e-9 * (lhs.abs() + rhs.abs() + 1.0),
+            "density-filter transpose is not the adjoint: <Wx,g>={lhs}, <x,Wᵀg>={rhs}"
+        );
+    }
+
+    #[test]
+    fn compliance_sensitivity_matches_finite_difference() {
+        // dC/dx_e = -(1-emin)·coeff·n·x^(n-1)·(uₑᵀ KE uₑ). A sign flip or a wrong
+        // exponent degrades the optimizer silently (it converges to a worse
+        // design), so anchor the analytic gradient to a central finite
+        // difference of the actual compliance on a small cantilever.
+        let (nx, ny, nz, h) = (6usize, 3usize, 3usize, 1.0f64);
+        let (e0, nu, exp, coeff) = (2000.0f64, 0.3f64, 2.0f64, 1.0f64);
+        let grid = VoxelGrid::solid_box(nx, ny, nz, h);
+        let (mx, my) = (nx + 1, ny + 1);
+        let node = |x: usize, y: usize, z: usize| ((z * my + y) * mx + x) as u32;
+        // NodeProblem.fixed holds NODE indices (all 3 dofs of each are pinned).
+        let mut fixed = Vec::new();
+        for z in 0..nz + 1 {
+            for y in 0..ny + 1 {
+                fixed.push(node(0, y, z));
+            }
+        }
+        let forces: Vec<(u32, [f64; 3])> = (0..nz + 1)
+            .flat_map(|z| (0..ny + 1).map(move |y| (z, y)))
+            .map(|(z, y)| (node(nx, y, z), [0.0, 0.0, -1.0]))
+            .collect();
+        let problem = NodeProblem { fixed: fixed.clone(), forces, ..Default::default() };
+        let settings = SolveSettings { e0, nu, tol: 1e-10, ..Default::default() };
+
+        let design: Vec<u32> = (0..grid.cell_count() as u32).collect();
+        let skin: Vec<u32> = Vec::new();
+        let skin_frac = vec![0f32; design.len()];
+        let x = vec![0.5f64; design.len()];
+        let eval = |xv: &[f64]| {
+            evaluate(&grid, 1, &problem, &settings, &skin, &design, &skin_frac, xv, exp, coeff, None)
+                .expect("eval")
+        };
+
+        let (_, _, u) = eval(&x);
+        // Analytic sensitivity, built exactly as the optimizer does.
+        let ke64 = ke_hex(e0, nu, h);
+        let eps = build_eps(&grid, &skin, &design, &skin_frac, &x, exp, coeff);
+        let mut fixed_bool = vec![false; 3 * (nx + 1) * (ny + 1) * (nz + 1)];
+        for &nn in &fixed {
+            for d in 0..3 {
+                fixed_bool[3 * nn as usize + d] = true;
+            }
+        }
+        let level = Level::new(nx, ny, nz, h, eps, ke64, &fixed_bool, Vec::new());
+        let mut se = vec![0f64; design.len()];
+        cell_strain_energy(&level, &ke64, &u, &design, &mut se);
+        let k = (0..se.len()).max_by(|&a, &b| se[a].total_cmp(&se[b])).unwrap();
+        let analytic = -(1.0 - EMIN_REL as f64) * coeff * exp * x[k].powf(exp - 1.0) * se[k];
+
+        // Central finite difference of the compliance at cell k.
+        let d = 1e-4;
+        let mut xp = x.clone();
+        xp[k] += d;
+        let mut xm = x.clone();
+        xm[k] -= d;
+        let fd = (eval(&xp).0 - eval(&xm).0) / (2.0 * d);
+
+        assert!(analytic < 0.0, "more material must reduce compliance, got {analytic}");
+        let rel = (analytic - fd).abs() / fd.abs().max(1e-12);
+        assert!(
+            rel < 0.02,
+            "compliance sensitivity disagrees with FD at cell {k}: analytic {analytic:.6}, fd {fd:.6} (rel {rel:.4})"
+        );
     }
 }

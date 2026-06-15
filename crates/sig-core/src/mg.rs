@@ -73,6 +73,11 @@ pub struct Level {
     lmax: f32,
     /// Last power-iteration eigenvector — warm restart across eps updates.
     eigvec: Vec<f32>,
+    /// Reusable power-iteration scratch (K*v and Dinv*K*v). Hoisted out of
+    /// `refresh_lmax` so an eps update — once per SIMP iteration, per level —
+    /// no longer allocates 2×ndof f32 it immediately frees.
+    pi_t: Vec<f32>,
+    pi_w: Vec<f32>,
 }
 
 impl Level {
@@ -130,6 +135,8 @@ impl Level {
             springs,
             lmax: 1.0,
             eigvec: Vec::new(),
+            pi_t: Vec::new(),
+            pi_w: Vec::new(),
         };
         level.build_colors();
         level.build_constrained(fixed);
@@ -159,8 +166,14 @@ impl Level {
             LMAX_ITERS_COLD
         };
         par::mask_zero(&mut v, &self.constrained);
-        let mut t = vec![0f32; n];
-        let mut w = vec![0f32; n];
+        // Reuse the scratch buffers across eps updates (apply/diag_apply fully
+        // overwrite them; the zero-resize just sizes the reused allocation).
+        let mut t = std::mem::take(&mut self.pi_t);
+        let mut w = std::mem::take(&mut self.pi_w);
+        t.clear();
+        t.resize(n, 0.0);
+        w.clear();
+        w.resize(n, 0.0);
         let mut lambda = 1.0f64;
         for _ in 0..iters {
             self.apply(&v, &mut t);
@@ -174,6 +187,8 @@ impl Level {
         }
         self.lmax = lambda as f32;
         self.eigvec = v;
+        self.pi_t = t;
+        self.pi_w = w;
     }
 
     /// Rediscretized coarse level: half resolution, child-averaged stiffness.
@@ -770,11 +785,15 @@ struct Workspaces {
     t: Vec<Vec<f32>>,
     t2: Vec<Vec<f32>>,
     d: Vec<Vec<f32>>,
+    /// Coarse-PCG scratch (residual, preconditioned residual, A·p, search dir).
+    /// Sized once to the coarsest level's ndof — reused on every V-cycle so the
+    /// coarse solve no longer allocates four vecs per MGCG iteration.
+    coarse_scratch: [Vec<f32>; 4],
 }
 
 fn v_cycle(levels: &[Level], ws: &mut Workspaces, l: usize) {
     if l == levels.len() - 1 {
-        coarse_pcg(&levels[l], &ws.r[l], &mut ws.z[l]);
+        coarse_pcg(&levels[l], &ws.r[l], &mut ws.z[l], &mut ws.coarse_scratch);
         return;
     }
     let level = &levels[l];
@@ -797,36 +816,35 @@ fn v_cycle(levels: &[Level], ws: &mut Workspaces, l: usize) {
     );
 }
 
-/// Block-diagonal preconditioned CG for the coarsest level (small).
-fn coarse_pcg(level: &Level, b: &[f32], x: &mut [f32]) {
-    let n = level.ndof();
+/// Block-diagonal preconditioned CG for the coarsest level (small). `scratch`
+/// holds [r, z, q, p], all pre-sized to `level.ndof()` and reused across calls.
+fn coarse_pcg(level: &Level, b: &[f32], x: &mut [f32], scratch: &mut [Vec<f32>; 4]) {
     par::fill(x, 0.0);
     let norm_b = par::norm2(b);
     if norm_b == 0.0 {
         return;
     }
-    let mut r = b.to_vec();
-    let mut z = vec![0f32; n];
-    let mut q = vec![0f32; n];
-    level.diag_apply(&r, &mut z);
-    let mut p = z.clone();
-    let mut rz = par::dot(&r, &z);
+    let [r, z, q, p] = scratch;
+    r.copy_from_slice(b);
+    level.diag_apply(r, z);
+    p.copy_from_slice(z);
+    let mut rz = par::dot(r, z);
     for _ in 0..800 {
-        level.apply(&p, &mut q);
-        let pq = par::dot(&p, &q);
+        level.apply(p, q);
+        let pq = par::dot(p, q);
         if pq <= 0.0 {
             break;
         }
         let alpha = (rz / pq) as f32;
-        par::axpy(x, alpha, &p);
-        par::axpy(&mut r, -alpha, &q);
-        if par::norm2(&r) / norm_b < 1e-8 {
+        par::axpy(x, alpha, p);
+        par::axpy(r, -alpha, q);
+        if par::norm2(r) / norm_b < 1e-8 {
             break;
         }
-        level.diag_apply(&r, &mut z);
-        let rz_new = par::dot(&r, &z);
+        level.diag_apply(r, z);
+        let rz_new = par::dot(r, z);
         let beta = (rz_new / rz) as f32;
-        par::xpby(&mut p, &z, beta);
+        par::xpby(p, z, beta);
         rz = rz_new;
     }
 }
@@ -880,12 +898,14 @@ impl MgSolver {
             let c = f.coarsen();
             levels.push(c);
         }
+        let coarse_n = levels.last().unwrap().ndof();
         let ws = Workspaces {
             r: levels.iter().map(|l| vec![0f32; l.ndof()]).collect(),
             z: levels.iter().map(|l| vec![0f32; l.ndof()]).collect(),
             t: levels.iter().map(|l| vec![0f32; l.ndof()]).collect(),
             t2: levels.iter().map(|l| vec![0f32; l.ndof()]).collect(),
             d: levels.iter().map(|l| vec![0f32; l.ndof()]).collect(),
+            coarse_scratch: std::array::from_fn(|_| vec![0f32; coarse_n]),
         };
         Self { levels, ws, eps_exact, last_trace: Vec::new() }
     }
@@ -965,6 +985,15 @@ impl MgSolver {
         let mut rz = par::dot_mixed(&r, &self.ws.z[0]);
 
         let mut res = f64::INFINITY;
+        // Stagnation watchdog: the residual on a resolution-limited problem
+        // (thin features below the grid scale — the documented Benchy plateau)
+        // stops improving while still paying full V-cycle cost. Track the best
+        // residual; if it doesn't improve by even 0.01% for STAGNATION_LIMIT
+        // iterations, stop early with the best iterate (a finite residual, so
+        // the caller treats it as a benign cap hit, not divergence).
+        const STAGNATION_LIMIT: usize = 30;
+        let mut best_res = res0;
+        let mut stall = 0usize;
         for it in 0..max_iter {
             // Cooperative cancel: bail like an iteration-cap hit; the caller
             // checks `cancel::requested()` and raises the Cancelled error.
@@ -973,7 +1002,7 @@ impl MgSolver {
             }
             self.levels[0].apply64_eps(&self.eps_exact, &p, &mut q);
             let pq = par::dot64(&p, &q);
-            if pq <= 0.0 {
+            if !pq.is_finite() || pq <= 0.0 {
                 return SolveStats { iterations: it, rel_residual: res, converged: false };
             }
             let alpha = rz / pq;
@@ -981,8 +1010,23 @@ impl MgSolver {
             par::axpy64(&mut r, -alpha, &q);
             res = par::norm2_64(&r) / norm_b;
             self.last_trace.push(res as f32);
+            if !res.is_finite() {
+                // Diverged (singular/near-singular operator). Surface the
+                // non-finite residual; `solve_cached` turns it into a hard
+                // `Diverged` error rather than presenting a garbage field.
+                return SolveStats { iterations: it + 1, rel_residual: res, converged: false };
+            }
             if res <= tol {
                 return SolveStats { iterations: it + 1, rel_residual: res, converged: true };
+            }
+            if res < best_res * (1.0 - 1e-4) {
+                best_res = res;
+                stall = 0;
+            } else {
+                stall += 1;
+                if stall >= STAGNATION_LIMIT {
+                    return SolveStats { iterations: it + 1, rel_residual: res, converged: false };
+                }
             }
             // Live preview: stream the trace every few iterations (not every
             // one — the UI repaints at frame cadence and the full, exact trace

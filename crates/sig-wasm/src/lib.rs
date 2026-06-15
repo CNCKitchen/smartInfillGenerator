@@ -14,7 +14,9 @@ use sig_core::bins::{
 };
 use sig_core::mesh::TriMesh;
 use sig_core::segment::{segment, Segmentation};
-use sig_core::simp::{evaluate_cached, optimize_cached as simp_optimize, OptimizeParams};
+use sig_core::simp::{
+    evaluate_cached, evaluate_cached_stats, optimize_cached as simp_optimize, OptimizeParams,
+};
 use sig_core::solve::{
     active_nodes, pad_for_levels, solve_nodes_cached, SolveSettings, Solution, SolverCache,
 };
@@ -1095,7 +1097,7 @@ impl Model {
         let mut warm_u: Option<Vec<f64>> = None;
         let mut pass_trace: Vec<(f64, f64)> = Vec::new();
         let mut total_iters = 0usize;
-        let (result, centers, bins, x_binned, c_binned, u_binned) = loop {
+        let (result, centers, bins, x_binned, c_binned, u_binned, verify_stats) = loop {
             let params_k = OptimizeParams { budget: budget_k, ..params };
             let result = simp_optimize(
                 &mut self.solver_cache,
@@ -1193,7 +1195,7 @@ impl Model {
 
             // Verification solve of the binned design (calibrated law);
             // warm-started from the optimizer's displacement via the cache.
-            let (c_b, _maxd, u_b) = evaluate_cached(
+            let (c_b, _maxd, u_b, stats_b) = evaluate_cached_stats(
                 &mut self.solver_cache, grid, *levels, &asm.problem, &self.settings,
                 &result.skin_cells, &result.design_cells, &result.skin_frac, &x_binned, eval_exp,
                 eval_coeff,
@@ -1202,12 +1204,12 @@ impl Model {
             pass_trace.push((budget_k, c_b));
 
             if !goal_match {
-                break (result, centers, bins, x_binned, c_b, u_b);
+                break (result, centers, bins, x_binned, c_b, u_b, stats_b);
             }
             // dev > 0: too compliant (needs more material); < 0: too stiff.
             let dev = c_b / c_target - 1.0;
             if dev.abs() <= MATCH_TOL || pass_no.get() >= max_passes || hi_b - lo_b < 0.005 {
-                break (result, centers, bins, x_binned, c_b, u_b);
+                break (result, centers, bins, x_binned, c_b, u_b, stats_b);
             }
             if dev > 0.0 {
                 lo_b = lo_b.max(budget_k);
@@ -1303,15 +1305,14 @@ impl Model {
             origin: grid.origin,
             active: active_nodes(grid),
             iterations: result.iterations,
-            // TODO(convergence): these three are placeholders — the binned
-            // verification solve's real stats are discarded by evaluate_cached
-            // (it returns only compliance/maxd/u). On a fine mesh that solve
-            // can hit the MGCG cap unconverged while the DESIGN converged, and
-            // nothing surfaces it (the UI's optimizer non-convergence banner
-            // keys off design stationarity only). Plumb solve_with_eps_cached's
-            // SolveStats through here and into the summary to report it.
-            rel_residual: 0.0,
-            converged: true,
+            // Real stats from the binned verification solve (the final pass of
+            // the goal-match loop). On a fine mesh that solve can hit the MGCG
+            // cap while the DESIGN converged — now it surfaces instead of being
+            // hard-coded to success. `iterations` stays the optimizer's outer
+            // count (what the progress UI reports); the residual/converged are
+            // the verification solve's.
+            rel_residual: verify_stats.rel_residual,
+            converged: verify_stats.converged,
             residuals: Vec::new(),
         });
 

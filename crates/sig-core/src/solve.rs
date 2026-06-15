@@ -67,6 +67,12 @@ pub enum SolveError {
     NoFixedNodes,
     LoadRegionEmpty(usize),
     NotConverged { iterations: usize, rel_residual: f64 },
+    /// The residual went non-finite (NaN/Inf): a (near-)singular operator —
+    /// typically a solid island or floating component with no anchoring
+    /// constraint, or a zero-net frictionless spring. Unlike an iteration-cap
+    /// hit (where the iterate is the best available approximation), the field
+    /// here is garbage and must NOT be presented as a result.
+    Diverged { iteration: usize },
     /// The embedder requested a stop (see `crate::cancel`).
     Cancelled,
 }
@@ -80,6 +86,10 @@ impl std::fmt::Display for SolveError {
             SolveError::NotConverged { iterations, rel_residual } => write!(
                 f,
                 "solver did not converge ({iterations} iterations, residual {rel_residual:.2e})"
+            ),
+            SolveError::Diverged { iteration } => write!(
+                f,
+                "solver diverged at iteration {iteration} (residual went non-finite — a region is likely unconstrained or floating)"
             ),
             SolveError::Cancelled => write!(f, "cancelled"),
         }
@@ -495,6 +505,11 @@ pub fn solve_cached(
         // it as a result.
         cache.last_u = u;
         return Err(SolveError::Cancelled);
+    }
+    if !stats.rel_residual.is_finite() {
+        // Diverged: never keep a NaN iterate as a warm start, and never ship it.
+        cache.last_u = vec![0f64; ndof];
+        return Err(SolveError::Diverged { iteration: stats.iterations });
     }
     let mut compliance = 0f64;
     for i in 0..ndof {

@@ -7,6 +7,15 @@
 //! the property that lets us accept arbitrary user STLs without repair.
 
 use crate::mesh::TriMesh;
+use std::cell::RefCell;
+
+thread_local! {
+    /// Per-thread traversal stack, reused across `winding_number` calls.
+    /// Voxelization queries the BVH once per cell plus 27× per boundary cell —
+    /// millions of calls — and each previously allocated a fresh 64-slot Vec.
+    /// One buffer per rayon worker (or the single wasm thread) removes that.
+    static WN_STACK: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+}
 
 const LEAF_SIZE: usize = 8;
 /// Far-field criterion: |q - c| > BETA * node_radius -> use dipole approximation.
@@ -170,22 +179,16 @@ impl WindingBvh {
 
     /// Generalized winding number at point q (1 inside a closed CCW mesh, 0 outside).
     pub fn winding_number(&self, q: [f64; 3]) -> f64 {
-        let mut acc = 0f64;
-        let mut stack: Vec<u32> = Vec::with_capacity(64);
-        stack.push(0);
-        while let Some(idx) = stack.pop() {
-            let node = &self.nodes[idx as usize];
-            let d = dist(&node.centroid, &q);
-            if node.count == 0 && d > BETA * node.radius {
-                // Far field: dipole approximation  w += A·(c - q) / (4π |c-q|³)
-                let r3 = d * d * d;
-                let dx = [node.centroid[0] - q[0], node.centroid[1] - q[1], node.centroid[2] - q[2]];
-                acc += (node.area_normal[0] * dx[0]
-                    + node.area_normal[1] * dx[1]
-                    + node.area_normal[2] * dx[2])
-                    / (4.0 * std::f64::consts::PI * r3);
-            } else if node.count > 0 {
-                if d > BETA * node.radius && node.radius > 0.0 {
+        WN_STACK.with(|cell| {
+            let mut stack = cell.borrow_mut();
+            stack.clear();
+            let mut acc = 0f64;
+            stack.push(0);
+            while let Some(idx) = stack.pop() {
+                let node = &self.nodes[idx as usize];
+                let d = dist(&node.centroid, &q);
+                if node.count == 0 && d > BETA * node.radius {
+                    // Far field: dipole approximation  w += A·(c - q) / (4π |c-q|³)
                     let r3 = d * d * d;
                     let dx =
                         [node.centroid[0] - q[0], node.centroid[1] - q[1], node.centroid[2] - q[2]];
@@ -193,17 +196,30 @@ impl WindingBvh {
                         + node.area_normal[1] * dx[1]
                         + node.area_normal[2] * dx[2])
                         / (4.0 * std::f64::consts::PI * r3);
-                } else {
-                    for ti in node.start..node.start + node.count {
-                        acc += solid_angle(&self.tris[ti as usize], &q);
+                } else if node.count > 0 {
+                    if d > BETA * node.radius && node.radius > 0.0 {
+                        let r3 = d * d * d;
+                        let dx = [
+                            node.centroid[0] - q[0],
+                            node.centroid[1] - q[1],
+                            node.centroid[2] - q[2],
+                        ];
+                        acc += (node.area_normal[0] * dx[0]
+                            + node.area_normal[1] * dx[1]
+                            + node.area_normal[2] * dx[2])
+                            / (4.0 * std::f64::consts::PI * r3);
+                    } else {
+                        for ti in node.start..node.start + node.count {
+                            acc += solid_angle(&self.tris[ti as usize], &q);
+                        }
                     }
+                } else {
+                    stack.push(node.left);
+                    stack.push(node.right);
                 }
-            } else {
-                stack.push(node.left);
-                stack.push(node.right);
             }
-        }
-        acc
+            acc
+        })
     }
 }
 
