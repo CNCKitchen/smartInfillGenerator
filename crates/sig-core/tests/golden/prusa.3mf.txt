@@ -1,0 +1,127 @@
+===== 3D/3dmodel.model =====
+<?xml version="1.0" encoding="UTF-8"?>
+<model unit="millimeter" xml:lang="en-US" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02" xmlns:slic3rpe="http://schemas.slic3r.org/3mf/2017/06">
+ <metadata name="slic3rpe:Version3mf">1</metadata>
+ <metadata name="Title">bracket &amp; arm</metadata>
+ <metadata name="Application">InFEAll-0.1.0</metadata>
+ <resources>
+  <object id="1" type="model">
+   <mesh>
+    <vertices>
+     <vertex x="-15" y="-10" z="-5"/>
+     <vertex x="-15" y="-10" z="5"/>
+     <vertex x="-15" y="10" z="5"/>
+     <vertex x="-15" y="10" z="-5"/>
+     <vertex x="15" y="-10" z="-5"/>
+     <vertex x="15" y="10" z="-5"/>
+     <vertex x="15" y="10" z="5"/>
+     <vertex x="15" y="-10" z="5"/>
+     <vertex x="-13" y="-8" z="-3"/>
+     <vertex x="-13" y="-8" z="3"/>
+     <vertex x="-13" y="5" z="3"/>
+     <vertex x="-13" y="5" z="-3"/>
+     <vertex x="5" y="-8" z="-3"/>
+     <vertex x="5" y="5" z="-3"/>
+     <vertex x="5" y="5" z="3"/>
+     <vertex x="5" y="-8" z="3"/>
+     <vertex x="-12" y="-7" z="-2"/>
+     <vertex x="-12" y="-7" z="2"/>
+     <vertex x="-12" y="0" z="2"/>
+     <vertex x="-12" y="0" z="-2"/>
+     <vertex x="-5" y="-7" z="-2"/>
+     <vertex x="-5" y="0" z="-2"/>
+     <vertex x="-5" y="0" z="2"/>
+     <vertex x="-5" y="-7" z="2"/>
+    </vertices>
+    <triangles>
+     <triangle v1="0" v2="1" v3="2"/>
+     <triangle v1="0" v2="2" v3="3"/>
+     <triangle v1="4" v2="5" v3="6"/>
+     <triangle v1="4" v2="6" v3="7"/>
+     <triangle v1="0" v2="4" v3="7"/>
+     <triangle v1="0" v2="7" v3="1"/>
+     <triangle v1="3" v2="2" v3="6"/>
+     <triangle v1="3" v2="6" v3="5"/>
+     <triangle v1="0" v2="3" v3="5"/>
+     <triangle v1="0" v2="5" v3="4"/>
+     <triangle v1="1" v2="7" v3="6"/>
+     <triangle v1="1" v2="6" v3="2"/>
+     <triangle v1="8" v2="9" v3="10"/>
+     <triangle v1="8" v2="10" v3="11"/>
+     <triangle v1="12" v2="13" v3="14"/>
+     <triangle v1="12" v2="14" v3="15"/>
+     <triangle v1="8" v2="12" v3="15"/>
+     <triangle v1="8" v2="15" v3="9"/>
+     <triangle v1="11" v2="10" v3="14"/>
+     <triangle v1="11" v2="14" v3="13"/>
+     <triangle v1="8" v2="11" v3="13"/>
+     <triangle v1="8" v2="13" v3="12"/>
+     <triangle v1="9" v2="15" v3="14"/>
+     <triangle v1="9" v2="14" v3="10"/>
+     <triangle v1="16" v2="17" v3="18"/>
+     <triangle v1="16" v2="18" v3="19"/>
+     <triangle v1="20" v2="21" v3="22"/>
+     <triangle v1="20" v2="22" v3="23"/>
+     <triangle v1="16" v2="20" v3="23"/>
+     <triangle v1="16" v2="23" v3="17"/>
+     <triangle v1="19" v2="18" v3="22"/>
+     <triangle v1="19" v2="22" v3="21"/>
+     <triangle v1="16" v2="19" v3="21"/>
+     <triangle v1="16" v2="21" v3="20"/>
+     <triangle v1="17" v2="23" v3="22"/>
+     <triangle v1="17" v2="22" v3="18"/>
+    </triangles>
+   </mesh>
+  </object>
+ </resources>
+ <build>
+  <item objectid="1" transform="1 0 0 0 1 0 0 0 1 125 105 5" printable="1"/>
+ </build>
+</model>
+===== Metadata/Slic3r_PE_model.config =====
+<?xml version="1.0" encoding="UTF-8"?>
+<config>
+ <object id="1" instances_count="1">
+  <metadata type="object" key="name" value="bracket &amp; arm"/>
+  <metadata type="object" key="fill_density" value="12%"/>
+  <metadata type="object" key="fill_pattern" value="concentric"/>
+  <metadata type="object" key="perimeters" value="3"/>
+  <metadata type="object" key="top_solid_layers" value="5"/>
+  <metadata type="object" key="bottom_solid_layers" value="5"/>
+  <volume firstid="0" lastid="11">
+   <metadata type="volume" key="name" value="bracket &amp; arm"/>
+   <metadata type="volume" key="volume_type" value="ModelPart"/>
+   <metadata type="volume" key="matrix" value="1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1"/>
+   <mesh edges_fixed="0" degenerate_facets="0" facets_removed="0" facets_reversed="0" backwards_edges="0"/>
+  </volume>
+  <volume firstid="12" lastid="23">
+   <metadata type="volume" key="name" value="infill 25%"/>
+   <metadata type="volume" key="modifier" value="1"/>
+   <metadata type="volume" key="volume_type" value="ParameterModifier"/>
+   <metadata type="volume" key="fill_density" value="25%"/>
+   <metadata type="volume" key="fill_pattern" value="concentric"/>
+   <metadata type="volume" key="matrix" value="1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1"/>
+   <mesh edges_fixed="0" degenerate_facets="0" facets_removed="0" facets_reversed="0" backwards_edges="0"/>
+  </volume>
+  <volume firstid="24" lastid="35">
+   <metadata type="volume" key="name" value="infill 50%"/>
+   <metadata type="volume" key="modifier" value="1"/>
+   <metadata type="volume" key="volume_type" value="ParameterModifier"/>
+   <metadata type="volume" key="fill_density" value="50%"/>
+   <metadata type="volume" key="fill_pattern" value="concentric"/>
+   <metadata type="volume" key="matrix" value="1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1"/>
+   <mesh edges_fixed="0" degenerate_facets="0" facets_removed="0" facets_reversed="0" backwards_edges="0"/>
+  </volume>
+ </object>
+</config>
+===== [Content_Types].xml =====
+<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+ <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+ <Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/>
+</Types>
+===== _rels/.rels =====
+<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+ <Relationship Target="/3D/3dmodel.model" Id="rel-1" Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/>
+</Relationships>

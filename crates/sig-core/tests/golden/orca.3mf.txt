@@ -1,0 +1,187 @@
+===== 3D/3dmodel.model =====
+<?xml version="1.0" encoding="UTF-8"?>
+<model unit="millimeter" xml:lang="en-US" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02" xmlns:BambuStudio="http://schemas.bambulab.com/package/2021" xmlns:p="http://schemas.microsoft.com/3dmanufacturing/production/2015/06" requiredextensions="p">
+ <metadata name="Application">BambuStudio-02.07.00.00</metadata>
+ <metadata name="BambuStudio:3mfVersion">1</metadata>
+ <metadata name="Title">bracket &amp; arm</metadata>
+ <resources>
+  <object id="4" p:UUID="00000005-89ab-cdef-0123-456789abcdef" type="model">
+   <components>
+    <component p:path="/3D/Objects/object_1.model" objectid="1" p:UUID="00000066-89ab-cdef-0123-456789abcdef" transform="1 0 0 0 1 0 0 0 1 0 0 0"/>
+    <component p:path="/3D/Objects/object_1.model" objectid="2" p:UUID="00000067-89ab-cdef-0123-456789abcdef" transform="1 0 0 0 1 0 0 0 1 0 0 0"/>
+    <component p:path="/3D/Objects/object_1.model" objectid="3" p:UUID="00000068-89ab-cdef-0123-456789abcdef" transform="1 0 0 0 1 0 0 0 1 0 0 0"/>
+   </components>
+  </object>
+ </resources>
+ <build p:UUID="000000c9-89ab-cdef-0123-456789abcdef">
+  <item objectid="4" p:UUID="000000ca-89ab-cdef-0123-456789abcdef" transform="1 0 0 0 1 0 0 0 1 113 118 -0" printable="1"/>
+ </build>
+</model>
+===== 3D/Objects/object_1.model =====
+<?xml version="1.0" encoding="UTF-8"?>
+<model unit="millimeter" xml:lang="en-US" xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02" xmlns:BambuStudio="http://schemas.bambulab.com/package/2021" xmlns:p="http://schemas.microsoft.com/3dmanufacturing/production/2015/06" requiredextensions="p">
+ <metadata name="BambuStudio:3mfVersion">1</metadata>
+ <resources>
+  <object id="1" p:UUID="00000002-89ab-cdef-0123-456789abcdef" type="model">
+   <mesh>
+    <vertices>
+     <vertex x="0" y="0" z="0"/>
+     <vertex x="0" y="0" z="10"/>
+     <vertex x="0" y="20" z="10"/>
+     <vertex x="0" y="20" z="0"/>
+     <vertex x="30" y="0" z="0"/>
+     <vertex x="30" y="20" z="0"/>
+     <vertex x="30" y="20" z="10"/>
+     <vertex x="30" y="0" z="10"/>
+    </vertices>
+    <triangles>
+     <triangle v1="0" v2="1" v3="2"/>
+     <triangle v1="0" v2="2" v3="3"/>
+     <triangle v1="4" v2="5" v3="6"/>
+     <triangle v1="4" v2="6" v3="7"/>
+     <triangle v1="0" v2="4" v3="7"/>
+     <triangle v1="0" v2="7" v3="1"/>
+     <triangle v1="3" v2="2" v3="6"/>
+     <triangle v1="3" v2="6" v3="5"/>
+     <triangle v1="0" v2="3" v3="5"/>
+     <triangle v1="0" v2="5" v3="4"/>
+     <triangle v1="1" v2="7" v3="6"/>
+     <triangle v1="1" v2="6" v3="2"/>
+    </triangles>
+   </mesh>
+  </object>
+  <object id="2" p:UUID="00000003-89ab-cdef-0123-456789abcdef" type="model">
+   <mesh>
+    <vertices>
+     <vertex x="2" y="2" z="2"/>
+     <vertex x="2" y="2" z="8"/>
+     <vertex x="2" y="15" z="8"/>
+     <vertex x="2" y="15" z="2"/>
+     <vertex x="20" y="2" z="2"/>
+     <vertex x="20" y="15" z="2"/>
+     <vertex x="20" y="15" z="8"/>
+     <vertex x="20" y="2" z="8"/>
+    </vertices>
+    <triangles>
+     <triangle v1="0" v2="1" v3="2"/>
+     <triangle v1="0" v2="2" v3="3"/>
+     <triangle v1="4" v2="5" v3="6"/>
+     <triangle v1="4" v2="6" v3="7"/>
+     <triangle v1="0" v2="4" v3="7"/>
+     <triangle v1="0" v2="7" v3="1"/>
+     <triangle v1="3" v2="2" v3="6"/>
+     <triangle v1="3" v2="6" v3="5"/>
+     <triangle v1="0" v2="3" v3="5"/>
+     <triangle v1="0" v2="5" v3="4"/>
+     <triangle v1="1" v2="7" v3="6"/>
+     <triangle v1="1" v2="6" v3="2"/>
+    </triangles>
+   </mesh>
+  </object>
+  <object id="3" p:UUID="00000004-89ab-cdef-0123-456789abcdef" type="model">
+   <mesh>
+    <vertices>
+     <vertex x="3" y="3" z="3"/>
+     <vertex x="3" y="3" z="7"/>
+     <vertex x="3" y="10" z="7"/>
+     <vertex x="3" y="10" z="3"/>
+     <vertex x="10" y="3" z="3"/>
+     <vertex x="10" y="10" z="3"/>
+     <vertex x="10" y="10" z="7"/>
+     <vertex x="10" y="3" z="7"/>
+    </vertices>
+    <triangles>
+     <triangle v1="0" v2="1" v3="2"/>
+     <triangle v1="0" v2="2" v3="3"/>
+     <triangle v1="4" v2="5" v3="6"/>
+     <triangle v1="4" v2="6" v3="7"/>
+     <triangle v1="0" v2="4" v3="7"/>
+     <triangle v1="0" v2="7" v3="1"/>
+     <triangle v1="3" v2="2" v3="6"/>
+     <triangle v1="3" v2="6" v3="5"/>
+     <triangle v1="0" v2="3" v3="5"/>
+     <triangle v1="0" v2="5" v3="4"/>
+     <triangle v1="1" v2="7" v3="6"/>
+     <triangle v1="1" v2="6" v3="2"/>
+    </triangles>
+   </mesh>
+  </object>
+ </resources>
+ <build/>
+</model>
+===== 3D/_rels/3dmodel.model.rels =====
+<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+ <Relationship Target="/3D/Objects/object_1.model" Id="rel-1" Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/>
+</Relationships>
+===== Metadata/model_settings.config =====
+<?xml version="1.0" encoding="UTF-8"?>
+<config>
+  <object id="4">
+    <metadata key="name" value="bracket &amp; arm"/>
+    <metadata key="extruder" value="1"/>
+    <metadata key="sparse_infill_density" value="12%"/>
+    <metadata key="sparse_infill_pattern" value="concentric"/>
+    <metadata key="wall_loops" value="3"/>
+    <metadata key="top_shell_layers" value="5"/>
+    <metadata key="bottom_shell_layers" value="5"/>
+    <part id="1" subtype="normal_part">
+      <metadata key="name" value="bracket &amp; arm"/>
+      <metadata key="matrix" value="1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1"/>
+      <mesh_stat edges_fixed="0" degenerate_facets="0" facets_removed="0" facets_reversed="0" backwards_edges="0"/>
+    </part>
+    <part id="2" subtype="modifier_part">
+      <metadata key="name" value="infill 25%"/>
+      <metadata key="matrix" value="1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1"/>
+      <metadata key="extruder" value="0"/>
+      <metadata key="sparse_infill_density" value="25%"/>
+      <metadata key="sparse_infill_pattern" value="concentric"/>
+      <mesh_stat edges_fixed="0" degenerate_facets="0" facets_removed="0" facets_reversed="0" backwards_edges="0"/>
+    </part>
+    <part id="3" subtype="modifier_part">
+      <metadata key="name" value="infill 50%"/>
+      <metadata key="matrix" value="1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1"/>
+      <metadata key="extruder" value="0"/>
+      <metadata key="sparse_infill_density" value="50%"/>
+      <metadata key="sparse_infill_pattern" value="concentric"/>
+      <mesh_stat edges_fixed="0" degenerate_facets="0" facets_removed="0" facets_reversed="0" backwards_edges="0"/>
+    </part>
+  </object>
+  <plate>
+    <metadata key="plater_id" value="1"/>
+    <metadata key="plater_name" value=""/>
+    <metadata key="locked" value="false"/>
+    <metadata key="thumbnail_file" value="Metadata/plate_1.png"/>
+    <model_instance>
+      <metadata key="object_id" value="4"/>
+      <metadata key="instance_id" value="0"/>
+      <metadata key="identify_id" value="463"/>
+    </model_instance>
+  </plate>
+  <assemble>
+   <assemble_item object_id="4" instance_id="0" transform="1 0 0 0 1 0 0 0 1 113 118 -0" offset="0 0 0" />
+  </assemble>
+</config>
+===== Metadata/slice_info.config =====
+<?xml version="1.0" encoding="UTF-8"?>
+<config>
+  <header>
+    <header_item key="X-BBL-Client-Type" value="slicer"/>
+    <header_item key="X-BBL-Client-Version" value="02.07.00.00"/>
+  </header>
+</config>
+===== [Content_Types].xml =====
+<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+ <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+ <Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml"/>
+ <Default Extension="png" ContentType="image/png"/>
+</Types>
+===== _rels/.rels =====
+<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+ <Relationship Target="/3D/3dmodel.model" Id="rel-1" Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel"/>
+ <Relationship Target="/Metadata/plate_1.png" Id="rel-2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/thumbnail"/>
+ <Relationship Target="/Metadata/plate_1.png" Id="rel-4" Type="http://schemas.bambulab.com/package/2021/cover-thumbnail-middle"/>
+ <Relationship Target="/Metadata/plate_1_small.png" Id="rel-5" Type="http://schemas.bambulab.com/package/2021/cover-thumbnail-small"/>
+</Relationships>
