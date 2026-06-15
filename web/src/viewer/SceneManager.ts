@@ -75,6 +75,10 @@ export class SceneManager {
   private _oRight = new THREE.Vector3();
   private _oTmp = new THREE.Vector3();
   private _oTmp2 = new THREE.Vector3();
+  private _oDir = new THREE.Vector3();
+  /** Clearance (rad, ~2.3°) kept between the view axis and the ±Z pole, where
+   *  OrbitControls' up = +Z `lookAt` is degenerate and the azimuth snaps 180°. */
+  private readonly poleEps = 0.04;
 
   private mesh: THREE.Mesh | null = null;
   private geometry: THREE.BufferGeometry | null = null;
@@ -261,6 +265,11 @@ export class SceneManager {
     // zoom — see installNavigation). OrbitControls keeps damping + R-drag pan.
     this.controls.enableRotate = false;
     this.controls.enableZoom = false;
+    // Safety net for the pole flip (see onOrbitMove): even though our manual
+    // orbit already clamps the pitch, keep OrbitControls' own per-frame
+    // reconstruction off the exact ±Z pole so nothing can resurface the snap.
+    this.controls.minPolarAngle = this.poleEps;
+    this.controls.maxPolarAngle = Math.PI - this.poleEps;
 
     const hemi = new THREE.HemisphereLight(0xffffff, 0xb9b6ae, 1.0);
     this.scene.add(hemi);
@@ -1002,11 +1011,32 @@ export class SceneManager {
     const pivot = this.orbitPivot;
     const rotSpeed = 0.005;
     // Pure quaternion rotation: yaw about world Z, pitch about the camera's
-    // right axis. No polar clamp — the camera can swing over the poles.
+    // right axis.
     this.camera.updateMatrixWorld();
     this._oRight.setFromMatrixColumn(this.camera.matrixWorld, 0).normalize(); // camera right
+
+    // Pitch clamp: keep the view direction clear of the ±Z pole. Yaw about Z
+    // doesn't change the tilt; only pitch can drive the look direction onto the
+    // Z axis. There, OrbitControls' per-frame `lookAt(target)` with up = +Z is
+    // degenerate and the azimuth snaps 180° — and a fast drag can shove the
+    // camera *past* the pole in one frame, so the snap flip-flops. Limiting the
+    // pitch to land just shy of vertical turns that jump into a clean stop.
+    const eps = this.poleEps;
+    this._oDir.copy(this.controls.target).sub(this.camera.position).normalize();
+    let pitch = -dy * rotSpeed;
+    const ang0 = Math.acos(Math.max(-1, Math.min(1, this._oDir.z))); // tilt from +Z, [0,π]
+    this._oq2.setFromAxisAngle(this._oRight, pitch);
+    const angP = Math.acos(
+      Math.max(-1, Math.min(1, this._oTmp.copy(this._oDir).applyQuaternion(this._oq2).z))
+    );
+    if (angP < eps || angP > Math.PI - eps) {
+      const clamped = Math.max(eps, Math.min(Math.PI - eps, angP));
+      const denom = angP - ang0;
+      pitch = Math.abs(denom) > 1e-9 ? pitch * ((clamped - ang0) / denom) : 0;
+    }
+
     this._oq1.setFromAxisAngle(this._oTmp.set(0, 0, 1), -dx * rotSpeed);
-    this._oq2.setFromAxisAngle(this._oRight, -dy * rotSpeed);
+    this._oq2.setFromAxisAngle(this._oRight, pitch);
     this._oq1.premultiply(this._oq2);
 
     // Swing both the camera and the orbit target around the pivot so
