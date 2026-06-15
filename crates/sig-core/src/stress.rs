@@ -17,6 +17,9 @@ use crate::voxel::VoxelGrid;
 pub enum FieldKind {
     /// von Mises stress (MPa).
     VonMises,
+    /// von Mises stress carrying the sign of the dominant (largest-magnitude)
+    /// principal stress: + in tension, − in compression (MPa).
+    SignedVonMises,
     Sxx,
     Syy,
     Szz,
@@ -37,6 +40,7 @@ impl FieldKind {
     pub fn parse(s: &str) -> Option<Self> {
         Some(match s {
             "vm" => Self::VonMises,
+            "svm" => Self::SignedVonMises,
             "sxx" => Self::Sxx,
             "syy" => Self::Syy,
             "szz" => Self::Szz,
@@ -57,8 +61,52 @@ impl FieldKind {
     pub fn is_stress(&self) -> bool {
         matches!(
             self,
-            Self::VonMises | Self::Sxx | Self::Syy | Self::Szz | Self::Sxy | Self::Syz | Self::Szx
+            Self::VonMises
+                | Self::SignedVonMises
+                | Self::Sxx
+                | Self::Syy
+                | Self::Szz
+                | Self::Sxy
+                | Self::Syz
+                | Self::Szx
         )
+    }
+}
+
+/// Sign (+1.0 / −1.0) of the principal stress with the largest magnitude — the
+/// convention that gives the always-positive von Mises stress a tension (+) /
+/// compression (−) sign. Returns +1.0 for a (near-)zero or purely deviatoric
+/// tensor where the sign is immaterial.
+///
+/// Principal stresses are the eigenvalues of the symmetric stress tensor;
+/// computed here in closed form (Smith's trigonometric method for a symmetric
+/// 3×3), which only needs the extreme eigenvalues σ₁ (max) and σ₃ (min).
+fn signed_vm_sign(sxx: f64, syy: f64, szz: f64, sxy: f64, syz: f64, szx: f64) -> f64 {
+    let p1 = sxy * sxy + syz * syz + szx * szx;
+    let q = (sxx + syy + szz) / 3.0; // mean (hydrostatic) stress
+    let (smax, smin) = if p1 <= 1e-30 {
+        // Diagonal tensor: the principal stresses are the diagonal entries.
+        (sxx.max(syy).max(szz), sxx.min(syy).min(szz))
+    } else {
+        let p2 =
+            (sxx - q).powi(2) + (syy - q).powi(2) + (szz - q).powi(2) + 2.0 * p1;
+        let p = (p2 / 6.0).sqrt();
+        // r = det((A − qI)/p) / 2, in [−1, 1] up to rounding.
+        let (bxx, byy, bzz) = ((sxx - q) / p, (syy - q) / p, (szz - q) / p);
+        let (bxy, byz, bzx) = (sxy / p, syz / p, szx / p);
+        let det = bxx * (byy * bzz - byz * byz) - bxy * (bxy * bzz - byz * bzx)
+            + bzx * (bxy * byz - byy * bzx);
+        let r = (det / 2.0).clamp(-1.0, 1.0);
+        let phi = r.acos() / 3.0;
+        let smax = q + 2.0 * p * phi.cos();
+        let smin = q + 2.0 * p * (phi + 2.0 * std::f64::consts::PI / 3.0).cos();
+        (smax, smin)
+    };
+    let dominant = if smax.abs() >= smin.abs() { smax } else { smin };
+    if dominant < 0.0 {
+        -1.0
+    } else {
+        1.0
     }
 }
 
@@ -205,13 +253,18 @@ pub fn cell_field(
                             FieldKind::Syz => syz,
                             FieldKind::Szx => szx,
                             _ => {
-                                // von Mises
-                                (0.5
+                                // von Mises (and its signed variant)
+                                let vm = (0.5
                                     * ((sxx - syy).powi(2)
                                         + (syy - szz).powi(2)
                                         + (szz - sxx).powi(2))
                                     + 3.0 * (sxy * sxy + syz * syz + szx * szx))
-                                    .sqrt()
+                                    .sqrt();
+                                if matches!(kind, FieldKind::SignedVonMises) {
+                                    vm * signed_vm_sign(sxx, syy, szz, sxy, syz, szx)
+                                } else {
+                                    vm
+                                }
                             }
                         }
                     }
@@ -265,5 +318,42 @@ mod tests {
         assert!((mat[0] - 10.0).abs() < 1e-3, "mat full cell {}", mat[0]);
         assert!((mat[1] - 10.0).abs() < 1e-3, "mat cut cell {}", mat[1]);
         assert!((mat[0] - mat[1]).abs() < 1e-4, "decoupled stress must be uniform");
+    }
+
+    /// Signed von Mises must equal the plain von Mises in magnitude and carry
+    /// the sign of the load: + under tension, − under compression.
+    #[test]
+    fn signed_von_mises_carries_tension_compression_sign() {
+        let h = 2.0;
+        let grid = VoxelGrid::solid_box(1, 1, 1, h);
+        let eps = grid.scale.clone();
+        let (mx, my, mz) = (2usize, 2, 2);
+        let (e0, nu) = (1000.0, 0.0);
+
+        // Uniaxial strain field u_x = a·X (u_y = u_z = 0) ⇒ ε_xx = a, a single
+        // nonzero principal stress σ_xx with the sign of a.
+        let build = |a: f32| {
+            let mut u = vec![0f32; 3 * mx * my * mz];
+            for nz in 0..mz {
+                for ny in 0..my {
+                    for nx in 0..mx {
+                        let n = (nz * my + ny) * mx + nx;
+                        u[3 * n] = a * (nx as f32 * h as f32);
+                    }
+                }
+            }
+            u
+        };
+        let vm = |u: &[f32]| cell_field(&grid, u, e0, nu, &eps, FieldKind::VonMises)[0];
+        let svm = |u: &[f32]| cell_field(&grid, u, e0, nu, &eps, FieldKind::SignedVonMises)[0];
+
+        let ut = build(0.01); // tension
+        let uc = build(-0.01); // compression
+        // Same magnitude as the unsigned von Mises, either sign.
+        assert!((svm(&ut).abs() - vm(&ut)).abs() < 1e-3, "|svm| == vm (tension)");
+        assert!((svm(&uc).abs() - vm(&uc)).abs() < 1e-3, "|svm| == vm (compression)");
+        // Sign tracks the dominant principal stress.
+        assert!(svm(&ut) > 0.0, "tension ⇒ +von Mises (got {})", svm(&ut));
+        assert!(svm(&uc) < 0.0, "compression ⇒ −von Mises (got {})", svm(&uc));
     }
 }

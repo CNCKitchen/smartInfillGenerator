@@ -2085,8 +2085,11 @@ export class SceneManager {
   }
 
   /** Stress/strain scalars per soup vertex; null reverts to |u| coloring.
-   *  `flip` inverts the colormap (safety factor: red = the critical LOW). */
-  setScalarField(values: Float32Array | null, flip = false) {
+   *  `flip` inverts the colormap (safety factor: red = the critical LOW).
+   *  `signed` centers the color scale on 0 (signed von Mises: blue =
+   *  compression, green ≈ unloaded, red = tension) — must match the store's
+   *  symmetric `fieldRange` so the legend agrees with the surface. */
+  setScalarField(values: Float32Array | null, flip = false, signed = false) {
     this.clearCallouts(); // values belong to the previous field
     if (values && values.length) {
       let min = Infinity;
@@ -2094,6 +2097,11 @@ export class SceneManager {
       for (let i = 0; i < values.length; i++) {
         min = Math.min(min, values[i]);
         max = Math.max(max, values[i]);
+      }
+      if (signed) {
+        const m = Math.max(Math.abs(min), Math.abs(max), 1e-12);
+        min = -m;
+        max = m;
       }
       this.scalarField = { values, min, max, flip };
     } else {

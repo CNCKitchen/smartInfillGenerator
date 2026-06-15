@@ -514,9 +514,17 @@ async function pushScalarField(set: SetState, get: () => AppState) {
     min = Math.min(min, values[i]);
     max = Math.max(max, values[i]);
   }
+  // Signed von Mises is a diverging field: center the scale on 0 so red =
+  // tension, blue = compression, green ≈ unloaded (and the legend reads ±M).
+  const signed = kind === "svm";
+  if (signed) {
+    const m = Math.max(Math.abs(min), Math.abs(max), 1e-12);
+    min = -m;
+    max = m;
+  }
   set({ fieldRange: { min, max } });
   // Safety factor: invert the colormap so red marks the critical LOW.
-  sceneEvents.onScalarField?.(values, kind.startsWith("sf"));
+  sceneEvents.onScalarField?.(values, kind.startsWith("sf"), signed);
 }
 
 /** Fetch + cache both safety-factor fields and write the min (and which
@@ -693,8 +701,9 @@ export interface SceneEvents {
   ) => void;
   onRegionVisibility?: (visible: boolean[]) => void;
   /** Stress/strain scalars for the deformed view (null = |u| colors).
-   *  flip inverts the colormap (safety factor: red = critical LOW). */
-  onScalarField?: (values: Float32Array | null, flip?: boolean) => void;
+   *  flip inverts the colormap (safety factor: red = critical LOW);
+   *  signed centers the color scale on 0 (signed von Mises: ±tension). */
+  onScalarField?: (values: Float32Array | null, flip?: boolean, signed?: boolean) => void;
   /** Color the deformed view by a displacement quantity: -1 = |u| magnitude,
    *  0/1/2 = signed X/Y/Z component (computed from the displacement buffer). */
   onDispComponent?: (comp: number) => void;

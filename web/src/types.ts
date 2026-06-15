@@ -147,6 +147,7 @@ export const RESULT_FIELDS: ResultFieldDef[] = [
   { value: "sfm", label: "Safety factor — material σₜ/σᵥᴹ", unit: "" },
   { value: "sfz", label: "Safety factor — layer adhesion", unit: "" },
   { value: "vm", label: "von Mises σ", unit: "MPa" },
+  { value: "svm", label: "Signed von Mises σ", unit: "MPa" },
   { value: "sxx", label: "Normal σxx", unit: "MPa" },
   { value: "syy", label: "Normal σyy", unit: "MPa" },
   { value: "szz", label: "Normal σzz", unit: "MPa" },

@@ -101,7 +101,8 @@ export function Viewer() {
     sceneEvents.onResultSolid = (solid) => scene.setResultSolid(solid);
     sceneEvents.captureThumbnail = () => scene.captureThumbnail();
     sceneEvents.onRegionVisibility = (vis) => scene.setRegionVisibility(vis);
-    sceneEvents.onScalarField = (v, flip) => scene.setScalarField(v, flip ?? false);
+    sceneEvents.onScalarField = (v, flip, signed) =>
+      scene.setScalarField(v, flip ?? false, signed ?? false);
     sceneEvents.onDispComponent = (comp) => scene.setDispComponent(comp);
     sceneEvents.onVoxelResult = (p, d, e, ed) => scene.setVoxelResult(p, d, e, ed);
     sceneEvents.onResultSurface = (s) => scene.setResultSurface(s);
@@ -261,12 +262,16 @@ function EditableBound({
   );
 }
 
-/** How the fixed value callouts work — shown under any contour legend. */
+/** How the fixed value callouts work — shown under any contour legend.
+ *  Stacked one line per mode so the legend stays narrow. */
 function CalloutHelp() {
   return (
     <div className="legendnote callouthelp">
-      <b>Pin values:</b> Ctrl-click a point · Shift-drag a box → highest · Alt-drag → lowest · Esc
-      clears
+      <b>Pin values</b>
+      <span>Ctrl-click → point</span>
+      <span>Shift-drag → highest</span>
+      <span>Alt-drag → lowest</span>
+      <span>Esc clears</span>
     </div>
   );
 }
@@ -379,6 +384,9 @@ function Legend() {
               ? "nodal-averaged, evaluated on the surface"
               : "cell-center values — voxel-edge peaks are approximate"}
           </div>
+        )}
+        {resultField === "svm" && (
+          <div className="legendnote">signed — red = tension, blue = compression</div>
         )}
         {isDispComp && (
           <div className="legendnote">signed component — red = +, blue = −</div>

@@ -151,6 +151,10 @@ assert(vmf.length === nTri * 3 && vmf.every((v) => Number.isFinite(v)), "von Mis
 assert(fmax(vmf) > 0, "von Mises has nonzero peak");
 const sxxf = model.result_field("sxx");
 assert(fmin(sxxf) < 0 && fmax(sxxf) > 0, "bending: sigma_xx tension + compression present");
+const svmf = model.result_field("svm");
+assert(svmf.length === nTri * 3 && svmf.every((v, i) => Math.abs(Math.abs(v) - vmf[i]) < 1e-3),
+  "signed von Mises has the von Mises magnitude");
+assert(fmin(svmf) < 0 && fmax(svmf) > 0, "bending: signed von Mises spans compression + tension");
 const ezzf = model.result_field("ezz");
 assert(ezzf.length === nTri * 3, "strain field per vertex");
 // Safety factor: sigma_t·rel(rho) / sigma_vM, capped at 99.
