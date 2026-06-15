@@ -83,6 +83,9 @@ export class SceneManager {
   private patchToTris = new Map<number, number[]>();
   private triCount = 0;
   private bboxDiag = 100;
+  /** Part AABB in world mm [lx,ly,lz,hx,hy,hz] — sizes/centers the symmetry
+   *  plane on the actual part. Null until a model is loaded. */
+  private partBbox: LoadedModel["bbox"] | null = null;
 
   /** Triangle-mesh wireframe overlay (inspect the input mesh) + its toggle. */
   private wireframeOn = false;
@@ -442,6 +445,7 @@ export class SceneManager {
 
     // Fit camera (parallel projection: frustum half-height from the bbox).
     const [lx, ly, lz, hx, hy, hz] = model.bbox;
+    this.partBbox = model.bbox;
     const center = new THREE.Vector3((lx + hx) / 2, (ly + hy) / 2, (lz + hz) / 2);
     this.bboxDiag = Math.hypot(hx - lx, hy - ly, hz - lz) || 100;
     const dist = this.bboxDiag * 2.2;
@@ -510,6 +514,7 @@ export class SceneManager {
     this.geometry.computeBoundingBox();
     this.geometry.computeBoundingSphere();
     this.basePositions = new Float32Array(positions);
+    this.partBbox = bbox;
     const [lx, ly, lz, hx, hy, hz] = bbox;
     this.bboxDiag = Math.hypot(hx - lx, hy - ly, hz - lz) || this.bboxDiag;
     this.controls.target.set((lx + hx) / 2, (ly + hy) / 2, (lz + hz) / 2);
@@ -1559,16 +1564,29 @@ export class SceneManager {
     if (n.lengthSq() < 1e-12) n.set(1, 0, 0);
     n.normalize();
     this.symProxy.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), n);
-    // Any point on the plane works; pick the one closest to the orbit
-    // target so the gizmo sits on the part.
-    const t = this.controls.target;
-    const d = n.dot(t) - c;
-    this.symProxy.position.copy(t).addScaledVector(n, -d);
+    // Any point on the plane works; pick the one closest to the part center
+    // so the gizmo and quad sit centered on the part (robust to camera pans).
+    const ctr = this.partCenter();
+    const d = n.dot(ctr) - c;
+    this.symProxy.position.copy(ctr).addScaledVector(n, -d);
+    this.updateSymQuadSize(); // refit the quad to the part at this orientation
     this.updateSymVisibility();
+  }
+
+  /** Part bbox center in world mm, falling back to the orbit target before a
+   *  model is loaded. */
+  private partCenter(): THREE.Vector3 {
+    const b = this.partBbox;
+    return b
+      ? new THREE.Vector3((b[0] + b[3]) / 2, (b[1] + b[4]) / 2, (b[2] + b[5]) / 2)
+      : this.controls.target.clone();
   }
 
   private emitSymmetryMoved() {
     const n = new THREE.Vector3(0, 0, 1).applyQuaternion(this.symProxy.quaternion);
+    // Tilting the plane (rotate ring) changes which part dimensions it spans —
+    // refit the quad live so it always reads as "the size of the part".
+    this.updateSymQuadSize();
     this.callbacks.onSymmetryMoved?.([n.x, n.y, n.z], n.dot(this.symProxy.position));
   }
 
@@ -1625,16 +1643,16 @@ export class SceneManager {
   }
 
   /** Translucent orange rectangle marking the symmetry plane (child of the
-   *  proxy — distinct from the blue section plane). */
+   *  proxy — distinct from the blue section plane). Built as a unit quad and
+   *  scaled to the part by {@link updateSymQuadSize}. */
   private buildSymQuad() {
     if (this.symQuad) {
       this.symProxy.remove(this.symQuad);
       for (const d of this.symQuadDisposables) d.dispose();
       this.symQuadDisposables = [];
     }
-    const d = this.bboxDiag * 1.1;
     const group = new THREE.Group();
-    const quadGeo = new THREE.PlaneGeometry(d, d);
+    const quadGeo = new THREE.PlaneGeometry(1, 1);
     const quadMat = new THREE.MeshBasicMaterial({
       color: 0xd97706,
       transparent: true,
@@ -1653,6 +1671,29 @@ export class SceneManager {
     group.add(new THREE.LineSegments(edgeGeo, edgeMat));
     this.symQuad = group;
     this.symProxy.add(group);
+    this.updateSymQuadSize();
+  }
+
+  /** Scale the unit quad so it spans the part: its two in-plane axes get the
+   *  extent of the part's AABB projected onto them (so an axis-aligned plane
+   *  is exactly the perpendicular part dimensions, and a tilted one stays the
+   *  silhouette size). Falls back to the bbox diagonal before a model loads. */
+  private updateSymQuadSize() {
+    if (!this.symQuad) return;
+    const b = this.partBbox;
+    if (!b) {
+      const d = this.bboxDiag * 1.1;
+      this.symQuad.scale.set(d, d, 1);
+      return;
+    }
+    const dim = new THREE.Vector3(b[3] - b[0], b[4] - b[1], b[5] - b[2]);
+    const q = this.symProxy.quaternion;
+    const ex = new THREE.Vector3(1, 0, 0).applyQuaternion(q);
+    const ey = new THREE.Vector3(0, 1, 0).applyQuaternion(q);
+    // Projected AABB extent along a world axis e: Σ |e·axis|·dim_axis.
+    const span = (e: THREE.Vector3) =>
+      Math.abs(e.x) * dim.x + Math.abs(e.y) * dim.y + Math.abs(e.z) * dim.z;
+    this.symQuad.scale.set(span(ex) || 1, span(ey) || 1, 1);
   }
 
   // ---------- section plane objects ----------

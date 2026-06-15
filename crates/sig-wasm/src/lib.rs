@@ -230,6 +230,15 @@ struct OptOutput {
     /// rectilinear/concentric solid fill); None = profile default.
     solid_pattern: Option<String>,
     summary: String,
+    /// SOLID topology result: the shape is one connected body, not modifiers.
+    solid: bool,
+    /// Frozen load/support cells (solid mode) — anchors for the connected-keep
+    /// when the export isosurface threshold is re-tuned.
+    anchor_cells: Vec<u32>,
+    /// Current export isosurface density (0..1): the level the exported shape /
+    /// dense modifier is extracted from the CONTINUOUS field at. User-tunable
+    /// after the run (a higher value keeps less material). Default 0.5.
+    iso_threshold: f64,
 }
 
 /// Options for `Model::optimize`, passed as one JSON object from the worker.
@@ -255,6 +264,14 @@ struct OptimizeOpts {
     /// p = 3 so the field converges toward {floor, 1} before quantization;
     /// evaluation still uses the calibrated law (exact at both endpoints).
     binary: bool,
+    /// SOLID topology mode (material removal, DESIGN.md #15): no skin, ersatz
+    /// void lower bound, linear eval law, output is one optimized shape. The
+    /// budget is the retained volume fraction. Takes precedence over `binary`.
+    solid: bool,
+    /// Self-supporting (AM) overhang filter — only used in solid mode.
+    self_support: bool,
+    /// Overhang angle from horizontal for the self-supporting filter (degrees).
+    overhang_deg: f64,
     /// Solid-fill pattern for the export in binary mode.
     solid_pattern: Option<String>,
     /// "budget" = stiffest design at the given mean infill (one pass);
@@ -288,6 +305,9 @@ impl Default for OptimizeOpts {
             cap_pct: 70.0,
             levels_pct: None,
             binary: false,
+            solid: false,
+            self_support: false,
+            overhang_deg: 45.0,
             solid_pattern: None,
             goal: "budget".into(),
             symmetry: None,
@@ -939,16 +959,26 @@ impl Model {
     ) -> Result<String, JsValue> {
         self.ensure_grid()?;
         let opts: OptimizeOpts = serde_json::from_str(opts_json).map_err(err)?;
-        // Calibrated pattern law: every stiffness EVALUATION uses this.
-        let eval_exp = opts.exponent.clamp(1.0, 3.5);
-        let eval_coeff = opts.coeff.clamp(0.05, 2.0);
-        // Optimizer law: binary mode swaps in SIMP penalization p=3 so the
-        // continuous field converges toward {floor, solid} — quantizing a
-        // physically-graded (n≈1.5) field straight to two levels would
-        // throw away far more.
-        let (opt_exp, opt_coeff) = if opts.binary { (3.0, 1.0) } else { (eval_exp, eval_coeff) };
-        let floor = (opts.floor_pct / 100.0).clamp(0.01, 0.5);
-        let cap = (opts.cap_pct / 100.0).clamp(floor + 0.05, 1.0);
+        let solid = opts.solid;
+        // Calibrated pattern law: every stiffness EVALUATION uses this. In SOLID
+        // topology mode the kept material is plain solid plastic, so the eval
+        // law is LINEAR E = ρ — exact at the {void, solid} endpoints.
+        let (eval_exp, eval_coeff) = if solid {
+            (1.0, 1.0)
+        } else {
+            (opts.exponent.clamp(1.0, 3.5), opts.coeff.clamp(0.05, 2.0))
+        };
+        // Optimizer law: binary AND solid modes swap in SIMP penalization p=3 so
+        // the continuous field converges toward the extremes ({floor, solid} for
+        // binary, {void, solid} for topology) before quantization — quantizing a
+        // physically-graded (n≈1.5) field straight to two levels throws away far
+        // more.
+        let (opt_exp, opt_coeff) =
+            if opts.binary || solid { (3.0, 1.0) } else { (eval_exp, eval_coeff) };
+        // SOLID mode lower bound is ersatz VOID (material removed), not a
+        // printability floor; everything else uses the printable band.
+        let floor = if solid { 1e-3 } else { (opts.floor_pct / 100.0).clamp(0.01, 0.5) };
+        let cap = if solid { 1.0 } else { (opts.cap_pct / 100.0).clamp(floor + 0.05, 1.0) };
         let budget_pct = opts.budget_pct;
         let perimeters = opts.perimeters.clamp(1, 8);
         let wall_mm = perimeters as f64 * opts.line_width.clamp(0.1, 1.5);
@@ -990,6 +1020,13 @@ impl Model {
             // Minimum member size: clamp to a sane mm range; the core maps it
             // to a filter radius and applies its own cell-radius bounds.
             min_member_mm: opts.min_member_mm.clamp(0.0, 10.0),
+            // SOLID topology mode: material removal (no skin). The
+            // self-supporting overhang filter is available in every mode (in
+            // infill modes it shapes the dense regions; unsupported cells fall
+            // to the floor density instead of void).
+            solid_mode: solid,
+            self_support: opts.self_support,
+            overhang_deg: opts.overhang_deg.clamp(0.0, 90.0),
             // Cap is a safety net; the change-based convergence criterion
             // normally stops the loop earlier.
             max_iter: 40,
@@ -1010,7 +1047,9 @@ impl Model {
         // warm-started from the previous design) until the BINNED design
         // lands within tolerance. Compliance is smooth and monotone in the
         // budget, so a handful of passes suffice.
-        let goal_match = opts.goal == "match";
+        // Match-stiffness goal is an infill concept (lightest design as stiff
+        // as a uniform print); solid topology uses the volume-fraction budget.
+        let goal_match = opts.goal == "match" && !solid;
         const MATCH_TOL: f64 = 0.02;
         let max_passes: usize = if goal_match { 5 } else { 1 };
         let ref_frac = (budget_pct / 100.0).clamp(params.floor, params.cap);
@@ -1114,23 +1153,36 @@ impl Model {
             // dense infill more efficient per gram, so load-bearing levels
             // land high). Assignment re-meets the budget via the anchored
             // bisection.
-            let centers: Vec<f64> = match &opts.levels_pct {
-                Some(user) if !user.is_empty() => {
-                    let mut l: Vec<f64> =
-                        user.iter().map(|&p| (p / 100.0).clamp(0.01, 1.0)).collect();
-                    l.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                    l.dedup_by(|a, b| (*a - *b).abs() < 0.005);
-                    l
-                }
-                _ => cluster_levels(
-                    &result.x, &result.se, n_bins, eval_exp, eval_coeff, params.floor, params.cap,
-                ),
+            // SOLID topology: two levels {void, solid}, the layout thresholded
+            // at ρ = 0.5, then floating islands (material not connected to a
+            // frozen load/support cell) dropped. Infill modes cluster levels.
+            let (centers, bins): (Vec<f64>, Vec<u8>) = if solid {
+                (
+                    vec![0.0, 1.0],
+                    solid_keep_bins(grid, &result.skin_cells, &result.design_cells, &result.x, 0.5),
+                )
+            } else {
+                let centers: Vec<f64> = match &opts.levels_pct {
+                    Some(user) if !user.is_empty() => {
+                        let mut l: Vec<f64> =
+                            user.iter().map(|&p| (p / 100.0).clamp(0.01, 1.0)).collect();
+                        l.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                        l.dedup_by(|a, b| (*a - *b).abs() < 0.005);
+                        l
+                    }
+                    _ => cluster_levels(
+                        &result.x, &result.se, n_bins, eval_exp, eval_coeff, params.floor,
+                        params.cap,
+                    ),
+                };
+                let target_mean = result.x.iter().sum::<f64>() / result.x.len().max(1) as f64;
+                let mut bins = assign_bins_mass(
+                    &result.x, &result.se, &centers, eval_exp, eval_coeff, target_mean,
+                );
+                let min_cells = (result.design_cells.len() / 500).max(30);
+                cleanup_small_regions(grid, &result.design_cells, &mut bins, centers.len(), min_cells);
+                (centers, bins)
             };
-            let target_mean = result.x.iter().sum::<f64>() / result.x.len().max(1) as f64;
-            let mut bins =
-                assign_bins_mass(&result.x, &result.se, &centers, eval_exp, eval_coeff, target_mean);
-            let min_cells = (result.design_cells.len() / 500).max(30);
-            cleanup_small_regions(grid, &result.design_cells, &mut bins, centers.len(), min_cells);
             let x_binned: Vec<f64> = bins.iter().map(|&b| centers[b as usize]).collect();
 
             // Verification solve of the binned design (calibrated law);
@@ -1262,6 +1314,13 @@ impl Model {
         for (i, &c) in result.design_cells.iter().enumerate() {
             bin_of_cell.insert(c, bins[i]);
         }
+        // SOLID mode: the frozen load/support cells are part of the optimized
+        // body — count them as kept so the extracted shape includes them.
+        if solid {
+            for &c in &result.skin_cells {
+                bin_of_cell.insert(c, 1);
+            }
+        }
         let mut regions_raw = Vec::new();
         for level in 1..centers.len() {
             let inside = |ci: usize| -> bool {
@@ -1312,6 +1371,7 @@ impl Model {
             "gainVsUniform": c_uniform / c_binned - 1.0,
             "maxDisplacement": max_disp,
             "binary": opts.binary,
+            "solid": solid,
             "goal": if goal_match { "match" } else { "budget" },
             "passes": pass_trace.len(),
         });
@@ -1351,6 +1411,9 @@ impl Model {
             top_bottom_layers: opts.top_bottom_layers.min(20),
             solid_pattern: opts.solid_pattern.clone(),
             summary: summary.clone(),
+            solid,
+            anchor_cells: result.skin_cells,
+            iso_threshold: 0.5,
         });
         Ok(summary)
     }
@@ -1360,6 +1423,47 @@ impl Model {
     pub fn resmooth_regions(&mut self, iters: u32) -> Result<(), JsValue> {
         let opt = self.opt.as_mut().ok_or_else(|| err("no optimization result"))?;
         opt.regions = smooth_regions(&opt.regions_raw, (iters as usize).min(60));
+        Ok(())
+    }
+
+    /// Re-extract the EXPORTED geometry from the CONTINUOUS optimized field at a
+    /// new isosurface density `threshold` (0..1) — the post-run "fine-tune how
+    /// the part looks" knob. SOLID mode rebuilds the single body (with the
+    /// connected-keep anchored to the load/support regions); BINARY mode rebuilds
+    /// the dense modifier region. The budget/density target is NOT touched — this
+    /// only moves the level the shape is cut at. Affects display + exports; the
+    /// regions are re-smoothed with `smooth_iters`. No-op for graded infill (its
+    /// regions are bin sets, not a single isosurface level).
+    pub fn set_iso_threshold(&mut self, threshold: f64, smooth_iters: u32) -> Result<(), JsValue> {
+        let (grid, _) = self.grid.as_ref().ok_or_else(|| err("no grid"))?;
+        let opt = self.opt.as_mut().ok_or_else(|| err("no optimization result"))?;
+        let t = threshold.clamp(0.05, 0.95);
+        let n = grid.cell_count();
+        let mut val = vec![0f64; n];
+        if opt.solid {
+            for &c in &opt.anchor_cells {
+                val[c as usize] = 1.0;
+            }
+            let kept =
+                solid_keep_bins(grid, &opt.anchor_cells, &opt.design_cells, &opt.x_cont, t);
+            for (i, &c) in opt.design_cells.iter().enumerate() {
+                if kept[i] == 1 {
+                    val[c as usize] = opt.x_cont[i];
+                }
+            }
+        } else {
+            // Binary: dense modifier = isosurface of the continuous field. The
+            // base bin stays the part's own infill; no connected-keep (sparse
+            // infill supports interior dense islands).
+            for (i, &c) in opt.design_cells.iter().enumerate() {
+                val[c as usize] = opt.x_cont[i];
+            }
+        }
+        let mut r = extract_iso(grid, &|ci| val[ci], t);
+        r.density = 1.0; // solid body / dense modifier
+        opt.regions_raw = vec![r];
+        opt.regions = smooth_regions(&opt.regions_raw, (smooth_iters as usize).min(60));
+        opt.iso_threshold = t;
         Ok(())
     }
 
@@ -1374,6 +1478,11 @@ impl Model {
             std::collections::HashMap::with_capacity(opt.design_cells.len());
         for (i, &c) in opt.design_cells.iter().enumerate() {
             field.insert(c, opt.x_cont[i]);
+        }
+        // Frozen load/support cells (Part Topo) are solid — show them in the
+        // cutaway so the preview matches the exported body.
+        for &c in &opt.anchor_cells {
+            field.insert(c, 1.0);
         }
         let t = threshold.clamp(0.0, 1.0);
         // Continuous level set of the filtered field — smooth by nature.
@@ -1692,7 +1801,110 @@ impl Model {
         let opt = self.opt.as_ref().ok_or_else(|| err("no optimization result — run optimize first"))?;
         Ok(export_stl_zip(&opt.regions))
     }
+
+    /// SOLID topology mode: the single optimized body as one binary STL (the
+    /// regions hold exactly one kept-material mesh). Re-sliceable / re-CAD-able.
+    pub fn export_solid_stl(&self) -> Result<Vec<u8>, JsValue> {
+        let opt = self.opt.as_ref().ok_or_else(|| err("no optimization result — run optimize first"))?;
+        let r = opt.regions.first().ok_or_else(|| err("no optimized shape"))?;
+        let mut tris: Vec<[f32; 9]> = Vec::with_capacity(r.indices.len() / 3);
+        for f in r.indices.chunks_exact(3) {
+            let v = |i: u32| {
+                let o = (i as usize) * 3;
+                [r.positions[o], r.positions[o + 1], r.positions[o + 2]]
+            };
+            let (a, b, c) = (v(f[0]), v(f[1]), v(f[2]));
+            tris.push([a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2]]);
+        }
+        Ok(TriMesh::from_triangles(tris).to_stl_binary())
+    }
 }
+
+/// SOLID topology mode: threshold the optimized field at `thresh` and keep
+/// only material connected (6-neighbour) to a frozen load/support cell, so
+/// floating islands are dropped. Returns 1 (kept solid) / 0 (void) per design
+/// slot. With no frozen anchors, keeps the single largest component. The
+/// threshold is the export "isosurface density" — lower keeps more material.
+fn solid_keep_bins(grid: &VoxelGrid, skin: &[u32], design: &[u32], x: &[f64], thresh: f64) -> Vec<u8> {
+    let (nx, ny, nz) = (grid.nx, grid.ny, grid.nz);
+    let n = grid.cell_count();
+    let mut member = vec![false; n];
+    let mut anchor = vec![false; n];
+    for &c in skin {
+        member[c as usize] = true;
+        anchor[c as usize] = true;
+    }
+    for (i, &c) in design.iter().enumerate() {
+        if x[i] >= thresh {
+            member[c as usize] = true;
+        }
+    }
+    // 6-connected components over member cells.
+    let mut comp = vec![u32::MAX; n];
+    let mut comp_keep: Vec<bool> = Vec::new();
+    let mut comp_size: Vec<usize> = Vec::new();
+    let mut stack: Vec<usize> = Vec::new();
+    for start in 0..n {
+        if !member[start] || comp[start] != u32::MAX {
+            continue;
+        }
+        let id = comp_keep.len() as u32;
+        let mut has_anchor = false;
+        let mut size = 0usize;
+        comp[start] = id;
+        stack.push(start);
+        while let Some(c) = stack.pop() {
+            size += 1;
+            if anchor[c] {
+                has_anchor = true;
+            }
+            let (cx, cy, cz) = (c % nx, (c / nx) % ny, c / (nx * ny));
+            let visit = |x: i64, y: i64, z: i64, comp: &mut [u32], stack: &mut Vec<usize>| {
+                if x < 0 || y < 0 || z < 0 || x >= nx as i64 || y >= ny as i64 || z >= nz as i64 {
+                    return;
+                }
+                let d = (z as usize * ny + y as usize) * nx + x as usize;
+                if member[d] && comp[d] == u32::MAX {
+                    comp[d] = id;
+                    stack.push(d);
+                }
+            };
+            let (xi, yi, zi) = (cx as i64, cy as i64, cz as i64);
+            visit(xi - 1, yi, zi, &mut comp, &mut stack);
+            visit(xi + 1, yi, zi, &mut comp, &mut stack);
+            visit(xi, yi - 1, zi, &mut comp, &mut stack);
+            visit(xi, yi + 1, zi, &mut comp, &mut stack);
+            visit(xi, yi, zi - 1, &mut comp, &mut stack);
+            visit(xi, yi, zi + 1, &mut comp, &mut stack);
+        }
+        comp_keep.push(has_anchor);
+        comp_size.push(size);
+    }
+    // No anchors (no BCs reached the grid): fall back to the largest component.
+    if !anchor.iter().any(|&a| a) {
+        if let Some((bi, _)) = comp_size.iter().enumerate().max_by_key(|(_, &s)| s) {
+            comp_keep.iter_mut().for_each(|k| *k = false);
+            comp_keep[bi] = true;
+        }
+    }
+    design
+        .iter()
+        .map(|&c| {
+            let c = c as usize;
+            let id = comp[c];
+            if member[c] && id != u32::MAX && comp_keep[id as usize] {
+                1
+            } else {
+                0
+            }
+        })
+        .collect()
+}
+
+/// How many Taubin passes one slider unit buys. The slider tops out at 40, so
+/// the max is 40·SMOOTH_PASS_MULT passes — enough, with the aggressive λ/μ in
+/// `taubin_smooth`, to fully melt the voxel staircase at the top of the range.
+const SMOOTH_PASS_MULT: usize = 4;
 
 /// Taubin-smooth copies of the raw regions (0 passes = verbatim copy).
 fn smooth_regions(raw: &[RegionMesh], iters: usize) -> Vec<RegionMesh> {
@@ -1704,7 +1916,7 @@ fn smooth_regions(raw: &[RegionMesh], iters: usize) -> Vec<RegionMesh> {
                 indices: r.indices.clone(),
             };
             if iters > 0 {
-                taubin_smooth(&mut rr.positions, &rr.indices, iters);
+                taubin_smooth(&mut rr.positions, &rr.indices, iters * SMOOTH_PASS_MULT);
             }
             rr
         })

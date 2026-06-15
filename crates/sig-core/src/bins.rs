@@ -595,8 +595,13 @@ pub fn taubin_smooth(positions: &mut [f32], indices: &[u32], passes: usize) {
         add(t[0], t[2], &mut neighbors);
     }
     let mut tmp = vec![0f32; positions.len()];
+    // Taubin λ/μ pair. The pass-band kPB = 1/λ − 1/|μ| sets how much detail
+    // survives: a SMALLER band removes more (smoother). These (0.63/−0.65,
+    // kPB ≈ 0.048) are deliberately more aggressive than the textbook
+    // 0.5/−0.53 (kPB ≈ 0.11) so cranking the slider visibly melts the voxel
+    // staircase; λ/μ stay volume-preserving (no net shrink).
     for pass in 0..passes * 2 {
-        let factor = if pass % 2 == 0 { 0.5f32 } else { -0.53f32 };
+        let factor = if pass % 2 == 0 { 0.63f32 } else { -0.65f32 };
         for v in 0..nv {
             let nb = &neighbors[v];
             if nb.is_empty() {

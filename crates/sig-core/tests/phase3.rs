@@ -1007,3 +1007,143 @@ fn weld_dedups_box() {
     assert_eq!(m.triangles.len(), 12);
     let _ = IndexedMesh { vertices: m.vertices.clone(), triangles: m.triangles.clone() };
 }
+
+#[test]
+fn solid_topology_beats_uniform_gray() {
+    // SOLID topology mode (material removal, DESIGN.md #15): the optimizer runs
+    // SIMP-penalized (p=3) toward {void, solid}, there is NO skin band, and the
+    // load/support cells are auto-frozen solid. The optimized 50%-volume layout
+    // must be STIFFER (lower compliance) than the same volume spread as uniform
+    // gray material — the classic topology-optimization result. Evaluation uses
+    // the LINEAR solid law (E = ρ), exact at the {void, solid} endpoints.
+    let beam = primitives::boxx([0.0; 3], [60.0, 10.0, 10.0]);
+    let grid0 = VoxelGrid::voxelize(&beam, 1.0);
+    let settings = SolveSettings { e0: 2400.0, nu: 0.35, tol: 1e-5, ..Default::default() };
+    let (grid, levels) = pad_for_levels(&grid0, settings.max_levels);
+    let bcs = vec![
+        BcSpec { kind: BcKind::Fixed, tris: face_tris(0) },
+        BcSpec { kind: BcKind::Force([0.0, 0.0, -30.0]), tris: face_tris(1) },
+    ];
+    let asm = assemble(&beam, &grid, &bcs, None, &settings).unwrap();
+    let params = OptimizeParams {
+        budget: 0.5, // retained volume fraction
+        exponent: 3.0, // SIMP penalization (optimizer law)
+        coeff: 1.0,
+        floor: 1e-3, // ersatz void
+        cap: 1.0,
+        solid_mode: true,
+        max_iter: 40,
+        ..Default::default()
+    };
+    let result =
+        optimize(&grid, levels, &asm.problem, &settings, &params, None, None, |_p, _x, _c| {})
+            .expect("optimize");
+
+    // In solid mode the only always-solid ("skin") cells are the auto-frozen
+    // load/support cells, and there are some.
+    assert!(!result.skin_cells.is_empty(), "load/support cells are frozen solid");
+
+    // SIMP penalization drives the field mostly black/white before quantization.
+    let extreme = result.x.iter().filter(|&&v| v < 0.2 || v > 0.8).count();
+    assert!(
+        extreme as f64 / result.x.len() as f64 > 0.55,
+        "penalized field should be mostly 0/1, got {extreme}/{}",
+        result.x.len()
+    );
+
+    // Thresholded shape vs uniform-gray design at the same material budget.
+    let x_opt: Vec<f64> = result.x.iter().map(|&v| if v >= 0.5 { 1.0 } else { 1e-3 }).collect();
+    let x_uniform = vec![0.5; result.x.len()];
+    let (c_opt, _, _) = evaluate(
+        &grid, levels, &asm.problem, &settings, &result.skin_cells, &result.design_cells,
+        &result.skin_frac, &x_opt, 1.0, 1.0, None,
+    )
+    .unwrap();
+    let (c_uniform, _, _) = evaluate(
+        &grid, levels, &asm.problem, &settings, &result.skin_cells, &result.design_cells,
+        &result.skin_frac, &x_uniform, 1.0, 1.0, None,
+    )
+    .unwrap();
+    assert!(
+        c_opt < c_uniform,
+        "optimized shape (c={c_opt:.3e}) must be stiffer than uniform gray (c={c_uniform:.3e})"
+    );
+}
+
+#[test]
+fn self_support_yields_supported_overhangs() {
+    // With the self-supporting filter ON, the optimized field must not leave
+    // high-density material directly above void steeper than the overhang cone:
+    // every solid cell (ρ ≥ 0.5) above the plate layer has SOME solid support
+    // in the layer below within the 45° reach. Off, the unconstrained optimum
+    // routinely violates this (a diagonal tension tie hanging in space).
+    let beam = primitives::boxx([0.0; 3], [40.0, 8.0, 20.0]);
+    let grid0 = VoxelGrid::voxelize(&beam, 1.0);
+    let settings = SolveSettings { e0: 2400.0, nu: 0.35, tol: 1e-5, ..Default::default() };
+    let (grid, levels) = pad_for_levels(&grid0, settings.max_levels);
+    let bcs = vec![
+        BcSpec { kind: BcKind::Fixed, tris: face_tris(0) },
+        BcSpec { kind: BcKind::Force([0.0, 0.0, -30.0]), tris: face_tris(1) },
+    ];
+    let asm = assemble(&beam, &grid, &bcs, None, &settings).unwrap();
+    let params = OptimizeParams {
+        budget: 0.4,
+        exponent: 3.0,
+        coeff: 1.0,
+        floor: 1e-3,
+        cap: 1.0,
+        solid_mode: true,
+        self_support: true,
+        overhang_deg: 45.0,
+        max_iter: 40,
+        ..Default::default()
+    };
+    let result =
+        optimize(&grid, levels, &asm.problem, &settings, &params, None, None, |_p, _x, _c| {})
+            .expect("optimize");
+
+    let (nx, ny) = (grid.nx, grid.ny);
+    let mut solid = std::collections::HashSet::new();
+    for (i, &c) in result.design_cells.iter().enumerate() {
+        if result.x[i] >= 0.5 {
+            solid.insert(c as usize);
+        }
+    }
+    for &c in &result.skin_cells {
+        solid.insert(c as usize);
+    }
+    let zmin = solid.iter().map(|&c| c / (nx * ny)).min().unwrap_or(0);
+    let mut violations = 0;
+    for &c in &solid {
+        let (cx, cy, cz) = (c % nx, (c / nx) % ny, c / (nx * ny));
+        if cz <= zmin {
+            continue; // on the plate
+        }
+        // 45° cone: a supporter exists in the 3×3 footprint of the layer below.
+        let mut supported = false;
+        for dy in -1i64..=1 {
+            for dx in -1i64..=1 {
+                let x = cx as i64 + dx;
+                let y = cy as i64 + dy;
+                if x < 0 || y < 0 || x >= nx as i64 || y >= ny as i64 {
+                    continue;
+                }
+                let below = ((cz - 1) * ny + y as usize) * nx + x as usize;
+                if solid.contains(&below) {
+                    supported = true;
+                }
+            }
+        }
+        if !supported {
+            violations += 1;
+        }
+    }
+    // Advisory filter: allow a few staircase stragglers, but the field must be
+    // overwhelmingly self-supported.
+    let frac = violations as f64 / (solid.len().max(1) as f64);
+    assert!(
+        frac < 0.02,
+        "self-support left {violations} unsupported solid cells of {}",
+        solid.len()
+    );
+}

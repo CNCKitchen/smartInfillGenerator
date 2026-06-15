@@ -112,11 +112,13 @@ type Req =
     }
   | { id: number; op: "densityShape"; threshold: number }
   | { id: number; op: "resmooth"; iters: number }
+  | { id: number; op: "setIsoThreshold"; threshold: number; smoothIters: number }
   | { id: number; op: "resultField"; kind: string }
   | { id: number; op: "voxelResults" }
   | { id: number; op: "voxelResultField"; kind: string }
   | { id: number; op: "exportThreeMf"; slicer: string }
-  | { id: number; op: "exportStls" };
+  | { id: number; op: "exportStls" }
+  | { id: number; op: "exportSolidStl" };
 
 /** Collect region meshes + transfer list (shared by optimize + resmooth). */
 function collectRegions(m: Model): {
@@ -368,6 +370,16 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
         );
         return;
       }
+      case "setIsoThreshold": {
+        const m = requireModel();
+        m.set_iso_threshold(msg.threshold, msg.smoothIters);
+        const { regions, transfer } = collectRegions(m);
+        (self as unknown as Worker).postMessage(
+          { id: msg.id, ok: true, data: { regions } },
+          transfer
+        );
+        return;
+      }
       case "resultField": {
         const values = requireModel().result_field(msg.kind);
         (self as unknown as Worker).postMessage({ id: msg.id, ok: true, data: values }, [
@@ -403,6 +415,13 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
       }
       case "exportStls": {
         const bytes = requireModel().export_stls();
+        (self as unknown as Worker).postMessage({ id: msg.id, ok: true, data: bytes }, [
+          bytes.buffer,
+        ]);
+        return;
+      }
+      case "exportSolidStl": {
+        const bytes = requireModel().export_solid_stl();
         (self as unknown as Worker).postMessage({ id: msg.id, ok: true, data: bytes }, [
           bytes.buffer,
         ]);

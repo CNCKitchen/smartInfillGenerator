@@ -126,10 +126,13 @@ function clampPct(v: number, lo: number, hi: number): number {
  *  the slider is the REFERENCE uniform infill %, which lives in the graded
  *  printable band regardless of fill mode. */
 export function budgetBounds(s: {
-  optMode: "graded" | "binary";
+  optMode: "graded" | "binary" | "solid";
   goal: "budget" | "match";
   levelSettings: LevelSettings;
 }): [number, number] {
+  // Solid topology: the budget is the RETAINED VOLUME fraction of the design
+  // domain, not an infill density — its own band.
+  if (s.optMode === "solid") return [5, 80];
   if (s.goal === "match") return [s.levelSettings.floorPct, s.levelSettings.capPct];
   return s.optMode === "binary"
     ? [s.levelSettings.binaryFloorPct, 90]
@@ -218,8 +221,13 @@ interface AppState {
   /** Optimization goal: stiffest at a mass budget, or lightest at a
    *  target stiffness ("as stiff as uniform X%"). */
   goal: "budget" | "match";
-  /** Graded densities vs binary (hollow/solid core). */
-  optMode: "graded" | "binary";
+  /** Optimization mode: graded infill densities, binary (hollow/solid core),
+   *  or solid topology (material removal — a new optimized shape). */
+  optMode: "graded" | "binary" | "solid";
+  /** Solid-mode self-supporting overhang filter (prints without supports). */
+  selfSupport: boolean;
+  /** Overhang angle from horizontal (degrees) for the self-supporting filter. */
+  overhangDeg: number;
   /** Planar symmetry constraint for the optimizer. Plane n·p = c (n unit,
    *  world mm) — the gizmo's rings can tilt it off-axis. */
   symOn: boolean;
@@ -258,7 +266,10 @@ interface AppState {
   /** Densities of the extracted modifier regions (for the region list). */
   regionInfos: { density: number }[];
   regionVisible: boolean[];
-  /** Density cutaway threshold in %, 0 = off (surface paint only). */
+  /** Isosurface density in % (0 = off for graded). For Part Topo / binary this
+   *  is the export level too — the level the exported geometry is cut from the
+   *  CONTINUOUS optimized field (separate from the budget). For graded it's a
+   *  display-only cutaway. */
   densityThreshold: number;
   /** Target slicer for the project 3MF export. */
   exportSlicer: SlicerFlavor;
@@ -369,10 +380,14 @@ interface AppState {
   /** Minimum member size in mm; null restores auto (2× line width). */
   setMinMemberMm(v: number | null): void;
   setGoal(g: "budget" | "match"): void;
-  setOptMode(m: "graded" | "binary"): void;
+  setOptMode(m: "graded" | "binary" | "solid"): void;
+  setSelfSupport(on: boolean): void;
+  setOverhangDeg(deg: number): void;
   setSolidPattern(p: "default" | "rectilinear" | "concentric"): void;
   updateLevelSettings(p: Partial<LevelSettings>): void;
   setRegionVisible(index: number, on: boolean): void;
+  /** Isosurface density: display cutaway in all modes, AND (Part Topo / binary)
+   *  the export level — re-extracts the geometry and what later exports use. */
   setDensityThreshold(v: number): void;
   setExportSlicer(s: SlicerFlavor): void;
   setResultSurface(surface: "stl" | "voxel"): Promise<void>;
@@ -391,6 +406,8 @@ interface AppState {
   runOptimize(): Promise<void>;
   downloadThreeMf(): Promise<void>;
   downloadStls(): Promise<void>;
+  /** Solid topology mode: download the optimized shape as one STL. */
+  downloadShape(): Promise<void>;
   setViewMode(mode: ViewMode): Promise<void>;
   setWireframe(on: boolean): void;
   setDeformScale(s: number): void;
@@ -910,6 +927,8 @@ export const useStore = create<AppState>((set, get) => ({
   symNormal: [1, 0, 0],
   symC: 0,
   optMode: "graded",
+  selfSupport: false,
+  overhangDeg: 45,
   solidPattern: "default",
   levelSettings: initialSettings.levels,
   busy: null,
@@ -957,7 +976,19 @@ export const useStore = create<AppState>((set, get) => ({
   async loadFile(name, bytes) {
     set({ busy: "Parsing & segmenting…", error: null, notice: null });
     try {
-      const model = await engine.load(bytes, name.replace(/\.(stl|3mf|step|stp)$/i, ""));
+      let model = await engine.load(bytes, name.replace(/\.(stl|3mf|step|stp)$/i, ""));
+      // Land every fresh import centered on the build grid: center the XY
+      // footprint over the plate origin and seat the part on the plate
+      // (z-min → 0). Mirrors the auto-seat that rotate / place-on-face do.
+      {
+        const cx = (model.bbox[0] + model.bbox[3]) / 2;
+        const cy = (model.bbox[1] + model.bbox[4]) / 2;
+        const dz = model.bbox[2];
+        if (Math.abs(cx) > 1e-6 || Math.abs(cy) > 1e-6 || Math.abs(dz) > 1e-6) {
+          const out = await engine.transform([1, 0, 0, 0, 1, 0, 0, 0, 1, -cx, -cy, -dz]);
+          model = { ...model, positions: out.positions, bbox: out.bbox as LoadedModel["bbox"] };
+        }
+      }
       const m = get().material;
       await engine.setMaterial(m.e0, m.nu, m.density, m.strength, m.strengthZ);
       await engine.setResolution(resolutionCells(get()));
@@ -1558,7 +1589,17 @@ export const useStore = create<AppState>((set, get) => ({
 
   setOptMode(m) {
     set({ optMode: m });
-    get().setBudget(get().budget); // re-clamp to the mode's printable band
+    // Solid topology has no "match uniform stiffness" goal — force budget goal.
+    if (m === "solid" && get().goal === "match") set({ goal: "budget" });
+    get().setBudget(get().budget); // re-clamp to the mode's band
+  },
+
+  setSelfSupport(on) {
+    set({ selfSupport: on });
+  },
+  setOverhangDeg(deg) {
+    // 0° = horizontal (no constraint) … 90° = vertical only.
+    set({ overhangDeg: Math.min(90, Math.max(0, Math.round(deg))) });
   },
 
   setSolidPattern(p) {
@@ -1585,9 +1626,13 @@ export const useStore = create<AppState>((set, get) => ({
     if (isoTimer) clearTimeout(isoTimer);
     isoTimer = setTimeout(() => {
       void (async () => {
-        const st = get();
-        if (!st.optSummary) return;
-        if (v < 10) {
+        const o = get().optSummary;
+        if (!o) return;
+        // Part Topo / binary: this ONE slider IS the export isosurface density —
+        // it both previews (cutaway) and re-extracts the exported geometry.
+        // Graded has no single export level, so it's a display-only cutaway.
+        const drivesExport = o.solid || o.binary;
+        if (v < 10 && !drivesExport) {
           // Below the printable floor everything is "inside" — cutaway off.
           sceneEvents.onOptShape?.(null, null);
           return;
@@ -1595,6 +1640,16 @@ export const useStore = create<AppState>((set, get) => ({
         try {
           const { positions, indices, density } = await engine.densityShape(v / 100);
           if (get().densityThreshold === v) sceneEvents.onOptShape?.(positions, indices, density);
+          if (drivesExport) {
+            const { regions } = await engine.setIsoThreshold(v / 100, get().smoothIters);
+            if (get().densityThreshold !== v || !get().optSummary) return;
+            set({
+              regionInfos: regions.map((r) => ({ density: r.density })),
+              regionVisible: regions.map(() => true),
+            });
+            sceneEvents.onRegions?.(regions);
+            sceneEvents.onRegionVisibility?.(get().regionVisible);
+          }
         } catch {
           // grid/result vanished mid-drag: ignore
         }
@@ -1788,7 +1843,7 @@ export const useStore = create<AppState>((set, get) => ({
     const st = get();
     if (!st.model) return;
     set({
-      busy: "Optimizing infill…",
+      busy: st.optMode === "solid" ? "Optimizing shape…" : "Optimizing infill…",
       error: null,
       optProgress: null,
       optSummary: null,
@@ -1801,20 +1856,28 @@ export const useStore = create<AppState>((set, get) => ({
       await pushBcs(get);
       await logGridInfo(set);
       const curve = st.curves[st.pattern];
+      const solid = st.optMode === "solid";
       const binary = st.optMode === "binary";
-      const match = st.goal === "match";
+      const match = st.goal === "match" && !solid;
       const ls = st.levelSettings;
-      const manual = !binary && ls.mode === "manual" && ls.manual.length >= 2;
+      const manual = !binary && !solid && ls.mode === "manual" && ls.manual.length >= 2;
       appendLog(
         set,
-        `Optimize (${binary ? `binary: ${ls.binaryFloorPct}% or solid` : manual ? `manual levels ${ls.manual.join("/")}%` : "graded, auto levels"}): ` +
-          (match
-            ? `match the stiffness of uniform ${st.budget}% — lightest design via budget secant`
-            : `infill budget ${st.budget}%`) +
-          ` (${st.pattern}: E/E₀ = ${curve.coeff}·ρ^${curve.exponent}), ` +
-          `skin ${st.perimeters}×${st.lineWidth} mm — convergence when mean |Δρ| < 0.005 twice` +
-          (binary ? " · optimizer SIMP-penalized p=3" : "") +
-          (st.symOn ? ` · symmetry plane ${symLabel(st.symNormal, st.symC)}` : "")
+        solid
+          ? `Optimize SOLID topology: keep ${st.budget}% of the material, ` +
+              `material removed elsewhere — convergence when mean |Δρ| < 0.005 twice · ` +
+              `optimizer SIMP-penalized p=3` +
+              (st.selfSupport ? ` · self-supporting ≥ ${st.overhangDeg}° overhang` : "") +
+              (st.symOn ? ` · symmetry plane ${symLabel(st.symNormal, st.symC)}` : "")
+          : `Optimize (${binary ? `binary: ${ls.binaryFloorPct}% or solid` : manual ? `manual levels ${ls.manual.join("/")}%` : "graded, auto levels"}): ` +
+              (match
+                ? `match the stiffness of uniform ${st.budget}% — lightest design via budget secant`
+                : `infill budget ${st.budget}%`) +
+              ` (${st.pattern}: E/E₀ = ${curve.coeff}·ρ^${curve.exponent}), ` +
+              `skin ${st.perimeters}×${st.lineWidth} mm — convergence when mean |Δρ| < 0.005 twice` +
+              (binary ? " · optimizer SIMP-penalized p=3" : "") +
+              (st.selfSupport ? ` · self-supporting ${st.overhangDeg}°` : "") +
+              (st.symOn ? ` · symmetry plane ${symLabel(st.symNormal, st.symC)}` : "")
       );
       let lastPass = 0;
       const out = await engine.optimize(
@@ -1830,8 +1893,11 @@ export const useStore = create<AppState>((set, get) => ({
           capPct: binary ? 100 : ls.capPct,
           levelsPct: binary ? [ls.binaryFloorPct, 100] : manual ? ls.manual : null,
           binary,
+          solid,
+          selfSupport: st.selfSupport,
+          overhangDeg: st.overhangDeg,
           solidPattern: binary && st.solidPattern !== "default" ? st.solidPattern : null,
-          goal: st.goal,
+          goal: solid ? "budget" : st.goal,
           symmetry: st.symOn ? [...st.symNormal, st.symC] : null,
           topBottomLayers: st.topBottomLayers,
           layerHeight: st.layerHeight,
@@ -1889,13 +1955,18 @@ export const useStore = create<AppState>((set, get) => ({
       appendLog(
         set,
         `Optimize ${out.summary.converged ? `converged in ${out.summary.iterations} iterations` : `stopped at the ${out.summary.iterations}-iteration cap`} ` +
-          `(${out.summary.seconds.toFixed(1)} s) · levels ${out.summary.bins.map((b) => `${Math.round(b.density * 100)}%`).join("/")} · ` +
-          `mean infill ${(out.summary.meanInfill * 100).toFixed(1)}% · mass ${out.summary.massGrams.toFixed(1)} g (${Math.round(out.summary.massFrac * 100)}% of solid)`
+          `(${out.summary.seconds.toFixed(1)} s) · ` +
+          (out.summary.solid
+            ? `retained volume ${(out.summary.meanInfill * 100).toFixed(1)}%`
+            : `levels ${out.summary.bins.map((b) => `${Math.round(b.density * 100)}%`).join("/")} · mean infill ${(out.summary.meanInfill * 100).toFixed(1)}%`) +
+          ` · mass ${out.summary.massGrams.toFixed(1)} g (${Math.round(out.summary.massFrac * 100)}% of solid)`
       );
       appendLog(
         set,
         `  verification: stiffness ${Math.round(out.summary.stiffnessVsSolid * 100)}% of solid · ` +
-          `+${(out.summary.gainVsUniform * 100).toFixed(1)}% stiffer than uniform ${Math.round(out.summary.meanInfill * 100)}% infill at equal weight`
+          (out.summary.solid
+            ? `+${(out.summary.gainVsUniform * 100).toFixed(1)}% stiffer than the same material spread uniformly`
+            : `+${(out.summary.gainVsUniform * 100).toFixed(1)}% stiffer than uniform ${Math.round(out.summary.meanInfill * 100)}% infill at equal weight`)
       );
       if (out.summary.goal === "match" && out.summary.massUniformRefGrams) {
         const saved = 1 - out.summary.massGrams / out.summary.massUniformRefGrams;
@@ -1942,10 +2013,10 @@ export const useStore = create<AppState>((set, get) => ({
       });
       sceneEvents.onRegions?.(out.regions);
       sceneEvents.onRegionVisibility?.(vis);
-      // Land in the density view with a 25% cutaway by default — the
-      // interior structure is the result, not the painted surface.
+      // Land in the density view. Part Topo / binary seed the isosurface
+      // density at 50% (the export level); graded shows a 25% cutaway.
       sceneEvents.onViewState?.("density", get().deformScale);
-      get().setDensityThreshold(25);
+      get().setDensityThreshold(out.summary.solid || out.summary.binary ? 50 : 25);
       // Re-arm the plane state (still hidden in result views; it shows again
       // when the user returns to a setup view on this step).
       pushSymmetry(get);
@@ -1996,6 +2067,16 @@ export const useStore = create<AppState>((set, get) => ({
       const bytes = await engine.exportStls();
       const base = (get().fileName ?? "part").replace(/\.(stl|3mf)$/i, "");
       download(bytes, `${base}_modifiers.zip`, "application/zip");
+    } catch (e) {
+      set({ error: e instanceof Error ? e.message : String(e) });
+    }
+  },
+
+  async downloadShape() {
+    try {
+      const bytes = await engine.exportSolidStl();
+      const base = (get().fileName ?? "part").replace(/\.(stl|3mf)$/i, "");
+      download(bytes, `${base}_optimized.stl`, "model/stl");
     } catch (e) {
       set({ error: e instanceof Error ? e.message : String(e) });
     }

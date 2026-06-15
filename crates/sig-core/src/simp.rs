@@ -15,6 +15,7 @@
 
 use crate::fem::ke_hex;
 use crate::mg::Level;
+use crate::selfsupport::SelfSupportFilter;
 use crate::solve::{solve_cached, NodeProblem, SolverCache, SolveSettings};
 use crate::voxel::VoxelGrid;
 
@@ -52,6 +53,18 @@ pub struct OptimizeParams {
     /// 0 = off ⇒ only the numerical anti-checkerboard floor applies. Advisory,
     /// not a hard guarantee (see `filter_radius_cells`).
     pub min_member_mm: f64,
+    /// SOLID topology mode (DESIGN.md #15): material-removal optimization, not
+    /// infill. The skin band is bypassed (`build_solid_split`): the auto-frozen
+    /// load/support cells are the only always-solid cells, every other solid
+    /// cell is a design cell, and the lower bound is ersatz void. The caller
+    /// sets the penalized optimizer law (p=3) and linear eval law.
+    pub solid_mode: bool,
+    /// Self-supporting (AM) filter: constrain the printed field to overhang at
+    /// most `overhang_deg` from the build plate (global +Z). Off = no
+    /// constraint. See `crate::selfsupport`.
+    pub self_support: bool,
+    /// Overhang angle from horizontal for the self-supporting filter (degrees).
+    pub overhang_deg: f64,
     pub max_iter: usize,
 }
 
@@ -69,6 +82,9 @@ impl Default for OptimizeParams {
             composite_skin: false,
             symmetry: None,
             min_member_mm: 0.0,
+            solid_mode: false,
+            self_support: false,
+            overhang_deg: 45.0,
             max_iter: 40,
         }
     }
@@ -304,6 +320,80 @@ pub fn classify_cells(
     SkinSplit { skin, design, skin_frac }
 }
 
+/// SOLID topology mode (DESIGN.md #15): no skin band. The always-solid cells
+/// are exactly the auto-frozen load/support cells (`frozen`); every other solid
+/// cell is a free design cell with zero skin fraction. This reuses the skin
+/// path (`skin` cells stay at eps = 1, excluded from the design vector) to pin
+/// the material under loads/supports so it is never optimized away.
+pub fn build_solid_split(grid: &VoxelGrid, frozen: &[u32]) -> SkinSplit {
+    let mut is_frozen = vec![false; grid.cell_count()];
+    for &c in frozen {
+        if (c as usize) < is_frozen.len() {
+            is_frozen[c as usize] = true;
+        }
+    }
+    let mut skin = Vec::new();
+    let mut design = Vec::new();
+    let mut skin_frac = Vec::new();
+    for ci in 0..grid.cell_count() {
+        if grid.scale[ci] <= 0.0 {
+            continue;
+        }
+        if is_frozen[ci] {
+            skin.push(ci as u32);
+        } else {
+            design.push(ci as u32);
+            skin_frac.push(0.0);
+        }
+    }
+    SkinSplit { skin, design, skin_frac }
+}
+
+/// Cells to freeze solid in topology mode: every solid cell incident to a
+/// loaded or constrained node (the assembled problem's fixed ∪ spring ∪ force
+/// nodes). Keeps material under loads and supports from being deleted — the
+/// "keep regions" of a commercial topology optimizer, derived automatically.
+pub fn frozen_cells_from_problem(grid: &VoxelGrid, problem: &NodeProblem) -> Vec<u32> {
+    let (nx, ny, nz) = (grid.nx, grid.ny, grid.nz);
+    let (mx, my) = (nx + 1, ny + 1);
+    let mut hit = vec![false; grid.cell_count()];
+    let mut mark = |n: u32| {
+        let n = n as usize;
+        let (i, j, k) = (n % mx, (n / mx) % my, n / (mx * my));
+        // The (up to 8) cells sharing node (i,j,k): cx ∈ {i-1,i}, etc.
+        for a in 0..2 {
+            for b in 0..2 {
+                for c in 0..2 {
+                    let cx = i as i64 - 1 + a;
+                    let cy = j as i64 - 1 + b;
+                    let cz = k as i64 - 1 + c;
+                    if cx < 0 || cy < 0 || cz < 0 {
+                        continue;
+                    }
+                    let (cx, cy, cz) = (cx as usize, cy as usize, cz as usize);
+                    if cx >= nx || cy >= ny || cz >= nz {
+                        continue;
+                    }
+                    let ci = (cz * ny + cy) * nx + cx;
+                    if grid.scale[ci] > 0.0 {
+                        hit[ci] = true;
+                    }
+                }
+            }
+        }
+    };
+    for &n in &problem.fixed {
+        mark(n);
+    }
+    for &(n, _, _) in &problem.springs {
+        mark(n);
+    }
+    for &(n, _) in &problem.forces {
+        mark(n);
+    }
+    (0..grid.cell_count() as u32).filter(|&c| hit[c as usize]).collect()
+}
+
 /// Mirror partner per design slot for a planar symmetry constraint:
 /// reflect each design cell's center across the plane n·p = c and look up
 /// the design cell containing the image (u32::MAX = no partner: the mirror
@@ -458,6 +548,52 @@ impl DensityFilter {
     }
 }
 
+/// Forward density projection: design variables → PRINTED densities. The
+/// linear density filter (min-member / anti-checkerboard) runs first into
+/// `x_tilde` (the filtered "blueprint", clamped to the printable band), then
+/// the optional self-supporting AM filter maps it to the printed field. With
+/// no self-support this is just the filtered, clamped field as before.
+fn project(
+    filter: &DensityFilter,
+    ss: Option<&SelfSupportFilter>,
+    x: &[f64],
+    x_tilde: &mut [f64],
+    x_phys: &mut [f64],
+    floor: f64,
+    cap: f64,
+) {
+    filter.apply(x, x_tilde);
+    for v in x_tilde.iter_mut() {
+        *v = v.clamp(floor, cap);
+    }
+    match ss {
+        Some(s) => s.apply(x_tilde, x_phys),
+        None => x_phys.copy_from_slice(x_tilde),
+    }
+    for v in x_phys.iter_mut() {
+        *v = v.clamp(floor, cap);
+    }
+}
+
+/// Transpose of `project`: dC/d(printed) → dC/d(design variable). Chains the
+/// self-support adjoint (recomputed from this iteration's `x_tilde`) then the
+/// density filter transpose. The clamps in `project` are inactive at the
+/// solution (interior of the band), so they are omitted from the adjoint.
+fn project_t(
+    filter: &DensityFilter,
+    ss: Option<&SelfSupportFilter>,
+    x_tilde: &[f64],
+    sens_phys: &[f64],
+    sens_tilde: &mut [f64],
+    sens: &mut [f64],
+) {
+    match ss {
+        Some(s) => s.apply_t(x_tilde, sens_phys, sens_tilde),
+        None => sens_tilde.copy_from_slice(sens_phys),
+    }
+    filter.apply_t(sens_tilde, sens);
+}
+
 /// Per-cell strain energy u_e^T KE u_e for the given cells (unit-eps KE).
 fn cell_strain_energy(
     level: &Level,
@@ -568,13 +704,21 @@ pub fn optimize_cached(
     u0: Option<&[f64]>,
     mut progress: impl FnMut(&OptimizeProgress, &[f64], &[u32]),
 ) -> Result<OptimizeResult, OptimizeError> {
-    let SkinSplit { skin, design: design_cells, skin_frac } = classify_cells(
-        grid,
-        params.wall_mm,
-        params.top_mm,
-        params.bottom_mm,
-        params.composite_skin,
-    );
+    // SOLID topology mode bypasses the skin band: the auto-frozen load/support
+    // cells become the only always-solid cells (reusing the skin path), every
+    // other solid cell is a free design cell. Infill modes keep the wall/shell
+    // skin model.
+    let SkinSplit { skin, design: design_cells, skin_frac } = if params.solid_mode {
+        build_solid_split(grid, &frozen_cells_from_problem(grid, problem))
+    } else {
+        classify_cells(
+            grid,
+            params.wall_mm,
+            params.top_mm,
+            params.bottom_mm,
+            params.composite_skin,
+        )
+    };
     if design_cells.is_empty() {
         return Err(OptimizeError::NoInterior);
     }
@@ -611,6 +755,13 @@ pub fn optimize_cached(
 
     let filter =
         DensityFilter::build(grid, &design_cells, filter_radius_cells(params.min_member_mm, grid.h));
+    // Self-supporting (AM) projection — the always-solid `skin` cells are full
+    // supporters. Off unless requested (UI exposes it only in solid mode).
+    let ss: Option<SelfSupportFilter> = if params.self_support {
+        Some(SelfSupportFilter::build(grid, &design_cells, &skin, params.overhang_deg))
+    } else {
+        None
+    };
     let ke64 = ke_hex(settings.e0, settings.nu, grid.h);
     let b = build_rhs(grid, problem);
 
@@ -632,8 +783,12 @@ pub fn optimize_cached(
         }
     }
     let mut x_phys = vec![0f64; design_cells.len()];
+    // Filtered blueprint (post density-filter, pre self-support); the transpose
+    // re-uses this iteration's value.
+    let mut x_tilde = vec![0f64; design_cells.len()];
     let mut se = vec![0f64; design_cells.len()];
     let mut sens_phys = vec![0f64; design_cells.len()];
+    let mut sens_tilde = vec![0f64; design_cells.len()];
     let mut sens = vec![0f64; design_cells.len()];
     let mut compliance = f64::INFINITY;
     let mut iterations = 0;
@@ -654,10 +809,7 @@ pub fn optimize_cached(
 
     for it in 0..params.max_iter {
         iterations = it + 1;
-        filter.apply(&x, &mut x_phys);
-        for v in x_phys.iter_mut() {
-            *v = v.clamp(params.floor, params.cap);
-        }
+        project(&filter, ss.as_ref(), &x, &mut x_tilde, &mut x_phys, params.floor, params.cap);
         let eps =
             build_eps(grid, &skin, &design_cells, &skin_frac, &x_phys, params.exponent, params.coeff);
         cache.solver.update_eps(eps);
@@ -692,7 +844,7 @@ pub fn optimize_cached(
                 * x_phys[k].powf(params.exponent - 1.0)
                 * se[k];
         }
-        filter.apply_t(&sens_phys, &mut sens);
+        project_t(&filter, ss.as_ref(), &x_tilde, &sens_phys, &mut sens_tilde, &mut sens);
         if !sym_partner.is_empty() {
             symmetrize(&mut sens, &sym_partner, &mut sym_buf);
         }
@@ -716,11 +868,9 @@ pub fn optimize_cached(
                     .clamp(params.floor, params.cap);
                 x_new[k] = xn;
             }
-            // Volume measured on filtered densities for consistency.
-            filter.apply(&x_new, &mut x_phys);
-            for v in x_phys.iter_mut() {
-                *v = v.clamp(params.floor, params.cap);
-            }
+            // Volume measured on the PRINTED densities (filter + self-support)
+            // for consistency with what the solve and the export will see.
+            project(&filter, ss.as_ref(), &x_new, &mut x_tilde, &mut x_phys, params.floor, params.cap);
             for k in 0..x.len() {
                 mean_phys += w[k] * x_phys[k];
             }
@@ -788,13 +938,10 @@ pub fn optimize_cached(
         }
     }
 
-    // Final physical field — symmetrized AFTER the filter so the output (and
-    // the bins/regions built from it) is exactly mirror-symmetric even when
-    // the filter stencil isn't.
-    filter.apply(&x, &mut x_phys);
-    for v in x_phys.iter_mut() {
-        *v = v.clamp(params.floor, params.cap);
-    }
+    // Final physical field — symmetrized AFTER the projection so the output
+    // (and the bins/regions built from it) is exactly mirror-symmetric even
+    // when the filter stencil isn't.
+    project(&filter, ss.as_ref(), &x, &mut x_tilde, &mut x_phys, params.floor, params.cap);
     if !sym_partner.is_empty() {
         symmetrize(&mut x_phys, &sym_partner, &mut sym_buf);
     }

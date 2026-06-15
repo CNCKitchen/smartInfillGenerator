@@ -20,6 +20,7 @@ pub mod mg;
 pub mod par;
 pub mod progress;
 pub mod segment;
+pub mod selfsupport;
 pub mod simp;
 pub mod solve;
 #[cfg(feature = "step")]

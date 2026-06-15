@@ -258,6 +258,12 @@ export class EngineClient {
     return this.call({ op: "resmooth", iters });
   }
 
+  /** Re-extract the exported geometry at a new isosurface density (Part Topo /
+   *  binary). Returns the new regions for display; affects later exports. */
+  setIsoThreshold(threshold: number, smoothIters: number): Promise<{ regions: OptRegion[] }> {
+    return this.call({ op: "setIsoThreshold", threshold, smoothIters });
+  }
+
   /** Stress/strain scalar per surface vertex (kind: vm|sxx|...|gzx). */
   resultField(kind: string): Promise<Float32Array> {
     return this.call({ op: "resultField", kind });
@@ -285,6 +291,11 @@ export class EngineClient {
 
   exportStls(): Promise<Uint8Array> {
     return this.call({ op: "exportStls" });
+  }
+
+  /** Solid topology mode: the single optimized body as one binary STL. */
+  exportSolidStl(): Promise<Uint8Array> {
+    return this.call({ op: "exportSolidStl" });
   }
 }
 
@@ -341,6 +352,13 @@ export interface OptimizeOptions {
   levelsPct: number[] | null;
   /** Binary (hollow/solid) mode — optimizer runs SIMP-penalized (p=3). */
   binary: boolean;
+  /** Solid topology mode — material removal (no skin); budget = retained
+   *  volume fraction; output is one optimized shape. Overrides `binary`. */
+  solid: boolean;
+  /** Self-supporting overhang filter (solid mode only). */
+  selfSupport: boolean;
+  /** Overhang angle from horizontal in degrees for the self-supporting filter. */
+  overhangDeg: number;
   /** Per-modifier sparse_infill_pattern for the export (binary mode). */
   solidPattern: string | null;
   /** "budget" = stiffest at the given mean infill; "match" = lightest design
@@ -407,6 +425,8 @@ export interface OptSummary {
   maxDisplacement: number;
   /** True when the run was binary (hollow/solid) mode. */
   binary: boolean;
+  /** True when the run was solid topology (material-removal) mode. */
+  solid: boolean;
   /** Optimization goal of the run. */
   goal: "budget" | "match";
   /** Outer passes executed (1 for budget mode). */

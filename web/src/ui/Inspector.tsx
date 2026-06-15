@@ -118,9 +118,15 @@ function PrintedResults() {
 function OptResults() {
   const s = useStore();
   const o = s.optSummary!;
+  const solid = o.solid;
   const stiff = Math.round(o.stiffnessVsSolid * 100);
   const gain = (o.gainVsUniform * 100).toFixed(1);
   const uniformPct = Math.round(o.meanInfill * 100);
+  // Solid topology: the comparison is against the SAME material spread evenly
+  // (not a uniform infill %); the win is the optimized layout at equal mass.
+  const uniformLabel = solid
+    ? "vs material spread evenly, same weight"
+    : `vs ${uniformPct} % uniform, same weight`;
   const isMatch = o.goal === "match" && o.massUniformRefGrams != null;
   const saved = isMatch ? 1 - o.massGrams / o.massUniformRefGrams! : 0;
   const [defl, deflUnit] = fmtDispParts(o.maxDisplacement);
@@ -163,7 +169,7 @@ function OptResults() {
       ) : (
         <div className="dro hero">
           <div className="dro-label">
-            <span>vs {uniformPct} % uniform, same weight</span>
+            <span>{uniformLabel}</span>
           </div>
           <div className="dro-window">
             <b>+{gain}</b>
@@ -207,8 +213,12 @@ function OptResults() {
         <b>{stiff} %</b>
       </div>
       <div className="kv">
-        <span>Infill levels</span>
-        <b>{o.bins.map((b) => `${Math.round(b.density * 100)}`).join(" · ")} %</b>
+        <span>{solid ? "Retained volume" : "Infill levels"}</span>
+        <b>
+          {solid
+            ? `${uniformPct} %`
+            : `${o.bins.map((b) => `${Math.round(b.density * 100)}`).join(" · ")} %`}
+        </b>
       </div>
       <div className="kv">
         <span>{o.converged ? "Converged" : "Stopped at cap"}</span>

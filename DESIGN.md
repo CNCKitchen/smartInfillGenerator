@@ -36,6 +36,7 @@ Reference points:
 | 12 | Infill patterns | Calibrated E(ρ) for **gyroid (default), cubic, grid**. All other patterns: generic Gibson-Ashby fallback + warning. Grid's anisotropy documented as limitation. |
 | 13 | Validation bar | **Solver unit tests vs analytic solutions (CI) + golden comparisons vs established FEA (CalculiX/Fusion) on ~5 representative parts.** Physical testing is post-launch content, not a release gate. |
 | 14 | Source posture | **REVISED 2026-06: Open source, AGPL-3.0-only, dual-licensed.** Code: AGPL (network copyleft closes the hosted-fork hole; GPL alone would not). Copyright stays with Stefan via CLA (CONTRIBUTING.md) → commercial exceptions sellable to slicer/printer/CAD vendors (COMMERCIAL.md). Name/logo trademarked, NOT AGPL. Measured calibration data licensed separately (the verified-materials business must stay unforkable). **Standing rule: no third-party (A)GPL/LGPL/SSPL/BSL/NC code in the core, ever** — it would legally break the commercial-exception model; allowed: MIT/Apache/BSD/ISC/Zlib/CC0/MPL-2.0 (enforced via deny.toml + CONTRIBUTING.md). |
+| 15 | Solid topology mode | **Material-removal topology optimization (2026-06), the third Optimize mode beside Graded / Binary infill (UI name "Part Topo").** Same SIMP engine, three swaps: (a) NO skin — `classify_cells` is bypassed, every solid cell is a design cell; (b) the lower bound is ersatz **void** (E_min ≈ 0, material actually removed) instead of a printability floor; (c) the eval law is **linear E = ρ** (SIMP-penalized p = 3 in the optimizer only, exact at the {void, solid} endpoints), and the output is **one watertight optimized shape** (marching-tets isosurface at ρ = 0.5 + the largest load-connected component), NOT density bins/modifiers. **Load/support patches are auto-frozen solid** (derived from the assembled fixed/spring/force nodes → incident cells, like a commercial optimizer's "keep regions") so material under a load/BC is never deleted. Kept material prints **solid (100 %)** — infill and topology stay separate features (combining them is a noted v1.x). **Self-supporting filter** (toggleable, variable overhang angle, build direction = global Z): a Langelaar-style layer-by-layer AM projection in the filter chain (`selfsupport.rs`) so the shape prints without supports; advisory (the staircase + smoothing can still nick the angle locally), default 45°. Budget knob = **retained volume fraction**; "match uniform stiffness" goal reuses the budget secant against the solid part as reference. Measured/expected: classic MBB/cantilever layouts. |
 
 ## 3. Engineering decisions (made during design, not interview-blocking)
 
@@ -163,6 +164,62 @@ Reference points:
   printable); it stays a noted future lever for **binary** mode, alongside a
   PDE/Helmholtz `O(n)` filter for cheap large length scales. Applies to both graded
   and binary passes (same filter), and is constant across the stiffness-match secant.
+- **Solid topology mode (2026-06, decision #15) — engine plumbing:** the mode is
+  `OptimizeParams::solid_mode`; almost everything is reuse. `optimize_cached` branches
+  the cell split: `classify_cells` (skin band) → `build_solid_split`, which makes the
+  auto-frozen cells the "skin" (always-solid, eps = 1, excluded from the design vector —
+  reusing the existing skin path verbatim) and every other solid cell a design cell with
+  `skin_frac = 0`. **Frozen cells** are derived inside the optimizer from the assembled
+  `NodeProblem` (the `fixed` ∪ spring ∪ force nodes → their incident solid cells, one-cell
+  dilated), so no plumbing of a separate keep-set is needed and every BC type is covered.
+  The wasm layer sets `floor ≈ 1e-3` (void), `cap = 1`, optimizer law p = 3 / coeff 1
+  (penalization → black/white), eval law linear (exp 1 / coeff 1, exact at 0 and 1). The
+  bins/clustering/modifier-3MF tail is skipped; instead the continuous field is
+  isosurfaced at ρ = 0.5 (the existing `extract_iso` + Taubin smooth), the **largest
+  connected component touching a frozen region** is kept (floating islands dropped), and
+  that single mesh is the result — visualized in the Regions/density views and exported as
+  one **STL** (a single-object project 3MF is a small follow-up — the modifier-3MF writer
+  takes a fixed base part, so solid mode needs the optimized mesh AS the base). Comparison
+  card reframes to "vs solid part: −N% mass at equal stiffness"; `stiffnessVsSolid` is
+  unchanged. UI name: **"Part Topo"**.
+- **Export isosurface threshold (2026-06):** the level the EXPORTED geometry is cut from
+  the CONTINUOUS optimized field is user-tunable AFTER the run (separate from the budget /
+  density target — this is the iso level, not the mass goal), for **Part Topo and binary**.
+  `Model::set_iso_threshold(t, smooth_iters)` re-extracts from `x_cont`: Part Topo re-runs
+  the connected-keep (anchored to the frozen load/support cells, stored as `anchor_cells`)
+  and isosurfaces the masked field at `t`; binary re-extracts the dense modifier at `t`
+  (no keep — sparse infill supports interior islands). Re-smoothed, regions replaced; lower
+  `t` keeps more material (chunkier), higher trims it leaner. **Unified with the density
+  cutaway (2026-06):** for Part Topo/binary this is ONE `densityThreshold` slider —
+  previewing the cutaway AND setting the export level (the display cutaway `density_isosurface`
+  now includes the frozen cells as solid so it matches the body); graded keeps a display-only
+  cutaway (its regions are bin sets, no single iso level). The Region-smoothing slider lives
+  in the Export step.
+- **Aggressive region smoothing (2026-06):** Taubin λ/μ moved from 0.5/−0.53 (pass-band
+  kPB ≈ 0.11) to 0.63/−0.65 (kPB ≈ 0.048 — a tighter band removes more), and `smooth_regions`
+  runs `SMOOTH_PASS_MULT` (= 4) Taubin passes per slider unit, so the 0–40 slider tops out
+  at 160 passes — enough to fully melt the voxel staircase while staying volume-preserving
+  (no net shrink).
+- **Self-supporting AM filter (2026-06, `selfsupport.rs`):** a Langelaar-style
+  layer-by-layer projection inserted between the density filter and `build_eps`, so the
+  printed field (hence the exported shape) overhangs at most the chosen angle from the
+  build plate. Build direction is **global Z** (the part is already oriented Z-up, so the
+  layer-adhesion SF and this filter share one convention — no new axis). Per layer from
+  the plate up, the printed density ξ_e = `smin(ρ_e, smax_{s ∈ support(e)} ξ_s)` with
+  `smin(a,b) = ½(a+b−√((a−b)²+ε))` and `smax` a P-norm over the supporting cells in the
+  layer below; the lateral support reach in cells = `round(1/tan θ)` clamped to
+  `[0, MAX_REACH]`. **Angle convention (2026-06): θ measured from the horizontal plate,
+  0–90° — 0° allows flat overhangs (no constraint, reach = MAX), 45° = the classic
+  one-cell rule, 90° = vertical growth only (reach 0).** Cells on the plate layer and
+  frozen/solid cells are full supporters (ξ = 1). The forward pass and its transpose
+  (chain-rule reverse sweep, recomputed from the filtered field — stateless) plug into the
+  OC sensitivity flow exactly like the density filter. Toggle = skip the stage.
+  **Available in EVERY mode** (2026-06): in Part Topo it shapes the removed material; in
+  graded/binary infill it constrains the dense regions (unsupported cells fall to the floor
+  density, not void). **Advisory** (matching the tool's other approximations): it guarantees
+  the *optimizer's field* is printable, but the staircase + region smoothing on the final
+  mesh can still nick the angle locally. A finite-difference gradient test guards the
+  transpose. Future lever: a Heaviside/robust projection for a near-hard guarantee.
 - **Directional skin: top/bottom shells (2026-06):** `classify_cells` models the printed
   shell structure the way a slicer builds it. WALLS (perimeters × line width) are an
   IN-PLANE band from each layer's outline (per-slice 2D BFS — no leaking through

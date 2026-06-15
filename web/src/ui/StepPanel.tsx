@@ -809,31 +809,39 @@ function StepOptimize() {
   const s = useStore();
   return (
     <>
-      <div className="group">
-        <div className="g-label">
-          <span>Goal</span>
+      {s.optMode !== "solid" && (
+        <div className="group">
+          <div className="g-label">
+            <span>Goal</span>
+          </div>
+          <div className="seg">
+            <button
+              className={s.goal === "budget" ? "on" : ""}
+              onClick={() => s.setGoal("budget")}
+              title="Maximize stiffness at a given material budget"
+            >
+              Stiffest at budget
+            </button>
+            <button
+              className={s.goal === "match" ? "on" : ""}
+              onClick={() => s.setGoal("match")}
+              title="Find the lightest design that is as stiff as a uniform print at X%"
+            >
+              Match uniform stiffness
+            </button>
+          </div>
         </div>
-        <div className="seg">
-          <button
-            className={s.goal === "budget" ? "on" : ""}
-            onClick={() => s.setGoal("budget")}
-            title="Maximize stiffness at a given material budget"
-          >
-            Stiffest at budget
-          </button>
-          <button
-            className={s.goal === "match" ? "on" : ""}
-            onClick={() => s.setGoal("match")}
-            title="Find the lightest design that is as stiff as a uniform print at X%"
-          >
-            Match uniform stiffness
-          </button>
-        </div>
-      </div>
+      )}
 
       <div className="group">
         <div className="g-label">
-          <span>{s.goal === "match" ? "As stiff as uniform" : "Infill budget"}</span>
+          <span>
+            {s.optMode === "solid"
+              ? "Retained volume"
+              : s.goal === "match"
+                ? "As stiff as uniform"
+                : "Infill budget"}
+          </span>
           <b>{s.budget} %</b>
         </div>
         <input
@@ -845,11 +853,13 @@ function StepOptimize() {
           onChange={(e) => s.setBudget(Number(e.target.value))}
         />
         <div className="dim small">
-          {s.goal === "match"
-            ? `Finds the LIGHTEST layout with the stiffness of a uniform ${s.budget}% print (a few warm-started passes search the needed budget).`
-            : s.optMode === "binary"
-              ? `Mean interior density: cells are either ${s.levelSettings.binaryFloorPct}% (so it prints) or 100% solid. The optimizer runs SIMP-penalized so the design goes black/white.`
-              : "Mean infill of the interior — same scale as your slicer's uniform infill %. Walls and shells come on top."}
+          {s.optMode === "solid"
+            ? `Keeps ${s.budget}% of the design volume as solid material and removes the rest — the stiffest shape at that mass. Load/support regions are kept regardless.`
+            : s.goal === "match"
+              ? `Finds the LIGHTEST layout with the stiffness of a uniform ${s.budget}% print (a few warm-started passes search the needed budget).`
+              : s.optMode === "binary"
+                ? `Mean interior density: cells are either ${s.levelSettings.binaryFloorPct}% (so it prints) or 100% solid. The optimizer runs SIMP-penalized so the design goes black/white.`
+                : "Mean infill of the interior — same scale as your slicer's uniform infill %. Walls and shells come on top."}
         </div>
       </div>
 
@@ -870,9 +880,22 @@ function StepOptimize() {
             onClick={() => s.setOptMode("binary")}
             title="Hollow or solid: interior is either the printability floor or 100% dense"
           >
-            Binary (hollow/solid)
+            Binary
+          </button>
+          <button
+            className={s.optMode === "solid" ? "on" : ""}
+            onClick={() => s.setOptMode("solid")}
+            title="Topology optimization: REMOVE material to make a new lightweight shape (no infill, no walls — the kept material prints solid)"
+          >
+            Part Topo
           </button>
         </div>
+        {s.optMode === "solid" && (
+          <div className="dim small">
+            Removes material to make a new shape — not infill. The kept material prints
+            solid; regions under loads &amp; supports are kept automatically.
+          </div>
+        )}
       </div>
 
       {s.optMode === "binary" && (
@@ -893,30 +916,78 @@ function StepOptimize() {
         </div>
       )}
 
-      <div className="row">
-        <div className="dim small" style={{ flex: 1 }}>
-          Skin {s.perimeters} × {s.lineWidth} mm · {s.pattern} —{" "}
-          <a className="link" onClick={() => s.setActiveStep(3)}>
-            edit in Properties
-          </a>
+      <div className="group">
+        <div className="g-label">
+          <span>Self-supporting</span>
+          <b>{s.selfSupport ? `${s.overhangDeg}°` : "off"}</b>
         </div>
-        {s.optMode === "binary" ? (
-          <span className="dim small">2 levels (hollow/solid)</span>
-        ) : s.levelSettings.mode === "manual" ? (
-          <span className="dim small" title="Manual levels — change in ⚙ Settings">
-            levels {s.levelSettings.manual.join("/")}%
-          </span>
-        ) : (
-          <label className="row">
-            <span className="dim small">Levels</span>
-            <select value={s.nBins} onChange={(e) => s.setNBins(Number(e.target.value))}>
-              <option value={2}>2</option>
-              <option value={3}>3</option>
-              <option value={4}>4</option>
-            </select>
-          </label>
+        <label className="rowcheck">
+          <input
+            type="checkbox"
+            checked={s.selfSupport}
+            onChange={(e) => s.setSelfSupport(e.target.checked)}
+          />
+          <span>Print without supports (overhang constraint)</span>
+        </label>
+        {s.selfSupport && (
+          <>
+            <div className="g-label">
+              <span className="dim small">Angle from horizontal — 0° off, 90° vertical</span>
+            </div>
+            <input
+              type="range"
+              min={10}
+              max={80}
+              step={5}
+              value={s.overhangDeg}
+              onChange={(e) => s.setOverhangDeg(Number(e.target.value))}
+            />
+          </>
         )}
+        <div className="dim small">
+          Build direction is Z (the print orientation).{" "}
+          {s.optMode === "solid"
+            ? "The shape is constrained so downward faces stay steeper than this angle — it prints without supports."
+            : "Constrains the dense regions to the overhang angle; unsupported material falls to the floor density."}{" "}
+          {s.selfSupport
+            ? `0° allows flat overhangs (no constraint), 90° allows only vertical walls.`
+            : ""}{" "}
+          Advisory: the voxel staircase can still nick the angle locally.
+        </div>
       </div>
+
+      {s.optMode === "solid" ? (
+        <div className="row">
+          <div className="dim small" style={{ flex: 1 }}>
+            Outer shape is optimized — no walls/infill. Load &amp; support regions stay solid.
+          </div>
+        </div>
+      ) : (
+        <div className="row">
+          <div className="dim small" style={{ flex: 1 }}>
+            Skin {s.perimeters} × {s.lineWidth} mm · {s.pattern} —{" "}
+            <a className="link" onClick={() => s.setActiveStep(3)}>
+              edit in Properties
+            </a>
+          </div>
+          {s.optMode === "binary" ? (
+            <span className="dim small">2 levels (hollow/solid)</span>
+          ) : s.levelSettings.mode === "manual" ? (
+            <span className="dim small" title="Manual levels — change in ⚙ Settings">
+              levels {s.levelSettings.manual.join("/")}%
+            </span>
+          ) : (
+            <label className="row">
+              <span className="dim small">Levels</span>
+              <select value={s.nBins} onChange={(e) => s.setNBins(Number(e.target.value))}>
+                <option value={2}>2</option>
+                <option value={3}>3</option>
+                <option value={4}>4</option>
+              </select>
+            </label>
+          )}
+        </div>
+      )}
 
       <div className="group">
         <div className="g-label">
@@ -962,26 +1033,6 @@ function StepOptimize() {
 
       <div className="group">
         <div className="g-label">
-          <span>Region smoothing</span>
-          <b>{s.smoothIters === 0 ? "off" : `${s.smoothIters}×`}</b>
-        </div>
-        <input
-          type="range"
-          min={0}
-          max={40}
-          step={1}
-          value={s.smoothIters}
-          onChange={(e) => s.setSmoothIters(Number(e.target.value))}
-        />
-        {s.optSummary && (
-          <div className="dim small">
-            Smoothing updates the regions live — check the Regions view; exports use what you see.
-          </div>
-        )}
-      </div>
-
-      <div className="group">
-        <div className="g-label">
           <span>Minimum member size</span>
           <b>{s.minMemberMm == null ? `auto · ${(2 * s.lineWidth).toFixed(2)} mm` : "mm"}</b>
         </div>
@@ -1020,7 +1071,7 @@ function StepOptimize() {
       </div>
 
       <button className="primary" onClick={() => void s.runOptimize()} disabled={!!s.busy}>
-        Optimize infill
+        {s.optMode === "solid" ? "Optimize shape" : "Optimize infill"}
       </button>
       {s.optProgress && (
         <div className="progress">
@@ -1062,26 +1113,53 @@ function StepExport() {
           resolution).
         </div>
       )}
-      {s.viewMode === "density" && s.optSummary && (
+      {/* Part Topo / binary: ONE isosurface-density control — previews AND sets
+          the level the exported geometry is cut from the optimized field. */}
+      {s.optSummary && (s.optSummary.solid || s.optSummary.binary) && (
         <div className="group">
           <div className="g-label">
-            <span>Density cutaway</span>
-            <b>{s.densityThreshold >= 10 ? `ρ ≥ ${s.densityThreshold}%` : "off"}</b>
+            <span>Isosurface density</span>
+            <b>{s.densityThreshold} %</b>
           </div>
           <input
             type="range"
-            min={0}
-            max={70}
+            min={20}
+            max={80}
             step={1}
             value={s.densityThreshold}
             onChange={(e) => s.setDensityThreshold(Number(e.target.value))}
           />
           <div className="dim small">
-            Shows only material denser than the threshold — look inside the part instead of just
-            its painted surface.
+            The density level the exported {s.optSummary.solid ? "shape" : "dense region"} is cut
+            from the optimized field — <b>not</b> the budget. Lower keeps more material (chunkier),
+            higher trims it leaner. The view updates live and exports use what you see.
           </div>
         </div>
       )}
+      {/* Graded: display-only cutaway (no single export level). */}
+      {s.viewMode === "density" &&
+        s.optSummary &&
+        !s.optSummary.solid &&
+        !s.optSummary.binary && (
+          <div className="group">
+            <div className="g-label">
+              <span>Density cutaway</span>
+              <b>{s.densityThreshold >= 10 ? `ρ ≥ ${s.densityThreshold}%` : "off"}</b>
+            </div>
+            <input
+              type="range"
+              min={0}
+              max={70}
+              step={1}
+              value={s.densityThreshold}
+              onChange={(e) => s.setDensityThreshold(Number(e.target.value))}
+            />
+            <div className="dim small">
+              Shows only material denser than the threshold — look inside the part instead of
+              just its painted surface.
+            </div>
+          </div>
+        )}
       {s.viewMode === "infill" && s.regionInfos.length > 0 && (
         <div className="group">
           <div className="g-label">
@@ -1121,6 +1199,42 @@ function StepExport() {
         </div>
       )}
       {s.optSummary && (
+        <div className="group">
+          <div className="g-label">
+            <span>Region smoothing</span>
+            <b>{s.smoothIters === 0 ? "off" : `${s.smoothIters}×`}</b>
+          </div>
+          <input
+            type="range"
+            min={0}
+            max={40}
+            step={1}
+            value={s.smoothIters}
+            onChange={(e) => s.setSmoothIters(Number(e.target.value))}
+          />
+          <div className="dim small">
+            Melts the voxel staircase off the exported surface — updates live, exports use what
+            you see. Crank it up for a fully smooth part.
+          </div>
+        </div>
+      )}
+      {s.optSummary && s.optSummary.solid && (
+        <div className="group">
+          <div className="g-label">
+            <span>Optimized shape</span>
+          </div>
+          <button className="primary" onClick={() => void s.downloadShape()}>
+            Download optimized shape (.stl)
+          </button>
+          <div className="hint">
+            A single watertight body of the kept material — re-slice it (print it solid /
+            100% infill) or re-import it into CAD. Material under loads &amp; supports was
+            kept automatically; floating islands were dropped. A single-object project 3MF is
+            a planned follow-up.
+          </div>
+        </div>
+      )}
+      {s.optSummary && !s.optSummary.solid && (
         <>
           <div className="group">
             <div className="g-label">
