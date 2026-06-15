@@ -17,8 +17,8 @@ use crate::voxel::VoxelGrid;
 pub enum FieldKind {
     /// von Mises stress (MPa).
     VonMises,
-    /// von Mises stress carrying the sign of the dominant (largest-magnitude)
-    /// principal stress: + in tension, − in compression (MPa).
+    /// von Mises stress carrying the sign of the first stress invariant
+    /// (σxx+σyy+σzz = σ₁+σ₂+σ₃): + in net tension, − in net compression (MPa).
     SignedVonMises,
     Sxx,
     Syy,
@@ -73,37 +73,14 @@ impl FieldKind {
     }
 }
 
-/// Sign (+1.0 / −1.0) of the principal stress with the largest magnitude — the
-/// convention that gives the always-positive von Mises stress a tension (+) /
-/// compression (−) sign. Returns +1.0 for a (near-)zero or purely deviatoric
-/// tensor where the sign is immaterial.
-///
-/// Principal stresses are the eigenvalues of the symmetric stress tensor;
-/// computed here in closed form (Smith's trigonometric method for a symmetric
-/// 3×3), which only needs the extreme eigenvalues σ₁ (max) and σ₃ (min).
-fn signed_vm_sign(sxx: f64, syy: f64, szz: f64, sxy: f64, syz: f64, szx: f64) -> f64 {
-    let p1 = sxy * sxy + syz * syz + szx * szx;
-    let q = (sxx + syy + szz) / 3.0; // mean (hydrostatic) stress
-    let (smax, smin) = if p1 <= 1e-30 {
-        // Diagonal tensor: the principal stresses are the diagonal entries.
-        (sxx.max(syy).max(szz), sxx.min(syy).min(szz))
-    } else {
-        let p2 =
-            (sxx - q).powi(2) + (syy - q).powi(2) + (szz - q).powi(2) + 2.0 * p1;
-        let p = (p2 / 6.0).sqrt();
-        // r = det((A − qI)/p) / 2, in [−1, 1] up to rounding.
-        let (bxx, byy, bzz) = ((sxx - q) / p, (syy - q) / p, (szz - q) / p);
-        let (bxy, byz, bzx) = (sxy / p, syz / p, szx / p);
-        let det = bxx * (byy * bzz - byz * byz) - bxy * (bxy * bzz - byz * bzx)
-            + bzx * (bxy * byz - byy * bzx);
-        let r = (det / 2.0).clamp(-1.0, 1.0);
-        let phi = r.acos() / 3.0;
-        let smax = q + 2.0 * p * phi.cos();
-        let smin = q + 2.0 * p * (phi + 2.0 * std::f64::consts::PI / 3.0).cos();
-        (smax, smin)
-    };
-    let dominant = if smax.abs() >= smin.abs() { smax } else { smin };
-    if dominant < 0.0 {
+/// Sign (+1.0 / −1.0) for the signed von Mises stress: the sign of the first
+/// stress invariant I₁ = σxx + σyy + σzz = σ₁ + σ₂ + σ₃ (the hydrostatic /
+/// volumetric part). + = net tension, − = net compression. This is the
+/// `(s1+s2+s3)/|s1+s2+s3|` convention; a purely deviatoric state (I₁ = 0, e.g.
+/// pure shear) is treated as + rather than the 0/0 = NaN that the bare ratio
+/// would give.
+fn signed_vm_sign(sxx: f64, syy: f64, szz: f64) -> f64 {
+    if sxx + syy + szz < 0.0 {
         -1.0
     } else {
         1.0
@@ -261,7 +238,7 @@ pub fn cell_field(
                                     + 3.0 * (sxy * sxy + syz * syz + szx * szx))
                                     .sqrt();
                                 if matches!(kind, FieldKind::SignedVonMises) {
-                                    vm * signed_vm_sign(sxx, syy, szz, sxy, syz, szx)
+                                    vm * signed_vm_sign(sxx, syy, szz)
                                 } else {
                                     vm
                                 }
@@ -331,7 +308,7 @@ mod tests {
         let (e0, nu) = (1000.0, 0.0);
 
         // Uniaxial strain field u_x = a·X (u_y = u_z = 0) ⇒ ε_xx = a, a single
-        // nonzero principal stress σ_xx with the sign of a.
+        // nonzero stress σ_xx (so I₁ = σ_xx) with the sign of a.
         let build = |a: f32| {
             let mut u = vec![0f32; 3 * mx * my * mz];
             for nz in 0..mz {
@@ -352,7 +329,7 @@ mod tests {
         // Same magnitude as the unsigned von Mises, either sign.
         assert!((svm(&ut).abs() - vm(&ut)).abs() < 1e-3, "|svm| == vm (tension)");
         assert!((svm(&uc).abs() - vm(&uc)).abs() < 1e-3, "|svm| == vm (compression)");
-        // Sign tracks the dominant principal stress.
+        // Sign tracks the first invariant I₁ = σxx+σyy+σzz.
         assert!(svm(&ut) > 0.0, "tension ⇒ +von Mises (got {})", svm(&ut));
         assert!(svm(&uc) < 0.0, "compression ⇒ −von Mises (got {})", svm(&uc));
     }
