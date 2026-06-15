@@ -926,6 +926,13 @@ input[type="number"] {
   line-height: 1.5;
 }
 
+/* Callout help: set apart from the other notes with a hairline separator. */
+.callouthelp {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--rule, rgba(0, 0, 0, 0.08));
+}
+
 .legend .legendedit,
 .legend .legendinput,
 .legend .legendreset,

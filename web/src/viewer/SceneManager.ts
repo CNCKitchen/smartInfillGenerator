@@ -391,6 +391,9 @@ export class SceneManager {
         "position:absolute;display:none;border:1px dashed #2b2f36;background:rgba(255,178,36,.12);pointer-events:none;";
       parent.appendChild(rect);
       this.annoRectEl = rect;
+
+      // Capture phase so it beats OrbitControls' own canvas pointerdown.
+      parent.addEventListener("pointerdown", this.onAnnoDownCapture, true);
     }
 
     const loop = () => {
@@ -408,6 +411,7 @@ export class SceneManager {
     document.removeEventListener("pointermove", this.onAnnoMove);
     document.removeEventListener("pointerup", this.onAnnoUp);
     document.removeEventListener("keydown", this.onAnnoKey);
+    this.canvas?.parentElement?.removeEventListener("pointerdown", this.onAnnoDownCapture, true);
     this.clearCallouts();
     this.canvas?.removeEventListener("wheel", this.onWheel);
     this.canvas?.removeEventListener("webglcontextlost", this.onGlLost);
@@ -985,15 +989,8 @@ export class SceneManager {
 
   private onPointerDown = (ev: PointerEvent) => {
     if (ev.button !== 0 || !this.mesh) return;
-    // Modifier-gated value callouts (contour views only): Ctrl = annotate the
-    // clicked point, Shift = max in a dragged box, Alt = min. Claim the gesture
-    // before orbit so the camera stays put while annotating.
-    const annoMode = ev.ctrlKey ? "point" : ev.shiftKey ? "max" : ev.altKey ? "min" : null;
-    if (annoMode && this.probeFormat && this.probeSource()) {
-      ev.preventDefault();
-      this.annoDrag = { mode: annoMode, x0: ev.clientX, y0: ev.clientY, x1: ev.clientX, y1: ev.clientY };
-      return;
-    }
+    // (Modifier-gated callout gestures are claimed earlier, in the capture-phase
+    // onAnnoDownCapture, so they never reach OrbitControls or this handler.)
     // Arm a pivot orbit on every left-press in a navigable tool. The camera
     // only moves once the drag passes a threshold, so a plain click still
     // selects/places without disturbing the view.
@@ -1321,6 +1318,19 @@ export class SceneManager {
 
   // ---------- fixed value callouts (contour views) ----------
 
+  /** Capture-phase pointerdown on the viewport parent — runs BEFORE OrbitControls'
+   *  own canvas listener so we can claim a modifier gesture and stop it. (Orbit-
+   *  Controls remaps shift/ctrl + left-drag to a PAN; returning from the bubble-
+   *  phase handler is too late, so we block it here.) */
+  private onAnnoDownCapture = (ev: PointerEvent) => {
+    if (ev.button !== 0 || !this.mesh) return;
+    const mode = ev.ctrlKey ? "point" : ev.shiftKey ? "max" : ev.altKey ? "min" : null;
+    if (!mode || !this.probeFormat || !this.probeSource()) return;
+    ev.stopImmediatePropagation(); // block OrbitControls pan + our own handlers
+    ev.preventDefault();
+    this.annoDrag = { mode, x0: ev.clientX, y0: ev.clientY, x1: ev.clientX, y1: ev.clientY };
+  };
+
   private onAnnoMove = (ev: PointerEvent) => {
     if (!this.annoDrag) return;
     this.annoDrag.x1 = ev.clientX;
@@ -1432,7 +1442,6 @@ export class SceneManager {
     const parent = this.canvas?.parentElement;
     if (!parent || !this.annoSvg) return;
     const label = this.probeFormat ? this.probeFormat(c.value) : `${c.value}`;
-    const prefix = c.kind === "max" ? "max " : c.kind === "min" ? "min " : "";
     const dot = document.createElement("div");
     dot.style.cssText =
       "position:absolute;width:9px;height:9px;margin:-5px 0 0 -5px;border-radius:50%;" +
@@ -1443,7 +1452,7 @@ export class SceneManager {
     chip.style.position = "absolute";
     chip.style.pointerEvents = "none";
     chip.style.zIndex = "5";
-    chip.textContent = prefix + label;
+    chip.textContent = label;
     const line = document.createElementNS(SVG_NS, "line");
     line.setAttribute("stroke", "#2b2f36");
     line.setAttribute("stroke-width", "1.25");
@@ -1455,7 +1464,7 @@ export class SceneManager {
     const w = this.calloutWorld(callout);
     if (w) {
       this.callbacks.onLog?.(
-        `callout ${prefix}${label} @ (${w.x.toFixed(1)}, ${w.y.toFixed(1)}, ${w.z.toFixed(1)}) mm`
+        `callout ${label} @ (${w.x.toFixed(1)}, ${w.y.toFixed(1)}, ${w.z.toFixed(1)}) mm`
       );
     }
   }
@@ -1864,17 +1873,24 @@ export class SceneManager {
   captureThumbnail(size = 512): Uint8Array | null {
     const r = this.renderer;
     if (!r) return null;
-    // Bounding box of the (visible) result meshes in world space.
+    // Graded/binary show the original part as a translucent envelope (like the
+    // viewport); Part Topo's body IS the result, so no envelope there.
+    const showGhost = !this.resultSolid && !!this.mesh;
+    // Frame the WHOLE part (envelope for graded/binary, else the result body) so
+    // nothing is cropped and it stays centered.
     const box = new THREE.Box3();
     const tmp = new THREE.Box3();
-    this.regionMeshes.forEach((m, i) => {
-      if (this.regionVisible[i] === false) return;
+    const addBox = (m: THREE.Mesh) => {
       m.geometry.computeBoundingBox();
       if (m.geometry.boundingBox) {
         tmp.copy(m.geometry.boundingBox).applyMatrix4(m.matrixWorld);
         box.union(tmp);
       }
+    };
+    this.regionMeshes.forEach((m, i) => {
+      if (this.regionVisible[i] !== false) addBox(m);
     });
+    if (showGhost && this.mesh) addBox(this.mesh);
     if (box.isEmpty()) return this.captureViewportSquare(size);
 
     const center = box.getCenter(new THREE.Vector3());
@@ -1905,14 +1921,37 @@ export class SceneManager {
     cam.bottom = -half;
     cam.updateProjectionMatrix();
 
-    // Show only the result meshes + lights; the scene background still paints.
+    // Show only the result meshes + lights (+ the ghost envelope); the scene
+    // background still paints.
+    const ghost = showGhost && this.mesh ? this.mesh : null;
     const snap = this.scene.children.map((o) => o.visible);
     for (const o of this.scene.children) {
-      o.visible = o instanceof THREE.Light || this.regionMeshes.includes(o as THREE.Mesh);
+      o.visible =
+        o instanceof THREE.Light || o === ghost || this.regionMeshes.includes(o as THREE.Mesh);
     }
     this.regionMeshes.forEach((m, i) => {
       if (this.regionVisible[i] === false) m.visible = false;
     });
+    // The part's live material may be opaque / stress-colored; swap a flat
+    // translucent gray so the envelope reads like the viewport ghost. Render it
+    // behind the regions.
+    let savedMat: THREE.Material | THREE.Material[] | null = null;
+    let savedOrder = 0;
+    let ghostMat: THREE.MeshStandardMaterial | null = null;
+    if (ghost) {
+      savedMat = ghost.material;
+      savedOrder = ghost.renderOrder;
+      ghostMat = new THREE.MeshStandardMaterial({
+        color: 0xc9c6bf,
+        transparent: true,
+        opacity: 0.16,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+        roughness: 0.95,
+      });
+      ghost.material = ghostMat;
+      ghost.renderOrder = -1; // under the (renderOrder ≥ 0) region meshes
+    }
 
     const rt = new THREE.WebGLRenderTarget(size, size);
     let bytes: Uint8Array | null = null;
@@ -1931,6 +1970,11 @@ export class SceneManager {
       bytes = null;
     } finally {
       rt.dispose();
+      if (ghost && savedMat) {
+        ghost.material = savedMat;
+        ghost.renderOrder = savedOrder;
+      }
+      ghostMat?.dispose();
       this.scene.children.forEach((o, i) => (o.visible = snap[i]));
     }
     return bytes;

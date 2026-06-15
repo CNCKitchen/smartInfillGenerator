@@ -261,6 +261,16 @@ function EditableBound({
   );
 }
 
+/** How the fixed value callouts work — shown under any contour legend. */
+function CalloutHelp() {
+  return (
+    <div className="legendnote callouthelp">
+      <b>Pin values:</b> Ctrl-click a point · Shift-drag a box → highest · Alt-drag → lowest · Esc
+      clears
+    </div>
+  );
+}
+
 function Legend() {
   const viewMode = useStore((s) => s.viewMode);
   const stats = useStore((s) => s.stats);
@@ -385,6 +395,7 @@ function Legend() {
           />
           {deformScale === 0 ? " (undeformed)" : ""}
         </div>
+        <CalloutHelp />
       </div>
     );
   }
@@ -403,6 +414,7 @@ function Legend() {
         {viewMode === "infill" && (
           <div className="legendnote">solid color = modifier region</div>
         )}
+        <CalloutHelp />
       </div>
     );
   }
@@ -459,6 +471,7 @@ function MeshLegend() {
           <>skin = {(perimeters * lineWidth).toFixed(2)} mm wall</>
         )}
       </div>
+      {meshDensity && <CalloutHelp />}
     </div>
   );
 }
