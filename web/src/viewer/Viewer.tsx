@@ -336,8 +336,18 @@ function Legend() {
   const setSmoothStress = useStore((s) => s.setSmoothStress);
   const materialStress = useStore((s) => s.materialStress);
   const setMaterialStress = useStore((s) => s.setMaterialStress);
+  const results = useStore((s) => s.results);
+  const activeResultId = useStore((s) => s.activeResultId);
 
-  if (viewMode === "deformed" && stats) {
+  // Show whenever a result is on screen — a live solve (stats) OR a result
+  // restored from a project (no stats, but an active entry carries the data).
+  if (viewMode === "deformed" && (stats || activeResultId)) {
+    // |u| fallback bound before the scene reports its range: the live solve
+    // stat, else the active restored result's stored max.
+    const fallbackMax =
+      stats?.maxDisplacement ??
+      results.find((r) => r.id === activeResultId)?.maxDisplacement ??
+      0;
     const total = autoScale * deformScale;
     const totalLabel = total >= 9.5 ? `×${Math.round(total)}` : `×${total.toFixed(1)}`;
     const def = RESULT_FIELDS.find((f) => f.value === resultField);
@@ -350,7 +360,7 @@ function Legend() {
     // its bounds from the scene-reported range so the legend follows the ACTIVE
     // result; the solve stat is only a first-paint fallback before the report.
     const autoMin = isField ? fieldRange!.min : fieldRange?.min ?? 0;
-    const autoMax = isField ? fieldRange!.max : fieldRange?.max ?? stats.maxDisplacement;
+    const autoMax = isField ? fieldRange!.max : fieldRange?.max ?? fallbackMax;
     const effMin = legendMin ?? autoMin;
     const effMax = legendMax ?? autoMax;
     const overridden = legendMin !== null || legendMax !== null;
