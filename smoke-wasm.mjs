@@ -4,7 +4,13 @@
 // Functional smoke test of the wasm-bindgen Model API (the same calls the web
 // worker makes). Run: node smoke-wasm.mjs
 import { readFileSync } from "node:fs";
-import init, { Model, set_cancel_flag, set_progress_buffer } from "./web/src/wasm/sig_wasm.js";
+import init, {
+  Model,
+  set_cancel_flag,
+  set_progress_buffer,
+  project_manifest,
+  project_model,
+} from "./web/src/wasm/sig_wasm.js";
 
 // --- build a binary STL box (matches sig-core primitives::boxx layout) ---
 function boxStl(lo, hi) {
@@ -560,5 +566,89 @@ assert(Math.abs(matchSummary.matchDeviation) <= 0.05,
 assert(matchSummary.massGrams < matchSummary.massUniformRefGrams,
   "matched design is lighter than the uniform reference");
 console.log("ok: stiffness-match goal (lighter at equal stiffness)");
+
+// ---- project (.infeall) save / load round-trip ----
+// Orient → optimize → export project → re-import the original file + replay the
+// transform + restore: the design (regions, density, stress eps) and the result
+// displacements must come back identical, with no re-optimization.
+{
+  const maxAbsDiff = (a, b) => {
+    let d = 0;
+    for (let i = 0; i < a.length; i++) d = Math.max(d, Math.abs(a[i] - b[i]));
+    return d;
+  };
+  const maxAbs = (a) => {
+    let m = 0;
+    for (let i = 0; i < a.length; i++) m = Math.max(m, Math.abs(a[i]));
+    return m;
+  };
+  const pStl = boxStl([0, 0, 0], [50, 10, 10]);
+  const pModel = new Model(pStl, "projbeam");
+  // Orient first (90° about Y) — exercises the saved-transform replay. Then set
+  // up + optimize on the oriented mesh, as the real workflow does.
+  pModel.transform(new Float64Array([0, 0, 1, 0, 1, 0, -1, 0, 0, 0, 0, 0]));
+  const psel = patchSelector(pModel);
+  pModel.set_material(2400, 0.35, 1.24, 50, 35);
+  pModel.set_resolution(20000);
+  pModel.add_fixed(psel(2, "min")); // after the rotation, the long axis is Z
+  pModel.add_force(psel(2, "max"), 0, 0, -30);
+  JSON.parse(
+    pModel.optimize(
+      JSON.stringify({
+        budgetPct: 30, exponent: 1.5, coeff: 1.0, perimeters: 2, lineWidth: 0.45,
+        smoothIters: 4, nBins: 3, floorPct: 10, capPct: 70, levelsPct: null,
+        binary: false, solidPattern: null, goal: "budget",
+      }),
+      () => {}
+    )
+  );
+  pModel.stash_result("optimized");
+  const regBefore = pModel.region_count();
+  const vdBefore = pModel.vertex_density();
+  const dispBefore = pModel.vertex_displacements();
+  const vmBefore = pModel.result_field("vm");
+  const accum = Array.from(pModel.transform_matrix());
+
+  const manifest = JSON.stringify({ app: "InFEAll", fileName: "projbeam.stl", transform: accum });
+
+  // Save WITH results, then read the pieces back out.
+  const proj = pModel.export_project(pStl, "model.stl", manifest, true);
+  assert(proj.length > 200 && proj[0] === 0x50 && proj[1] === 0x4b, "project export is a zip");
+  assert(project_manifest(proj) === manifest, "manifest round-trips out of the project");
+  const embedded = project_model(proj);
+  assert(embedded.length === pStl.length, "original model bytes embedded verbatim");
+
+  // Re-open: fresh model from the embedded file, replay settings + orientation,
+  // restore the design + results.
+  const q = new Model(project_model(proj), "reopened");
+  q.set_material(2400, 0.35, 1.24, 50, 35);
+  q.set_resolution(20000);
+  q.transform(new Float64Array(accum));
+  const summary = JSON.parse(q.restore_project(proj));
+  assert(summary.hasDesign === true, "restore reports the design");
+  assert(summary.restoredResults.includes("optimized"), "optimized result restored");
+  assert(q.region_count() === regBefore, `regions match (${q.region_count()} vs ${regBefore})`);
+  assert(maxAbsDiff(q.vertex_density(), vdBefore) < 1e-6, "vertex density matches the saved design");
+  const dispAfter = q.activate_result("optimized");
+  assert(maxAbsDiff(dispAfter, dispBefore) < 1e-4 * (1 + maxAbs(dispBefore)),
+    "restored optimized displacement matches");
+  assert(maxAbsDiff(q.result_field("vm"), vmBefore) < 1e-2 * (1 + maxAbs(vmBefore)),
+    "restored stress field matches (eps re-derived)");
+  // Re-export the 3MF from the restored design — the tool's main output survives.
+  const reMf = q.export_3mf("orca", new Uint8Array());
+  assert(reMf.length > 500 && reMf[0] === 0x50, "restored design re-exports a 3MF");
+
+  // Save WITHOUT results: design restores, but no result stash.
+  const projNo = pModel.export_project(pStl, "model.stl", manifest, false);
+  const q2 = new Model(project_model(projNo), "reopened2");
+  q2.set_material(2400, 0.35, 1.24, 50, 35);
+  q2.set_resolution(20000);
+  q2.transform(new Float64Array(accum));
+  const summary2 = JSON.parse(q2.restore_project(projNo));
+  assert(summary2.hasDesign === true, "design-only project restores the design");
+  assert(summary2.restoredResults.length === 0, "design-only project carries no FEA results");
+  assert(q2.region_count() === regBefore, "design-only regions match");
+}
+console.log("ok: project save / load round-trip (with + without results)");
 
 console.log("\nALL SMOKE TESTS PASSED");

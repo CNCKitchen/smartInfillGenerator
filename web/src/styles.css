@@ -97,6 +97,47 @@ body {
   flex: none;
 }
 
+/* save-project menu (top bar) */
+.saveproj {
+  position: relative;
+}
+
+.savemenu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 50;
+  background: rgba(252, 252, 250, 0.99);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.16);
+  padding: 11px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  min-width: 178px;
+}
+
+.savemenu label {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-size: 13px;
+  color: var(--ink);
+  cursor: pointer;
+  user-select: none;
+}
+
+.savemenu label.locked {
+  color: var(--dim);
+  cursor: default;
+}
+
+.savemenu .savebtn {
+  margin-top: 3px;
+  width: 100%;
+}
+
 .brandmark {
   width: 30px;
   height: 30px;

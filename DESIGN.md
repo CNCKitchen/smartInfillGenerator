@@ -529,3 +529,52 @@ is capped by **replacing a same-kind result on re-run** (the list can't grow unb
 a resolution/geometry change clears the stash (every result is stale anyway). Verify
 solve/optimize touches with regbench + the wasm smoke test (the pipeline change only
 stops discarding two vectors — the numerics are byte-identical).
+
+## 12. Project save / load — `.infeall` files (interview 2026-06-16)
+
+**Problem.** Work was ephemeral — reload the page and the model, loads, settings,
+and results were gone. Users need to save and reopen a project.
+
+| # | Topic | Decision |
+|---|-------|----------|
+| 1 | Results in the file | **Embed the FEA results (instant reopen), toggled.** Re-deriving from the saved density field is cheap, but the user chose to store the displacement buffers so reopen needs zero compute. A "results" checkbox in the Save control includes/excludes them. |
+| 2 | Model storage | **Embed the original imported file** (self-contained, shareable). On open it re-imports + replays the orientation, reproducing the exact working mesh so the triangle-index load/support selections restore correctly — embedding the *processed* mesh would re-tessellate differently and scramble them. |
+| 3 | Results-excluded reopen | **Keep the optimized design.** The compact density field is always saved, so a small file still restores the optimized design (Density/Regions + 3MF re-export); deflection recomputes when you re-run Optimize. |
+| 4 | Heavy data | Just the **displacement vector per result** (+ its `eps`). Stress/strain/SF derive from displacement on the fly, so they're never stored. |
+
+**File format** — one **stored-zip** (`sig_core::zip`, the same writer behind the 3MF
+export), extension `.infeall`:
+- `project.json` — schema + app version, all session settings (material/curve *values*
+  used — self-contained), the loads/supports (triangle indices), the cumulative
+  orientation matrix, the `optSummary`/region densities, and the result roster (metadata
+  only) when results are included.
+- `model.<stl|3mf>` — the original imported bytes, verbatim.
+- `design.bin` — compact optimized design: the per-design-cell binned density + `x_cont`
+  + bins + centers + the skin/eval scalars needed to **re-derive** the region meshes and
+  stress `eps` on load (no region geometry is stored — it rebuilds via `classify_cells`
+  + `extract_region` + `smooth_regions`, deterministic for the restored grid).
+- `results/<id>.f32` — `[displacement][eps]` per retained result (only when included).
+
+**Orientation.** `Model` tracks a cumulative transform (`transform_accum`, composed in
+`transform()`); `transform_matrix()` returns it for the manifest. On open: re-import the
+original file (canonical pose) → push settings → `transform(savedMatrix)` once → push
+loads → restore. Because re-import reproduces the canonical subdivision and the transform
+doesn't reindex, the saved BC triangle indices stay valid.
+
+**Engine API.** `export_project(modelBytes, entry, manifest, includeResults)` assembles the
+zip; free fns `project_manifest`/`project_model` pull the manifest + model out; `Model`
+methods `restore_optimization(designBlob)` (rebuild `self.opt` + the optimized `eps`) and
+`restore_result(id, blob)` (inject a displacement into the stash) are driven by
+`restore_project(zipBytes)`. The worker keeps the original bytes (`lastModel`) for save and
+stages the zip between the two-phase open (`openProjectModel` → push settings → `openProjectRestore`).
+
+**Verified** with a smoke round-trip: orient → optimize → save → re-import the original
+file + replay the transform + restore reproduces the regions, vertex density, displacement
+(< 1e-4), and stress field, and re-exports the 3MF; the design-only save restores the
+design with no results. regbench stays byte-identical (the optimize tail only snapshots
+already-computed fields).
+
+**Deferred.** The "few-second re-verify" on a results-excluded reopen (re-solve the
+restored design's verification + baselines instead of a full re-optimize) — the fallback
+today is re-running Optimize. The on-disk format is uncompressed (stored zip); add DEFLATE
+if file size becomes a concern.

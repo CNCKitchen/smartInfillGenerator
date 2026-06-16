@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
 
+import { useEffect, useRef, useState } from "react";
 import { useShallow } from "zustand/shallow";
 import { useStore } from "../store";
 import { fmtLen } from "./fmt";
@@ -12,10 +13,39 @@ export function TopBar() {
     useShallow((s) => ({
       model: s.model,
       fileName: s.fileName,
+      busy: s.busy,
       openSettings: s.openSettings,
+      saveProject: s.saveProject,
+      openProject: s.openProject,
+      loadFile: s.loadFile,
     }))
   );
+  const openRef = useRef<HTMLInputElement>(null);
+  const saveRef = useRef<HTMLDivElement>(null);
+  const [saveOpen, setSaveOpen] = useState(false);
+  // Results default to embedded (instant reopen); model + settings are always in.
+  const [withResults, setWithResults] = useState(true);
   const m = s.model;
+
+  // Close the save menu on an outside click.
+  useEffect(() => {
+    if (!saveOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (saveRef.current && !saveRef.current.contains(e.target as Node)) setSaveOpen(false);
+    };
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [saveOpen]);
+
+  // Load Project also accepts a plain STL/3MF and falls back to a normal import.
+  const onLoad = async (f: File | undefined) => {
+    if (f) {
+      if (/\.infeall$/i.test(f.name)) await s.openProject(f);
+      else await s.loadFile(f.name, await f.arrayBuffer());
+    }
+    if (openRef.current) openRef.current.value = ""; // allow re-picking the same file
+  };
+
   return (
     <header className="top">
       <div className="brandmark">IF</div>
@@ -38,7 +68,65 @@ export function TopBar() {
         )}
       </div>
       <div className="grow" />
-      <button className="ghost" onClick={() => s.openSettings(true)} title="Materials, infill stiffness curves, density levels">
+      <input
+        ref={openRef}
+        type="file"
+        accept=".infeall,.stl,.3mf"
+        hidden
+        onChange={(e) => void onLoad(e.target.files?.[0] ?? undefined)}
+      />
+      <div className="saveproj" ref={saveRef}>
+        <button
+          className="ghost"
+          onClick={() => setSaveOpen((o) => !o)}
+          disabled={!!s.busy || !m}
+          title="Save the project as a .infeall file"
+        >
+          Save Project ▾
+        </button>
+        {saveOpen && (
+          <div className="savemenu">
+            <label className="locked" title="Always saved — the project can't reopen without them">
+              <input type="checkbox" checked readOnly disabled />
+              <span>Settings</span>
+            </label>
+            <label className="locked" title="The original imported file, embedded so it opens anywhere">
+              <input type="checkbox" checked readOnly disabled />
+              <span>Model ({/\.3mf$/i.test(s.fileName ?? "") ? "3MF" : "STL"})</span>
+            </label>
+            <label title="Embed the FEA results for instant reopen — larger file. Off keeps the optimized design only.">
+              <input
+                type="checkbox"
+                checked={withResults}
+                onChange={(e) => setWithResults(e.target.checked)}
+              />
+              <span>Results (FEA)</span>
+            </label>
+            <button
+              className="primary savebtn"
+              onClick={() => {
+                setSaveOpen(false);
+                void s.saveProject(withResults);
+              }}
+            >
+              Save
+            </button>
+          </div>
+        )}
+      </div>
+      <button
+        className="ghost"
+        onClick={() => openRef.current?.click()}
+        disabled={!!s.busy}
+        title="Open a .infeall project — or a plain STL / 3MF to start fresh"
+      >
+        Load Project
+      </button>
+      <button
+        className="ghost"
+        onClick={() => s.openSettings(true)}
+        title="Materials, infill stiffness curves, density levels"
+      >
         ⚙ Settings
       </button>
       <a

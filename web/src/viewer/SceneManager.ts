@@ -1707,10 +1707,12 @@ export class SceneManager {
       if (v < dmin) dmin = v;
       if (v > dmax) dmax = v;
     }
-    if (comp >= 0) this.reportDispRange(dmin, dmax);
     // |u| anchors the scale at 0; a signed component spans its own min/max.
     const autoLo = comp < 0 ? 0 : dmin;
     const autoHi = comp < 0 ? Math.max(dmax, 1e-12) : dmax;
+    // Report the auto range for BOTH |u| and the signed components so the
+    // legend bound follows the active result (de-duped in reportDispRange).
+    this.reportDispRange(autoLo, autoHi);
     const lo = this.legendRange.min ?? autoLo;
     const hi = this.legendRange.max ?? autoHi;
     return { values, lo, hi };

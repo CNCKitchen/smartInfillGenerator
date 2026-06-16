@@ -1061,7 +1061,7 @@ pub fn evaluate_cached_stats(
     // is accurate to ~1e-4 — aborting a finished optimization over the last
     // decimals would be far worse UX. But the caller should still SEE that it
     // capped (it no longer assumes converged=true).
-    let r = solve_cached(slot, grid, levels, problem, settings, eps, settings.tol, 600)?;
+    let r = solve_cached(slot, grid, levels, problem, settings, eps, settings.tol, 2000)?;
     let mut max2 = 0f64;
     for n in 0..r.u.len() / 3 {
         let m = r.u[3 * n] * r.u[3 * n]

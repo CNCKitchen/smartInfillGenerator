@@ -47,8 +47,10 @@ impl Default for SolveSettings {
     fn default() -> Self {
         // max_iter sized from real-part measurements: a 3DBenchy (thin-shell,
         // jagged-boundary worst case) needs 172/249/286 MGCG iterations at the
-        // preview/normal/fine presets — 600 leaves 2x margin.
-        Self { e0: 2400.0, nu: 0.35, tol: 1e-5, max_iter: 600, max_levels: 5 }
+        // preview/normal/fine presets. Fine grids on stiff/ill-conditioned parts
+        // can run far longer, so the cap is 2000 (a converging solve stops at
+        // `tol` well before this; the cap only bounds non-converging runs).
+        Self { e0: 2400.0, nu: 0.35, tol: 1e-5, max_iter: 2000, max_levels: 5 }
     }
 }
 

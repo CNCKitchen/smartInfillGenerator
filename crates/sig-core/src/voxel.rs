@@ -248,12 +248,22 @@ impl VoxelGrid {
 /// the budget; a hard cell cap bounds the cost, and when even k = 1
 /// (h = wall) would blow past the cap the snap is abandoned for the nominal
 /// size.
-pub fn pick_voxel_size(bbox_volume: f64, target_cells: f64, snap_wall_mm: f64) -> f64 {
-    let h0 = (bbox_volume / target_cells.max(1.0)).cbrt().max(1e-3);
+pub fn pick_voxel_size(
+    fill_volume: f64,
+    bbox_volume: f64,
+    target_cells: f64,
+    snap_wall_mm: f64,
+) -> f64 {
+    const HARD_CAP_CELLS: f64 = 4_000_000.0;
+    // Size the cell so the part's SOLID cells (`fill_volume`) hit the target —
+    // far more precise than the bounding box for parts that don't fill their
+    // box. The TOTAL grid is still bbox/h³, so floor h so it can't exceed the
+    // cap on very sparse parts.
+    let h0 = (fill_volume / target_cells.max(1.0)).cbrt().max(1e-3);
+    let h0 = h0.max((bbox_volume / HARD_CAP_CELLS).cbrt());
     if snap_wall_mm <= 0.0 {
         return h0;
     }
-    const HARD_CAP_CELLS: f64 = 4_000_000.0;
     let cells = |h: f64| bbox_volume / h.powi(3);
     let mut k = (snap_wall_mm / h0).round().max(1.0);
     while k > 1.0 && cells(snap_wall_mm / k) > HARD_CAP_CELLS {

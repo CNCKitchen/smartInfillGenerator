@@ -19,8 +19,8 @@ interface Pending {
 
 /** Capacity of the live residual buffer (f32 slots). Caps the streamed
  *  preview length; the final exact trace comes back in the solve stats and is
- *  not limited by this. 1024 ≫ the worst-case MGCG iteration count. */
-const PROGRESS_CAP = 1024;
+ *  not limited by this. 2048 covers the 2000-iteration MGCG cap. */
+const PROGRESS_CAP = 2048;
 
 export class EngineClient {
   private worker: Worker;
@@ -145,6 +145,11 @@ export class EngineClient {
 
   setResolution(cells: number): Promise<void> {
     return this.call({ op: "setResolution", cells });
+  }
+
+  /** Custom resolution: pin the analysis cell size to exactly `h` mm. */
+  setVoxelSize(h: number): Promise<void> {
+    return this.call({ op: "setVoxelSize", h });
   }
 
   /** Snap the voxel size to wall/k so the skin is k cell layers (0 = off). */
@@ -298,6 +303,37 @@ export class EngineClient {
   /** Drop every stashed result (geometry/grid change — all stale). */
   clearResults(): Promise<void> {
     return this.call({ op: "clearResults" });
+  }
+
+  /** Cumulative orientation transform since import (for project save). */
+  transformMatrix(): Promise<number[]> {
+    return this.call({ op: "transformMatrix" });
+  }
+
+  /** Assemble a `.infeall` project zip (model + manifest + design + results). */
+  exportProject(manifest: string, modelEntry: string, includeResults: boolean): Promise<Uint8Array> {
+    return this.call({ op: "exportProject", manifest, modelEntry, includeResults });
+  }
+
+  /** Phase 1 of open: extract the manifest + rebuild the Model from the embedded
+   *  file. The caller then pushes settings/orientation/BCs and calls
+   *  openProjectRestore. */
+  openProjectModel(
+    bytes: ArrayBuffer
+  ): Promise<{ manifest: string; model: LoadedModel & { meshObjects?: number } }> {
+    return this.call({ op: "openProjectModel", bytes }, [bytes]);
+  }
+
+  /** Phase 2 of open: restore the design + result buffers into the configured
+   *  Model. Returns which results came back. */
+  openProjectRestore(): Promise<{ restoredResults: string[]; hasDesign: boolean }> {
+    return this.call({ op: "openProjectRestore" });
+  }
+
+  /** Final binned density per soup vertex (Density view) — standalone fetch
+   *  for restoring a project's design without re-optimizing. */
+  vertexDensity(): Promise<Float32Array> {
+    return this.call({ op: "vertexDensity" });
   }
 
   /** Project 3MF in the chosen slicer's flavor. `thumbnail` (PNG bytes) becomes

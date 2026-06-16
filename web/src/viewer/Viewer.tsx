@@ -346,14 +346,11 @@ function Legend() {
     const isField = resultField !== "u" && !isDispComp && !!def && !!fieldRange;
     const isSf = resultField.startsWith("sf");
     const unit = isField ? def!.unit : "mm"; // displacement (|u| or component) is mm
-    // A signed component takes its bounds from the reported field range; |u|
-    // anchors at 0 and uses the solve's max-displacement stat.
-    const autoMin = isField ? fieldRange!.min : isDispComp ? fieldRange?.min ?? 0 : 0;
-    const autoMax = isField
-      ? fieldRange!.max
-      : isDispComp
-        ? fieldRange?.max ?? stats.maxDisplacement
-        : stats.maxDisplacement;
+    // Every displacement plot (|u| anchored at 0, or a signed component) takes
+    // its bounds from the scene-reported range so the legend follows the ACTIVE
+    // result; the solve stat is only a first-paint fallback before the report.
+    const autoMin = isField ? fieldRange!.min : fieldRange?.min ?? 0;
+    const autoMax = isField ? fieldRange!.max : fieldRange?.max ?? stats.maxDisplacement;
     const effMin = legendMin ?? autoMin;
     const effMax = legendMax ?? autoMax;
     const overridden = legendMin !== null || legendMax !== null;

@@ -226,6 +226,23 @@ impl TriMesh {
         Some((lo, hi))
     }
 
+    /// Signed enclosed volume (mm³) via the divergence/tetrahedron sum over the
+    /// triangle soup: V = (1/6) Σ a·(b×c). Exact for closed meshes; for open or
+    /// non-manifold soup it is the best available estimate. The sign follows the
+    /// winding (use `.abs()`), and it tolerates inside-out meshes.
+    pub fn volume(&self) -> f64 {
+        let mut v = 0.0;
+        for t in &self.tris {
+            let a = [t[0] as f64, t[1] as f64, t[2] as f64];
+            let b = [t[3] as f64, t[4] as f64, t[5] as f64];
+            let c = [t[6] as f64, t[7] as f64, t[8] as f64];
+            v += a[0] * (b[1] * c[2] - b[2] * c[1])
+                - a[1] * (b[0] * c[2] - b[2] * c[0])
+                + a[2] * (b[0] * c[1] - b[1] * c[0]);
+        }
+        v / 6.0
+    }
+
     /// Parse STL from bytes, auto-detecting binary vs ASCII.
     /// Robustness: drops non-finite and zero-area-degenerate triangles, ignores
     /// stored normals, tolerates a binary file whose header starts with "solid".

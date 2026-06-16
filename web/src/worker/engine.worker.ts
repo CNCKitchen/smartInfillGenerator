@@ -14,6 +14,13 @@ let setCancelFlagFn: ((flag: Int32Array) => void) | null = null;
 let cancelArr: Int32Array | null = null;
 /** wasm hook installing the live residual-progress buffer (thread-local). */
 let setProgressBufferFn: ((count: Int32Array, data: Float32Array) => void) | null = null;
+/** Project (.infeall) unzip helpers from the wasm module. */
+let projectManifestFn: ((bytes: Uint8Array) => string) | null = null;
+let projectModelFn: ((bytes: Uint8Array) => Uint8Array) | null = null;
+/** Original imported model bytes (for project save) + name. */
+let lastModel: { bytes: Uint8Array; name: string } | null = null;
+/** Project bytes staged between openProjectModel and openProjectRestore. */
+let pendingProject: Uint8Array | null = null;
 
 // Pick the threaded module when the page is cross-origin isolated
 // (SharedArrayBuffer available); otherwise the single-threaded fallback.
@@ -33,6 +40,8 @@ const ready = (async () => {
     ModelCtor = mt.Model;
     setCancelFlagFn = mt.set_cancel_flag;
     setProgressBufferFn = mt.set_progress_buffer;
+    projectManifestFn = mt.project_manifest;
+    projectModelFn = mt.project_model;
     console.info(`engine: threaded wasm (${threads} threads)`);
   } else {
     const st = await import("../wasm/sig_wasm.js");
@@ -40,6 +49,8 @@ const ready = (async () => {
     ModelCtor = st.Model;
     setCancelFlagFn = st.set_cancel_flag;
     setProgressBufferFn = st.set_progress_buffer;
+    projectManifestFn = st.project_manifest;
+    projectModelFn = st.project_model;
     console.info("engine: single-threaded wasm (page not cross-origin isolated)");
   }
 })();
@@ -65,6 +76,7 @@ type Req =
     }
   | { id: number; op: "setGravity"; on: boolean }
   | { id: number; op: "setResolution"; cells: number }
+  | { id: number; op: "setVoxelSize"; h: number }
   | {
       id: number;
       op: "setBcs";
@@ -119,6 +131,11 @@ type Req =
   | { id: number; op: "stashResult"; resultId: string }
   | { id: number; op: "activateResult"; resultId: string }
   | { id: number; op: "clearResults" }
+  | { id: number; op: "transformMatrix" }
+  | { id: number; op: "exportProject"; manifest: string; modelEntry: string; includeResults: boolean }
+  | { id: number; op: "openProjectModel"; bytes: ArrayBuffer }
+  | { id: number; op: "openProjectRestore" }
+  | { id: number; op: "vertexDensity" }
   | { id: number; op: "exportThreeMf"; slicer: string; thumbnail: Uint8Array | null }
   | { id: number; op: "exportStls" }
   | { id: number; op: "exportSolidStl" };
@@ -146,7 +163,9 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
     switch (msg.op) {
       case "load": {
         model?.free();
-        model = new ModelCtor(new Uint8Array(msg.bytes), msg.name);
+        const loadBytes = new Uint8Array(msg.bytes);
+        model = new ModelCtor(loadBytes, msg.name);
+        lastModel = { bytes: loadBytes, name: msg.name };
         const positions = model.positions();
         const patchIds = model.patch_ids();
         const data = {
@@ -200,6 +219,9 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
         break;
       case "setResolution":
         requireModel().set_resolution(msg.cells);
+        break;
+      case "setVoxelSize":
+        requireModel().set_voxel_size(msg.h);
         break;
       case "setSnapWall":
         requireModel().set_snap_wall(msg.wall);
@@ -422,6 +444,70 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
       case "clearResults":
         requireModel().clear_results();
         break;
+      case "transformMatrix": {
+        const mtx = Array.from(requireModel().transform_matrix());
+        (self as unknown as Worker).postMessage({ id: msg.id, ok: true, data: mtx });
+        return;
+      }
+      case "exportProject": {
+        if (!lastModel) throw new Error("no model loaded to save");
+        const bytes = requireModel().export_project(
+          lastModel.bytes,
+          msg.modelEntry,
+          msg.manifest,
+          msg.includeResults
+        );
+        (self as unknown as Worker).postMessage({ id: msg.id, ok: true, data: bytes }, [bytes.buffer]);
+        return;
+      }
+      case "openProjectModel": {
+        if (!projectManifestFn || !projectModelFn) throw new Error("engine not ready");
+        const projBytes = new Uint8Array(msg.bytes);
+        const manifest = projectManifestFn(projBytes);
+        const modelBytes = projectModelFn(projBytes);
+        let name = "project";
+        try {
+          const mf = JSON.parse(manifest);
+          if (mf.fileName) name = String(mf.fileName).replace(/\.(stl|3mf|infeall)$/i, "");
+        } catch {
+          // manifest name is cosmetic — fall back to "project"
+        }
+        model?.free();
+        model = new ModelCtor(modelBytes, name);
+        lastModel = { bytes: modelBytes, name };
+        pendingProject = projBytes;
+        const positions = model.positions();
+        const patchIds = model.patch_ids();
+        const data = {
+          manifest,
+          model: {
+            positions,
+            patchIds,
+            patchCount: model.patch_count(),
+            triCount: model.triangle_count(),
+            bbox: Array.from(model.bbox()),
+            meshObjects: model.mesh_object_count(),
+            hasCadFaces: model.has_cad_faces(),
+          },
+        };
+        (self as unknown as Worker).postMessage({ id: msg.id, ok: true, data }, [
+          positions.buffer,
+          patchIds.buffer,
+        ]);
+        return;
+      }
+      case "openProjectRestore": {
+        if (!pendingProject) throw new Error("no project staged to restore");
+        const summary = JSON.parse(requireModel().restore_project(pendingProject));
+        pendingProject = null;
+        (self as unknown as Worker).postMessage({ id: msg.id, ok: true, data: summary });
+        return;
+      }
+      case "vertexDensity": {
+        const vd = requireModel().vertex_density();
+        (self as unknown as Worker).postMessage({ id: msg.id, ok: true, data: vd }, [vd.buffer]);
+        return;
+      }
       case "exportThreeMf": {
         const thumb = msg.thumbnail ?? new Uint8Array(0);
         const bytes = requireModel().export_3mf(msg.slicer, thumb);

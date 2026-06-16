@@ -257,6 +257,24 @@ struct OptOutput {
     /// dense modifier is extracted from the CONTINUOUS field at. User-tunable
     /// after the run (a higher value keeps less material). Default 0.5.
     iso_threshold: f64,
+    // ---- project-save snapshot: the inputs needed to re-derive this design's
+    // regions + stress eps on reload (and re-verify it), so a `.infeall` file
+    // stores only a compact density field, not the heavy region meshes. ----
+    /// Bin index per design cell (parallel to `design_cells`).
+    bins: Vec<u8>,
+    /// Density level per bin (centers[0] = base/floor).
+    centers: Vec<f64>,
+    /// Binned density per design cell (parallel to `design_cells`).
+    x_binned: Vec<f32>,
+    /// Skin band geometry the solve assumed (mm) — re-classifies the grid.
+    wall_mm: f64,
+    tb_mm: f64,
+    /// Calibrated E(ρ) law the eps was built with.
+    eval_exp: f64,
+    eval_coeff: f64,
+    /// Region smoothing passes (re-applied on restore).
+    smooth_iters: u32,
+    binary: bool,
 }
 
 /// Options for `Model::optimize`, passed as one JSON object from the worker.
@@ -401,6 +419,9 @@ pub struct Model {
     strength_z: f64,
     gravity_on: bool,
     target_cells: u32,
+    /// Custom mode: pin the cell size to this exact value (mm) instead of
+    /// sizing it from the part volume + target cell count. None = auto (preset).
+    fixed_h: Option<f64>,
     /// Snap the voxel size to wall/k (0 = off) so the printed skin is
     /// resolved by an integer number of cell layers.
     snap_wall: f64,
@@ -437,6 +458,11 @@ pub struct Model {
     /// stress eps. Dropped when the geometry/grid changes (`clear_results`).
     results: std::collections::HashMap<String, StashedResult>,
     opt: Option<OptOutput>,
+    /// Cumulative orientation transform applied since import (3×3 row-major +
+    /// translation). Saved in a project so re-importing the original file +
+    /// replaying this one matrix reproduces the exact oriented working mesh
+    /// (and thus the load/support triangle indices). Identity at import.
+    transform_accum: [f64; 12],
 }
 
 /// One stashed solution for the result switcher: the displacement field and the
@@ -457,6 +483,153 @@ fn remap_segmentation(orig: &Segmentation, parents: &[u32]) -> Segmentation {
         patch_of_tri: parents.iter().map(|&p| orig.patch_of_tri[p as usize]).collect(),
         patch_count: orig.patch_count,
     }
+}
+
+// ---- project (.infeall) binary serialization ----
+
+const DESIGN_MAGIC: &[u8; 4] = b"SIGD";
+
+fn put_u32(v: &mut Vec<u8>, x: u32) {
+    v.extend_from_slice(&x.to_le_bytes());
+}
+fn put_f64(v: &mut Vec<u8>, x: f64) {
+    v.extend_from_slice(&x.to_le_bytes());
+}
+fn put_f32s(v: &mut Vec<u8>, xs: &[f32]) {
+    put_u32(v, xs.len() as u32);
+    for &x in xs {
+        v.extend_from_slice(&x.to_le_bytes());
+    }
+}
+fn put_f64s(v: &mut Vec<u8>, xs: &[f64]) {
+    put_u32(v, xs.len() as u32);
+    for &x in xs {
+        v.extend_from_slice(&x.to_le_bytes());
+    }
+}
+fn put_bytes(v: &mut Vec<u8>, xs: &[u8]) {
+    put_u32(v, xs.len() as u32);
+    v.extend_from_slice(xs);
+}
+
+/// Cursor over a little-endian project blob with bounds-checked reads.
+struct Reader<'a> {
+    b: &'a [u8],
+    p: usize,
+}
+impl<'a> Reader<'a> {
+    fn new(b: &'a [u8]) -> Self {
+        Self { b, p: 0 }
+    }
+    fn need(&self, n: usize) -> Result<(), JsValue> {
+        if self.p + n > self.b.len() {
+            return Err(err("project file is truncated or corrupt"));
+        }
+        Ok(())
+    }
+    fn u32(&mut self) -> Result<u32, JsValue> {
+        self.need(4)?;
+        let x = u32::from_le_bytes(self.b[self.p..self.p + 4].try_into().unwrap());
+        self.p += 4;
+        Ok(x)
+    }
+    fn byte(&mut self) -> Result<u8, JsValue> {
+        self.need(1)?;
+        let x = self.b[self.p];
+        self.p += 1;
+        Ok(x)
+    }
+    fn f64(&mut self) -> Result<f64, JsValue> {
+        self.need(8)?;
+        let x = f64::from_le_bytes(self.b[self.p..self.p + 8].try_into().unwrap());
+        self.p += 8;
+        Ok(x)
+    }
+    fn f32s(&mut self) -> Result<Vec<f32>, JsValue> {
+        let n = self.u32()? as usize;
+        self.need(n * 4)?;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            out.push(f32::from_le_bytes(self.b[self.p..self.p + 4].try_into().unwrap()));
+            self.p += 4;
+        }
+        Ok(out)
+    }
+    fn f64s(&mut self) -> Result<Vec<f64>, JsValue> {
+        let n = self.u32()? as usize;
+        self.need(n * 8)?;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            out.push(f64::from_le_bytes(self.b[self.p..self.p + 8].try_into().unwrap()));
+            self.p += 8;
+        }
+        Ok(out)
+    }
+    fn bytes(&mut self) -> Result<Vec<u8>, JsValue> {
+        let n = self.u32()? as usize;
+        self.need(n)?;
+        let out = self.b[self.p..self.p + n].to_vec();
+        self.p += n;
+        Ok(out)
+    }
+    fn tag(&mut self, expect: &[u8; 4]) -> Result<(), JsValue> {
+        self.need(4)?;
+        if &self.b[self.p..self.p + 4] != expect {
+            return Err(err("not a valid InFEAll project (bad design magic)"));
+        }
+        self.p += 4;
+        Ok(())
+    }
+}
+
+/// Serialize the compact optimized design (density field + the inputs to
+/// re-derive its regions and stress eps). No region meshes — they rebuild.
+fn design_blob(opt: &OptOutput) -> Vec<u8> {
+    let mut v = Vec::new();
+    v.extend_from_slice(DESIGN_MAGIC);
+    put_u32(&mut v, 1); // format version
+    put_f64(&mut v, opt.base_density);
+    put_f64(&mut v, opt.iso_threshold);
+    put_f64(&mut v, opt.eval_exp);
+    put_f64(&mut v, opt.eval_coeff);
+    put_f64(&mut v, opt.wall_mm);
+    put_f64(&mut v, opt.tb_mm);
+    put_u32(&mut v, opt.perimeters);
+    put_u32(&mut v, opt.top_bottom_layers);
+    put_u32(&mut v, opt.smooth_iters);
+    v.push(opt.solid as u8);
+    v.push(opt.binary as u8);
+    put_bytes(&mut v, opt.solid_pattern.as_deref().unwrap_or("").as_bytes());
+    put_f64s(&mut v, &opt.centers);
+    put_f32s(&mut v, &opt.x_binned);
+    let xcont: Vec<f32> = opt.x_cont.iter().map(|&x| x as f32).collect();
+    put_f32s(&mut v, &xcont);
+    put_bytes(&mut v, &opt.bins);
+    v
+}
+
+/// Read the manifest (project.json) out of a `.infeall` project file.
+#[wasm_bindgen]
+pub fn project_manifest(bytes: &[u8]) -> Result<String, JsValue> {
+    let entries = sig_core::zip::read_zip(bytes).map_err(|e| err(format!("{e:?}")))?;
+    for (name, data) in entries {
+        if name == "project.json" {
+            return String::from_utf8(data).map_err(err);
+        }
+    }
+    Err(err("not an InFEAll project (no project.json)"))
+}
+
+/// Extract the embedded original model bytes from a project file.
+#[wasm_bindgen]
+pub fn project_model(bytes: &[u8]) -> Result<Vec<u8>, JsValue> {
+    let entries = sig_core::zip::read_zip(bytes).map_err(|e| err(format!("{e:?}")))?;
+    for (name, data) in entries {
+        if name.starts_with("model.") {
+            return Ok(data);
+        }
+    }
+    Err(err("project file has no embedded model"))
 }
 
 #[wasm_bindgen]
@@ -510,6 +683,7 @@ impl Model {
             strength_z: 35.0,  // PLA layer adhesion, MPa
             gravity_on: false,
             target_cells: 300_000,
+            fixed_h: None,
             snap_wall: 0.0,
             composite_skin: false,
             smooth_stress: false,
@@ -520,6 +694,7 @@ impl Model {
             solution_eps: None,
             results: std::collections::HashMap::new(),
             opt: None,
+            transform_accum: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
         })
     }
 
@@ -574,12 +749,29 @@ impl Model {
         };
         apply(&mut self.mesh);
         apply(&mut self.mesh_orig);
+        // Compose into the cumulative orientation (this transform applied AFTER
+        // the accumulated one): R' = Rm·Ra, t' = Rm·ta + tm.
+        let a = self.transform_accum;
+        let mut na = [0f64; 12];
+        for r in 0..3 {
+            for c in 0..3 {
+                na[3 * r + c] = m[3 * r] * a[c] + m[3 * r + 1] * a[3 + c] + m[3 * r + 2] * a[6 + c];
+            }
+            na[9 + r] = m[3 * r] * a[9] + m[3 * r + 1] * a[10] + m[3 * r + 2] * a[11] + m[9 + r];
+        }
+        self.transform_accum = na;
         self.grid = None;
         self.solver_cache = None;
         self.solution = None;
         self.solution_eps = None;
         self.opt = None;
+        self.results.clear(); // geometry moved — stashed results no longer align
         Ok(())
+    }
+
+    /// Cumulative orientation transform since import (for project save).
+    pub fn transform_matrix(&self) -> Vec<f64> {
+        self.transform_accum.to_vec()
     }
 
     /// Re-run segmentation with a different crease angle (degrees). Switches the
@@ -637,11 +829,26 @@ impl Model {
     }
 
     pub fn set_resolution(&mut self, target_cells: u32) {
-        if target_cells != self.target_cells {
-            self.target_cells = target_cells.clamp(10_000, 4_000_000);
+        let clamped = target_cells.clamp(10_000, 4_000_000);
+        if clamped != self.target_cells || self.fixed_h.is_some() {
+            self.target_cells = clamped;
+            self.fixed_h = None; // back to auto (part-volume) sizing
             self.grid = None;
             self.solution = None;
-        self.opt = None;
+            self.opt = None;
+        }
+    }
+
+    /// Custom resolution: pin the analysis cell size to exactly `h` mm (still
+    /// snapped to the wall when snapping is on), bypassing the automatic
+    /// part-volume sizing. Clamped to a sane range; capped by the cell budget.
+    pub fn set_voxel_size(&mut self, h: f64) {
+        let h = h.clamp(0.02, 50.0);
+        if self.fixed_h != Some(h) {
+            self.fixed_h = Some(h);
+            self.grid = None;
+            self.solution = None;
+            self.opt = None;
         }
     }
 
@@ -736,8 +943,36 @@ impl Model {
             return Ok(());
         }
         let (lo, hi) = self.mesh.bounds().ok_or_else(|| err("empty mesh"))?;
-        let vol = (hi[0] - lo[0]).max(1e-6) * (hi[1] - lo[1]).max(1e-6) * (hi[2] - lo[2]).max(1e-6);
-        let h = sig_core::voxel::pick_voxel_size(vol, self.target_cells as f64, self.snap_wall);
+        let bbox_vol =
+            (hi[0] - lo[0]).max(1e-6) * (hi[1] - lo[1]).max(1e-6) * (hi[2] - lo[2]).max(1e-6);
+        // Size the grid from the part's ACTUAL volume so a part that fills only
+        // part of its bounding box still gets ~target solid cells (precise
+        // resolution). A floor at 2% of the bbox guards degenerate/open meshes
+        // whose signed volume is near zero from exploding the cell count.
+        let h = if let Some(fh) = self.fixed_h {
+            // Custom mode: the user's exact cell size, snapped to the wall when
+            // snapping is on, floored so it can't blow the cell budget.
+            let h = if self.snap_wall > 0.0 {
+                let k = (self.snap_wall / fh).round().max(1.0);
+                (self.snap_wall / k).max(1e-3)
+            } else {
+                fh
+            };
+            h.max((bbox_vol / 4_000_000.0).cbrt())
+        } else {
+            let part_vol = self.mesh.volume().abs();
+            let fill_vol = if part_vol.is_finite() && part_vol > 1e-9 {
+                part_vol.clamp(bbox_vol * 0.02, bbox_vol)
+            } else {
+                bbox_vol
+            };
+            sig_core::voxel::pick_voxel_size(
+                fill_vol,
+                bbox_vol,
+                self.target_cells as f64,
+                self.snap_wall,
+            )
+        };
         let grid = VoxelGrid::voxelize(&self.mesh, h);
         if grid.solid_count() == 0 {
             return Err(err("voxelization produced no solid cells — model too thin for this resolution"));
@@ -956,6 +1191,193 @@ impl Model {
     /// node grid they sample no longer matches the part).
     pub fn clear_results(&mut self) {
         self.results.clear();
+    }
+
+    /// Assemble a `.infeall` project zip: the original model bytes, the JS-built
+    /// manifest (settings + BCs + result roster), the compact optimized design,
+    /// and — when `include_results` — every stashed result's displacement + eps.
+    pub fn export_project(
+        &self,
+        model_bytes: &[u8],
+        model_entry: &str,
+        manifest: &str,
+        include_results: bool,
+    ) -> Vec<u8> {
+        let mut zip = sig_core::zip::ZipWriter::new();
+        zip.add(model_entry, model_bytes);
+        zip.add("project.json", manifest.as_bytes());
+        if let Some(opt) = &self.opt {
+            zip.add("design.bin", &design_blob(opt));
+        }
+        if include_results {
+            for (id, r) in &self.results {
+                let mut blob = Vec::new();
+                put_f32s(&mut blob, &r.sol.u);
+                put_f32s(&mut blob, r.eps.as_deref().unwrap_or(&[]));
+                zip.add(&format!("results/{id}.f32"), &blob);
+            }
+        }
+        zip.finish()
+    }
+
+    /// Rebuild `self.opt` (+ the optimized stress eps) from a saved design blob.
+    /// Settings (material/resolution/snap/composite) and the orientation must be
+    /// applied first so the grid + cell classification match the saved run.
+    pub fn restore_optimization(&mut self, blob: &[u8]) -> Result<(), JsValue> {
+        self.ensure_grid()?;
+        let mut rd = Reader::new(blob);
+        rd.tag(DESIGN_MAGIC)?;
+        let _version = rd.u32()?;
+        let base_density = rd.f64()?;
+        let iso_threshold = rd.f64()?;
+        let eval_exp = rd.f64()?;
+        let eval_coeff = rd.f64()?;
+        let wall_mm = rd.f64()?;
+        let tb_mm = rd.f64()?;
+        let perimeters = rd.u32()?;
+        let top_bottom_layers = rd.u32()?;
+        let smooth_iters = rd.u32()?;
+        let solid = rd.byte()? != 0;
+        let binary = rd.byte()? != 0;
+        let pat = String::from_utf8(rd.bytes()?).map_err(err)?;
+        let solid_pattern = if pat.is_empty() { None } else { Some(pat) };
+        let centers = rd.f64s()?;
+        let x_binned = rd.f32s()?;
+        let x_cont32 = rd.f32s()?;
+        let bins = rd.bytes()?;
+
+        let split = {
+            let (grid, _) = self.grid.as_ref().unwrap();
+            sig_core::simp::classify_cells(grid, wall_mm, tb_mm, tb_mm, self.composite_skin)
+        };
+        let (skin, design, skin_frac) = (split.skin, split.design, split.skin_frac);
+        if design.len() != x_binned.len()
+            || design.len() != bins.len()
+            || design.len() != x_cont32.len()
+        {
+            return Err(err(
+                "the saved design no longer matches the model + settings — re-run the optimization",
+            ));
+        }
+        let x_binned_f64: Vec<f64> = x_binned.iter().map(|&x| x as f64).collect();
+        let x_cont: Vec<f64> = x_cont32.iter().map(|&x| x as f64).collect();
+        let mut cell_density: std::collections::HashMap<u32, f64> = Default::default();
+        let mut bin_of_cell: std::collections::HashMap<u32, u8> = Default::default();
+        for (k, &c) in design.iter().enumerate() {
+            cell_density.insert(c, x_binned_f64[k]);
+            bin_of_cell.insert(c, bins[k]);
+        }
+        if solid {
+            for &c in &skin {
+                bin_of_cell.insert(c, 1);
+            }
+        }
+        let (regions_raw, eps) = {
+            let (grid, _) = self.grid.as_ref().unwrap();
+            let mut regions_raw = Vec::new();
+            for level in 1..centers.len() {
+                let inside = |ci: usize| -> bool {
+                    bin_of_cell.get(&(ci as u32)).is_some_and(|&b| b as usize >= level)
+                };
+                let mut r = sig_core::bins::extract_region(grid, &inside, 0.4);
+                if r.indices.is_empty() {
+                    continue;
+                }
+                r.density = centers[level];
+                regions_raw.push(r);
+            }
+            let eps = sig_core::simp::build_eps(
+                grid, &skin, &design, &skin_frac, &x_binned_f64, eval_exp, eval_coeff,
+            );
+            (regions_raw, eps)
+        };
+        let regions = sig_core::pipeline::smooth_regions(&regions_raw, smooth_iters as usize);
+        self.solution = None;
+        self.solution_eps = Some(eps);
+        self.opt = Some(OptOutput {
+            regions,
+            regions_raw,
+            base_density,
+            cell_density,
+            design_cells: design,
+            x_cont,
+            perimeters,
+            top_bottom_layers,
+            solid_pattern,
+            summary: String::new(),
+            solid,
+            anchor_cells: skin,
+            iso_threshold,
+            bins,
+            centers,
+            x_binned,
+            wall_mm,
+            tb_mm,
+            eval_exp,
+            eval_coeff,
+            smooth_iters,
+            binary,
+        });
+        Ok(())
+    }
+
+    /// Inject a saved result's displacement (+eps) into the stash so the Results
+    /// view can show/switch to it without re-solving. The grid must already be
+    /// built (restore the design, or ensure the grid, first).
+    pub fn restore_result(&mut self, id: &str, blob: &[u8]) -> Result<(), JsValue> {
+        let (mx, my, mz, h, origin, active) = {
+            let (grid, _) = self.grid.as_ref().ok_or_else(|| err("no grid for result restore"))?;
+            (grid.nx + 1, grid.ny + 1, grid.nz + 1, grid.h, grid.origin, active_nodes(grid))
+        };
+        let mut rd = Reader::new(blob);
+        let u = rd.f32s()?;
+        let eps_v = rd.f32s()?;
+        if u.len() != mx * my * mz * 3 {
+            return Err(err("saved result doesn't fit the grid — re-run the analysis"));
+        }
+        let eps = if eps_v.is_empty() { None } else { Some(eps_v) };
+        let sol = Solution {
+            u,
+            mx,
+            my,
+            mz,
+            h,
+            origin,
+            active,
+            iterations: 0,
+            rel_residual: 0.0,
+            converged: true,
+            residuals: Vec::new(),
+        };
+        self.results.insert(id.to_string(), StashedResult { sol, eps });
+        Ok(())
+    }
+
+    /// Read design.bin + results/*.f32 out of a project zip and restore them.
+    /// The model + its settings/orientation must already be set up. Returns JSON
+    /// { restoredResults: [...ids], hasDesign }.
+    pub fn restore_project(&mut self, project_bytes: &[u8]) -> Result<String, JsValue> {
+        self.ensure_grid()?;
+        let entries = sig_core::zip::read_zip(project_bytes).map_err(|e| err(format!("{e:?}")))?;
+        for (name, data) in &entries {
+            if name == "design.bin" {
+                self.restore_optimization(data)?;
+            }
+        }
+        let mut restored: Vec<String> = Vec::new();
+        for (name, data) in &entries {
+            if let Some(rest) = name.strip_prefix("results/") {
+                if let Some(id) = rest.strip_suffix(".f32") {
+                    self.restore_result(id, data)?;
+                    restored.push(id.to_string());
+                }
+            }
+        }
+        Ok(serde_json::json!({
+            "restoredResults": restored,
+            "hasDesign": self.opt.is_some(),
+        })
+        .to_string())
     }
 
     /// Sample a density field (cell -> density map) at every soup vertex,
@@ -1323,6 +1745,15 @@ impl Model {
             solid,
             anchor_cells: oc.skin_cells,
             iso_threshold: 0.5,
+            bins: oc.bins,
+            centers: oc.centers,
+            x_binned: oc.x_binned.iter().map(|&x| x as f32).collect(),
+            wall_mm,
+            tb_mm: params.top_mm,
+            eval_exp,
+            eval_coeff,
+            smooth_iters: smooth_iters as u32,
+            binary: opts.binary,
         });
         Ok(summary)
     }

@@ -21,21 +21,21 @@ fn voxel_snap_picks_integer_wall_fractions() {
     let target = vol / 0.6f64.powi(3); // nominal h0 = 0.6
 
     // 0.9 mm wall: k = round(0.9/0.6) = 2 -> h = 0.45, and 2·h is the wall.
-    let h = pick_voxel_size(vol, target, 0.9);
+    let h = pick_voxel_size(vol, vol, target, 0.9);
     assert!((h - 0.45).abs() < 1e-9, "snapped h: {h}");
     assert!((2.0 * h - 0.9).abs() < 1e-9);
 
     // Wall coarser than nominal still snaps (k = 1 -> h = wall).
-    let h1 = pick_voxel_size(vol, target, 0.5);
+    let h1 = pick_voxel_size(vol, vol, target, 0.5);
     assert!((h1 - 0.5).abs() < 1e-9, "k=1 snap: {h1}");
 
     // Snap off: the nominal size.
-    let h0 = pick_voxel_size(vol, target, 0.0);
+    let h0 = pick_voxel_size(vol, vol, target, 0.0);
     assert!((h0 - 0.6).abs() < 1e-9, "nominal h: {h0}");
 
     // A wall far finer than the budget allows abandons the snap instead of
     // exploding the grid: 0.2 mm wall over a 1 m³-class volume.
-    let hbig = pick_voxel_size(1.0e6, 1.0e6, 0.2);
+    let hbig = pick_voxel_size(1.0e6, 1.0e6, 1.0e6, 0.2);
     assert!((hbig - 1.0).abs() < 1e-9, "cap fallback: {hbig}");
 }
 
@@ -44,7 +44,7 @@ fn snapped_grid_resolves_skin_as_exact_layers() {
     let beam = primitives::boxx([0.0; 3], [20.0, 6.0, 6.0]);
     let vol = 20.0 * 6.0 * 6.0;
     let wall = 0.9; // 2 perimeters x 0.45
-    let h = pick_voxel_size(vol, vol / 0.5f64.powi(3), wall);
+    let h = pick_voxel_size(vol, vol, vol / 0.5f64.powi(3), wall);
     assert!((h - 0.45).abs() < 1e-9, "0.5 nominal snaps to 0.45: {h}");
 
     let grid0 = VoxelGrid::voxelize(&beam, h);

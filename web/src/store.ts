@@ -490,6 +490,12 @@ interface AppState {
   downloadStls(): Promise<void>;
   /** Solid topology mode: download the optimized shape as one STL. */
   downloadShape(): Promise<void>;
+  /** Save the whole project as a `.infeall` file. `includeResults` embeds the
+   *  FEA displacement buffers (instant reopen) — off keeps the file small and
+   *  restores the optimized design only. */
+  saveProject(includeResults: boolean): Promise<void>;
+  /** Open a `.infeall` project: restore model, settings, design, and results. */
+  openProject(file: File): Promise<void>;
   setViewMode(mode: ViewMode): Promise<void>;
   setWireframe(on: boolean): void;
   setDeformScale(s: number): void;
@@ -570,9 +576,10 @@ async function pushScalarField(set: SetState, get: () => AppState) {
   const dispComp = kind === "u" ? -1 : kind === "ux" ? 0 : kind === "uy" ? 1 : kind === "uz" ? 2 : null;
   if (dispComp !== null) {
     sceneEvents.onScalarField?.(null);
-    // |u| uses the solve's max-displacement stat for the legend; a signed
-    // component's range comes back from the scene via onResultRange → fieldRange.
-    if (dispComp < 0) set({ fieldRange: null });
+    // Both |u| (anchored [0, max]) and the signed components report their auto
+    // range back from the scene via onResultRange → fieldRange, so the legend
+    // follows the ACTIVE result instead of a stale solve stat. Don't null it
+    // here — the scene repopulates it synchronously as it colors.
     sceneEvents.onDispComponent?.(dispComp);
     return;
   }
@@ -874,6 +881,18 @@ function resolutionCells(s: AppState): number {
   return RESOLUTIONS[s.resolution];
 }
 
+/** Push the analysis resolution to the engine: a preset targets a SOLID-cell
+ *  count (the engine sizes the cell from the part volume); custom pins the exact
+ *  cell size. */
+async function pushResolution(get: () => AppState) {
+  const s = get();
+  if (s.resolution === "custom" && s.customH > 0) {
+    await engine.setVoxelSize(s.customH);
+  } else {
+    await engine.setResolution(resolutionCells(get()));
+  }
+}
+
 /** Push the voxel-snap wall to the engine from the current print settings. */
 async function pushSnap(get: () => AppState) {
   const s = get();
@@ -904,6 +923,33 @@ async function refreshMeshView(set: SetState, get: () => AppState): Promise<bool
   } catch (e) {
     set({ error: e instanceof Error ? e.message : String(e) });
     return false;
+  }
+}
+
+/** Eagerly build + cache the analysis voxel hull on the scene so the Mesh view
+ *  is available INSTANTLY — including DURING a solve/optimization, when the
+ *  single worker is blocked inside the WASM solver and can't serve a fresh
+ *  request. Builds the full (uncut) hull; section re-cuts happen lazily once
+ *  the worker is free again. Skips when a current hull is already cached. */
+async function prebuildMeshView(set: SetState, get: () => AppState) {
+  const st = get();
+  if (!st.model || st.voxelMeshReady) return;
+  const wall = st.perimeters * st.lineWidth;
+  try {
+    const { hull, edges, density, info } = await engine.voxelMeshCut(
+      null,
+      wall,
+      st.topBottomLayers * st.layerHeight,
+      st.printInfill
+    );
+    set({ voxelInfo: info, voxelMeshReady: true });
+    sceneEvents.onVoxelCutActive?.(false);
+    // The scene retains the hull and only shows it when the Mesh view is active
+    // (refreshView gates voxelGroup visibility) — caching it now is invisible
+    // until the user switches to Mesh, mid-run or after.
+    sceneEvents.onVoxelMesh?.(hull, edges, density);
+  } catch {
+    // Non-fatal: the Mesh view just stays lazy (built on first entry).
   }
 }
 
@@ -995,6 +1041,72 @@ function referenceMaxDisp(results: ResultEntry[], extra?: number): number {
   for (const r of results) if (r.maxDisplacement > 0) m = Math.min(m, r.maxDisplacement);
   if (extra && extra > 0) m = Math.min(m, extra);
   return Number.isFinite(m) && m > 0 ? m : 1;
+}
+
+// ---- project (.infeall) save / load ----
+
+const PROJECT_SCHEMA = 1;
+const APP_VERSION = "0.1.0";
+
+/** The session settings a project round-trips. The per-browser library stays
+ *  separate; the project embeds the VALUES it used so it opens identically
+ *  on any machine. */
+function collectSettings(s: AppState) {
+  return {
+    segAngle: s.segAngle,
+    segSource: s.segSource,
+    material: s.material,
+    materials: s.materials,
+    curves: s.curves,
+    levelSettings: s.levelSettings,
+    resolution: s.resolution,
+    customH: s.customH,
+    pattern: s.pattern,
+    perimeters: s.perimeters,
+    lineWidth: s.lineWidth,
+    topBottomLayers: s.topBottomLayers,
+    layerHeight: s.layerHeight,
+    printInfill: s.printInfill,
+    snapVoxel: s.snapVoxel,
+    compositeSkin: s.compositeSkin,
+    smoothStress: s.smoothStress,
+    materialStress: s.materialStress,
+    analyzeMode: s.analyzeMode,
+    budget: s.budget,
+    smoothIters: s.smoothIters,
+    nBins: s.nBins,
+    minMemberMm: s.minMemberMm,
+    goal: s.goal,
+    optMode: s.optMode,
+    retainBc: s.retainBc,
+    selfSupport: s.selfSupport,
+    overhangDeg: s.overhangDeg,
+    symOn: s.symOn,
+    symNormal: s.symNormal,
+    symC: s.symC,
+    solidPattern: s.solidPattern,
+    exportSlicer: s.exportSlicer,
+    densityThreshold: s.densityThreshold,
+    resultSurface: s.resultSurface,
+  };
+}
+type ProjectSettings = ReturnType<typeof collectSettings>;
+
+interface ProjectManifest {
+  app: string;
+  schemaVersion: number;
+  appVersion: string;
+  fileName: string;
+  /** Cumulative orientation transform (12 numbers) to replay on the re-import. */
+  transform: number[];
+  settings: ProjectSettings;
+  bcs: (Omit<Bc, "tris"> & { tris: number[] })[];
+  optSummary: OptSummary | null;
+  regionInfos: { density: number }[];
+  /** Result roster (metadata only; the buffers live in results/*.f32). Null
+   *  when results were excluded from the save. */
+  results: ResultEntry[] | null;
+  activeResultId: ResultKind | null;
 }
 
 /** Model or resolution changed: the voxel grid (and its display mesh) is stale. */
@@ -1123,7 +1235,7 @@ export const useStore = create<AppState>((set, get) => ({
       }
       const m = get().material;
       await engine.setMaterial(m.e0, m.nu, m.density, m.strength, m.strengthZ);
-      await engine.setResolution(resolutionCells(get()));
+      await pushResolution(get);
       // A fresh wasm Model defaults to snap off; push the current setting.
       // (Inline, not pushSnap: the store's `model` isn't set yet.)
       await engine.setSnapWall(
@@ -1562,7 +1674,7 @@ export const useStore = create<AppState>((set, get) => ({
     }
     invalidateResults(set, get);
     invalidateGrid(set, get);
-    void engine.setResolution(resolutionCells(get()));
+    void pushResolution(get);
   },
 
   setCustomH(v) {
@@ -1570,7 +1682,7 @@ export const useStore = create<AppState>((set, get) => ({
     if (get().resolution === "custom") {
       invalidateResults(set, get);
       invalidateGrid(set, get);
-      void engine.setResolution(resolutionCells(get()));
+      void pushResolution(get);
     }
   },
 
@@ -1828,9 +1940,11 @@ export const useStore = create<AppState>((set, get) => ({
   async selectResult(id) {
     const e = get().results.find((r) => r.id === id);
     if (!e || get().busy) return;
+    // Keep whatever plot the user is on (|u|, a component, or a stress/SF
+    // field) across the switch — only the manual legend override belongs to
+    // the previous result's magnitude.
     set({
       activeResultId: id,
-      resultField: "u",
       fieldRange: null,
       legendMin: null,
       legendMax: null,
@@ -1859,7 +1973,18 @@ export const useStore = create<AppState>((set, get) => ({
           sceneEvents.onResultSurface?.("stl");
         }
       }
-      await pushScalarField(set, get);
+      try {
+        // Re-fetch the SAME field for the newly-active solution (recomputes the
+        // contour and the legend range from this result's data).
+        await pushScalarField(set, get);
+      } catch {
+        // The retained field doesn't apply to this result — fall back to |u|.
+        if (get().activeResultId === id) {
+          set({ resultField: "u", fieldRange: null });
+          sceneEvents.onScalarField?.(null);
+          sceneEvents.onDispComponent?.(-1);
+        }
+      }
     } catch (err) {
       set({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -1917,6 +2042,9 @@ export const useStore = create<AppState>((set, get) => ({
         });
         return;
       }
+      // Cache the voxel hull NOW (worker still free) so the Mesh view is
+      // viewable during the blocking solve that follows.
+      await prebuildMeshView(set, get);
       const st0 = get();
       const m = st0.material;
       const printed = st0.analyzeMode === "printed";
@@ -2100,6 +2228,9 @@ export const useStore = create<AppState>((set, get) => ({
     try {
       await pushBcs(get);
       await logGridInfo(set);
+      // Cache the voxel hull NOW (worker still free) so the Mesh view is
+      // viewable during the blocking optimization that follows.
+      await prebuildMeshView(set, get);
       const curve = st.curves[st.pattern];
       const solid = st.optMode === "solid";
       const binary = st.optMode === "binary";
@@ -2433,13 +2564,222 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
+  async saveProject(includeResults) {
+    const s = get();
+    if (!s.model || !s.fileName) return;
+    set({ busy: "Saving project…", error: null, notice: null });
+    try {
+      const transform = await engine.transformMatrix();
+      const ext = /\.3mf$/i.test(s.fileName) ? "3mf" : "stl";
+      const manifest: ProjectManifest = {
+        app: "InFEAll",
+        schemaVersion: PROJECT_SCHEMA,
+        appVersion: APP_VERSION,
+        fileName: s.fileName,
+        transform,
+        settings: collectSettings(s),
+        bcs: s.bcs.map((b) => ({ ...b, tris: Array.from(b.tris) })),
+        optSummary: s.optSummary,
+        regionInfos: s.regionInfos,
+        results: includeResults ? s.results : null,
+        activeResultId: includeResults ? s.activeResultId : null,
+      };
+      const bytes = await engine.exportProject(JSON.stringify(manifest), `model.${ext}`, includeResults);
+      const base = s.fileName.replace(/\.(stl|3mf)$/i, "");
+      download(bytes, `${base}.infeall`, "application/octet-stream");
+      set({
+        busy: null,
+        notice: includeResults
+          ? "Project saved — model, settings, and results embedded."
+          : "Project saved — model, settings, and the optimized design (no FEA results).",
+      });
+    } catch (e) {
+      set({ busy: null, error: e instanceof Error ? e.message : String(e) });
+    }
+  },
+
+  async openProject(file) {
+    set({ busy: "Opening project…", error: null, notice: null });
+    try {
+      const bytes = await file.arrayBuffer();
+      const { manifest, model: mi } = await engine.openProjectModel(bytes);
+      const mf = JSON.parse(manifest) as ProjectManifest;
+      if (mf.app !== "InFEAll" || typeof mf.schemaVersion !== "number") {
+        throw new Error("Not an InFEAll project file.");
+      }
+      if (mf.schemaVersion > PROJECT_SCHEMA) {
+        throw new Error("This project was saved by a newer version of InFEAll — please update to open it.");
+      }
+      const st = mf.settings;
+      const model: LoadedModel = {
+        positions: mi.positions,
+        patchIds: mi.patchIds,
+        patchCount: mi.patchCount,
+        triCount: mi.triCount,
+        bbox: mi.bbox as LoadedModel["bbox"],
+        hasCadFaces: mi.hasCadFaces,
+      };
+      // Re-id the loads/supports so they can't collide with this session's counter.
+      const bcs: Bc[] = mf.bcs.map((b) => ({ ...b, id: `bc${++bcCounter}`, tris: Uint32Array.from(b.tris) }));
+      set({
+        fileName: mf.fileName,
+        model,
+        segAngle: st.segAngle,
+        segSource: st.segSource,
+        material: st.material,
+        materials: st.materials,
+        curves: st.curves,
+        levelSettings: st.levelSettings,
+        resolution: st.resolution,
+        customH: st.customH,
+        pattern: st.pattern,
+        perimeters: st.perimeters,
+        lineWidth: st.lineWidth,
+        topBottomLayers: st.topBottomLayers,
+        layerHeight: st.layerHeight,
+        printInfill: st.printInfill,
+        snapVoxel: st.snapVoxel,
+        compositeSkin: st.compositeSkin,
+        smoothStress: st.smoothStress,
+        materialStress: st.materialStress,
+        analyzeMode: st.analyzeMode,
+        budget: st.budget,
+        smoothIters: st.smoothIters,
+        nBins: st.nBins,
+        minMemberMm: st.minMemberMm,
+        goal: st.goal,
+        optMode: st.optMode,
+        retainBc: st.retainBc,
+        selfSupport: st.selfSupport,
+        overhangDeg: st.overhangDeg,
+        symOn: st.symOn,
+        symNormal: st.symNormal,
+        symC: st.symC,
+        solidPattern: st.solidPattern,
+        exportSlicer: st.exportSlicer,
+        resultSurface: st.resultSurface,
+        bcs,
+        activeBcId: null,
+        tool: "orbit",
+        activeStep: 6,
+        check: null,
+        stats: null,
+        hasResult: false,
+        optSummary: null,
+        results: [],
+        activeResultId: null,
+        resultEpochs: { ...ZERO_EPOCHS },
+        regionInfos: [],
+        regionVisible: [],
+        densityThreshold: 0,
+        resultField: "u",
+        fieldRange: null,
+        legendMin: null,
+        legendMax: null,
+        autoScale: 1,
+        voxelInfo: null,
+        voxelMeshReady: false,
+      });
+      session.invalidateSolution();
+      // Push the saved physics + grid settings to the engine.
+      const m = get().material;
+      await engine.setMaterial(m.e0, m.nu, m.density, m.strength, m.strengthZ);
+      await pushResolution(get);
+      await engine.setSnapWall(st.snapVoxel ? st.perimeters * st.lineWidth : 0);
+      await engine.setCompositeSkin(st.compositeSkin);
+      await engine.setSmoothStress(st.smoothStress);
+      await engine.setMaterialStress(st.materialStress);
+      // Replay the saved orientation (clears the engine grid + opt; restore
+      // rebuilds them), then push the loads/supports.
+      if (Array.isArray(mf.transform) && mf.transform.length === 12) {
+        const out = await engine.transform(mf.transform);
+        set({ model: { ...get().model!, positions: out.positions, bbox: out.bbox as LoadedModel["bbox"] } });
+      }
+      await engine.setBcs(bcs);
+      // Clear any stale overlays, then push the restored model + BC glyphs.
+      sceneEvents.onScalarField?.(null);
+      sceneEvents.onDisplacements?.(null, null);
+      sceneEvents.onVertexDensity?.(null);
+      sceneEvents.onRegions?.(null);
+      sceneEvents.onOptShape?.(null, null);
+      sceneEvents.onModelLoaded?.(get().model!);
+      sceneEvents.onBcsChanged?.(bcs, null);
+      // Phase 2: restore the design + result buffers into the engine.
+      const restore = await engine.openProjectRestore();
+      // Optimized design → store + scene (Density/Regions/export).
+      if (restore.hasDesign && mf.optSummary) {
+        set({
+          optSummary: mf.optSummary,
+          regionInfos: mf.regionInfos,
+          regionVisible: mf.regionInfos.map(() => true),
+        });
+        const { regions } = await engine.resmoothRegions(get().smoothIters);
+        const vd = await engine.vertexDensity();
+        sceneEvents.onResultSolid?.(!!mf.optSummary.solid);
+        sceneEvents.onVertexDensity?.(vd);
+        sceneEvents.onRegions?.(regions);
+        sceneEvents.onRegionVisibility?.(get().regionVisible);
+      }
+      // Embedded FEA results → store + scene (deflection views + switcher).
+      const haveResults = !!(mf.results && mf.results.length && restore.restoredResults.length);
+      if (haveResults) {
+        const roster: ResultEntry[] = mf
+          .results!.filter((r) => restore.restoredResults.includes(r.id))
+          .map((r) => ({ ...r, epochs: { ...ZERO_EPOCHS } }));
+        roster.sort((a, b) => RESULT_ORDER.indexOf(a.kind) - RESULT_ORDER.indexOf(b.kind));
+        const activeId =
+          mf.activeResultId && roster.some((r) => r.id === mf.activeResultId)
+            ? mf.activeResultId
+            : (roster[0]?.id ?? null);
+        set({ results: roster, activeResultId: activeId, hasResult: true });
+        if (activeId) {
+          const disp = await engine.activateResult(activeId);
+          session.invalidateSolution();
+          sceneEvents.onResultSolid?.(activeId === "optimized" && !!mf.optSummary?.solid);
+          sceneEvents.onScalarField?.(null);
+          sceneEvents.onDisplacements?.(disp, { maxDisplacement: referenceMaxDisp(roster) });
+          if (get().resultSurface === "voxel") {
+            try {
+              await session.loadVoxelResult();
+            } catch {
+              set({ resultSurface: "stl" });
+              sceneEvents.onResultSurface?.("stl");
+            }
+          }
+        }
+      }
+      const landing: ViewMode = haveResults ? "deformed" : restore.hasDesign ? "density" : "setup";
+      set({ busy: null, viewMode: landing });
+      sceneEvents.onViewState?.(landing, get().deformScale);
+      if (restore.hasDesign) get().setDensityThreshold(st.densityThreshold);
+      if (landing === "deformed") await pushScalarField(set, get);
+      appendLog(
+        set,
+        `Opened project "${mf.fileName}"` +
+          (haveResults
+            ? ` — ${restore.restoredResults.length} result${restore.restoredResults.length === 1 ? "" : "s"} restored`
+            : restore.hasDesign
+              ? " — optimized design restored (re-run Optimize to recompute deflection)"
+              : "")
+      );
+    } catch (e) {
+      set({ busy: null, error: e instanceof Error ? e.message : String(e) });
+    }
+  },
+
   async setViewMode(mode) {
     if (mode === "mesh") {
-      const first = !get().voxelMeshReady;
-      if (first) set({ busy: "Building analysis mesh…", error: null });
       const prev = get().viewMode;
       set({ viewMode: "mesh" });
       sceneEvents.onViewState?.("mesh", get().deformScale);
+      // A run is in flight: the worker is blocked inside the solver and can't
+      // build a fresh hull. Show the one cached at run start (prebuildMeshView)
+      // — refreshView already made the voxel group visible — and don't queue a
+      // request that would only resolve after the run (and overwrite its
+      // status with a misleading "building mesh" message).
+      if (get().busy) return;
+      const first = !get().voxelMeshReady;
+      if (first) set({ busy: "Building analysis mesh…", error: null });
       const ok = await refreshMeshView(set, get);
       if (first) set({ busy: null });
       if (!ok) {

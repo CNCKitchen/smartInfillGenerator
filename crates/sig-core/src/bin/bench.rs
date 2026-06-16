@@ -100,7 +100,7 @@ fn bench_benchy() {
     let mesh = sig_core::mesh::TriMesh::from_stl(&bytes).expect("benchy parse");
     let (lo, hi) = mesh.bounds().unwrap();
     let vol = (hi[0] - lo[0]) * (hi[1] - lo[1]) * (hi[2] - lo[2]);
-    let h = sig_core::voxel::pick_voxel_size(vol, 300_000.0, 0.0);
+    let h = sig_core::voxel::pick_voxel_size(vol, vol, 300_000.0, 0.0);
     let t0 = Instant::now();
     let grid = VoxelGrid::voxelize(&mesh, h);
     let t_vox = t0.elapsed();
