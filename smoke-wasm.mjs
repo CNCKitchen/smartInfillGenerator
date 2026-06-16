@@ -398,6 +398,47 @@ optModel.resmooth_regions(8);
 const vd = optModel.vertex_density();
 assert(vd.length === optTri * 3, "final vertex density buffer");
 
+// ---- result switcher: stash + activate the kept baselines ----
+// The optimizer already stashed the equal-mass uniform + solid baselines (their
+// displacement fields used to be discarded); the optimized solution is stashed
+// here as the store does. Activating one swaps it in for displacement/stress
+// queries; clearing drops them all.
+assert(summary.hasBaselines === true, "optimize exposes the uniform + solid baselines");
+assert(summary.uniformMaxDisp > summary.maxDisplacement,
+  `uniform deflects more than the optimized design at equal mass (${summary.uniformMaxDisp.toFixed(4)} > ${summary.maxDisplacement.toFixed(4)} mm)`);
+assert(summary.solidMaxDisp < summary.maxDisplacement,
+  `solid is stiffer than the optimized design (${summary.solidMaxDisp.toFixed(4)} < ${summary.maxDisplacement.toFixed(4)} mm)`);
+{
+  const maxOf = (a) => {
+    let m = 0;
+    for (let i = 0; i < a.length; i += 3) m = Math.max(m, Math.hypot(a[i], a[i + 1], a[i + 2]));
+    return m;
+  };
+  optModel.stash_result("optimized");
+  const dispUniform = optModel.activate_result("uniform");
+  assert(dispUniform.length === optTri * 9, "activate_result returns per-soup-vertex displacements");
+  assert(Math.abs(maxOf(dispUniform) - summary.uniformMaxDisp) < 0.05 * summary.uniformMaxDisp + 1e-6,
+    `activated uniform max |u| matches the summary (${maxOf(dispUniform).toFixed(4)} mm)`);
+  const vmUniform = optModel.result_field("vm");
+  assert(vmUniform.length === optTri * 3 && vmUniform.every((v) => Number.isFinite(v)),
+    "stress field resolves on the activated uniform result");
+  const dispSolid = optModel.activate_result("solid");
+  assert(Math.abs(maxOf(dispSolid) - summary.solidMaxDisp) < 0.05 * summary.solidMaxDisp + 1e-6,
+    `activated solid max |u| matches the summary (${maxOf(dispSolid).toFixed(4)} mm)`);
+  const dispOpt = optModel.activate_result("optimized");
+  assert(Math.abs(maxOf(dispOpt) - summary.maxDisplacement) < 0.05 * summary.maxDisplacement + 1e-6,
+    `re-activating the optimized result restores its field (${maxOf(dispOpt).toFixed(4)} mm)`);
+  optModel.clear_results();
+  let cleared = false;
+  try {
+    optModel.activate_result("uniform");
+  } catch (e) {
+    cleared = /no such result/i.test(String(e));
+  }
+  assert(cleared, "clear_results drops the stash (activate then fails)");
+}
+console.log("ok: result switcher (stash / activate / clear)");
+
 // Analysis-mesh display buffers.
 const hull = optModel.voxel_hull();
 const hedges = optModel.voxel_edges();

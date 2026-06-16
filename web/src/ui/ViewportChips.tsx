@@ -6,7 +6,7 @@
 // the section plane bottom left. Result review happens ON the result.
 
 import { useShallow } from "zustand/shallow";
-import { useStore, type ViewMode } from "../store";
+import { useStore, resultStale, type ViewMode, type ResultKind } from "../store";
 import { RESULT_FIELDS } from "../types";
 
 function ViewBtn({ mode, label }: { mode: ViewMode; label: string }) {
@@ -27,6 +27,10 @@ export function ViewportChips() {
       viewMode: s.viewMode,
       hasResult: s.hasResult,
       optSummary: s.optSummary,
+      results: s.results,
+      activeResultId: s.activeResultId,
+      resultEpochs: s.resultEpochs,
+      selectResult: s.selectResult,
       wireframe: s.wireframe,
       setWireframe: s.setWireframe,
       resultSurface: s.resultSurface,
@@ -67,6 +71,24 @@ export function ViewportChips() {
 
       {resultsView && (
         <div className="fieldchip">
+          {s.results.length > 0 && (
+            <>
+              <select
+                className="resultsel"
+                value={s.activeResultId ?? ""}
+                onChange={(e) => void s.selectResult(e.target.value as ResultKind)}
+                title="Which result to view — optimized, the even-fill baselines, or the as-printed solve"
+              >
+                {s.results.map((r) => (
+                  <option key={r.id} value={r.id}>
+                    {resultStale(r, s.resultEpochs) ? "⚠ " : ""}
+                    {r.label}
+                  </option>
+                ))}
+              </select>
+              <span className="chipdiv" />
+            </>
+          )}
           <div className="seg">
             <button
               className={s.resultSurface === "stl" ? "on" : ""}
@@ -129,7 +151,7 @@ export function ViewportChips() {
           onClick={() => s.setAnimateDeformed(!s.animateDeformed)}
           title="Loop the deflection 0 → max"
         >
-          {s.animateDeformed ? "■ Stop" : "▶ Play deflection"}
+          {s.animateDeformed ? "■ Stop" : "▶ Animate"}
         </button>
       )}
 

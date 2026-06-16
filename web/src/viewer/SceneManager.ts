@@ -13,6 +13,22 @@ import type { Tool, ViewMode } from "../store";
 import { jet, ramp, type RGB } from "./colormaps";
 import type { OptRegion } from "../engine/EngineClient";
 
+/** Named orthographic camera presets (keyboard Ctrl + 0–6). Axes follow the
+ *  Z-up / Blender convention: "front" is the −Y face, matching the default
+ *  isometric corner the part is framed from on load. */
+export type CameraView = "default" | "top" | "bottom" | "front" | "behind" | "left" | "right";
+
+/** Digit (KeyboardEvent.key) → camera preset for the Ctrl + 0–6 shortcuts. */
+const VIEW_KEYS: Record<string, CameraView> = {
+  "0": "default",
+  "1": "top",
+  "2": "bottom",
+  "3": "front",
+  "4": "behind",
+  "5": "left",
+  "6": "right",
+};
+
 const BASE_COLOR = new THREE.Color(0x9aa3ad);
 // Hover highlight: saturated amber, unmistakable against the gray part and
 // every BC color (a light gray tint was too close to the base material).
@@ -282,7 +298,7 @@ export class SceneManager {
   private lutJet = makeLut(jet);
   private lutRamp = makeLut(ramp);
   private uvs: Float32Array | null = null;
-  private scalarMode: "none" | "jet" | "ramp" = "none";
+  private scalarMode: "none" | "jet" | "ramp" | "flat" = "none";
 
   private clock = new THREE.Clock();
   private callbacks: SceneCallbacks = {};
@@ -312,11 +328,14 @@ export class SceneManager {
     // zoom — see installNavigation). OrbitControls keeps damping + R-drag pan.
     this.controls.enableRotate = false;
     this.controls.enableZoom = false;
-    // Safety net for the pole flip (see onOrbitMove): even though our manual
-    // orbit already clamps the pitch, keep OrbitControls' own per-frame
-    // reconstruction off the exact ±Z pole so nothing can resurface the snap.
-    this.controls.minPolarAngle = this.poleEps;
-    this.controls.maxPolarAngle = Math.PI - this.poleEps;
+    // Full polar range: the manual orbit (onOrbitMove) already clamps its own
+    // pitch to poleEps, so OrbitControls' per-frame reconstruction never lands
+    // on the ±Z pole *during a drag* (where up = +Z lookAt is degenerate and
+    // the azimuth snaps). The only on-pole placements are the top/bottom camera
+    // presets (setCameraView), which set up = +Y so lookAt stays well-defined —
+    // a poleEps clamp here would knock those ~2.3° off a true axis view.
+    this.controls.minPolarAngle = 0;
+    this.controls.maxPolarAngle = Math.PI;
 
     const hemi = new THREE.HemisphereLight(0xffffff, 0xb9b6ae, 1.0);
     this.scene.add(hemi);
@@ -411,6 +430,7 @@ export class SceneManager {
     document.removeEventListener("pointermove", this.onAnnoMove);
     document.removeEventListener("pointerup", this.onAnnoUp);
     document.removeEventListener("keydown", this.onAnnoKey);
+    document.removeEventListener("keydown", this.onViewKey);
     this.canvas?.parentElement?.removeEventListener("pointerdown", this.onAnnoDownCapture, true);
     this.clearCallouts();
     this.canvas?.removeEventListener("wheel", this.onWheel);
@@ -442,6 +462,69 @@ export class SceneManager {
     this.camera.top = this.orthoHalf;
     this.camera.bottom = -this.orthoHalf;
     this.camera.updateProjectionMatrix();
+  }
+
+  /** Snap to a named orthographic preset, re-framing the part. The default
+   *  reproduces the on-load isometric (see setModel); the six axis views look
+   *  straight down a world axis. Top/bottom take up = +Y (Z is the view axis);
+   *  the rest keep the printer's Z-up. */
+  setCameraView(view: CameraView) {
+    if (!this.camera || !this.controls) return;
+
+    // Re-centre on the part; fall back to the live orbit target with no model.
+    const center = new THREE.Vector3();
+    const b = this.partBbox;
+    if (b) center.set((b[0] + b[3]) / 2, (b[1] + b[4]) / 2, (b[2] + b[5]) / 2);
+    else center.copy(this.controls.target);
+
+    // dir: offset from the part toward the camera (parallel projection, so its
+    // length only sets clipping, not framing). up: which way is up on screen.
+    let dir: THREE.Vector3;
+    let up: THREE.Vector3;
+    switch (view) {
+      case "top":
+        dir = new THREE.Vector3(0, 0, 1);
+        up = new THREE.Vector3(0, 1, 0);
+        break;
+      case "bottom":
+        dir = new THREE.Vector3(0, 0, -1);
+        up = new THREE.Vector3(0, 1, 0);
+        break;
+      case "front":
+        dir = new THREE.Vector3(0, -1, 0);
+        up = new THREE.Vector3(0, 0, 1);
+        break;
+      case "behind":
+        dir = new THREE.Vector3(0, 1, 0);
+        up = new THREE.Vector3(0, 0, 1);
+        break;
+      case "left":
+        dir = new THREE.Vector3(-1, 0, 0);
+        up = new THREE.Vector3(0, 0, 1);
+        break;
+      case "right":
+        dir = new THREE.Vector3(1, 0, 0);
+        up = new THREE.Vector3(0, 0, 1);
+        break;
+      default: // isometric, identical to the on-load fit in setModel
+        dir = new THREE.Vector3(0.7, -0.8, 0.55);
+        up = new THREE.Vector3(0, 0, 1);
+        break;
+    }
+
+    const dist = this.bboxDiag * 2.2;
+    this.camera.up.copy(up);
+    this.camera.position.copy(center).addScaledVector(dir, dist);
+    this.controls.target.copy(center);
+    this.camera.near = this.bboxDiag / 100;
+    this.camera.far = this.bboxDiag * 50;
+    this.camera.zoom = 1;
+    this.orthoHalf = this.bboxDiag * 0.62;
+    this.updateFrustum();
+    this.camera.lookAt(center);
+    this.controls.update();
+    // Re-pivot the next orbit drag on the part centre, not a stale surface hit.
+    this.lastOrbitPivot = center.clone();
   }
 
   setTool(tool: Tool, brushRadius: number, brushErase: boolean) {
@@ -1066,6 +1149,7 @@ export class SceneManager {
     document.addEventListener("pointermove", this.onAnnoMove);
     document.addEventListener("pointerup", this.onAnnoUp);
     document.addEventListener("keydown", this.onAnnoKey);
+    document.addEventListener("keydown", this.onViewKey);
     canvas.addEventListener("wheel", this.onWheel, { passive: false });
   }
 
@@ -1352,6 +1436,20 @@ export class SceneManager {
 
   private onAnnoKey = (ev: KeyboardEvent) => {
     if (ev.key === "Escape" && this.callouts.length) this.clearCallouts();
+  };
+
+  /** Ctrl/⌘ + 0–6 snap the camera to a named orthographic view (slicer
+   *  convention): 0 default ISO, 1 top, 2 bottom, 3 front, 4 behind, 5 left,
+   *  6 right. */
+  private onViewKey = (ev: KeyboardEvent) => {
+    if ((!ev.ctrlKey && !ev.metaKey) || ev.altKey || ev.shiftKey) return;
+    // Don't hijack the digit while typing in a field (e.g. legend bound editor).
+    const t = ev.target as HTMLElement | null;
+    if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
+    const view = VIEW_KEYS[ev.key];
+    if (!view) return;
+    ev.preventDefault();
+    this.setCameraView(view);
   };
 
   private drawAnnoRect() {
@@ -2551,17 +2649,25 @@ export class SceneManager {
     this.applyColors();
   }
 
-  /** Switch the part material between BC vertex colors and a scalar LUT. */
-  private setSurfaceMaterialMode(mode: "none" | "jet" | "ramp") {
+  /** Switch the part material between BC vertex colors, a scalar LUT, or a flat
+   *  uni-color (the translucent envelope used when the readout lives elsewhere
+   *  — e.g. the density cutaway carries the colors, the part is just a shell). */
+  private setSurfaceMaterialMode(mode: "none" | "jet" | "ramp" | "flat") {
     if (!this.mesh || mode === this.scalarMode) return;
     this.scalarMode = mode;
     const mat = this.mesh.material as THREE.MeshStandardMaterial;
     if (mode === "none") {
       mat.map = null;
       mat.vertexColors = true;
+      mat.color.setHex(0xffffff); // vertex colors carry the actual color
+    } else if (mode === "flat") {
+      mat.map = null;
+      mat.vertexColors = false;
+      mat.color.setHex(0xc9c6bf); // neutral Werkbank-chassis envelope tone
     } else {
       mat.map = mode === "jet" ? this.lutJet : this.lutRamp;
       mat.vertexColors = false;
+      mat.color.setHex(0xffffff); // LUT map supplies the color
     }
     mat.needsUpdate = true;
   }
@@ -2633,6 +2739,17 @@ export class SceneManager {
       return;
     }
     if (this.viewMode === "density" && this.vertexDensity) {
+      // With a cutaway/skeleton present, the dense interior is shown there
+      // (color-coded); the part is just a flat translucent envelope so the
+      // density isn't also smeared onto its mostly-skin outer surface.
+      if (this.optShapeMesh) {
+        this.setSurfaceMaterialMode("flat");
+        this.extremeData = null;
+        this.updateExtremeMarkers();
+        this.repaint();
+        return;
+      }
+      // No cutaway: paint the density straight onto the surface.
       for (let i = 0; i < this.vertexDensity.length; i++) {
         this.uvs[2 * i] = Math.min(1, this.vertexDensity[i] / 0.8);
         this.uvs[2 * i + 1] = 0.5;

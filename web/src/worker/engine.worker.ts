@@ -116,6 +116,9 @@ type Req =
   | { id: number; op: "resultField"; kind: string }
   | { id: number; op: "voxelResults" }
   | { id: number; op: "voxelResultField"; kind: string }
+  | { id: number; op: "stashResult"; resultId: string }
+  | { id: number; op: "activateResult"; resultId: string }
+  | { id: number; op: "clearResults" }
   | { id: number; op: "exportThreeMf"; slicer: string; thumbnail: Uint8Array | null }
   | { id: number; op: "exportStls" }
   | { id: number; op: "exportSolidStl" };
@@ -406,6 +409,19 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
         ]);
         return;
       }
+      case "stashResult":
+        requireModel().stash_result(msg.resultId);
+        break;
+      case "activateResult": {
+        const displacements = requireModel().activate_result(msg.resultId);
+        (self as unknown as Worker).postMessage({ id: msg.id, ok: true, data: displacements }, [
+          displacements.buffer,
+        ]);
+        return;
+      }
+      case "clearResults":
+        requireModel().clear_results();
+        break;
       case "exportThreeMf": {
         const thumb = msg.thumbnail ?? new Uint8Array(0);
         const bytes = requireModel().export_3mf(msg.slicer, thumb);

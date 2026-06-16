@@ -189,6 +189,7 @@ pub struct NodeProblem {
     pub forces: Vec<(u32, [f64; 3])>,
 }
 
+#[derive(Clone)]
 pub struct Solution {
     /// Nodal displacements (mm), 3 per node, on the PADDED node grid.
     pub u: Vec<f32>,

@@ -140,6 +140,73 @@ export function budgetBounds(s: {
     : [s.levelSettings.floorPct, s.levelSettings.capPct];
 }
 
+// ---- result set (Results-view switcher + staleness) ----
+
+/** A retained, selectable result. Identity = its engine stash key. */
+export type ResultKind = "optimized" | "uniform" | "solid" | "asprinted";
+
+/** Monotonic input epochs. A result is stale when an epoch it depends on has
+ *  advanced past the value it was built at. Grid/geometry changes are NOT
+ *  epochs — they DROP the result set (the stashed node grid no longer matches). */
+export interface ResultEpochs {
+  /** Loads & supports (BCs). */
+  loads: number;
+  /** Material properties. */
+  material: number;
+  /** As-printed knobs: print infill, pattern, shells, snap-off skin. */
+  print: number;
+  /** Optimization knobs: budget, goal, mode, levels, symmetry, skin… */
+  opt: number;
+}
+
+const ZERO_EPOCHS: ResultEpochs = { loads: 0, material: 0, print: 0, opt: 0 };
+
+/** One retained result: metadata for the dropdown + the provenance card.
+ *  The displacement/stress data itself lives in the engine stash (keyed by id)
+ *  and in the worker's per-result solution. */
+export interface ResultEntry {
+  id: ResultKind;
+  kind: ResultKind;
+  /** Dropdown label, e.g. "Optimized · graded 24%". */
+  label: string;
+  /** Headline outputs for the provenance card. */
+  maxDisplacement: number;
+  massGrams: number | null;
+  /** Min safety factor (as-printed only; null = not computed). */
+  minSf: number | null;
+  converged: boolean;
+  /** Provenance card title + rows (the settings the result was built with). */
+  provTitle: string;
+  provRows: [string, string][];
+  /** Epoch stamps at build time — diffed against the live epochs for staleness. */
+  epochs: ResultEpochs;
+}
+
+/** Fixed display order in the dropdown. */
+const RESULT_ORDER: ResultKind[] = ["optimized", "uniform", "asprinted", "solid"];
+
+/** A result is stale when a dependency epoch has advanced. Displacement stays
+ *  correct (the stash is self-contained); stress may be inconsistent — which is
+ *  exactly why it's badged "re-run". */
+export function resultStale(e: ResultEntry, ep: ResultEpochs): boolean {
+  if (ep.loads !== e.epochs.loads || ep.material !== e.epochs.material) return true;
+  if (e.kind === "asprinted") return ep.print !== e.epochs.print;
+  if (e.kind === "solid") return false; // depends on grid+loads+material only
+  return ep.opt !== e.epochs.opt; // optimized + uniform
+}
+
+/** Cheap fingerprint of the loads/supports — changes whenever a BC is added,
+ *  removed, re-parameterized, or re-painted. */
+function bcFingerprint(bcs: Bc[]): string {
+  return bcs
+    .map((b) => {
+      let triSum = 0;
+      for (let i = 0; i < b.tris.length; i++) triSum = (triSum + b.tris[i]) >>> 0;
+      return [b.kind, b.tris.length, triSum, b.axes?.join(""), b.force?.join(","), b.pressure, b.stiffness].join(",");
+    })
+    .join("|");
+}
+
 function saveSettings(
   materials: Material[],
   curves: Record<PatternKey, PatternCurve>,
@@ -250,6 +317,12 @@ interface AppState {
   hasResult: boolean;
   optProgress: { iteration: number; maxIter: number; pass?: number; passes?: number } | null;
   optSummary: OptSummary | null;
+  /** Retained, selectable results for the Results view's switcher. */
+  results: ResultEntry[];
+  /** Which retained result the Results (deformed) view is showing. */
+  activeResultId: ResultKind | null;
+  /** Live input epochs — diffed against each result's stamps for staleness. */
+  resultEpochs: ResultEpochs;
   viewMode: ViewMode;
   /** Overlay the model's triangle mesh as a wireframe (Setup/Mesh views) so
    *  the input mesh quality can be inspected. */
@@ -408,6 +481,8 @@ interface AppState {
   clearLog(): void;
   /** Append a line to the nerd log (e.g. a placed value callout from the viewer). */
   logNote(msg: string): void;
+  /** Switch the Results view to a retained result (instant — engine-stashed). */
+  selectResult(id: ResultKind): Promise<void>;
   runCheck(): Promise<void>;
   runSolve(): Promise<void>;
   runOptimize(): Promise<void>;
@@ -832,6 +907,9 @@ async function refreshMeshView(set: SetState, get: () => AppState): Promise<bool
   }
 }
 
+/** DESTRUCTIVE reset — geometry/grid changes only. The stashed results sit on
+ *  the OLD node grid (or moved part), so they can't be shown correctly: drop
+ *  the whole set (engine stash included) and snap out of any result view. */
 function invalidateResults(set: (p: Partial<AppState>) => void, get: () => AppState) {
   set({
     check: null,
@@ -839,6 +917,9 @@ function invalidateResults(set: (p: Partial<AppState>) => void, get: () => AppSt
     hasResult: false,
     optSummary: null,
     printedStats: null,
+    results: [],
+    activeResultId: null,
+    resultEpochs: { ...ZERO_EPOCHS },
     regionInfos: [],
     regionVisible: [],
     densityThreshold: 0,
@@ -848,6 +929,7 @@ function invalidateResults(set: (p: Partial<AppState>) => void, get: () => AppSt
     legendMax: null,
   });
   session.invalidateSolution();
+  void engine.clearResults();
   sceneEvents.onLegendRange?.(null, null);
   sceneEvents.onScalarField?.(null);
   sceneEvents.onRegions?.(null);
@@ -859,6 +941,60 @@ function invalidateResults(set: (p: Partial<AppState>) => void, get: () => AppSt
     set({ viewMode: "setup" });
     sceneEvents.onViewState?.("setup", get().deformScale);
   }
+}
+
+/** NON-destructive — bump the given input epochs so the dependent retained
+ *  results badge "re-run needed" while staying viewable on the same grid.
+ *  No-op when nothing is retained. */
+function markResultsStale(
+  set: (p: Partial<AppState>) => void,
+  get: () => AppState,
+  ...keys: (keyof ResultEpochs)[]
+) {
+  if (get().results.length === 0) return;
+  const ep = { ...get().resultEpochs };
+  for (const k of keys) ep[k] += 1;
+  set({ resultEpochs: ep });
+}
+
+/** Insert (or replace same-kind) a freshly-computed result and keep the set in
+ *  a fixed display order. Replacing on re-run is the retention cap. */
+function upsertResult(set: (p: Partial<AppState>) => void, get: () => AppState, entry: ResultEntry) {
+  const next = get().results.filter((r) => r.id !== entry.id);
+  next.push(entry);
+  next.sort((a, b) => RESULT_ORDER.indexOf(a.kind) - RESULT_ORDER.indexOf(b.kind));
+  set({ results: next });
+}
+
+/** Sign-aware mm/µm formatter for the provenance card. */
+function fmtMm(v: number): string {
+  const a = Math.abs(v);
+  return a >= 0.01 ? `${v.toFixed(2)} mm` : `${(v * 1000).toFixed(1)} µm`;
+}
+
+/** Signed percentage with an explicit + (negatives carry their own −). Both
+ *  "vs uniform" (positive: stiffer than even fill) and "vs solid" (negative:
+ *  softer than fully dense) read off the same compliance-ratio calculation. */
+function signedPct(x: number): string {
+  return `${x >= 0 ? "+" : ""}${(x * 100).toFixed(0)}%`;
+}
+
+/** Analysis-grid summary line for the provenance card. */
+function meshLabel(s: AppState): string {
+  const vi = s.voxelInfo;
+  return vi ? `h ${vi.h.toFixed(2)} mm · ${Math.round(vi.cells / 1000)}k cells` : "—";
+}
+
+/** Shared deformation reference = the LOWEST-deflection retained result (min
+ *  max |u|). Feeding this same value to the viewer for EVERY result keeps the
+ *  exaggeration factor equal across switches, so a stiffer result visibly
+ *  deflects less than a softer one instead of each self-normalizing. `extra`
+ *  folds in a result that's being created before it's in the set. */
+function referenceMaxDisp(results: ResultEntry[], extra?: number): number {
+  let m = Infinity;
+  for (const r of results) if (r.maxDisplacement > 0) m = Math.min(m, r.maxDisplacement);
+  if (extra && extra > 0) m = Math.min(m, extra);
+  return Number.isFinite(m) && m > 0 ? m : 1;
 }
 
 /** Model or resolution changed: the voxel grid (and its display mesh) is stale. */
@@ -932,6 +1068,9 @@ export const useStore = create<AppState>((set, get) => ({
   hasResult: false,
   optProgress: null,
   optSummary: null,
+  results: [],
+  activeResultId: null,
+  resultEpochs: { ...ZERO_EPOCHS },
   viewMode: "setup",
   wireframe: false,
   deformScale: 1,
@@ -1010,6 +1149,9 @@ export const useStore = create<AppState>((set, get) => ({
         stats: null,
         hasResult: false,
         optSummary: null,
+        results: [],
+        activeResultId: null,
+        resultEpochs: { ...ZERO_EPOCHS },
         optProgress: null,
         viewMode: "setup",
         voxelInfo: null,
@@ -1136,6 +1278,7 @@ export const useStore = create<AppState>((set, get) => ({
   toggleSymmetry() {
     const on = !get().symOn;
     set({ symOn: on });
+    markResultsStale(set, get, "opt");
     if (on) get().centerSymmetry();
     else pushSymmetry(get);
   },
@@ -1143,6 +1286,7 @@ export const useStore = create<AppState>((set, get) => ({
     set({
       symNormal: [axis === "x" ? 1 : 0, axis === "y" ? 1 : 0, axis === "z" ? 1 : 0],
     });
+    markResultsStale(set, get, "opt");
     get().centerSymmetry(); // re-anchor: c along the old normal is meaningless
   },
   centerSymmetry() {
@@ -1162,6 +1306,7 @@ export const useStore = create<AppState>((set, get) => ({
   onSymmetryPlaneMoved(normal, c) {
     // The scene already moved the plane — just mirror the values.
     set({ symNormal: normal, symC: Math.round(c * 100) / 100 });
+    markResultsStale(set, get, "opt");
   },
 
   setBrushRadius(r) {
@@ -1192,7 +1337,7 @@ export const useStore = create<AppState>((set, get) => ({
       forceDirAuto: kind === "force" ? true : undefined,
     };
     set({ bcs: [...get().bcs, bc], activeBcId: bc.id, tool: "select" });
-    invalidateResults(set, get);
+    markResultsStale(set, get, "loads");
     sceneEvents.onBcsChanged?.(get().bcs, bc.id);
   },
 
@@ -1202,7 +1347,7 @@ export const useStore = create<AppState>((set, get) => ({
       activeBcId: get().activeBcId === id ? null : get().activeBcId,
     });
     if (get().bcs.length === 0) set({ tool: "orbit" });
-    invalidateResults(set, get);
+    markResultsStale(set, get, "loads");
     sceneEvents.onBcsChanged?.(get().bcs, get().activeBcId);
     void pushBcs(get);
   },
@@ -1231,14 +1376,14 @@ export const useStore = create<AppState>((set, get) => ({
         return next;
       }),
     });
-    invalidateResults(set, get);
+    markResultsStale(set, get, "loads");
     sceneEvents.onBcsChanged?.(get().bcs, get().activeBcId);
     void pushBcs(get);
   },
 
   updateBcParams(id, params) {
     set({ bcs: get().bcs.map((b) => (b.id === id ? { ...b, ...params } : b)) });
-    invalidateResults(set, get);
+    markResultsStale(set, get, "loads");
     sceneEvents.onBcsChanged?.(get().bcs, get().activeBcId);
     void pushBcs(get);
   },
@@ -1338,7 +1483,7 @@ export const useStore = create<AppState>((set, get) => ({
 
   setMaterial(m) {
     set({ material: m });
-    invalidateResults(set, get);
+    markResultsStale(set, get, "material");
     void engine.setMaterial(m.e0, m.nu, m.density, m.strength, m.strengthZ);
   },
 
@@ -1350,7 +1495,7 @@ export const useStore = create<AppState>((set, get) => ({
     saveSettings(mats, get().curves, get().levelSettings);
     if (wasSelected) {
       set({ material: m });
-      invalidateResults(set, get);
+      markResultsStale(set, get, "material");
       void engine.setMaterial(m.e0, m.nu, m.density, m.strength, m.strengthZ);
     }
   },
@@ -1434,11 +1579,13 @@ export const useStore = create<AppState>((set, get) => ({
     // of the active mode (graded: floor..cap; binary: binary floor..90).
     const [lo, hi] = budgetBounds(get());
     set({ budget: Math.min(hi, Math.max(lo, Math.round(v))) });
+    markResultsStale(set, get, "opt");
   },
   setPattern(p) {
-    // The pattern law feeds the next solve/optimize; a shown printed result
-    // would no longer match it.
+    // The pattern law feeds the next solve/optimize; both the as-printed and
+    // the optimized results were built with the old curve.
     set({ pattern: p, printedStats: null });
+    markResultsStale(set, get, "print", "opt");
   },
   setPerimeters(v) {
     set({ perimeters: Math.min(8, Math.max(1, Math.round(v))), printedStats: null });
@@ -1446,6 +1593,10 @@ export const useStore = create<AppState>((set, get) => ({
       // The wall changed: with snapping on the engine rebuilds the grid.
       invalidateResults(set, get);
       invalidateGrid(set, get);
+    } else {
+      // No snap: the grid survives, but the skin band differs — the as-printed
+      // and optimized results no longer match the wall.
+      markResultsStale(set, get, "print", "opt");
     }
     void pushSnap(get);
   },
@@ -1454,25 +1605,31 @@ export const useStore = create<AppState>((set, get) => ({
     if (get().snapVoxel) {
       invalidateResults(set, get);
       invalidateGrid(set, get);
+    } else {
+      markResultsStale(set, get, "print", "opt");
     }
     void pushSnap(get);
   },
   setTopBottomLayers(v) {
     set({ topBottomLayers: Math.min(20, Math.max(0, Math.round(v))), printedStats: null });
-    invalidateResults(set, get);
+    markResultsStale(set, get, "print", "opt");
     if (get().viewMode === "mesh") void refreshMeshView(set, get);
   },
   setLayerHeight(v) {
     set({ layerHeight: Math.min(0.6, Math.max(0.04, v)), printedStats: null });
-    invalidateResults(set, get);
+    markResultsStale(set, get, "print", "opt");
     if (get().viewMode === "mesh") void refreshMeshView(set, get);
   },
   setPrintInfill(v) {
     const pct = Math.min(100, Math.max(5, Math.round(v)));
     set({ printInfill: pct, printedStats: null });
-    // "Here's your print today — now beat it": the optimizer's budget
-    // follows the print setting (still clamped to its own band).
-    get().setBudget(pct);
+    // Print infill is an AS-PRINTED knob — stale only that baseline.
+    markResultsStale(set, get, "print");
+    // "Here's your print today — now beat it": the optimizer's budget follows
+    // the print setting (clamped to its band). Update it inline, NOT via
+    // setBudget, so the budget-follow doesn't also stale the optimized result.
+    const [blo, bhi] = budgetBounds(get());
+    set({ budget: Math.min(bhi, Math.max(blo, pct)) });
     // The mesh view's element-density colors follow the infill setting —
     // debounce the rebuild while the slider drags.
     if (get().viewMode === "mesh") {
@@ -1566,10 +1723,12 @@ export const useStore = create<AppState>((set, get) => ({
   },
   setNBins(v) {
     set({ nBins: v });
+    markResultsStale(set, get, "opt");
   },
   setMinMemberMm(v) {
     // null = auto (2× line width); otherwise clamp to a sane printable range.
     set({ minMemberMm: v == null ? null : Math.min(10, Math.max(0, v)) });
+    markResultsStale(set, get, "opt");
   },
 
   setGoal(g) {
@@ -1586,17 +1745,21 @@ export const useStore = create<AppState>((set, get) => ({
 
   setRetainBc(on) {
     set({ retainBc: on });
+    markResultsStale(set, get, "opt");
   },
   setSelfSupport(on) {
     set({ selfSupport: on });
+    markResultsStale(set, get, "opt");
   },
   setOverhangDeg(deg) {
     // 0° = horizontal (no constraint) … 90° = vertical only.
     set({ overhangDeg: Math.min(90, Math.max(0, Math.round(deg))) });
+    markResultsStale(set, get, "opt");
   },
 
   setSolidPattern(p) {
     set({ solidPattern: p });
+    markResultsStale(set, get, "opt");
   },
 
   updateLevelSettings(p) {
@@ -1660,6 +1823,46 @@ export const useStore = create<AppState>((set, get) => ({
 
   logNote(msg) {
     appendLog(set, msg);
+  },
+
+  async selectResult(id) {
+    const e = get().results.find((r) => r.id === id);
+    if (!e || get().busy) return;
+    set({
+      activeResultId: id,
+      resultField: "u",
+      fieldRange: null,
+      legendMin: null,
+      legendMax: null,
+    });
+    sceneEvents.onLegendRange?.(null, null);
+    try {
+      // Swap the stashed solution in (instant) and re-deform the viewport.
+      const displacements = await engine.activateResult(id);
+      if (get().activeResultId !== id) return; // user switched again mid-fetch
+      // The field + voxel caches belonged to the previously active result.
+      session.invalidateSolution();
+      // Only the optimized result in Part Topo mode is a solid body; every
+      // other result renders on the part hull.
+      sceneEvents.onResultSolid?.(id === "optimized" && !!get().optSummary?.solid);
+      sceneEvents.onScalarField?.(null);
+      // Anchor the exaggeration on the lowest-deflection result so the scale
+      // stays equal across switches (this result still uses its own buffer).
+      sceneEvents.onDisplacements?.(displacements, {
+        maxDisplacement: referenceMaxDisp(get().results),
+      });
+      if (get().resultSurface === "voxel") {
+        try {
+          await session.loadVoxelResult();
+        } catch {
+          set({ resultSurface: "stl" });
+          sceneEvents.onResultSurface?.("stl");
+        }
+      }
+      await pushScalarField(set, get);
+    } catch (err) {
+      set({ error: err instanceof Error ? err.message : String(err) });
+    }
   },
 
   async runCheck() {
@@ -1797,7 +2000,9 @@ export const useStore = create<AppState>((set, get) => ({
           : `Solver did NOT converge (stopped at the iteration cap, residual ${stats.relResidual.toExponential(1)}) — the results are unconverged and only indicative. See the caution in the results panel; a coarser resolution converges reliably.`,
       });
       sceneEvents.onScalarField?.(null);
-      sceneEvents.onDisplacements?.(displacements, stats);
+      sceneEvents.onDisplacements?.(displacements, {
+        maxDisplacement: referenceMaxDisp(get().results, stats.maxDisplacement),
+      });
       sceneEvents.onViewState?.("deformed", get().deformScale);
       // Voxel result surface active: reload its hull for the new solution.
       if (get().resultSurface === "voxel") {
@@ -1821,6 +2026,47 @@ export const useStore = create<AppState>((set, get) => ({
                 ? `layer adhesion governs (σₜᶻ ${m.strengthZ} MPa vs σzz tension)`
                 : `material governs (σₜ ${m.strength} MPa vs σᵥᴹ)`)
           );
+        }
+      }
+      // Retain this solve as a switchable result (as-printed or solid baseline)
+      // so the Results view can compare it against the optimized design.
+      {
+        const rid: ResultKind = printedSummary ? "asprinted" : "solid";
+        try {
+          await engine.stashResult(rid);
+          const cur = get();
+          const rows: [string, string][] = printedSummary
+            ? [
+                ["Infill", `${printedSummary.infillPct}% ${printedSummary.pattern}`],
+                ["Skin", `${printedSummary.perimeters} × ${printedSummary.lineWidth} mm`],
+                ["Material", cur.material.name],
+                ["Mesh", meshLabel(cur)],
+                ["Mass", `${printedSummary.massGrams.toFixed(1)} g`],
+                ["Max |u|", fmtMm(stats.maxDisplacement)],
+              ]
+            : [
+                ["Model", "fully dense E₀"],
+                ["Material", cur.material.name],
+                ["Mesh", meshLabel(cur)],
+                ["Max |u|", fmtMm(stats.maxDisplacement)],
+              ];
+          upsertResult(set, get, {
+            id: rid,
+            kind: rid,
+            label: printedSummary
+              ? `As printed · ${printedSummary.infillPct}% ${printedSummary.pattern}`
+              : "Solid material",
+            maxDisplacement: stats.maxDisplacement,
+            massGrams: printedSummary ? printedSummary.massGrams : null,
+            minSf: cur.printedStats?.minSf ?? null,
+            converged: stats.converged,
+            provTitle: printedSummary ? "As printed" : "Solid material",
+            provRows: rows,
+            epochs: { ...cur.resultEpochs },
+          });
+          set({ activeResultId: rid });
+        } catch {
+          // stash failed — the solve still shows, it just isn't switchable
         }
       }
     } catch (e) {
@@ -2011,8 +2257,18 @@ export const useStore = create<AppState>((set, get) => ({
       });
       sceneEvents.onOptShape?.(null, null);
       sceneEvents.onVertexDensity?.(out.vertexDensity);
+      // The result set after this run is: any surviving as-printed result plus
+      // optimized + (infill modes) the uniform/solid baselines. Anchor the
+      // exaggeration on the stiffest of those so switching keeps it equal.
       sceneEvents.onDisplacements?.(out.displacements, {
-        maxDisplacement: out.summary.maxDisplacement,
+        maxDisplacement: referenceMaxDisp(
+          get().results.filter((r) => r.id === "asprinted"),
+          Math.min(
+            out.summary.maxDisplacement,
+            out.summary.uniformMaxDisp ?? Infinity,
+            out.summary.solidMaxDisp ?? Infinity
+          )
+        ),
       });
       // Part Topo: the body IS the result — drop the original envelope hull in
       // the result views so it doesn't moiré against the coincident body.
@@ -2026,6 +2282,91 @@ export const useStore = create<AppState>((set, get) => ({
       // Re-arm the plane state (still hidden in result views; it shows again
       // when the user returns to a setup view on this step).
       pushSymmetry(get);
+      // ---- retain the optimized design + its baseline solves as switchable
+      // results. The equal-mass uniform and solid baselines were already solved
+      // AND stashed by the optimizer (infill modes); the optimized solution is
+      // stashed here. The set is rebuilt: keep any as-printed result, replace
+      // the optimize-owned ones (drops baselines that solid mode doesn't keep).
+      try {
+        await engine.stashResult("optimized");
+        const cur = get();
+        const sm = out.summary;
+        const meanPct = Math.round(sm.meanInfill * 100);
+        const modeLabel = sm.solid ? "Part Topo" : sm.binary ? "binary" : "graded";
+        const goalNote = sm.goal === "match" ? " · match" : "";
+        const ep = { ...cur.resultEpochs };
+        const optRows: [string, string][] = [
+          ["Mode", modeLabel + goalNote],
+          [sm.solid ? "Retained vol" : "Mean infill", `${meanPct}%`],
+        ];
+        if (!sm.solid) optRows.push(["Pattern", st.pattern]);
+        optRows.push(
+          ["Material", cur.material.name],
+          ["Mesh", meshLabel(cur)],
+          ["Mass", `${sm.massGrams.toFixed(1)} g`],
+          ["Max |u|", fmtMm(sm.maxDisplacement)],
+          // Same compliance-ratio calc for both; vs solid comes out negative
+          // (the optimized design is softer than fully dense material).
+          ["vs solid", signedPct(sm.stiffnessVsSolid - 1)],
+          ["vs uniform", signedPct(sm.gainVsUniform)]
+        );
+        const next: ResultEntry[] = get().results.filter((r) => r.id === "asprinted");
+        next.push({
+          id: "optimized",
+          kind: "optimized",
+          label: `Optimized · ${modeLabel} ${meanPct}%`,
+          maxDisplacement: sm.maxDisplacement,
+          massGrams: sm.massGrams,
+          minSf: null,
+          converged: sm.converged,
+          provTitle: sm.solid ? "Optimized shape" : "Optimized infill",
+          provRows: optRows,
+          epochs: ep,
+        });
+        if (sm.hasBaselines) {
+          next.push({
+            id: "uniform",
+            kind: "uniform",
+            label: `Uniform · equal mass ${meanPct}%`,
+            maxDisplacement: sm.uniformMaxDisp ?? sm.maxDisplacement,
+            massGrams: sm.massGrams,
+            minSf: null,
+            converged: true,
+            provTitle: "Uniform · equal mass",
+            provRows: [
+              ["Infill", `${meanPct}% (even)`],
+              ["Pattern", st.pattern],
+              ["Material", cur.material.name],
+              ["Mesh", meshLabel(cur)],
+              ["Mass", `${sm.massGrams.toFixed(1)} g`],
+              ["Max |u|", fmtMm(sm.uniformMaxDisp ?? sm.maxDisplacement)],
+            ],
+            epochs: ep,
+          });
+          next.push({
+            id: "solid",
+            kind: "solid",
+            label: "Solid material",
+            maxDisplacement: sm.solidMaxDisp ?? 0,
+            massGrams: sm.massSolidGrams,
+            minSf: null,
+            converged: true,
+            provTitle: "Solid material",
+            provRows: [
+              ["Model", "fully dense E₀"],
+              ["Material", cur.material.name],
+              ["Mesh", meshLabel(cur)],
+              ["Mass", `${sm.massSolidGrams.toFixed(1)} g`],
+              ["Max |u|", fmtMm(sm.solidMaxDisp ?? 0)],
+            ],
+            epochs: ep,
+          });
+        }
+        next.sort((a, b) => RESULT_ORDER.indexOf(a.kind) - RESULT_ORDER.indexOf(b.kind));
+        set({ results: next, activeResultId: "optimized" });
+      } catch {
+        // stash failed — the optimized result still shows, it just isn't switchable
+      }
     } catch (e) {
       sceneEvents.onOptShape?.(null, null);
       const msg = e instanceof Error ? e.message : String(e);

@@ -6,7 +6,7 @@
 
 import { useEffect, useRef } from "react";
 import { useShallow } from "zustand/shallow";
-import { budgetBounds, symLabel, useStore } from "../store";
+import { budgetBounds, resultStale, symLabel, useStore } from "../store";
 import { NumInput } from "./NumInput";
 import type { Bc, BcKind, PatternKey } from "../types";
 import { fmtDisp, fmtLen, rampCss } from "./fmt";
@@ -1244,6 +1244,8 @@ function StepExport() {
     useShallow((s) => ({
       hasResult: s.hasResult,
       optSummary: s.optSummary,
+      results: s.results,
+      resultEpochs: s.resultEpochs,
       viewMode: s.viewMode,
       densityThreshold: s.densityThreshold,
       setDensityThreshold: s.setDensityThreshold,
@@ -1359,6 +1361,16 @@ function StepExport() {
           bottom, min/max markers and click-to-edit scale & exaggeration in the legend.
         </div>
       )}
+      {(() => {
+        const opt = s.results.find((r) => r.id === "optimized");
+        return opt && resultStale(opt, s.resultEpochs) ? (
+          <div className="warnbanner">
+            ⚠ <b>Settings changed since this optimization.</b> The mesh, loads, material, or an
+            optimization input was edited — this result and export are out of date. Re-run{" "}
+            <b>Optimize infill</b> (step 5) before exporting.
+          </div>
+        ) : null;
+      })()}
       {s.optSummary && !s.optSummary.converged && (
         <div className="warnbanner">
           ⚠ <b>Exporting an unconverged result.</b> The optimization stopped at its iteration cap

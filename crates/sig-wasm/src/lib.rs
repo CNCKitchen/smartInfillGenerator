@@ -430,7 +430,20 @@ pub struct Model {
     /// None = plain solid solve (grid.scale), Some = binned-infill field.
     /// Stress evaluation must use the same eps as the solve.
     solution_eps: Option<Vec<f32>>,
+    /// Finished solutions kept for the Results view's instant result switcher,
+    /// keyed by a stable id (e.g. "optimized", "uniform", "solid", "asprinted").
+    /// `activate_result` swaps one back into `solution`/`solution_eps`; all
+    /// share the current grid, so each entry is just its displacement field +
+    /// stress eps. Dropped when the geometry/grid changes (`clear_results`).
+    results: std::collections::HashMap<String, StashedResult>,
     opt: Option<OptOutput>,
+}
+
+/// One stashed solution for the result switcher: the displacement field and the
+/// stress eps it was solved with (None = plain solid solve → grid.scale).
+struct StashedResult {
+    sol: Solution,
+    eps: Option<Vec<f32>>,
 }
 
 fn err(e: impl std::fmt::Display) -> JsValue {
@@ -505,6 +518,7 @@ impl Model {
             solver_cache: None,
             solution: None,
             solution_eps: None,
+            results: std::collections::HashMap::new(),
             opt: None,
         })
     }
@@ -908,6 +922,42 @@ impl Model {
         Ok(out)
     }
 
+    /// Snapshot the CURRENT live solution under `id` so the Results view can
+    /// recall it instantly later. Re-stashing the same id replaces it.
+    pub fn stash_result(&mut self, id: &str) -> Result<(), JsValue> {
+        let sol = self
+            .solution
+            .as_ref()
+            .ok_or_else(|| err("no live solution to stash — run Solve or Optimize first"))?;
+        self.results.insert(
+            id.to_string(),
+            StashedResult { sol: sol.clone(), eps: self.solution_eps.clone() },
+        );
+        Ok(())
+    }
+
+    /// Make a previously stashed result the live solution (for displacement +
+    /// stress/strain queries) and return its per-soup-vertex displacements so
+    /// the viewport can re-deform without a second round-trip.
+    pub fn activate_result(&mut self, id: &str) -> Result<Vec<f32>, JsValue> {
+        let (sol, eps) = {
+            let r = self
+                .results
+                .get(id)
+                .ok_or_else(|| err("no such result — it was never stashed or has been cleared"))?;
+            (r.sol.clone(), r.eps.clone())
+        };
+        self.solution = Some(sol);
+        self.solution_eps = eps;
+        self.vertex_displacements()
+    }
+
+    /// Drop every stashed result (geometry/grid change — all are stale and the
+    /// node grid they sample no longer matches the part).
+    pub fn clear_results(&mut self) {
+        self.results.clear();
+    }
+
     /// Sample a density field (cell -> density map) at every soup vertex,
     /// probing slightly inward and falling back to nearby solid cells.
     fn sample_cell_field(&self, grid: &VoxelGrid, field: &std::collections::HashMap<u32, f64>) -> Vec<f32> {
@@ -1169,6 +1219,12 @@ impl Model {
             "stiffnessVsSolid": oc.c_solid / oc.c_binned,
             "gainVsUniform": oc.c_uniform / oc.c_binned - 1.0,
             "maxDisplacement": oc.max_disp,
+            // Max |u| of the equal-mass uniform + fully-solid baseline solves,
+            // for the Results-view provenance card. Baselines are stashed (and
+            // selectable) for infill modes only — see the stash block below.
+            "uniformMaxDisp": oc.max_disp_uniform,
+            "solidMaxDisp": oc.max_disp_solid,
+            "hasBaselines": !solid,
             "binary": opts.binary,
             "solid": solid,
             "goal": if goal_match { "match" } else { "budget" },
@@ -1213,6 +1269,40 @@ impl Model {
             converged: oc.verify_converged,
             residuals: Vec::new(),
         });
+
+        // ---- stash the equal-mass uniform + solid baseline solutions ----
+        // The pipeline already solved these for the comparison card and we now
+        // keep their displacement fields (otherwise discarded). Stashing them
+        // here lets the Results view switch to them instantly (same grid, so a
+        // stash is just the u vector + its eps). Infill modes only: in solid
+        // (Part Topo) mode the baselines live on the full envelope, not the
+        // carved body, so they would be misleading — drop any stale ones.
+        // The optimized solution itself is stashed by the caller (stash_result).
+        if !solid {
+            let active = active_nodes(grid);
+            let (gh, gorigin) = (grid.h, grid.origin);
+            let mk = |u: &[f64], eps: &[f32]| StashedResult {
+                sol: Solution {
+                    u: u.iter().map(|&v| v as f32).collect(),
+                    mx,
+                    my,
+                    mz,
+                    h: gh,
+                    origin: gorigin,
+                    active: active.clone(),
+                    iterations: 0,
+                    rel_residual: 0.0,
+                    converged: true,
+                    residuals: Vec::new(),
+                },
+                eps: Some(eps.to_vec()),
+            };
+            self.results.insert("uniform".into(), mk(&oc.u_uniform, &oc.eps_uniform));
+            self.results.insert("solid".into(), mk(&oc.u_solid, &oc.eps_solid));
+        } else {
+            self.results.remove("uniform");
+            self.results.remove("solid");
+        }
 
         // ---- store the optimization result ----
         let mut field: std::collections::HashMap<u32, f64> = Default::default();

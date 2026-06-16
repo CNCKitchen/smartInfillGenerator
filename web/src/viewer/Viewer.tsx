@@ -2,8 +2,9 @@
 // Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
 
 import { useEffect, useRef, useState } from "react";
+import { useShallow } from "zustand/shallow";
 import { SceneManager } from "./SceneManager";
-import { sceneEvents, useStore } from "../store";
+import { sceneEvents, useStore, resultStale, type ResultEntry } from "../store";
 import { RESULT_FIELDS } from "../types";
 import { cssGradient, jet, ramp } from "./colormaps";
 
@@ -182,7 +183,47 @@ export function Viewer() {
   return (
     <div className="viewer" ref={wrapRef}>
       <canvas ref={canvasRef} />
+      <Provenance />
       <Legend />
+    </div>
+  );
+}
+
+// ---- result provenance card (top-left overlay) ----
+
+// Mirrors the legend's instrument styling, on the opposite corner: the settings
+// the SELECTED result was computed with, plus a staleness caution. In the
+// Density/Regions views it pins to the optimized run (those tabs are its).
+function Provenance() {
+  const s = useStore(
+    useShallow((st) => ({
+      results: st.results,
+      activeResultId: st.activeResultId,
+      resultEpochs: st.resultEpochs,
+      viewMode: st.viewMode,
+    }))
+  );
+  let entry: ResultEntry | undefined;
+  if (s.viewMode === "deformed") entry = s.results.find((r) => r.id === s.activeResultId);
+  else if (s.viewMode === "density" || s.viewMode === "infill")
+    entry = s.results.find((r) => r.id === "optimized");
+  if (!entry) return null;
+  const stale = resultStale(entry, s.resultEpochs);
+  return (
+    <div className="provenance">
+      <div className="legendtitle">{entry.provTitle}</div>
+      <div className="provrows">
+        {entry.provRows.map(([k, v]) => (
+          <div className="provrow" key={k}>
+            <span>{k}</span>
+            <b>{v}</b>
+          </div>
+        ))}
+      </div>
+      {!entry.converged && <div className="provnote">unconverged — indicative only</div>}
+      {stale && (
+        <div className="provstale">⚠ Inputs changed — re-run from the Solve / Optimize step.</div>
+      )}
     </div>
   );
 }

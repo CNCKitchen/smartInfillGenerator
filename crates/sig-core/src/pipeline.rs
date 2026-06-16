@@ -103,6 +103,15 @@ pub struct OptOutcome {
     pub c_target: f64,
     pub u_binned: Vec<f64>,
     pub max_disp: f64,
+    /// Equal-mass uniform baseline solve (displacement + stress eps + max |u|),
+    /// kept so the Results view can show "the same material spread evenly".
+    pub u_uniform: Vec<f64>,
+    pub eps_uniform: Vec<f32>,
+    pub max_disp_uniform: f64,
+    /// Fully-solid (CAD-ideal) baseline solve — the same trio.
+    pub u_solid: Vec<f64>,
+    pub eps_solid: Vec<f32>,
+    pub max_disp_solid: f64,
     /// eps the verification solve used (for stress recovery).
     pub solution_eps: Vec<f32>,
     pub mean_binned: f64,
@@ -290,15 +299,27 @@ pub fn run_optimization(
     // (The cache doesn't key on tol, so warm starts survive.)
     let ref_settings = SolveSettings { tol: settings.tol.max(5e-4), ..*settings };
     let x_uniform = vec![mean_binned; x_binned.len()];
-    let (c_uniform, _, _) = evaluate_cached(
+    // KEEP the reference solves' displacement fields (they used to be dropped):
+    // the equal-mass uniform and fully-solid baselines are surfaced as
+    // selectable results in the Results view, and the optimizer already pays
+    // for the solves. Their eps (for stress recovery) is rebuilt from x.
+    let (c_uniform, max_disp_uniform, u_uniform) = evaluate_cached(
         slot, grid, levels, problem, &ref_settings, &result.skin_cells, &result.design_cells,
         &result.skin_frac, &x_uniform, eval_exp, eval_coeff,
     )?;
+    let eps_uniform = build_eps(
+        grid, &result.skin_cells, &result.design_cells, &result.skin_frac, &x_uniform, eval_exp,
+        eval_coeff,
+    );
     let x_solid = vec![1.0; x_binned.len()];
-    let (c_solid, _, _) = evaluate_cached(
+    let (c_solid, max_disp_solid, u_solid) = evaluate_cached(
         slot, grid, levels, problem, &ref_settings, &result.skin_cells, &result.design_cells,
         &result.skin_frac, &x_solid, eval_exp, eval_coeff,
     )?;
+    let eps_solid = build_eps(
+        grid, &result.skin_cells, &result.design_cells, &result.skin_frac, &x_solid, eval_exp,
+        eval_coeff,
+    );
 
     // ---- deformed field + stress eps ----
     let max_disp = (0..u_binned.len() / 3)
@@ -358,6 +379,12 @@ pub fn run_optimization(
         c_target,
         u_binned,
         max_disp,
+        u_uniform,
+        eps_uniform,
+        max_disp_uniform,
+        u_solid,
+        eps_solid,
+        max_disp_solid,
         solution_eps,
         mean_binned,
         regions,

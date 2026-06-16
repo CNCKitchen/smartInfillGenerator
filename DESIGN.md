@@ -496,3 +496,36 @@ panel. Fallback pattern law: conservative generic n = 2.
   animation path. Optimization objective "maximize first resonance
   frequency" (Rayleigh-quotient sensitivities — known to need mode-switching
   care). Useful for drone frames (prop-wash excitation) and machine parts.
+
+## 11. Result organization & staleness (interview 2026-06-16)
+
+**Problem.** The viewport had ONE "Results" tab fed by ONE live solution: whatever
+ran last (as-printed solve, solid solve, or the optimized design's verification
+solve), with nothing labeling which. Editing a load / mesh / material *destroyed*
+the result (snapped back to Setup). Users couldn't tell what they were looking at
+or compare the optimized design against the homogeneous print.
+
+| # | Topic | Decision |
+|---|-------|----------|
+| 1 | Availability | **Retain finished results in memory, switch instantly** (not re-solve-on-switch, not label-only). The comparison experience is the point. |
+| 2 | Result set | **Manual population** — results exist only after you run them. But ONE Optimize yields several at once because the engine already solves them: **Optimized**, **Uniform · equal mass** (the "evenly distributed" baseline at the optimized mean density), and **Solid** (CAD-ideal reference). **As printed** comes from Solve once (As printed). No arbitrary verification runs — "as printed" in the Verify tab *is* the verification run. |
+| 3 | Equal-mass is free | The optimize pipeline ALREADY solves the equal-mass uniform field (`x_uniform = mean_binned`) and the solid field for the comparison card (`pipeline.rs`, `c_uniform`/`c_solid`), then **discarded their displacement vectors** (`let (c_uniform, _, _) = …`). We now KEEP `u_uniform`/`u_solid` and surface them as selectable results — near-zero extra compute. |
+| 4 | Selector placement | A result dropdown **inside the Results view only**, in the floating field-chip beside the STL/Voxel + field-type controls. Density/Regions tabs are untouched (they belong to the optimized run; a uniform field has no density map) and don't show the selector. |
+| 5 | Provenance window | A small **top-left overlay, legend-style** (`.provenance`), showing the SELECTED result's inputs (kind · mode/goal · budget or infill % · pattern · material · mesh h/cells) and headline outputs (mass, max deflection, min SF, convergence), plus a stale notice. |
+| 6 | Staleness — non-destructive | Changing an invalidating input no longer drops results; it **marks them stale** (badge in the dropdown, caution in the provenance window, export guard) and the result stays viewable. Re-run **from the origin step** (Solve once / Optimize) — no in-place re-run button. |
+| 7 | Staleness — per-result signature | Each result records the inputs it was built from; a change stales **only** dependents. Shared (geometry/pose, mesh resolution/snap/composite, loads & supports, material) → all stale. Optimized + Equal-mass → also budget/goal/mode/levels/min-member/symmetry/self-support/skin (Equal-mass is stale exactly when its parent Optimized is). As printed → also print infill/pattern/perimeters/line-width/shells/layer-height. Solid → shared only. |
+
+**Enabling backend change (extends the open K2 `EngineSession` item).** Displacement
+coloring (`|u|`, `ux/uy/uz`) is computed client-side from each result's cached buffer,
+so switching those is instant with no engine round-trip. Stress/strain/SF fields are
+computed in wasm from the *active* solution (`Model.solution` + `solution_eps`), so
+instant switching of THOSE requires the engine to hold several solutions and activate
+one for field queries: `Model.stash_result(id)` snapshots the live `solution`/`eps`
+under a key; `Model.activate_result(id)` swaps a stashed pair back in; `clear_results()`
+drops them. All results of one part share the same grid, so a stash is just the `u`
+vector + its `eps` (no grid copy). The optimize pipeline additionally builds `Solution`s
+for the kept `u_uniform`/`u_solid` and stashes them next to the optimized one. Retention
+is capped by **replacing a same-kind result on re-run** (the list can't grow unbounded);
+a resolution/geometry change clears the stash (every result is stale anyway). Verify
+solve/optimize touches with regbench + the wasm smoke test (the pipeline change only
+stops discarding two vectors — the numerics are byte-identical).

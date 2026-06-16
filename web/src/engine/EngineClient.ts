@@ -284,6 +284,22 @@ export class EngineClient {
     return this.call({ op: "voxelResultField", kind });
   }
 
+  /** Snapshot the current solution under `id` for the Results-view switcher. */
+  stashResult(id: string): Promise<void> {
+    return this.call({ op: "stashResult", resultId: id });
+  }
+
+  /** Make a stashed result the live solution; returns its per-soup-vertex
+   *  displacements so the viewport can re-deform in one round-trip. */
+  activateResult(id: string): Promise<Float32Array> {
+    return this.call({ op: "activateResult", resultId: id });
+  }
+
+  /** Drop every stashed result (geometry/grid change — all stale). */
+  clearResults(): Promise<void> {
+    return this.call({ op: "clearResults" });
+  }
+
   /** Project 3MF in the chosen slicer's flavor. `thumbnail` (PNG bytes) becomes
    *  the plate preview; null falls back to an embedded placeholder. */
   exportThreeMf(slicer: SlicerFlavor, thumbnail?: Uint8Array | null): Promise<Uint8Array> {
@@ -426,6 +442,13 @@ export interface OptSummary {
   stiffnessVsSolid: number;
   gainVsUniform: number;
   maxDisplacement: number;
+  /** Max |u| of the equal-mass uniform + fully-solid baseline solves (the
+   *  optimizer already solved them) — for the Results-view switcher. Present
+   *  only when `hasBaselines` (infill modes). */
+  uniformMaxDisp?: number;
+  solidMaxDisp?: number;
+  /** Infill modes expose the uniform + solid baselines as selectable results. */
+  hasBaselines?: boolean;
   /** True when the run was binary (hollow/solid) mode. */
   binary: boolean;
   /** True when the run was solid topology (material-removal) mode. */
