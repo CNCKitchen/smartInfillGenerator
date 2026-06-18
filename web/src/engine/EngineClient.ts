@@ -211,6 +211,15 @@ export class EngineClient {
     return this.call({ op: "solve" });
   }
 
+  /** Re-solve the optimized design under the CURRENT BCs (DESIGN §13): the
+   *  per-step pass that evaluates one multi-load design under every load step.
+   *  Reuses the optimized stress eps, so it's a cheap RHS swap when the step
+   *  shares fixtures. Requires a prior optimize(). */
+  solveOptimized(): Promise<{ stats: SolveStats; displacements: Float32Array }> {
+    this.resetProgress();
+    return this.call({ op: "solveOptimized" });
+  }
+
   /** Analyze the part AS PRINTED: solid skin + uniform infill through the
    *  calibrated pattern law. Same fields as solve() plus print-mass stats. */
   solvePrinted(

@@ -651,4 +651,71 @@ console.log("ok: stiffness-match goal (lighter at equal stiffness)");
 }
 console.log("ok: project save / load round-trip (with + without results)");
 
+// ---- per-step optimized evaluation (DESIGN §13): solve_optimized ----
+// The Results roster after a multi-load optimize evaluates the ONE optimized
+// design under every load step. solve_optimized must keep that design across BC
+// changes (its stiffness field outlives the live solution) and re-solve under
+// each step's loads — the deflection follows the load, and the result differs.
+{
+  const so = new Model(boxStl([0, 0, 0], [60, 12, 12]), "stepbeam");
+  const ssel = patchSelector(so);
+  so.set_material(2400, 0.35, 1.24, 50, 35);
+  so.set_resolution(30000);
+  so.add_fixed(ssel(0, "min"));
+  so.add_force(ssel(0, "max"), 0, 0, -40); // load A: −Z tip load
+  let errored = false;
+  try { so.solve_optimized(); } catch (e) { errored = /no optimized design/i.test(String(e)); }
+  assert(errored, "solve_optimized errors before any optimization");
+
+  const sum = JSON.parse(so.optimize(JSON.stringify({
+    budgetPct: 35, exponent: 1.5, coeff: 1.0, perimeters: 2, lineWidth: 0.45,
+    smoothIters: 4, nBins: 3, floorPct: 10, capPct: 70, levelsPct: null,
+    binary: false, solidPattern: null, goal: "budget",
+  }), () => {}));
+  const tipMean = (disp) => {
+    const pos = so.positions();
+    let uy = 0, uz = 0, n = 0;
+    for (let v = 0; v < pos.length / 3; v++)
+      if (Math.abs(pos[3 * v] - 60) < 1e-3) { uy += disp[3 * v + 1]; uz += disp[3 * v + 2]; n++; }
+    return { uy: uy / n, uz: uz / n };
+  };
+  const maxU = (a) => { let m = 0; for (let i = 0; i < a.length; i += 3) m = Math.max(m, Math.hypot(a[i], a[i + 1], a[i + 2])); return m; };
+
+  // Load A = the optimized load: reproduces the run's primary result AND is
+  // softer than solid — proof it evaluates the OPTIMIZED design, not a re-solve.
+  const sA = JSON.parse(so.solve_optimized());
+  assert(Math.abs(sA.maxDisplacement - sum.maxDisplacement) < 0.05 * sum.maxDisplacement + 1e-6,
+    `solve_optimized under the optimized load matches the run (${sA.maxDisplacement.toFixed(4)} mm)`);
+  assert(sA.maxDisplacement > sum.solidMaxDisp * 1.05, "optimized design is softer than solid");
+  const tA = tipMean(so.vertex_displacements());
+  assert(Math.abs(tA.uz) > 3 * Math.abs(tA.uy), "under −Z the tip deflects mainly in Z");
+  so.stash_result("optimized::A");
+
+  // Load B = a DIFFERENT step (−Y). Changing BCs normally drops the design; the
+  // kept stiffness field lets solve_optimized re-evaluate it. Result must follow
+  // the new load direction and genuinely differ from A.
+  so.clear_bcs();
+  so.add_fixed(ssel(0, "min"));
+  so.add_force(ssel(0, "max"), 0, -40, 0);
+  const sB = JSON.parse(so.solve_optimized());
+  const tB = tipMean(so.vertex_displacements());
+  assert(Math.abs(tB.uy) > 3 * Math.abs(tB.uz), "under −Y the tip deflects mainly in Y");
+  assert(Math.abs(sB.maxDisplacement - sA.maxDisplacement) > 0.02 * sA.maxDisplacement,
+    `the two load steps give different results (A ${sA.maxDisplacement.toFixed(4)} vs B ${sB.maxDisplacement.toFixed(4)} mm)`);
+  so.stash_result("optimized::B");
+
+  // Per-step stashes (`optimized::stepId`) round-trip through activate_result.
+  assert(Math.abs(maxU(so.activate_result("optimized::A")) - sA.maxDisplacement) < 0.05 * sA.maxDisplacement + 1e-6,
+    "stash/activate round-trips for optimized::A");
+  assert(Math.abs(maxU(so.activate_result("optimized::B")) - sB.maxDisplacement) < 0.05 * sB.maxDisplacement + 1e-6,
+    "stash/activate round-trips for optimized::B");
+
+  // A grid change retires the kept design → clean error (no stale evaluation).
+  so.set_resolution(80000);
+  let stale = false;
+  try { so.solve_optimized(); } catch (e) { stale = /no optimized design|predates the current grid/i.test(String(e)); }
+  assert(stale, "solve_optimized refuses a design that predates a grid change");
+}
+console.log("ok: per-step optimized evaluation (solve_optimized across load steps)");
+
 console.log("\nALL SMOKE TESTS PASSED");

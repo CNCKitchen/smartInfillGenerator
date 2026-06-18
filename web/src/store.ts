@@ -4,6 +4,7 @@
 import { create } from "zustand";
 import {
   engine,
+  type OptimizeOutput,
   type OptRegion,
   type OptSummary,
   type SlicerFlavor,
@@ -1641,6 +1642,262 @@ async function solveAllSteps(set: SetState, get: () => AppState) {
   );
 }
 
+/** After a multi-step optimization, evaluate the SINGLE optimized design under
+ *  every load step so the Results roster offers each one — not just the
+ *  optimizer's primary case (DESIGN §13). The optimized stress eps is
+ *  BC-independent, so each step is a fresh loads/supports solve (shared-support
+ *  steps reuse the cached multigrid hierarchy) via engine.solveOptimized().
+ *  Returns the per-step optimized entries (`optimized::stepId`); the caller
+ *  folds in the baselines + envelope and chooses which to display. A step that's
+ *  under-constrained on its own is skipped, never fatal — the optimize result is
+ *  already on screen. The engine ends on the LAST stashed step's solution. */
+async function stashOptimizedSteps(
+  set: SetState,
+  get: () => AppState,
+  out: OptimizeOutput
+): Promise<ResultEntry[]> {
+  const st = get();
+  const steps = st.loadSteps;
+  const sm = out.summary;
+  const meanPct = Math.round(sm.meanInfill * 100);
+  const modeLabel = sm.solid ? "Part Topo" : sm.binary ? "binary" : "graded";
+  const goalNote = sm.goal === "match" ? " · match" : "";
+  const ep = { ...st.resultEpochs };
+  const entries: ResultEntry[] = [];
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i];
+    set({ busy: `Evaluating optimized design · ${step.name} (${i + 1}/${steps.length})…` });
+    await engine.setBcs(effectiveBcs(st.bcs, step));
+    // A step under-constrained in isolation can't be evaluated — skip it rather
+    // than discarding the whole optimized roster.
+    const report = await engine.check();
+    if (!report.ok) {
+      appendLog(set, `  ${step.name}: under-constrained on its own — left out of the optimized roster`);
+      continue;
+    }
+    let stats: SolveStats;
+    try {
+      const r = await engine.solveOptimized();
+      stats = r.stats;
+    } catch (e) {
+      appendLog(set, `  ${step.name}: ${e instanceof Error ? e.message : String(e)} — skipped`);
+      continue;
+    }
+    const rid = resultStashId("optimized", step.id, false);
+    await engine.stashResult(rid);
+    const cur = get();
+    const rows: [string, string][] = [
+      ["Load step", step.name],
+      ["Mode", modeLabel + goalNote],
+      [sm.solid ? "Retained vol" : "Mean infill", `${meanPct}%`],
+    ];
+    if (!sm.solid) rows.push(["Pattern", st.pattern]);
+    rows.push(
+      ["Material", cur.material.name],
+      ["Mesh", meshLabel(cur)],
+      ["Mass", `${sm.massGrams.toFixed(1)} g`],
+      ["Max |u|", fmtMm(stats.maxDisplacement)]
+    );
+    entries.push({
+      id: rid,
+      kind: "optimized",
+      loadStepId: step.id,
+      loadStepName: step.name,
+      label: `Optimized · ${modeLabel} ${meanPct}%`,
+      maxDisplacement: stats.maxDisplacement,
+      massGrams: sm.massGrams,
+      minSf: null,
+      converged: stats.converged,
+      provTitle: `Optimized ${sm.solid ? "shape" : "infill"} · ${step.name}`,
+      provRows: rows,
+      epochs: ep,
+    });
+    appendLog(
+      set,
+      `  ${step.name}: max |u| ${stats.maxDisplacement.toExponential(2)} mm` +
+        (stats.converged ? "" : " — UNCONVERGED")
+    );
+  }
+  return entries;
+}
+
+/** Single-step (or single-load) optimize result roster — byte-identical to the
+ *  pre-load-step model and old `.infeall` files: one bare `optimized` stash plus
+ *  the equal-mass uniform + solid baselines (infill modes), tagged with the sole
+ *  (active) load step. */
+async function stashOptimizedSingle(set: SetState, get: () => AppState, out: OptimizeOutput) {
+  await engine.stashResult("optimized");
+  const cur = get();
+  const sm = out.summary;
+  const meanPct = Math.round(sm.meanInfill * 100);
+  const modeLabel = sm.solid ? "Part Topo" : sm.binary ? "binary" : "graded";
+  const goalNote = sm.goal === "match" ? " · match" : "";
+  const ep = { ...cur.resultEpochs };
+  const optStepId = cur.activeLoadStepId;
+  const optStepName = activeStep(cur)?.name ?? "Load step";
+  const optRows: [string, string][] = [
+    ["Mode", modeLabel + goalNote],
+    [sm.solid ? "Retained vol" : "Mean infill", `${meanPct}%`],
+  ];
+  if (!sm.solid) optRows.push(["Pattern", cur.pattern]);
+  optRows.push(
+    ["Material", cur.material.name],
+    ["Mesh", meshLabel(cur)],
+    ["Mass", `${sm.massGrams.toFixed(1)} g`],
+    ["Max |u|", fmtMm(sm.maxDisplacement)],
+    // Same compliance-ratio calc for both; vs solid comes out negative
+    // (the optimized design is softer than fully dense material).
+    ["vs solid", signedPct(sm.stiffnessVsSolid - 1)],
+    ["vs uniform", signedPct(sm.gainVsUniform)]
+  );
+  const next: ResultEntry[] = get().results.filter((r) => r.kind === "asprinted");
+  next.push({
+    id: "optimized",
+    kind: "optimized",
+    loadStepId: optStepId,
+    loadStepName: optStepName,
+    label: `Optimized · ${modeLabel} ${meanPct}%`,
+    maxDisplacement: sm.maxDisplacement,
+    massGrams: sm.massGrams,
+    minSf: null,
+    converged: sm.converged,
+    provTitle: sm.solid ? "Optimized shape" : "Optimized infill",
+    provRows: optRows,
+    epochs: ep,
+  });
+  if (sm.hasBaselines) {
+    next.push({
+      id: "uniform",
+      kind: "uniform",
+      loadStepId: optStepId,
+      loadStepName: optStepName,
+      label: `Uniform · equal mass ${meanPct}%`,
+      maxDisplacement: sm.uniformMaxDisp ?? sm.maxDisplacement,
+      massGrams: sm.massGrams,
+      minSf: null,
+      converged: true,
+      provTitle: "Uniform · equal mass",
+      provRows: [
+        ["Infill", `${meanPct}% (even)`],
+        ["Pattern", cur.pattern],
+        ["Material", cur.material.name],
+        ["Mesh", meshLabel(cur)],
+        ["Mass", `${sm.massGrams.toFixed(1)} g`],
+        ["Max |u|", fmtMm(sm.uniformMaxDisp ?? sm.maxDisplacement)],
+      ],
+      epochs: ep,
+    });
+    next.push({
+      id: "solid",
+      kind: "solid",
+      loadStepId: optStepId,
+      loadStepName: optStepName,
+      label: "Solid material",
+      maxDisplacement: sm.solidMaxDisp ?? 0,
+      massGrams: sm.massSolidGrams,
+      minSf: null,
+      converged: true,
+      provTitle: "Solid material",
+      provRows: [
+        ["Model", "fully dense E₀"],
+        ["Material", cur.material.name],
+        ["Mesh", meshLabel(cur)],
+        ["Mass", `${sm.massSolidGrams.toFixed(1)} g`],
+        ["Max |u|", fmtMm(sm.solidMaxDisp ?? 0)],
+      ],
+      epochs: ep,
+    });
+  }
+  set({ results: sortResults(next, cur.loadSteps), activeResultId: "optimized" });
+}
+
+/** Multi-step optimize result roster (DESIGN §13): the one optimized design
+ *  evaluated under EVERY load step (`optimized::stepId`) + a worst-case
+ *  envelope, so the viewer's step selector offers them all. The equal-mass
+ *  uniform + solid baselines were solved by the optimizer under the PRIMARY
+ *  (first included) load only — they're tagged with that step (single-step
+ *  kinds, no envelope). Displays the active step's optimized result. */
+async function stashOptimizedMultiStep(set: SetState, get: () => AppState, out: OptimizeOutput) {
+  const optEntries = await stashOptimizedSteps(set, get, out);
+  const cur = get();
+  const sm = out.summary;
+  const meanPct = Math.round(sm.meanInfill * 100);
+  const ep = optEntries[0]?.epochs ?? { ...cur.resultEpochs };
+  // The optimizer's primary case = the first INCLUDED step (its baselines belong
+  // to that load). Fall back defensively if includes were cleared post-run.
+  const included = cur.loadSteps.filter((s) => s.includeInOptimize);
+  const primary = included[0] ?? activeStep(cur) ?? cur.loadSteps[0];
+  const baseEntries: ResultEntry[] = [];
+  if (sm.hasBaselines) {
+    baseEntries.push({
+      id: "uniform",
+      kind: "uniform",
+      loadStepId: primary.id,
+      loadStepName: primary.name,
+      label: `Uniform · equal mass ${meanPct}%`,
+      maxDisplacement: sm.uniformMaxDisp ?? sm.maxDisplacement,
+      massGrams: sm.massGrams,
+      minSf: null,
+      converged: true,
+      provTitle: "Uniform · equal mass",
+      provRows: [
+        ["Infill", `${meanPct}% (even)`],
+        ["Pattern", cur.pattern],
+        ["Material", cur.material.name],
+        ["Mesh", meshLabel(cur)],
+        ["Mass", `${sm.massGrams.toFixed(1)} g`],
+        ["Max |u|", fmtMm(sm.uniformMaxDisp ?? sm.maxDisplacement)],
+        ["Load case", primary.name],
+      ],
+      epochs: ep,
+    });
+    baseEntries.push({
+      id: "solid",
+      kind: "solid",
+      loadStepId: primary.id,
+      loadStepName: primary.name,
+      label: "Solid material",
+      maxDisplacement: sm.solidMaxDisp ?? 0,
+      massGrams: sm.massSolidGrams,
+      minSf: null,
+      converged: true,
+      provTitle: "Solid material",
+      provRows: [
+        ["Model", "fully dense E₀"],
+        ["Material", cur.material.name],
+        ["Mesh", meshLabel(cur)],
+        ["Mass", `${sm.massSolidGrams.toFixed(1)} g`],
+        ["Max |u|", fmtMm(sm.solidMaxDisp ?? 0)],
+        ["Load case", primary.name],
+      ],
+      epochs: ep,
+    });
+  }
+  const kept = cur.results.filter((r) => r.kind === "asprinted");
+  const roster = withEnvelope(
+    sortResults([...kept, ...optEntries, ...baseEntries], cur.loadSteps),
+    cur.loadSteps
+  );
+  // Show the ACTIVE step's optimized result (fall back to the first stashed).
+  // Activating it makes its displacements the live deform buffer; the view is
+  // still on "infill", so this just primes the result/deformed views.
+  const activeRid = resultStashId("optimized", cur.activeLoadStepId, false);
+  const showId = optEntries.some((e) => e.id === activeRid)
+    ? activeRid
+    : optEntries[0]?.id ?? "optimized";
+  let disp = out.displacements;
+  if (optEntries.length) {
+    try {
+      disp = await engine.activateResult(showId);
+    } catch {
+      // keep the optimizer's primary displacements
+    }
+  }
+  session.invalidateSolution();
+  set({ results: roster, activeResultId: showId, busy: null });
+  sceneEvents.onDisplacements?.(disp, { maxDisplacement: referenceMaxDisp(roster) });
+}
+
 // ---- project (.infeall) save / load ----
 
 const PROJECT_SCHEMA = 1;
@@ -3275,92 +3532,14 @@ export const useStore = create<AppState>((set, get) => ({
       // stashed here. The set is rebuilt: keep any as-printed result, replace
       // the optimize-owned ones (drops baselines that solid mode doesn't keep).
       try {
-        await engine.stashResult("optimized");
-        const cur = get();
-        const sm = out.summary;
-        const meanPct = Math.round(sm.meanInfill * 100);
-        const modeLabel = sm.solid ? "Part Topo" : sm.binary ? "binary" : "graded";
-        const goalNote = sm.goal === "match" ? " · match" : "";
-        const ep = { ...cur.resultEpochs };
-        // The optimizer runs the ACTIVE load step's loads (single-load until the
-        // multi-load optimizer lands); tag its results with that step.
-        const optStepId = cur.activeLoadStepId;
-        const optStepName = activeStep(cur)?.name ?? "Load step";
-        const optRows: [string, string][] = [
-          ["Mode", modeLabel + goalNote],
-          [sm.solid ? "Retained vol" : "Mean infill", `${meanPct}%`],
-        ];
-        if (!sm.solid) optRows.push(["Pattern", st.pattern]);
-        optRows.push(
-          ["Material", cur.material.name],
-          ["Mesh", meshLabel(cur)],
-          ["Mass", `${sm.massGrams.toFixed(1)} g`],
-          ["Max |u|", fmtMm(sm.maxDisplacement)],
-          // Same compliance-ratio calc for both; vs solid comes out negative
-          // (the optimized design is softer than fully dense material).
-          ["vs solid", signedPct(sm.stiffnessVsSolid - 1)],
-          ["vs uniform", signedPct(sm.gainVsUniform)]
-        );
-        const next: ResultEntry[] = get().results.filter((r) => r.kind === "asprinted");
-        next.push({
-          id: "optimized",
-          kind: "optimized",
-          loadStepId: optStepId,
-          loadStepName: optStepName,
-          label: `Optimized · ${modeLabel} ${meanPct}%`,
-          maxDisplacement: sm.maxDisplacement,
-          massGrams: sm.massGrams,
-          minSf: null,
-          converged: sm.converged,
-          provTitle: sm.solid ? "Optimized shape" : "Optimized infill",
-          provRows: optRows,
-          epochs: ep,
-        });
-        if (sm.hasBaselines) {
-          next.push({
-            id: "uniform",
-            kind: "uniform",
-            loadStepId: optStepId,
-            loadStepName: optStepName,
-            label: `Uniform · equal mass ${meanPct}%`,
-            maxDisplacement: sm.uniformMaxDisp ?? sm.maxDisplacement,
-            massGrams: sm.massGrams,
-            minSf: null,
-            converged: true,
-            provTitle: "Uniform · equal mass",
-            provRows: [
-              ["Infill", `${meanPct}% (even)`],
-              ["Pattern", st.pattern],
-              ["Material", cur.material.name],
-              ["Mesh", meshLabel(cur)],
-              ["Mass", `${sm.massGrams.toFixed(1)} g`],
-              ["Max |u|", fmtMm(sm.uniformMaxDisp ?? sm.maxDisplacement)],
-            ],
-            epochs: ep,
-          });
-          next.push({
-            id: "solid",
-            kind: "solid",
-            loadStepId: optStepId,
-            loadStepName: optStepName,
-            label: "Solid material",
-            maxDisplacement: sm.solidMaxDisp ?? 0,
-            massGrams: sm.massSolidGrams,
-            minSf: null,
-            converged: true,
-            provTitle: "Solid material",
-            provRows: [
-              ["Model", "fully dense E₀"],
-              ["Material", cur.material.name],
-              ["Mesh", meshLabel(cur)],
-              ["Mass", `${sm.massSolidGrams.toFixed(1)} g`],
-              ["Max |u|", fmtMm(sm.solidMaxDisp ?? 0)],
-            ],
-            epochs: ep,
-          });
-        }
-        set({ results: sortResults(next, cur.loadSteps), activeResultId: "optimized" });
+        // MULTI-STEP projects evaluate the one optimized design under EVERY load
+        // step so the Results roster carries them all (+ a worst-case envelope),
+        // not just the optimizer's primary case (DESIGN §13). A single load step
+        // keeps the byte-identical pre-load-step path.
+        if (get().loadSteps.length > 1) await stashOptimizedMultiStep(set, get, out);
+        else await stashOptimizedSingle(set, get, out);
       } catch {
+        set({ busy: null });
         // stash failed — the optimized result still shows, it just isn't switchable
       }
     } catch (e) {

@@ -105,6 +105,7 @@ type Req =
     }
   | { id: number; op: "check" }
   | { id: number; op: "solve" }
+  | { id: number; op: "solveOptimized" }
   | { id: number; op: "setSnapWall"; wall: number }
   | { id: number; op: "setCompositeSkin"; on: boolean }
   | { id: number; op: "setSmoothStress"; on: boolean }
@@ -317,6 +318,18 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
         if (cancelArr) Atomics.store(cancelArr, 0, 0); // arm fresh
         const t0 = performance.now();
         const stats = JSON.parse(requireModel().solve());
+        const displacements = requireModel().vertex_displacements();
+        stats.seconds = (performance.now() - t0) / 1000;
+        (self as unknown as Worker).postMessage(
+          { id: msg.id, ok: true, data: { stats, displacements } },
+          [displacements.buffer]
+        );
+        return;
+      }
+      case "solveOptimized": {
+        if (cancelArr) Atomics.store(cancelArr, 0, 0); // arm fresh
+        const t0 = performance.now();
+        const stats = JSON.parse(requireModel().solve_optimized());
         const displacements = requireModel().vertex_displacements();
         stats.seconds = (performance.now() - t0) / 1000;
         (self as unknown as Worker).postMessage(

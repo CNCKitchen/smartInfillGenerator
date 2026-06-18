@@ -456,6 +456,13 @@ pub struct Model {
     /// None = plain solid solve (grid.scale), Some = binned-infill field.
     /// Stress evaluation must use the same eps as the solve.
     solution_eps: Option<Vec<f32>>,
+    /// The optimized design's stiffness field (`solution_eps` at optimize time),
+    /// kept ACROSS load-step changes so `solve_optimized` can re-evaluate the one
+    /// design under every load step (DESIGN §13). `solution_eps` is reset by BC
+    /// edits (the live solution no longer matches); this isn't — it depends only
+    /// on the geometry, so it stays valid until the GRID rebuilds (cleared in
+    /// `ensure_grid`) or the skin classification changes (`set_composite_skin`).
+    opt_eps: Option<Vec<f32>>,
     /// Finished solutions kept for the Results view's instant result switcher,
     /// keyed by a stable id (e.g. "optimized", "uniform", "solid", "asprinted").
     /// `activate_result` swaps one back into `solution`/`solution_eps`; all
@@ -698,6 +705,7 @@ impl Model {
             solver_cache: None,
             solution: None,
             solution_eps: None,
+            opt_eps: None,
             results: std::collections::HashMap::new(),
             opt: None,
             transform_accum: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
@@ -880,6 +888,10 @@ impl Model {
             self.solution = None;
             self.solution_eps = None;
             self.opt = None;
+            // Skin/design split changes → the optimized stiffness field (same
+            // cell count, different values) is stale; the length guard in
+            // solve_optimized can't see this, so drop it here.
+            self.opt_eps = None;
         }
     }
 
@@ -973,6 +985,9 @@ impl Model {
         if self.grid.is_some() {
             return Ok(());
         }
+        // A grid rebuild means any cached optimized stiffness field no longer
+        // matches the cell layout — drop it (re-optimizing sets a fresh one).
+        self.opt_eps = None;
         let (lo, hi) = self.mesh.bounds().ok_or_else(|| err("empty mesh"))?;
         let bbox_vol =
             (hi[0] - lo[0]).max(1e-6) * (hi[1] - lo[1]).max(1e-6) * (hi[2] - lo[2]).max(1e-6);
@@ -1174,6 +1189,57 @@ impl Model {
         Ok(out)
     }
 
+    /// Re-solve the CURRENT optimized design under the CURRENT BCs — the per-step
+    /// pass that fills the Results roster after a multi-load optimization
+    /// (DESIGN §13). The optimized design's stress eps (density → element
+    /// stiffness) is BC-independent, so every load step reuses it and only the
+    /// loads/supports change; steps that share fixtures hit the cached multigrid
+    /// hierarchy (cheap RHS swap). Requires a prior optimize()/restore — the live
+    /// solution + eps are left on this step so stash_result snapshots it. JSON
+    /// matches solve().
+    pub fn solve_optimized(&mut self) -> Result<String, JsValue> {
+        // ensure_grid first: a stale grid rebuilds here and clears opt_eps, so a
+        // design that predates a resolution change falls through to a clean error.
+        self.ensure_grid()?;
+        // opt_eps is the optimized stiffness field, kept across load-step edits
+        // (unlike solution_eps, which BC changes reset). Set by optimize/restore.
+        let eps = self
+            .opt_eps
+            .clone()
+            .ok_or_else(|| err("no optimized design to evaluate — run Optimize first"))?;
+        let (grid, levels) = self.grid.as_ref().unwrap();
+        if eps.len() != grid.cell_count() {
+            return Err(err("the optimized design predates the current grid — re-run Optimize"));
+        }
+        let asm = assemble(&self.mesh, grid, &self.bcs, self.gravity_arg(), &self.settings)
+            .map_err(err)?;
+        let report = check_problem(grid, &asm);
+        if !report.ok {
+            return Err(err("model is under-constrained — run check() for details"));
+        }
+        let (sol, _compliance) = sig_core::simp::solve_with_eps_cached(
+            &mut self.solver_cache,
+            grid,
+            *levels,
+            &asm.problem,
+            &self.settings,
+            eps.clone(),
+        )
+        .map_err(err)?;
+        let out = serde_json::json!({
+            "iterations": sol.iterations,
+            "relResidual": sol.rel_residual,
+            "converged": sol.converged,
+            "maxDisplacement": sol.max_displacement(),
+            "tol": self.settings.tol,
+            "residuals": sol.residuals.clone(),
+        })
+        .to_string();
+        self.solution = Some(sol);
+        self.solution_eps = Some(eps);
+        Ok(out)
+    }
+
     /// Displacement vector (mm) per soup vertex: 9 floats per triangle.
     pub fn vertex_displacements(&self) -> Result<Vec<f32>, JsValue> {
         let sol = self.solution.as_ref().ok_or_else(|| err("no solution — call solve() first"))?;
@@ -1325,6 +1391,8 @@ impl Model {
         let regions = sig_core::pipeline::smooth_regions(&regions_raw, smooth_iters as usize);
         self.solution = None;
         self.solution_eps = Some(eps);
+        // A restored design is evaluable under every load step too (DESIGN §13).
+        self.opt_eps = self.solution_eps.clone();
         self.opt = Some(OptOutput {
             regions,
             regions_raw,
@@ -1726,6 +1794,10 @@ impl Model {
         // ---- deformed-view Solution + stress eps ----
         let (mx, my, mz) = (grid.nx + 1, grid.ny + 1, grid.nz + 1);
         self.solution_eps = Some(oc.solution_eps);
+        // Keep the optimized stiffness field for the per-step Results roster: it
+        // survives load-step changes so solve_optimized can re-evaluate this one
+        // design under every load step (DESIGN §13).
+        self.opt_eps = self.solution_eps.clone();
         self.solution = Some(Solution {
             u: oc.u_binned.iter().map(|&v| v as f32).collect(),
             mx,
