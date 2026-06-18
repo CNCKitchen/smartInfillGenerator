@@ -15,6 +15,8 @@ import type {
   ForceMode,
   CheckReport,
   LoadedModel,
+  LoadStep,
+  LoadStepOverride,
   Material,
   PatternCurve,
   PatternKey,
@@ -23,6 +25,7 @@ import type {
   VoxelInfo,
 } from "./types";
 import { DEFAULT_CURVES, DEFAULT_MATERIALS, RESOLUTIONS, RESULT_FIELDS } from "./types";
+import { CONTOUR_BANDS, CONTOUR_BANDS_MIN, CONTOUR_BANDS_MAX } from "./viewer/colormaps";
 
 export type Tool = "orbit" | "select" | "brush" | "place" | "pickdir";
 export type ViewMode = "setup" | "mesh" | "deformed" | "density" | "infill";
@@ -142,7 +145,8 @@ export function budgetBounds(s: {
 
 // ---- result set (Results-view switcher + staleness) ----
 
-/** A retained, selectable result. Identity = its engine stash key. */
+/** The TYPE of a retained result. A result's full identity is (kind, load
+ *  step) — see `ResultEntry.id` / `resultStashId`. */
 export type ResultKind = "optimized" | "uniform" | "solid" | "asprinted";
 
 /** Monotonic input epochs. A result is stale when an epoch it depends on has
@@ -165,8 +169,15 @@ const ZERO_EPOCHS: ResultEpochs = { loads: 0, material: 0, print: 0, opt: 0 };
  *  The displacement/stress data itself lives in the engine stash (keyed by id)
  *  and in the worker's per-result solution. */
 export interface ResultEntry {
-  id: ResultKind;
+  /** Engine stash key = the result's full identity. Single load step: the bare
+   *  `kind` (byte-identical to the pre-load-step model + old project files).
+   *  Multiple steps: `${kind}::${loadStepId}` (see `resultStashId`). */
+  id: string;
   kind: ResultKind;
+  /** Which load step this result was solved for. */
+  loadStepId: string;
+  /** Step name at build time — labels the viewer's load-step selector. */
+  loadStepName: string;
   /** Dropdown label, e.g. "Optimized · graded 24%". */
   label: string;
   /** Headline outputs for the provenance card. */
@@ -184,6 +195,75 @@ export interface ResultEntry {
 
 /** Fixed display order in the dropdown. */
 const RESULT_ORDER: ResultKind[] = ["optimized", "uniform", "asprinted", "solid"];
+
+/** Engine stash key for a (kind, load step). With a single load step we keep
+ *  the BARE kind so the stash key, the result roster, and saved `.infeall`
+ *  files are byte-identical to the pre-load-step model. Only once a project has
+ *  more than one step do results become per-step (`kind::stepId`). */
+function resultStashId(kind: ResultKind, stepId: string, singleStep: boolean): string {
+  return singleStep ? kind : `${kind}::${stepId}`;
+}
+
+/** Sentinel `loadStepId` for the envelope pseudo-step (DESIGN §13): the worst
+ *  case across all of a kind's load steps. Not a real load step — it has no
+ *  stashed solution; its field is reduced client-side from the steps. */
+const ENVELOPE_STEP = "__envelope__";
+
+function isEnvelope(e: ResultEntry): boolean {
+  return e.loadStepId === ENVELOPE_STEP;
+}
+
+/** Append an "Envelope · worst case" pseudo-step to every kind that has ≥2 real
+ *  load-step results (a single step has nothing to envelope). The entry carries
+ *  worst-case headline numbers (max |u|, min SF) for the provenance card. */
+function withEnvelope(results: ResultEntry[], steps: LoadStep[]): ResultEntry[] {
+  const out = results.filter((r) => !isEnvelope(r)); // rebuild envelopes fresh
+  const kinds: ResultKind[] = [];
+  for (const r of out) if (!kinds.includes(r.kind)) kinds.push(r.kind);
+  for (const kind of kinds) {
+    const group = out.filter((r) => r.kind === kind);
+    if (group.length < 2) continue;
+    const maxDisplacement = Math.max(...group.map((r) => r.maxDisplacement));
+    const sfs = group.map((r) => r.minSf).filter((v): v is number => v != null);
+    const minSf = sfs.length ? Math.min(...sfs) : null;
+    const label = group[0].label;
+    out.push({
+      id: `${kind}::${ENVELOPE_STEP}`,
+      kind,
+      loadStepId: ENVELOPE_STEP,
+      loadStepName: "Envelope · worst case",
+      label,
+      maxDisplacement,
+      massGrams: group[0].massGrams,
+      minSf,
+      converged: group.every((r) => r.converged),
+      provTitle: `${group[0].provTitle.split(" · ")[0]} · envelope`,
+      provRows: [
+        ["Load steps", `${group.length} combined`],
+        ["Worst max |u|", fmtMm(maxDisplacement)],
+        ...(minSf != null ? ([["Min safety factor", `${minSf.toFixed(2)}×`]] as [string, string][]) : []),
+        ["Reduction", "max field · min SF, per point"],
+      ],
+      epochs: { ...group[0].epochs },
+    });
+  }
+  return out;
+}
+
+/** Order results by kind, then by their load step's position (so the per-step
+ *  entries of one kind stay in step order in the selector). The envelope's
+ *  sentinel step id isn't in `steps`, so it sorts AFTER the real steps. */
+function sortResults(results: ResultEntry[], steps: LoadStep[]): ResultEntry[] {
+  const stepIdx = (id: string) => {
+    const i = steps.findIndex((s) => s.id === id);
+    return i < 0 ? steps.length : i;
+  };
+  return [...results].sort(
+    (a, b) =>
+      RESULT_ORDER.indexOf(a.kind) - RESULT_ORDER.indexOf(b.kind) ||
+      stepIdx(a.loadStepId) - stepIdx(b.loadStepId)
+  );
+}
 
 /** A result is stale when a dependency epoch has advanced. Displacement stays
  *  correct (the stash is self-contained); stress may be inconsistent — which is
@@ -238,6 +318,13 @@ interface AppState {
   // bcs
   bcs: Bc[];
   activeBcId: string | null;
+  /** FEA load steps (load cases) — see DESIGN §13. A fresh model has exactly
+   *  one step with empty overrides, so the single-case setup is unchanged; a
+   *  table appears in the UI only once a 2nd step is added. The shared `bcs`
+   *  hold geometry/baseline; each step overrides per-BC active/force/pressure. */
+  loadSteps: LoadStep[];
+  /** Which load step is being edited / shown. Always a valid `loadSteps` id. */
+  activeLoadStepId: string;
   // physics
   material: Material;
   materials: Material[];
@@ -278,6 +365,13 @@ interface AppState {
    *  occupancy-scaled value — removes the curved-skin staircase stripes.
    *  Display-side only; the safety factor is unchanged. */
   materialStress: boolean;
+  /** Discrete ("contour banded") result display: the color scale is quantized
+   *  into fixed steps with hard edges (classic FEA contour bands) instead of a
+   *  smooth gradient. Toggled by clicking the result legend bar. */
+  bandedContour: boolean;
+  /** Number of discrete steps when `bandedContour` is on — adjusted by
+   *  scrolling the legend bar (clamped to CONTOUR_BANDS_MIN..MAX). */
+  bandCount: number;
   // optimization inputs
   budget: number; // infill budget: target mean interior density in %
   smoothIters: number; // Taubin passes on modifier regions
@@ -319,8 +413,9 @@ interface AppState {
   optSummary: OptSummary | null;
   /** Retained, selectable results for the Results view's switcher. */
   results: ResultEntry[];
-  /** Which retained result the Results (deformed) view is showing. */
-  activeResultId: ResultKind | null;
+  /** Which retained result the Results (deformed) view is showing — a
+   *  `ResultEntry.id` (bare kind when single-step, else `kind::stepId`). */
+  activeResultId: string | null;
   /** Live input epochs — diffed against each result's stamps for staleness. */
   resultEpochs: ResultEpochs;
   viewMode: ViewMode;
@@ -334,6 +429,8 @@ interface AppState {
   voxelInfo: VoxelInfo | null;
   voxelMeshReady: boolean;
   settingsOpen: boolean;
+  /** Load-steps manager modal (step on/off matrix + naming) — DESIGN §13. */
+  loadStepsOpen: boolean;
   /** Imprint & privacy modal (German Impressumspflicht). */
   imprintOpen: boolean;
   /** Startup disclaimer (legal): shown every load unless skipped below. */
@@ -395,6 +492,8 @@ interface AppState {
   addBc(kind: BcKind): void;
   removeBc(id: string): void;
   setActiveBc(id: string | null): void;
+  /** Rename a condition (display only — doesn't stale results). */
+  setBcName(id: string, name: string): void;
   updateBcTris(id: string, tris: Uint32Array): void;
   updateBcParams(
     id: string,
@@ -405,6 +504,7 @@ interface AppState {
         | "pressure"
         | "stiffness"
         | "axes"
+        | "disp"
         | "forceMode"
         | "forceDir"
         | "forceMag"
@@ -426,6 +526,28 @@ interface AppState {
   resetForceDirToNormal(id: string): void;
   /** Scene → store: the pick-direction tool clicked a triangle (its normal). */
   applyPickedDir(normal: [number, number, number]): void;
+  // load steps (FEA load cases) — see DESIGN §13. The data layer; the table UI
+  // and the multi-step solve/optimize wiring land in later milestones.
+  /** Append a new load step (all BCs active at base) and make it active. */
+  addLoadStep(): void;
+  /** Remove a load step; no-op when only one remains. */
+  removeLoadStep(id: string): void;
+  /** Rename a load step. */
+  renameLoadStep(id: string, name: string): void;
+  /** Select the load step being edited / shown. */
+  setActiveLoadStep(id: string): void;
+  /** Activate/deactivate a BC within a step (constraints + load inclusion). */
+  setStepBcActive(stepId: string, bcId: string, active: boolean): void;
+  /** Set a step's per-BC force vector (force BCs). */
+  setStepForce(stepId: string, bcId: string, force: [number, number, number]): void;
+  /** Aim a step's force along the selection's average normal (magnitude kept). */
+  aimStepForceAlongNormal(stepId: string, bcId: string): void;
+  /** Set a step's per-BC pressure (pressure BCs). */
+  setStepPressure(stepId: string, bcId: string, pressure: number): void;
+  /** Include/exclude a step from the multi-load optimizer. */
+  setStepIncludeOptimize(stepId: string, include: boolean): void;
+  /** Set a step's weight in the weighted-sum optimizer objective. */
+  setStepWeight(stepId: string, weight: number): void;
   setMaterial(m: Material): void;
   updateMaterial(index: number, m: Material): void;
   addMaterial(): void;
@@ -434,6 +556,7 @@ interface AppState {
   setCurve(pattern: PatternKey, c: PatternCurve): void;
   resetCurves(): void;
   openSettings(open: boolean): void;
+  openLoadSteps(open: boolean): void;
   openImprint(open: boolean): void;
   setResolution(r: ResolutionKey | "custom"): void;
   setCustomH(v: number): void;
@@ -450,6 +573,10 @@ interface AppState {
   setMeshDensity(on: boolean): void;
   setSmoothStress(on: boolean): void;
   setMaterialStress(on: boolean): void;
+  /** Flip between smooth and discrete (banded) result contours. */
+  toggleBandedContour(): void;
+  /** Set the discrete band count (turns banding on); clamped to MIN..MAX. */
+  setBandCount(n: number): void;
   /** Scene → store: the section plane moved (three.js plane convention). */
   onSectionPlaneMoved(normal: [number, number, number], constant: number): void;
   setSmoothIters(v: number): void;
@@ -482,7 +609,10 @@ interface AppState {
   /** Append a line to the nerd log (e.g. a placed value callout from the viewer). */
   logNote(msg: string): void;
   /** Switch the Results view to a retained result (instant — engine-stashed). */
-  selectResult(id: ResultKind): Promise<void>;
+  selectResult(id: string): Promise<void>;
+  /** Pin the legend's color range to the CURRENT step's data (the "fit"
+   *  button) so stepping through load cases stays comparable. */
+  fitLegend(): void;
   runCheck(): Promise<void>;
   runSolve(): Promise<void>;
   runOptimize(): Promise<void>;
@@ -543,6 +673,49 @@ export interface OptIterSample {
 }
 
 let bcCounter = 0;
+let stepCounter = 0;
+
+/** Short kind labels for auto-generated BC names ("Force 1", "Fixed 2", …). */
+const BC_KIND_NAME: Record<BcKind, string> = {
+  fixed: "Fixed",
+  frictionless: "Frictionless",
+  displacement: "Displacement",
+  elastic: "Elastic",
+  force: "Force",
+  pressure: "Pressure",
+};
+
+/** Fresh load step with no overrides (every BC active at its base value). */
+function makeLoadStep(name: string): LoadStep {
+  return { id: `ls${++stepCounter}`, name, overrides: {}, includeInOptimize: true, weight: 1 };
+}
+
+/** Deep-copy a step's per-BC overrides (so a cloned step diverges freely). */
+function cloneOverrides(ov: Record<string, LoadStepOverride>): Record<string, LoadStepOverride> {
+  const out: Record<string, LoadStepOverride> = {};
+  for (const [k, v] of Object.entries(ov)) {
+    out[k] = { ...v, force: v.force ? ([...v.force] as [number, number, number]) : undefined };
+  }
+  return out;
+}
+
+/** Immutably patch (or, with `patch === null`, drop) one BC's override in one
+ *  step. Used by the per-step edit actions. */
+function patchStepOverride(
+  steps: LoadStep[],
+  stepId: string,
+  bcId: string,
+  patch: Partial<LoadStepOverride> | null
+): LoadStep[] {
+  return steps.map((s) => {
+    if (s.id !== stepId) return s;
+    const overrides = { ...s.overrides };
+    if (patch === null) delete overrides[bcId];
+    else overrides[bcId] = { ...overrides[bcId], ...patch };
+    return { ...s, overrides };
+  });
+}
+
 let isoTimer: ReturnType<typeof setTimeout> | null = null;
 let smoothTimer: ReturnType<typeof setTimeout> | null = null;
 let meshCutTimer: ReturnType<typeof setTimeout> | null = null;
@@ -567,9 +740,49 @@ const session = new EngineSession((p, d, e, ed) =>
   sceneEvents.onVoxelResult?.(p, d, e, ed)
 );
 
+/** Push the envelope's worst-case `field` as a scalar contour on the undeformed
+ *  part (it has no single displacement). Reduces the kind's steps client-side;
+ *  every field — including |u| — goes through the scalar-field path. */
+async function pushEnvelopeField(
+  set: SetState,
+  get: () => AppState,
+  kind: ResultKind,
+  field: string
+) {
+  const values = await computeEnvelopeField(get, kind, field);
+  // Bail if the user moved on (switched result or field) during the reduction.
+  const active = get().results.find((r) => r.id === get().activeResultId);
+  if (!active || !isEnvelope(active) || active.kind !== kind || get().resultField !== field) return;
+  if (!values) {
+    sceneEvents.onScalarField?.(null);
+    return;
+  }
+  let min = Infinity;
+  let max = -Infinity;
+  for (let i = 0; i < values.length; i++) {
+    if (values[i] < min) min = values[i];
+    if (values[i] > max) max = values[i];
+  }
+  const signed = field === "svm";
+  if (signed) {
+    const m = Math.max(Math.abs(min), Math.abs(max), 1e-12);
+    min = -m;
+    max = m;
+  } else if (field === "u") {
+    min = 0; // |u| anchors at zero like the per-step view
+  }
+  set({ fieldRange: { min, max } });
+  sceneEvents.onScalarField?.(values, field.startsWith("sf"), signed);
+}
+
 /** Push the active result field, sized for the active result surface
  *  ("u" = displacement coloring straight from the displacement arrays). */
 async function pushScalarField(set: SetState, get: () => AppState) {
+  const active = get().results.find((r) => r.id === get().activeResultId);
+  if (active && isEnvelope(active)) {
+    await pushEnvelopeField(set, get, active.kind, get().resultField);
+    return;
+  }
   const kind = get().resultField;
   // Displacement fields are colored client-side from the displacement buffer:
   // |u| magnitude (-1) or a signed X/Y/Z component (0/1/2). No engine fetch.
@@ -609,6 +822,37 @@ async function pushScalarField(set: SetState, get: () => AppState) {
   sceneEvents.onScalarField?.(values, kind.startsWith("sf"), signed);
 }
 
+/** Min safety factor of the CURRENT (live) printed solution from BOTH limits
+ *  (material σᵥᴹ and layer-adhesion σzz), and which governs. Pure read. When
+ *  `cache` is set the two fields are kept in the shared field cache (instant to
+ *  view afterwards) — the multi-step loop passes false so a non-displayed
+ *  step's fields never shadow the displayed one. Null if a fetch fails. */
+async function computeMinSf(
+  cache: boolean
+): Promise<{ minSf: number; governs: "layer" | "material" } | null> {
+  try {
+    const [sfm, sfz] = await Promise.all([
+      engine.resultField("sfm"),
+      engine.resultField("sfz"),
+    ]);
+    if (cache) {
+      session.setField("sfm", false, sfm);
+      session.setField("sfz", false, sfz);
+    }
+    let minM = Infinity;
+    let minZ = Infinity;
+    for (let i = 0; i < sfm.length; i++) minM = Math.min(minM, sfm[i]);
+    for (let i = 0; i < sfz.length; i++) minZ = Math.min(minZ, sfz[i]);
+    const minSf = Math.min(minM, minZ);
+    if (Number.isFinite(minSf)) {
+      return { minSf, governs: minZ < minM ? "layer" : "material" };
+    }
+  } catch {
+    // result vanished mid-fetch
+  }
+  return null;
+}
+
 /** Fetch + cache both safety-factor fields and write the min (and which
  *  limit governs) into printedStats. Returns the minima for logging, or
  *  null when there is no printed result / it vanished mid-fetch. */
@@ -617,26 +861,12 @@ async function refreshMinSf(
   get: () => AppState
 ): Promise<{ minSf: number; governs: "layer" | "material" } | null> {
   if (!get().printedStats) return null;
-  try {
-    const [sfm, sfz] = await Promise.all([
-      engine.resultField("sfm"),
-      engine.resultField("sfz"),
-    ]);
-    session.setField("sfm", false, sfm);
-    session.setField("sfz", false, sfz);
-    let minM = Infinity;
-    let minZ = Infinity;
-    for (let i = 0; i < sfm.length; i++) minM = Math.min(minM, sfm[i]);
-    for (let i = 0; i < sfz.length; i++) minZ = Math.min(minZ, sfz[i]);
-    const minSf = Math.min(minM, minZ);
-    if (Number.isFinite(minSf) && get().printedStats) {
-      const governs: "layer" | "material" = minZ < minM ? "layer" : "material";
-      set({ printedStats: { ...get().printedStats!, minSf, sfGoverns: governs } });
-      return { minSf, governs };
-    }
-  } catch {
-    // result vanished mid-fetch: the dock shows mass/deflection only
+  const sf = await computeMinSf(true);
+  if (sf && get().printedStats) {
+    set({ printedStats: { ...get().printedStats!, minSf: sf.minSf, sfGoverns: sf.governs } });
+    return sf;
   }
+  // no printed result, or the field vanished mid-fetch: dock shows mass/deflection only
   return null;
 }
 
@@ -746,7 +976,7 @@ function fieldUnit(kind: string): string {
 export interface SceneEvents {
   onModelLoaded?: (m: LoadedModel) => void;
   onPatchIdsChanged?: (patchIds: Uint32Array) => void;
-  onBcsChanged?: (bcs: Bc[], activeBcId: string | null) => void;
+  onBcsChanged?: (bcs: Bc[], activeBcId: string | null, inactive?: Set<string>) => void;
   onAnimateMode?: (mode: { t: number[]; r: number[]; center: number[] } | null) => void;
   onDisplacements?: (disp: Float32Array | null, stats: { maxDisplacement: number } | null) => void;
   onVertexDensity?: (density: Float32Array | null) => void;
@@ -803,6 +1033,8 @@ export interface SceneEvents {
   onLegendRange?: (min: number | null, max: number | null) => void;
   /** Min/max location markers; unit drives the label formatting. */
   onShowExtremes?: (on: boolean, unit: string) => void;
+  /** Smooth vs discrete (banded) result contours, and the band count. */
+  onBandedContour?: (on: boolean, count: number) => void;
   // Section plane controls.
   onSectionState?: (on: boolean) => void;
   onSectionFlip?: () => void;
@@ -811,8 +1043,82 @@ export interface SceneEvents {
 
 export const sceneEvents: SceneEvents = {};
 
+/** Resolve the BCs the solver should see for one load step (DESIGN §13):
+ *  drop BCs deactivated in the step and apply its per-step force / pressure
+ *  overrides. With an empty override map (the default single step) this returns
+ *  the base BCs unchanged — so the single-case solve is byte-identical. */
+export function effectiveBcs(bcs: Bc[], step: LoadStep | undefined): Bc[] {
+  if (!step) return bcs;
+  const out: Bc[] = [];
+  for (const b of bcs) {
+    const ov = step.overrides[b.id];
+    if (!ov) {
+      out.push(b);
+      continue;
+    }
+    if (ov.active === false) continue; // deactivated in this step
+    if (ov.force === undefined && ov.pressure === undefined) {
+      out.push(b);
+      continue;
+    }
+    out.push({ ...b, force: ov.force ?? b.force, pressure: ov.pressure ?? b.pressure });
+  }
+  return out;
+}
+
+/** The load step currently being edited / solved. */
+function activeStep(s: AppState): LoadStep | undefined {
+  return s.loadSteps.find((ls) => ls.id === s.activeLoadStepId);
+}
+
+/** BCs as the active step sees them, for the 3D glyphs + surface tint: per-step
+ *  force / pressure values applied so the viewport reflects the case you're on.
+ *  Deactivated BCs keep their values too — the viewport draws them TRANSLUCENT
+ *  (see `inactiveBcIds`) rather than hiding them. Single step (empty overrides)
+ *  → returns the base BCs unchanged. */
+function sceneBcs(bcs: Bc[], step: LoadStep | undefined): Bc[] {
+  if (!step) return bcs;
+  return bcs.map((b) => {
+    const ov = step.overrides[b.id];
+    if (!ov) return b;
+    return { ...b, force: ov.force ?? b.force, pressure: ov.pressure ?? b.pressure };
+  });
+}
+
+/** Ids of BCs deactivated in the active step — drawn translucent in the viewport. */
+function inactiveBcIds(step: LoadStep | undefined): Set<string> {
+  const set = new Set<string>();
+  if (step) {
+    for (const [id, ov] of Object.entries(step.overrides)) {
+      if (ov.active === false) set.add(id);
+    }
+  }
+  return set;
+}
+
+/** Push the active step's BC glyphs to the viewport. */
+function pushBcGlyphs(get: () => AppState, activeBcId?: string | null) {
+  const id = activeBcId === undefined ? get().activeBcId : activeBcId;
+  const step = activeStep(get());
+  sceneEvents.onBcsChanged?.(sceneBcs(get().bcs, step), id, inactiveBcIds(step));
+}
+
 async function pushBcs(get: () => AppState) {
-  await engine.setBcs(get().bcs);
+  await engine.setBcs(effectiveBcs(get().bcs, activeStep(get())));
+}
+
+/** After a per-step override edit: if it touched the ACTIVE step, re-sync the
+ *  engine (live RBM check + next solve) and stale any standing result. Edits to
+ *  a non-active step are invisible to the solver until that step is selected. */
+function syncIfActiveStep(
+  set: (p: Partial<AppState>) => void,
+  get: () => AppState,
+  stepId: string
+) {
+  if (stepId !== get().activeLoadStepId) return;
+  markResultsStale(set, get, "loads");
+  void pushBcs(get);
+  pushBcGlyphs(get);
 }
 
 /** Area-weighted average outward normal of a triangle selection (matches the
@@ -957,6 +1263,7 @@ async function prebuildMeshView(set: SetState, get: () => AppState) {
  *  the OLD node grid (or moved part), so they can't be shown correctly: drop
  *  the whole set (engine stash included) and snap out of any result view. */
 function invalidateResults(set: (p: Partial<AppState>) => void, get: () => AppState) {
+  clearEnvelopeCache();
   set({
     check: null,
     stats: null,
@@ -1003,13 +1310,13 @@ function markResultsStale(
   set({ resultEpochs: ep });
 }
 
-/** Insert (or replace same-kind) a freshly-computed result and keep the set in
- *  a fixed display order. Replacing on re-run is the retention cap. */
+/** Insert a freshly-computed (single-step) result, REPLACING every prior result
+ *  of the same kind — including the per-step entries of an earlier multi-step
+ *  solve, which a single-step re-run supersedes — and keep the set ordered. */
 function upsertResult(set: (p: Partial<AppState>) => void, get: () => AppState, entry: ResultEntry) {
-  const next = get().results.filter((r) => r.id !== entry.id);
+  const next = get().results.filter((r) => r.kind !== entry.kind);
   next.push(entry);
-  next.sort((a, b) => RESULT_ORDER.indexOf(a.kind) - RESULT_ORDER.indexOf(b.kind));
-  set({ results: next });
+  set({ results: sortResults(next, get().loadSteps) });
 }
 
 /** Sign-aware mm/µm formatter for the provenance card. */
@@ -1041,6 +1348,297 @@ function referenceMaxDisp(results: ResultEntry[], extra?: number): number {
   for (const r of results) if (r.maxDisplacement > 0) m = Math.min(m, r.maxDisplacement);
   if (extra && extra > 0) m = Math.min(m, extra);
   return Number.isFinite(m) && m > 0 ? m : 1;
+}
+
+/** The color range to PIN for the field currently on screen, used to hold the
+ *  legend fixed while stepping through load cases (and as the "fit" target).
+ *  |u| anchors at 0; signed components and stress/SF fields take the scene-
+ *  reported data range. Null when there's nothing concrete to pin yet. */
+function currentLegendRange(s: AppState): [number, number] | null {
+  const fr = s.fieldRange;
+  if (s.resultField === "u") {
+    const max =
+      fr?.max ?? s.results.find((r) => r.id === s.activeResultId)?.maxDisplacement ?? 0;
+    return max > 0 ? [0, max] : null;
+  }
+  return fr ? [fr.min, fr.max] : null;
+}
+
+// ---- envelope (worst case across load steps) ----
+
+/** Reduced envelope fields, keyed `${kind}::${field}`. Cleared whenever the
+ *  result set is rebuilt (new solve / grid drop) — the stashes it reduces over
+ *  would no longer match. */
+const envelopeFields = new Map<string, Float32Array>();
+function clearEnvelopeCache() {
+  envelopeFields.clear();
+}
+
+/** Displacement component index for a field, or null for an engine field. */
+function dispCompOf(field: string): number | null {
+  return field === "u" ? -1 : field === "ux" ? 0 : field === "uy" ? 1 : field === "uz" ? 2 : null;
+}
+
+/** Worst case of `field` across every real load step of `kind`, per surface
+ *  vertex: MIN for safety factors ("does it survive any load"), MAX otherwise.
+ *  Activates each step's stash in turn and reduces client-side; cached. The
+ *  fields are NOT written to the shared field cache (they'd shadow a real
+ *  step's). */
+async function computeEnvelopeField(
+  get: () => AppState,
+  kind: ResultKind,
+  field: string
+): Promise<Float32Array | null> {
+  const key = `${kind}::${field}`;
+  const hit = envelopeFields.get(key);
+  if (hit) return hit;
+  const steps = get().results.filter((r) => r.kind === kind && !isEnvelope(r));
+  if (!steps.length) return null;
+  const comp = dispCompOf(field);
+  const isSf = field.startsWith("sf");
+  let acc: Float32Array | null = null;
+  for (const step of steps) {
+    const disp = await engine.activateResult(step.id);
+    let vals: Float32Array;
+    if (comp !== null) {
+      const n = disp.length / 3;
+      vals = new Float32Array(n);
+      for (let i = 0; i < n; i++) {
+        vals[i] = comp < 0 ? Math.hypot(disp[3 * i], disp[3 * i + 1], disp[3 * i + 2]) : disp[3 * i + comp];
+      }
+    } else {
+      vals = (await engine.resultField(field)).slice();
+    }
+    if (!acc) {
+      acc = comp !== null ? vals : vals.slice();
+    } else {
+      const n = Math.min(acc.length, vals.length);
+      for (let i = 0; i < n; i++) acc[i] = isSf ? Math.min(acc[i], vals[i]) : Math.max(acc[i], vals[i]);
+    }
+  }
+  if (acc) envelopeFields.set(key, acc);
+  return acc;
+}
+
+/** Display an envelope result: undeformed geometry (it has no single
+ *  displacement state) colored by the worst-case scalar field. */
+async function showEnvelope(set: SetState, get: () => AppState, e: ResultEntry) {
+  const model = get().model;
+  if (!model) return;
+  // The reduction runs on the smooth-surface fields — force the STL surface.
+  if (get().resultSurface === "voxel") {
+    set({ resultSurface: "stl" });
+    sceneEvents.onResultSurface?.("stl");
+  }
+  session.invalidateSolution();
+  sceneEvents.onResultSolid?.(false);
+  // Zero displacement buffer → the part sits undeformed; the worst-case contour
+  // carries the meaning. Length matches the surface soup (9 floats per triangle).
+  const zero = new Float32Array(model.triCount * 9);
+  sceneEvents.onScalarField?.(null);
+  sceneEvents.onDisplacements?.(zero, { maxDisplacement: referenceMaxDisp(get().results) });
+  await pushScalarField(set, get); // envelope branch reduces + paints the field
+}
+
+/** Standard analysis across MULTIPLE load steps (DESIGN §13). Solves every step
+ *  — steps that share fixtures reuse the cached multigrid hierarchy, so only the
+ *  forces (cheap RHS) change between them — stashes each as a per-step result
+ *  (`kind::stepId`), then displays the active step. Single-step projects never
+ *  reach here: `runSolve` keeps its byte-identical path. THROWS on cancel /
+ *  solver error (runSolve's catch handles it); returns early (no throw) when a
+ *  step is under-constrained. */
+async function solveAllSteps(set: SetState, get: () => AppState) {
+  const st0 = get();
+  const steps = st0.loadSteps;
+  const m = st0.material;
+  const printed = st0.analyzeMode === "printed";
+  const curve = st0.curves[st0.pattern];
+  const kind: ResultKind = printed ? "asprinted" : "solid";
+  const activeId = st0.activeLoadStepId;
+
+  appendLog(set, `Solve ${steps.length} load steps — ${printed ? "as printed" : "solid"}, ${m.name}`);
+  await logGridInfo(set);
+  clearEnvelopeCache(); // the previous solve's reduced fields no longer apply
+
+  // 1) Validate every step up front (each may toggle different supports), so a
+  //    bad step aborts cleanly instead of leaving a half-built roster.
+  for (let i = 0; i < steps.length; i++) {
+    set({ busy: `Checking load step ${i + 1}/${steps.length}: ${steps[i].name}…` });
+    await engine.setBcs(effectiveBcs(st0.bcs, steps[i]));
+    const report = await engine.check();
+    if (steps[i].id === activeId) set({ check: report });
+    if (!report.ok) {
+      const bad = report.components.find((c) => !c.constrained && c.mode);
+      set({ activeLoadStepId: steps[i].id, check: report });
+      pushBcGlyphs(get);
+      sceneEvents.onAnimateMode?.(bad?.mode ?? null);
+      appendLog(set, `Solve aborted: load step "${steps[i].name}" is under-constrained`);
+      set({
+        busy: null,
+        error:
+          report.islandCount > 1
+            ? `Load step "${steps[i].name}" has ${report.islandCount} disconnected parts and is under-constrained — see the animated motion.`
+            : `Load step "${steps[i].name}" is under-constrained — the animation shows the free motion. Add or extend supports.`,
+      });
+      return;
+    }
+  }
+
+  // 2) Cache the voxel hull once (BC-independent) so the Mesh view is viewable
+  //    during the blocking solves.
+  await prebuildMeshView(set, get);
+
+  // 3) Solve each step, stash it, build its result entry.
+  const entries: ResultEntry[] = [];
+  let displayStats: SolveStats | null = null;
+  let displayPrinted: PrintedSummary | null = null;
+  let displayMinSf: { minSf: number; governs: "layer" | "material" } | null = null;
+  for (let i = 0; i < steps.length; i++) {
+    const step = steps[i];
+    set({ busy: `Solving load step ${i + 1}/${steps.length}: ${step.name}…`, solveResiduals: [] });
+    await engine.setBcs(effectiveBcs(st0.bcs, step));
+    const stop = session.startResidualPoll((r) => set({ solveResiduals: r }));
+    let stats: SolveStats;
+    let printedSummary: PrintedSummary | null = null;
+    try {
+      if (printed) {
+        const out = await engine.solvePrinted({
+          infillPct: st0.printInfill,
+          exponent: curve.exponent,
+          coeff: curve.coeff,
+          perimeters: st0.perimeters,
+          lineWidth: st0.lineWidth,
+          topBottomLayers: st0.topBottomLayers,
+          layerHeight: st0.layerHeight,
+        });
+        stats = out.stats;
+        printedSummary = {
+          massGrams: out.stats.massGrams,
+          massSolidGrams: out.stats.massSolidGrams,
+          skinLayers: out.stats.skinLayers,
+          compositeSkin: out.stats.compositeSkin,
+          infillPct: st0.printInfill,
+          pattern: st0.pattern,
+          perimeters: st0.perimeters,
+          lineWidth: st0.lineWidth,
+          minSf: null,
+          sfGoverns: null,
+        };
+      } else {
+        const out = await engine.solve();
+        stats = out.stats;
+      }
+    } finally {
+      stop();
+    }
+    // Per-step min safety factor (printed only). Don't cache the fields — a
+    // non-displayed step's sf would otherwise shadow the displayed one.
+    let minSf: number | null = null;
+    if (printed) {
+      const sf = await computeMinSf(false);
+      if (sf) minSf = sf.minSf;
+      if (step.id === activeId) displayMinSf = sf;
+    }
+    const rid = resultStashId(kind, step.id, false);
+    await engine.stashResult(rid);
+    const cur = get();
+    const rows: [string, string][] = printedSummary
+      ? [
+          ["Load step", step.name],
+          ["Infill", `${printedSummary.infillPct}% ${printedSummary.pattern}`],
+          ["Skin", `${printedSummary.perimeters} × ${printedSummary.lineWidth} mm`],
+          ["Material", m.name],
+          ["Mesh", meshLabel(cur)],
+          ["Mass", `${printedSummary.massGrams.toFixed(1)} g`],
+          ["Max |u|", fmtMm(stats.maxDisplacement)],
+        ]
+      : [
+          ["Load step", step.name],
+          ["Model", "fully dense E₀"],
+          ["Material", m.name],
+          ["Mesh", meshLabel(cur)],
+          ["Max |u|", fmtMm(stats.maxDisplacement)],
+        ];
+    entries.push({
+      id: rid,
+      kind,
+      loadStepId: step.id,
+      loadStepName: step.name,
+      label: printed ? `As printed · ${st0.printInfill}% ${st0.pattern}` : "Solid material",
+      maxDisplacement: stats.maxDisplacement,
+      massGrams: printedSummary ? printedSummary.massGrams : null,
+      minSf,
+      converged: stats.converged,
+      provTitle: `${printed ? "As printed" : "Solid material"} · ${step.name}`,
+      provRows: rows,
+      epochs: { ...cur.resultEpochs },
+    });
+    appendLog(
+      set,
+      `  ${step.name}: max |u| ${stats.maxDisplacement.toExponential(2)} mm` +
+        (printed && minSf != null ? `, min SF ${minSf.toFixed(2)}×` : "") +
+        (stats.converged ? "" : " — UNCONVERGED")
+    );
+    if (step.id === activeId) {
+      displayStats = stats;
+      displayPrinted = printedSummary;
+    }
+  }
+
+  // 4) Display the active step: make its stash the live solution and paint it.
+  //    (Every step was solved; the active one is what the user was editing.)
+  const finalStats = displayStats!; // the active step is always one of `steps`
+  const activeRid = resultStashId(kind, activeId, false);
+  const roster = withEnvelope(
+    sortResults([...st0.results.filter((r) => r.kind !== kind), ...entries], steps),
+    steps
+  );
+  session.invalidateSolution();
+  const disp = await engine.activateResult(activeRid);
+  sceneEvents.onLegendRange?.(null, null);
+  const anyUnconverged = entries.some((e) => !e.converged);
+  set({
+    results: roster,
+    activeResultId: activeRid,
+    stats: finalStats,
+    printedStats: displayPrinted
+      ? {
+          ...displayPrinted,
+          minSf: displayMinSf?.minSf ?? null,
+          sfGoverns: displayMinSf?.governs ?? null,
+        }
+      : null,
+    solveResiduals: finalStats.residuals ?? [],
+    solveTol: finalStats.tol ?? get().solveTol,
+    hasResult: true,
+    viewMode: "deformed",
+    busy: null,
+    resultField: "u",
+    fieldRange: null,
+    legendMin: null,
+    legendMax: null,
+    notice: anyUnconverged
+      ? "Some load steps did not converge (stopped at the iteration cap) — those results are only indicative. A coarser resolution converges reliably."
+      : displayPrinted && !displayPrinted.compositeSkin && displayPrinted.skinLayers === 1
+        ? "The wall is only one voxel layer thick at this resolution — printed-mode results are coarse. Raise the resolution in Properties, or enable composite skin."
+        : null,
+  });
+  sceneEvents.onResultSolid?.(false); // a standard solve is never the optimized solid body
+  sceneEvents.onScalarField?.(null);
+  sceneEvents.onDisplacements?.(disp, { maxDisplacement: referenceMaxDisp(roster) });
+  sceneEvents.onViewState?.("deformed", get().deformScale);
+  if (get().resultSurface === "voxel") {
+    try {
+      await session.loadVoxelResult();
+    } catch {
+      set({ resultSurface: "stl" });
+      sceneEvents.onResultSurface?.("stl");
+    }
+  }
+  appendLog(
+    set,
+    `Solve complete: ${steps.length} load steps. Showing "${activeStep(get())?.name ?? ""}".`
+  );
 }
 
 // ---- project (.infeall) save / load ----
@@ -1092,6 +1690,18 @@ function collectSettings(s: AppState) {
 }
 type ProjectSettings = ReturnType<typeof collectSettings>;
 
+/** On-disk load step. Overrides are keyed by the BC's INDEX in `bcs` (ids are
+ *  reassigned on load), so the keys survive the re-id. See DESIGN §13. */
+interface SerializedLoadStep {
+  /** Stable step id (additive — absent in pre-feature files). Persisted so a
+   *  saved per-step result's `kind::stepId` key still resolves after reload. */
+  id?: string;
+  name: string;
+  includeInOptimize: boolean;
+  weight: number;
+  overrides: Record<number, LoadStepOverride>;
+}
+
 interface ProjectManifest {
   app: string;
   schemaVersion: number;
@@ -1101,12 +1711,59 @@ interface ProjectManifest {
   transform: number[];
   settings: ProjectSettings;
   bcs: (Omit<Bc, "tris"> & { tris: number[] })[];
+  /** FEA load steps (DESIGN §13). OPTIONAL & additive: absent in v1 files and
+   *  files saved before this feature → the loader synthesizes a single step,
+   *  so the schema version does NOT bump and old/new builds interoperate. */
+  loadSteps?: SerializedLoadStep[];
   optSummary: OptSummary | null;
   regionInfos: { density: number }[];
   /** Result roster (metadata only; the buffers live in results/*.f32). Null
    *  when results were excluded from the save. */
   results: ResultEntry[] | null;
-  activeResultId: ResultKind | null;
+  activeResultId: string | null;
+}
+
+/** Load steps → on-disk form: re-key each override by the BC's index (ids are
+ *  reassigned on load) and drop overrides for BCs that no longer exist. */
+function serializeLoadSteps(bcs: Bc[], steps: LoadStep[]): SerializedLoadStep[] {
+  const index = new Map(bcs.map((b, i) => [b.id, i]));
+  return steps.map((s) => ({
+    id: s.id,
+    name: s.name,
+    includeInOptimize: s.includeInOptimize,
+    weight: s.weight,
+    overrides: Object.fromEntries(
+      Object.entries(s.overrides).flatMap(([bcId, ov]) => {
+        const i = index.get(bcId);
+        return i === undefined ? [] : [[i, ov] as [number, LoadStepOverride]];
+      })
+    ),
+  }));
+}
+
+/** On-disk load steps → runtime, remapping override keys from BC index back to
+ *  the freshly-assigned BC ids. Absent/empty `serialized` (v1 or pre-feature
+ *  files) synthesizes a single default step over `bcs`. */
+function deserializeLoadSteps(bcs: Bc[], serialized: SerializedLoadStep[] | undefined): LoadStep[] {
+  if (!serialized || serialized.length === 0) return [makeLoadStep("Load step 1")];
+  // Keep saved step ids verbatim (so per-step result keys still resolve), and
+  // advance the counter past them so later new steps can't collide.
+  for (const s of serialized) {
+    const n = s.id && /^ls(\d+)$/.exec(s.id);
+    if (n) stepCounter = Math.max(stepCounter, Number(n[1]));
+  }
+  return serialized.map((s) => ({
+    id: s.id ?? `ls${++stepCounter}`,
+    name: s.name,
+    includeInOptimize: s.includeInOptimize ?? true,
+    weight: s.weight ?? 1,
+    overrides: Object.fromEntries(
+      Object.entries(s.overrides ?? {}).flatMap(([idx, ov]) => {
+        const id = bcs[Number(idx)]?.id;
+        return id === undefined ? [] : [[id, ov] as [string, LoadStepOverride]];
+      })
+    ),
+  }));
 }
 
 /** Model or resolution changed: the voxel grid (and its display mesh) is stale. */
@@ -1129,6 +1786,8 @@ function download(bytes: Uint8Array, filename: string, mime: string) {
   setTimeout(() => URL.revokeObjectURL(url), 5000);
 }
 
+const initialStep = makeLoadStep("Load step 1");
+
 export const useStore = create<AppState>((set, get) => ({
   activeStep: 1,
   fileName: null,
@@ -1140,6 +1799,8 @@ export const useStore = create<AppState>((set, get) => ({
   brushErase: false,
   bcs: [],
   activeBcId: null,
+  loadSteps: [initialStep],
+  activeLoadStepId: initialStep.id,
   material: initialSettings.materials[0],
   materials: initialSettings.materials,
   curves: initialSettings.curves,
@@ -1159,6 +1820,8 @@ export const useStore = create<AppState>((set, get) => ({
   meshDensity: false,
   smoothStress: true,
   materialStress: true,
+  bandedContour: false,
+  bandCount: CONTOUR_BANDS,
   smoothIters: 15,
   nBins: 3,
   minMemberMm: null, // auto = 2× line width
@@ -1191,6 +1854,7 @@ export const useStore = create<AppState>((set, get) => ({
   voxelInfo: null,
   voxelMeshReady: false,
   settingsOpen: false,
+  loadStepsOpen: false,
   imprintOpen: false,
   disclaimerOpen: !disclaimerSkippedInit(),
   disclaimerSkipped: disclaimerSkippedInit(),
@@ -1244,6 +1908,7 @@ export const useStore = create<AppState>((set, get) => ({
       await engine.setCompositeSkin(get().compositeSkin);
       await engine.setSmoothStress(get().smoothStress);
       await engine.setMaterialStress(get().materialStress);
+      const freshStep = makeLoadStep("Load step 1");
       set({
         fileName: name,
         model,
@@ -1255,6 +1920,8 @@ export const useStore = create<AppState>((set, get) => ({
         activeStep: 1,
         bcs: [],
         activeBcId: null,
+        loadSteps: [freshStep],
+        activeLoadStepId: freshStep.id,
         tool: "orbit",
         symOn: false,
         check: null,
@@ -1429,16 +2096,21 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   addBc(kind) {
+    // Auto-name "Force 1", "Force 2", … per kind so steps/tables read clearly.
+    const nOfKind = get().bcs.filter((b) => b.kind === kind).length;
     const bc: Bc = {
       id: `bc${++bcCounter}`,
       kind,
+      name: `${BC_KIND_NAME[kind]} ${nOfKind + 1}`,
       tris: new Uint32Array(0),
       force: kind === "force" ? [0, 0, -10] : undefined,
       pressure: kind === "pressure" ? 0.1 : undefined,
       // ~printed-plastic mount; bolted-to-steel would be >= 5000 (≈ fixed).
       stiffness: kind === "elastic" ? 100 : undefined,
-      // Displacement support: roller locking the vertical (Z) axis by default.
+      // Displacement support: roller locking the vertical (Z) axis by default,
+      // prescribed value 0 (a classic pin-to-zero until the user sets a value).
       axes: kind === "displacement" ? [false, false, true] : undefined,
+      disp: kind === "displacement" ? [0, 0, 0] : undefined,
       // Force: default to DIRECTION mode — the direction auto-tracks the
       // selection's average normal (forceDirAuto) and the magnitude is 10 N,
       // which is what most users want (push/pull on a face). Switch to
@@ -1450,24 +2122,34 @@ export const useStore = create<AppState>((set, get) => ({
     };
     set({ bcs: [...get().bcs, bc], activeBcId: bc.id, tool: "select" });
     markResultsStale(set, get, "loads");
-    sceneEvents.onBcsChanged?.(get().bcs, bc.id);
+    pushBcGlyphs(get, bc.id);
   },
 
   removeBc(id) {
     set({
       bcs: get().bcs.filter((b) => b.id !== id),
       activeBcId: get().activeBcId === id ? null : get().activeBcId,
+      // Drop any per-step overrides that referenced the removed BC.
+      loadSteps: get().loadSteps.map((s) =>
+        id in s.overrides
+          ? { ...s, overrides: Object.fromEntries(Object.entries(s.overrides).filter(([k]) => k !== id)) }
+          : s
+      ),
     });
     if (get().bcs.length === 0) set({ tool: "orbit" });
     markResultsStale(set, get, "loads");
-    sceneEvents.onBcsChanged?.(get().bcs, get().activeBcId);
+    pushBcGlyphs(get);
     void pushBcs(get);
   },
 
   setActiveBc(id) {
     set({ activeBcId: id });
     if (id === null) set({ tool: "orbit" });
-    sceneEvents.onBcsChanged?.(get().bcs, id);
+    pushBcGlyphs(get, id);
+  },
+
+  setBcName(id, name) {
+    set({ bcs: get().bcs.map((b) => (b.id === id ? { ...b, name } : b)) });
   },
 
   updateBcTris(id, tris) {
@@ -1489,14 +2171,14 @@ export const useStore = create<AppState>((set, get) => ({
       }),
     });
     markResultsStale(set, get, "loads");
-    sceneEvents.onBcsChanged?.(get().bcs, get().activeBcId);
+    pushBcGlyphs(get);
     void pushBcs(get);
   },
 
   updateBcParams(id, params) {
     set({ bcs: get().bcs.map((b) => (b.id === id ? { ...b, ...params } : b)) });
     markResultsStale(set, get, "loads");
-    sceneEvents.onBcsChanged?.(get().bcs, get().activeBcId);
+    pushBcGlyphs(get);
     void pushBcs(get);
   },
 
@@ -1588,9 +2270,100 @@ export const useStore = create<AppState>((set, get) => ({
     if (!id) return;
     const bc = get().bcs.find((b) => b.id === id);
     if (!bc || bc.kind !== "force") return;
-    // Switch to direction mode if needed, then point along the clicked face.
+    // Multi-step: aim THIS step's force vector along the clicked face (keep its
+    // magnitude); single-step edits the base BC's direction.
+    const step = get().loadSteps.length > 1 ? activeStep(get()) : undefined;
+    if (step) {
+      const cur = step.overrides[id]?.force ?? bc.force ?? [0, 0, 0];
+      const mag = Math.hypot(cur[0], cur[1], cur[2]) || forceMagFor(bc);
+      get().setStepForce(step.id, id, [normal[0] * mag, normal[1] * mag, normal[2] * mag]);
+      return;
+    }
     if (bc.forceMode !== "direction") get().setForceMode(id, "direction");
     get().setForceDir(id, normal);
+  },
+
+  // ---- load steps (FEA load cases) — see DESIGN §13 ----
+  // The active step's effective BCs drive the solve (pushBcs reads it), so
+  // selecting a step or editing its overrides re-syncs the engine + the live
+  // RBM check and stales any standing result. Edits to a non-active step only
+  // mutate state. The batch "solve every step" pass + per-step result roster
+  // land in the next milestone; here Solve runs whichever step is active.
+  addLoadStep() {
+    const steps = get().loadSteps;
+    const step = makeLoadStep(`Load step ${steps.length + 1}`);
+    // Seed the new step from the one you were on (values + on/off), so it starts
+    // like its predecessor instead of resetting to base — tweak from there.
+    const src = steps.find((s) => s.id === get().activeLoadStepId) ?? steps[steps.length - 1];
+    if (src) {
+      step.overrides = cloneOverrides(src.overrides);
+      step.includeInOptimize = src.includeInOptimize;
+      step.weight = src.weight;
+    }
+    set({ loadSteps: [...steps, step], activeLoadStepId: step.id });
+    void pushBcs(get);
+    pushBcGlyphs(get);
+  },
+
+  removeLoadStep(id) {
+    const steps = get().loadSteps;
+    if (steps.length <= 1) return; // always keep at least one step
+    const next = steps.filter((s) => s.id !== id);
+    const switched = get().activeLoadStepId === id;
+    const active = switched ? next[0].id : get().activeLoadStepId;
+    set({ loadSteps: next, activeLoadStepId: active });
+    if (switched) {
+      markResultsStale(set, get, "loads");
+      void pushBcs(get);
+      pushBcGlyphs(get);
+    }
+  },
+
+  renameLoadStep(id, name) {
+    set({ loadSteps: get().loadSteps.map((s) => (s.id === id ? { ...s, name } : s)) });
+  },
+
+  setActiveLoadStep(id) {
+    if (!get().loadSteps.some((s) => s.id === id) || id === get().activeLoadStepId) return;
+    set({ activeLoadStepId: id });
+    markResultsStale(set, get, "loads");
+    void pushBcs(get);
+    pushBcGlyphs(get);
+  },
+
+  setStepBcActive(stepId, bcId, active) {
+    set({ loadSteps: patchStepOverride(get().loadSteps, stepId, bcId, { active }) });
+    syncIfActiveStep(set, get, stepId);
+  },
+
+  setStepForce(stepId, bcId, force) {
+    set({ loadSteps: patchStepOverride(get().loadSteps, stepId, bcId, { force }) });
+    syncIfActiveStep(set, get, stepId);
+  },
+
+  aimStepForceAlongNormal(stepId, bcId) {
+    const bc = get().bcs.find((b) => b.id === bcId);
+    if (!bc) return;
+    const n = selectionNormal(get().model?.positions, bc.tris);
+    if (!n) return;
+    const cur = get().loadSteps.find((s) => s.id === stepId)?.overrides[bcId]?.force ?? bc.force ?? [0, 0, 0];
+    const mag = Math.hypot(cur[0], cur[1], cur[2]) || forceMagFor(bc);
+    get().setStepForce(stepId, bcId, [n[0] * mag, n[1] * mag, n[2] * mag]);
+  },
+
+  setStepPressure(stepId, bcId, pressure) {
+    set({ loadSteps: patchStepOverride(get().loadSteps, stepId, bcId, { pressure }) });
+    syncIfActiveStep(set, get, stepId);
+  },
+
+  setStepIncludeOptimize(stepId, include) {
+    set({
+      loadSteps: get().loadSteps.map((s) => (s.id === stepId ? { ...s, includeInOptimize: include } : s)),
+    });
+  },
+
+  setStepWeight(stepId, weight) {
+    set({ loadSteps: get().loadSteps.map((s) => (s.id === stepId ? { ...s, weight } : s)) });
   },
 
   setMaterial(m) {
@@ -1656,6 +2429,10 @@ export const useStore = create<AppState>((set, get) => ({
 
   openSettings(open) {
     set({ settingsOpen: open });
+  },
+
+  openLoadSteps(open) {
+    set({ loadStepsOpen: open });
   },
 
   openImprint(open) {
@@ -1775,6 +2552,20 @@ export const useStore = create<AppState>((set, get) => ({
     sceneEvents.onMeshDensity?.(on);
   },
 
+  toggleBandedContour() {
+    const on = !get().bandedContour;
+    set({ bandedContour: on });
+    sceneEvents.onBandedContour?.(on, get().bandCount);
+  },
+
+  setBandCount(n) {
+    // Adjusting the band count (scrolling the legend) implies banded display.
+    const count = Math.max(CONTOUR_BANDS_MIN, Math.min(CONTOUR_BANDS_MAX, Math.round(n)));
+    if (count === get().bandCount && get().bandedContour) return;
+    set({ bandCount: count, bandedContour: true });
+    sceneEvents.onBandedContour?.(true, count);
+  },
+
   setSmoothStress(on) {
     set({ smoothStress: on });
     if (!get().model) return;
@@ -1783,6 +2574,7 @@ export const useStore = create<AppState>((set, get) => ({
       // Pure post-processing: the solution stays valid — just re-fetch the
       // active field and the dock's min-SF under the new sampling.
       session.clearAllFields();
+      clearEnvelopeCache(); // reduced fields were sampled at the old setting
       if (get().hasResult) {
         await pushScalarField(set, get);
         await refreshMinSf(set, get);
@@ -1799,6 +2591,7 @@ export const useStore = create<AppState>((set, get) => ({
       // (SF is unaffected — the same factor cancels — but refresh it anyway so
       // the dock stays consistent if the user toggles mid-session.)
       session.clearAllFields();
+      clearEnvelopeCache(); // reduced fields were sampled at the old setting
       if (get().hasResult) {
         await pushScalarField(set, get);
         await refreshMinSf(set, get);
@@ -1938,18 +2731,44 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   async selectResult(id) {
-    const e = get().results.find((r) => r.id === id);
-    if (!e || get().busy) return;
-    // Keep whatever plot the user is on (|u|, a component, or a stress/SF
-    // field) across the switch — only the manual legend override belongs to
-    // the previous result's magnitude.
-    set({
-      activeResultId: id,
-      fieldRange: null,
-      legendMin: null,
-      legendMax: null,
-    });
-    sceneEvents.onLegendRange?.(null, null);
+    const cur = get();
+    const e = cur.results.find((r) => r.id === id);
+    if (!e || cur.busy) return;
+    // Envelope (worst case across steps): no stashed solution — render the
+    // UNDEFORMED part colored by the reduced field. Always auto-fits (its range
+    // differs from any single step).
+    if (isEnvelope(e)) {
+      set({ activeResultId: id, fieldRange: null, legendMin: null, legendMax: null });
+      sceneEvents.onLegendRange?.(null, null);
+      try {
+        await showEnvelope(set, get, e);
+      } catch (err) {
+        set({ error: err instanceof Error ? err.message : String(err) });
+      }
+      return;
+    }
+    // Stepping through load cases of the SAME kind holds the color scale FIXED
+    // so the steps stay visually comparable (a redder step really is more
+    // stressed): pin the current range across the switch, pinning to what's on
+    // screen now if it wasn't already. A KIND switch (or leaving the envelope)
+    // auto-fits as before.
+    const prev = cur.results.find((r) => r.id === cur.activeResultId);
+    const stepSwitch = !!prev && !isEnvelope(prev) && prev.id !== e.id && prev.kind === e.kind;
+    let pinMin: number | null = null;
+    let pinMax: number | null = null;
+    if (stepSwitch) {
+      if (cur.legendMin !== null || cur.legendMax !== null) {
+        pinMin = cur.legendMin;
+        pinMax = cur.legendMax;
+      } else {
+        const r = currentLegendRange(cur);
+        if (r) [pinMin, pinMax] = r;
+      }
+    }
+    // Keep whatever plot the user is on (|u|, a component, or a stress/SF field)
+    // across the switch.
+    set({ activeResultId: id, fieldRange: null, legendMin: pinMin, legendMax: pinMax });
+    sceneEvents.onLegendRange?.(pinMin, pinMax);
     try {
       // Swap the stashed solution in (instant) and re-deform the viewport.
       const displacements = await engine.activateResult(id);
@@ -1958,7 +2777,7 @@ export const useStore = create<AppState>((set, get) => ({
       session.invalidateSolution();
       // Only the optimized result in Part Topo mode is a solid body; every
       // other result renders on the part hull.
-      sceneEvents.onResultSolid?.(id === "optimized" && !!get().optSummary?.solid);
+      sceneEvents.onResultSolid?.(e.kind === "optimized" && !!get().optSummary?.solid);
       sceneEvents.onScalarField?.(null);
       // Anchor the exaggeration on the lowest-deflection result so the scale
       // stays equal across switches (this result still uses its own buffer).
@@ -2025,6 +2844,12 @@ export const useStore = create<AppState>((set, get) => ({
     sceneEvents.onAnimateMode?.(null);
     let stopResidualPoll = () => {};
     try {
+      // Multiple load steps: solve them all (each manages its own residual poll
+      // and result stash). Single step falls through to the byte-identical path.
+      if (get().loadSteps.length > 1) {
+        await solveAllSteps(set, get);
+        return;
+      }
       await pushBcs(get);
       await logGridInfo(set);
       const report = await engine.check();
@@ -2181,6 +3006,8 @@ export const useStore = create<AppState>((set, get) => ({
           upsertResult(set, get, {
             id: rid,
             kind: rid,
+            loadStepId: cur.activeLoadStepId,
+            loadStepName: activeStep(cur)?.name ?? "Load step",
             label: printedSummary
               ? `As printed · ${printedSummary.infillPct}% ${printedSummary.pattern}`
               : "Solid material",
@@ -2226,7 +3053,36 @@ export const useStore = create<AppState>((set, get) => ({
     sceneEvents.onAnimateMode?.(null);
     pushSymmetry(get); // editing aid — hide while the optimization runs
     try {
-      await pushBcs(get);
+      // MULTI-LOAD (DESIGN §13): register every INCLUDED load step as a weighted
+      // optimization case (the optimizer minimizes the weighted-sum compliance).
+      // A single-step project — or one included step — keeps the single-load
+      // path (active / sole step's BCs), byte-identical to before.
+      await engine.clearLoadCases();
+      const included = st.loadSteps.filter((s) => s.includeInOptimize);
+      const multiLoad = st.loadSteps.length > 1 && included.length >= 2;
+      if (multiLoad) {
+        for (const step of included) {
+          await engine.setBcs(effectiveBcs(st.bcs, step));
+          await engine.addLoadCase(step.weight);
+        }
+        const wsum = included.reduce((a, s) => a + s.weight, 0) || 1;
+        appendLog(
+          set,
+          `Multi-load optimize — weighted sum of ${included.length} load steps: ` +
+            included.map((s) => `${s.name} ${Math.round((100 * s.weight) / wsum)}%`).join(" · ")
+        );
+      } else if (st.loadSteps.length > 1 && included.length === 1) {
+        await engine.setBcs(effectiveBcs(st.bcs, included[0]));
+      } else if (included.length === 0) {
+        set({
+          busy: null,
+          error:
+            "No load steps are included in the optimization — enable at least one in “Manage load steps”.",
+        });
+        return;
+      } else {
+        await pushBcs(get); // single step: the active (sole) step's BCs
+      }
       await logGridInfo(set);
       // Cache the voxel hull NOW (worker still free) so the Mesh view is
       // viewable during the blocking optimization that follows.
@@ -2393,7 +3249,7 @@ export const useStore = create<AppState>((set, get) => ({
       // exaggeration on the stiffest of those so switching keeps it equal.
       sceneEvents.onDisplacements?.(out.displacements, {
         maxDisplacement: referenceMaxDisp(
-          get().results.filter((r) => r.id === "asprinted"),
+          get().results.filter((r) => r.kind === "asprinted"),
           Math.min(
             out.summary.maxDisplacement,
             out.summary.uniformMaxDisp ?? Infinity,
@@ -2426,6 +3282,10 @@ export const useStore = create<AppState>((set, get) => ({
         const modeLabel = sm.solid ? "Part Topo" : sm.binary ? "binary" : "graded";
         const goalNote = sm.goal === "match" ? " · match" : "";
         const ep = { ...cur.resultEpochs };
+        // The optimizer runs the ACTIVE load step's loads (single-load until the
+        // multi-load optimizer lands); tag its results with that step.
+        const optStepId = cur.activeLoadStepId;
+        const optStepName = activeStep(cur)?.name ?? "Load step";
         const optRows: [string, string][] = [
           ["Mode", modeLabel + goalNote],
           [sm.solid ? "Retained vol" : "Mean infill", `${meanPct}%`],
@@ -2441,10 +3301,12 @@ export const useStore = create<AppState>((set, get) => ({
           ["vs solid", signedPct(sm.stiffnessVsSolid - 1)],
           ["vs uniform", signedPct(sm.gainVsUniform)]
         );
-        const next: ResultEntry[] = get().results.filter((r) => r.id === "asprinted");
+        const next: ResultEntry[] = get().results.filter((r) => r.kind === "asprinted");
         next.push({
           id: "optimized",
           kind: "optimized",
+          loadStepId: optStepId,
+          loadStepName: optStepName,
           label: `Optimized · ${modeLabel} ${meanPct}%`,
           maxDisplacement: sm.maxDisplacement,
           massGrams: sm.massGrams,
@@ -2458,6 +3320,8 @@ export const useStore = create<AppState>((set, get) => ({
           next.push({
             id: "uniform",
             kind: "uniform",
+            loadStepId: optStepId,
+            loadStepName: optStepName,
             label: `Uniform · equal mass ${meanPct}%`,
             maxDisplacement: sm.uniformMaxDisp ?? sm.maxDisplacement,
             massGrams: sm.massGrams,
@@ -2477,6 +3341,8 @@ export const useStore = create<AppState>((set, get) => ({
           next.push({
             id: "solid",
             kind: "solid",
+            loadStepId: optStepId,
+            loadStepName: optStepName,
             label: "Solid material",
             maxDisplacement: sm.solidMaxDisp ?? 0,
             massGrams: sm.massSolidGrams,
@@ -2493,8 +3359,7 @@ export const useStore = create<AppState>((set, get) => ({
             epochs: ep,
           });
         }
-        next.sort((a, b) => RESULT_ORDER.indexOf(a.kind) - RESULT_ORDER.indexOf(b.kind));
-        set({ results: next, activeResultId: "optimized" });
+        set({ results: sortResults(next, cur.loadSteps), activeResultId: "optimized" });
       } catch {
         // stash failed — the optimized result still shows, it just isn't switchable
       }
@@ -2579,9 +3444,11 @@ export const useStore = create<AppState>((set, get) => ({
         transform,
         settings: collectSettings(s),
         bcs: s.bcs.map((b) => ({ ...b, tris: Array.from(b.tris) })),
+        loadSteps: serializeLoadSteps(s.bcs, s.loadSteps),
         optSummary: s.optSummary,
         regionInfos: s.regionInfos,
-        results: includeResults ? s.results : null,
+        // Envelopes have no stashed buffer — they're re-derived on load.
+        results: includeResults ? s.results.filter((r) => !isEnvelope(r)) : null,
         activeResultId: includeResults ? s.activeResultId : null,
       };
       const bytes = await engine.exportProject(JSON.stringify(manifest), `model.${ext}`, includeResults);
@@ -2621,6 +3488,9 @@ export const useStore = create<AppState>((set, get) => ({
       };
       // Re-id the loads/supports so they can't collide with this session's counter.
       const bcs: Bc[] = mf.bcs.map((b) => ({ ...b, id: `bc${++bcCounter}`, tris: Uint32Array.from(b.tris) }));
+      // Load steps remap their override keys onto the re-id'd BCs (above);
+      // pre-feature files synthesize a single default step.
+      const loadSteps = deserializeLoadSteps(bcs, mf.loadSteps);
       set({
         fileName: mf.fileName,
         model,
@@ -2660,6 +3530,8 @@ export const useStore = create<AppState>((set, get) => ({
         resultSurface: st.resultSurface,
         bcs,
         activeBcId: null,
+        loadSteps,
+        activeLoadStepId: loadSteps[0].id,
         tool: "orbit",
         activeStep: 6,
         check: null,
@@ -2695,7 +3567,9 @@ export const useStore = create<AppState>((set, get) => ({
         const out = await engine.transform(mf.transform);
         set({ model: { ...get().model!, positions: out.positions, bbox: out.bbox as LoadedModel["bbox"] } });
       }
-      await engine.setBcs(bcs);
+      // Push the active (first) load step's effective BCs — identical to `bcs`
+      // for a single-step / pre-feature project.
+      await engine.setBcs(effectiveBcs(bcs, loadSteps[0]));
       // Clear any stale overlays, then push the restored model + BC glyphs.
       sceneEvents.onScalarField?.(null);
       sceneEvents.onDisplacements?.(null, null);
@@ -2703,7 +3577,7 @@ export const useStore = create<AppState>((set, get) => ({
       sceneEvents.onRegions?.(null);
       sceneEvents.onOptShape?.(null, null);
       sceneEvents.onModelLoaded?.(get().model!);
-      sceneEvents.onBcsChanged?.(bcs, null);
+      pushBcGlyphs(get, null);
       // Phase 2: restore the design + result buffers into the engine.
       const restore = await engine.openProjectRestore();
       // Optimized design → store + scene (Density/Regions/export).
@@ -2723,10 +3597,24 @@ export const useStore = create<AppState>((set, get) => ({
       // Embedded FEA results → store + scene (deflection views + switcher).
       const haveResults = !!(mf.results && mf.results.length && restore.restoredResults.length);
       if (haveResults) {
-        const roster: ResultEntry[] = mf
-          .results!.filter((r) => restore.restoredResults.includes(r.id))
-          .map((r) => ({ ...r, epochs: { ...ZERO_EPOCHS } }));
-        roster.sort((a, b) => RESULT_ORDER.indexOf(a.kind) - RESULT_ORDER.indexOf(b.kind));
+        // Backfill the load-step fields for results saved before this feature
+        // (always single-step → the sole step) so the roster type holds.
+        const step0 = get().loadSteps[0];
+        clearEnvelopeCache();
+        const roster: ResultEntry[] = withEnvelope(
+          sortResults(
+            mf
+              .results!.filter((r) => restore.restoredResults.includes(r.id))
+              .map((r) => ({
+                ...r,
+                loadStepId: r.loadStepId ?? step0?.id ?? "",
+                loadStepName: r.loadStepName ?? step0?.name ?? "Load step",
+                epochs: { ...ZERO_EPOCHS },
+              })),
+            get().loadSteps
+          ),
+          get().loadSteps
+        );
         const activeId =
           mf.activeResultId && roster.some((r) => r.id === mf.activeResultId)
             ? mf.activeResultId
@@ -2735,7 +3623,8 @@ export const useStore = create<AppState>((set, get) => ({
         if (activeId) {
           const disp = await engine.activateResult(activeId);
           session.invalidateSolution();
-          sceneEvents.onResultSolid?.(activeId === "optimized" && !!mf.optSummary?.solid);
+          const activeKind = roster.find((r) => r.id === activeId)?.kind;
+          sceneEvents.onResultSolid?.(activeKind === "optimized" && !!mf.optSummary?.solid);
           sceneEvents.onScalarField?.(null);
           sceneEvents.onDisplacements?.(disp, { maxDisplacement: referenceMaxDisp(roster) });
           if (get().resultSurface === "voxel") {
@@ -2853,6 +3742,19 @@ export const useStore = create<AppState>((set, get) => ({
     if (min !== null && max !== null && !(max > min)) return; // ignore inverted
     set({ legendMin: min, legendMax: max });
     sceneEvents.onLegendRange?.(min, max);
+  },
+
+  fitLegend() {
+    // Rescale (and pin) the legend to the CURRENT step's data — the shared-scale
+    // escape hatch when one load case dwarfs the others.
+    const r = currentLegendRange(get());
+    if (r) {
+      set({ legendMin: r[0], legendMax: r[1] });
+      sceneEvents.onLegendRange?.(r[0], r[1]);
+    } else {
+      set({ legendMin: null, legendMax: null });
+      sceneEvents.onLegendRange?.(null, null);
+    }
   },
 
   setShowExtremes(on) {

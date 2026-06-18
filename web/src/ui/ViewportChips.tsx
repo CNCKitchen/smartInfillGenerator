@@ -71,24 +71,59 @@ export function ViewportChips() {
 
       {resultsView && (
         <div className="fieldchip">
-          {s.results.length > 0 && (
-            <>
-              <select
-                className="resultsel"
-                value={s.activeResultId ?? ""}
-                onChange={(e) => void s.selectResult(e.target.value as ResultKind)}
-                title="Which result to view — optimized, the even-fill baselines, or the as-printed solve"
-              >
-                {s.results.map((r) => (
-                  <option key={r.id} value={r.id}>
-                    {resultStale(r, s.resultEpochs) ? "⚠ " : ""}
-                    {r.label}
-                  </option>
-                ))}
-              </select>
-              <span className="chipdiv" />
-            </>
-          )}
+          {s.results.length > 0 && (() => {
+            // Results are pre-sorted (kind order, then load-step order). Collapse
+            // to DISTINCT kinds for the first dropdown; the second dropdown steps
+            // through the active kind's load cases (hidden when there's one).
+            const activeEntry = s.results.find((r) => r.id === s.activeResultId);
+            const activeKind = activeEntry?.kind;
+            const kinds: ResultKind[] = [];
+            for (const r of s.results) if (!kinds.includes(r.kind)) kinds.push(r.kind);
+            const stepsForKind = s.results.filter((r) => r.kind === activeKind);
+            const kindLabel = (k: ResultKind) => s.results.find((r) => r.kind === k)?.label ?? k;
+            const kindStale = (k: ResultKind) =>
+              s.results.some((r) => r.kind === k && resultStale(r, s.resultEpochs));
+            const pickKind = (k: ResultKind) => {
+              const same = s.results.find(
+                (r) => r.kind === k && r.loadStepId === activeEntry?.loadStepId
+              );
+              const target = same ?? s.results.find((r) => r.kind === k);
+              if (target) void s.selectResult(target.id);
+            };
+            return (
+              <>
+                <select
+                  className="resultsel"
+                  value={activeKind ?? ""}
+                  onChange={(e) => pickKind(e.target.value as ResultKind)}
+                  title="Which result to view — optimized, the even-fill baselines, or the as-printed solve"
+                >
+                  {kinds.map((k) => (
+                    <option key={k} value={k}>
+                      {kindStale(k) ? "⚠ " : ""}
+                      {kindLabel(k)}
+                    </option>
+                  ))}
+                </select>
+                {stepsForKind.length > 1 && (
+                  <select
+                    className="resultsel stepsel"
+                    value={s.activeResultId ?? ""}
+                    onChange={(e) => void s.selectResult(e.target.value)}
+                    title="Step through the load cases — the color scale stays fixed so they compare directly (use Fit to rescale)"
+                  >
+                    {stepsForKind.map((r) => (
+                      <option key={r.id} value={r.id}>
+                        {resultStale(r, s.resultEpochs) ? "⚠ " : ""}
+                        {r.loadStepName}
+                      </option>
+                    ))}
+                  </select>
+                )}
+                <span className="chipdiv" />
+              </>
+            );
+          })()}
           <div className="seg">
             <button
               className={s.resultSurface === "stl" ? "on" : ""}

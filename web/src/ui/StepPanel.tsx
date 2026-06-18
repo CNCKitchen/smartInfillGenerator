@@ -4,12 +4,13 @@
 // One panel, one step: the active station's controls. Everything the old
 // all-at-once sidebar offered is still here, just shown one step at a time.
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useShallow } from "zustand/shallow";
 import { budgetBounds, resultStale, symLabel, useStore } from "../store";
 import { NumInput } from "./NumInput";
-import type { Bc, BcKind, PatternKey } from "../types";
+import type { Bc, ForceMode, LoadStep, PatternKey } from "../types";
 import { fmtDisp, fmtLen, rampCss } from "./fmt";
+import { bcLabel, KIND_DOT, KIND_LABEL, SUPPORT_KINDS } from "./bcmeta";
 
 const SLICER_NAMES = {
   orca: "OrcaSlicer",
@@ -17,24 +18,9 @@ const SLICER_NAMES = {
   prusa: "PrusaSlicer",
 } as const;
 
-const KIND_LABEL: Record<BcKind, string> = {
-  fixed: "Fixed support",
-  frictionless: "Frictionless support",
-  displacement: "Displacement support",
-  elastic: "Elastic support",
-  force: "Force",
-  pressure: "Pressure",
-};
-
-// Mirrors BC_COLORS in SceneManager — the rows must match the 3D glyphs.
-const KIND_DOT: Record<BcKind, string> = {
-  fixed: "#2563eb",
-  frictionless: "#0e9cbf",
-  displacement: "#7c3aed",
-  elastic: "#1f9d6b",
-  force: "#d93025",
-  pressure: "#c97b10",
-};
+/** Round a unit-direction component for display (avoids 0.00003757… noise from
+ *  an auto-tracked surface normal; the value re-normalizes on commit anyway). */
+const r4 = (x: number) => Math.round(x * 1e4) / 1e4;
 
 const HEAD: Record<number, { title: string; sub: string }> = {
   1: { title: "Model", sub: "Drop an STL or 3MF — units are mm." },
@@ -249,8 +235,6 @@ function StepModel() {
 
 // ---------------- 2 · Boundary conditions ----------------
 
-const SUPPORT_KINDS: BcKind[] = ["fixed", "elastic", "frictionless", "displacement"];
-
 function StepBcs() {
   const s = useStore(
     useShallow((s) => ({
@@ -269,6 +253,7 @@ function StepBcs() {
   const loads = s.bcs.filter((bc) => !SUPPORT_KINDS.includes(bc.kind));
   return (
     <>
+      <LoadStepPanel />
       <div className="group">
         <div className="g-label">
           <span>Supports</span>
@@ -369,22 +354,102 @@ function StepBcs() {
   );
 }
 
+// Load steps (FEA load cases) — DESIGN §13. The single-case setup is unchanged:
+// with one step this is just a subtle "+ Add load step". Adding a 2nd step
+// reveals a compact step SELECTOR; the BC list below then edits whichever step
+// is active (and its loads show in the viewport). Naming + the per-step on/off
+// matrix live in the ⚙ Manage modal (LoadStepsModal), like Settings.
+function LoadStepPanel() {
+  const s = useStore(
+    useShallow((s) => ({
+      loadSteps: s.loadSteps,
+      activeLoadStepId: s.activeLoadStepId,
+      addLoadStep: s.addLoadStep,
+      setActiveLoadStep: s.setActiveLoadStep,
+      openLoadSteps: s.openLoadSteps,
+    }))
+  );
+  if (s.loadSteps.length <= 1) {
+    return (
+      <div className="addrow lsadd">
+        <button onClick={() => s.addLoadStep()} title="Analyze the part under several load cases">
+          + Add load step
+        </button>
+      </div>
+    );
+  }
+  const active = s.loadSteps.find((ls) => ls.id === s.activeLoadStepId);
+  return (
+    <div className="group lsbar">
+      <div className="g-label">
+        <span>Load step</span>
+        <button
+          className="lsmanage"
+          onClick={() => s.openLoadSteps(true)}
+          title="Rename steps & toggle which supports / loads are active in each"
+        >
+          ⚙ Manage load steps
+        </button>
+      </div>
+      <div className="lspills">
+        {s.loadSteps.map((ls, i) => (
+          <button
+            key={ls.id}
+            className={ls.id === s.activeLoadStepId ? "lspill on" : "lspill"}
+            onClick={() => s.setActiveLoadStep(ls.id)}
+            title={ls.name}
+          >
+            {i + 1}
+          </button>
+        ))}
+        <button className="lspill add" onClick={() => s.addLoadStep()} title="Add a load step">
+          +
+        </button>
+      </div>
+      <div className="dim lsactive">
+        Editing <b>{active?.name}</b> — its loads show below and in the viewport.
+      </div>
+    </div>
+  );
+}
+
 function BcRow({ bc }: { bc: Bc }) {
   const s = useStore(
     useShallow((s) => ({
       activeBcId: s.activeBcId,
       setActiveBc: s.setActiveBc,
       removeBc: s.removeBc,
+      setBcName: s.setBcName,
       updateBcParams: s.updateBcParams,
+      setStepPressure: s.setStepPressure,
+      loadSteps: s.loadSteps,
+      activeLoadStepId: s.activeLoadStepId,
     }))
   );
   const active = s.activeBcId === bc.id;
+  // Multi-step: the editors bind to the ACTIVE step (undefined = single-step,
+  // edit the base BC as before). A BC switched off in the active step is dimmed
+  // — its on/off lives in ⚙ Manage.
+  const step =
+    s.loadSteps.length > 1 ? s.loadSteps.find((ls) => ls.id === s.activeLoadStepId) : undefined;
+  const off = step ? step.overrides[bc.id]?.active === false : false;
   return (
-    <div className={active ? "bc active" : "bc"} onClick={() => s.setActiveBc(active ? null : bc.id)}>
+    <div
+      className={`bc${active ? " active" : ""}${off ? " off" : ""}`}
+      onClick={() => s.setActiveBc(active ? null : bc.id)}
+    >
       <div className="bchead">
         <span className="dot" style={{ background: KIND_DOT[bc.kind] }} />
-        <span className="bcname">{KIND_LABEL[bc.kind]}</span>
-        <span className="dim">{bc.tris.length ? `${bc.tris.length} tris` : "select surfaces…"}</span>
+        <input
+          className="bcnameinput"
+          value={bcLabel(bc)}
+          spellCheck={false}
+          onClick={(e) => e.stopPropagation()}
+          onChange={(e) => s.setBcName(bc.id, e.target.value)}
+          title="Rename this condition"
+        />
+        {off && <span className="bcoff">off</span>}
+        <span className="dim">{bc.tris.length ? `${bc.tris.length} tris` : "select…"}</span>
         <button
           className="x"
           onClick={(e) => {
@@ -395,16 +460,18 @@ function BcRow({ bc }: { bc: Bc }) {
           ×
         </button>
       </div>
-      {bc.kind === "force" && <ForceEditor bc={bc} />}
+      {bc.kind === "force" && <ForceEditor bc={bc} step={step} />}
       {bc.kind === "displacement" && <DisplacementEditor bc={bc} />}
       {bc.kind === "pressure" && (
         <div className="bcparams" onClick={(e) => e.stopPropagation()}>
           <label>
             p
             <NumInput
-              value={bc.pressure ?? 0}
+              value={step ? step.overrides[bc.id]?.pressure ?? bc.pressure ?? 0 : bc.pressure ?? 0}
               step={0.01}
-              onCommit={(v) => s.updateBcParams(bc.id, { pressure: v })}
+              onCommit={(v) =>
+                step ? s.setStepPressure(step.id, bc.id, v) : s.updateBcParams(bc.id, { pressure: v })
+              }
             />
           </label>
           <span className="dim">MPa</span>
@@ -434,10 +501,77 @@ function BcRow({ bc }: { bc: Bc }) {
   );
 }
 
-/** Force load editor: either Fx/Fy/Fz components, or a unit direction (which
- *  defaults to the selection's average normal, pickable off the model) plus a
- *  scalar magnitude. */
-function ForceEditor({ bc }: { bc: Bc }) {
+/** Stacked X/Y/Z inputs — full-width rows so the numbers are fully visible (the
+ *  old 3-across layout clipped them). Reused for force components AND the
+ *  direction vector, so both read the same. Unit sits behind each field. */
+function VectorInput({
+  values,
+  onChange,
+  label = "F",
+  unit = "",
+  step = 1,
+}: {
+  values: [number, number, number];
+  onChange: (v: [number, number, number]) => void;
+  label?: string;
+  unit?: string;
+  step?: number;
+}) {
+  return (
+    <div className="forcegrid">
+      {(["X", "Y", "Z"] as const).map((axis, i) => (
+        <label key={axis} className="forcerow">
+          <span className="flabel">
+            {label}
+            {axis}
+          </span>
+          <NumInput
+            className="fnum"
+            value={values[i]}
+            step={step}
+            onCommit={(v) => {
+              const nv = [...values] as [number, number, number];
+              nv[i] = v;
+              onChange(nv);
+            }}
+          />
+          {unit && <span className="funit">{unit}</span>}
+        </label>
+      ))}
+    </div>
+  );
+}
+
+function ForceModeToggle({ mode, onMode }: { mode: ForceMode; onMode: (m: ForceMode) => void }) {
+  return (
+    <div className="seg">
+      <button
+        className={mode === "components" ? "on" : ""}
+        onClick={() => onMode("components")}
+        title="Define the load by its X/Y/Z components"
+      >
+        Components
+      </button>
+      <button
+        className={mode === "direction" ? "on" : ""}
+        onClick={() => onMode("direction")}
+        title="Define the load by a direction and a magnitude"
+      >
+        Direction
+      </button>
+    </div>
+  );
+}
+
+/** Force editor: components OR direction + magnitude. `step` set ⇒ edits that
+ *  load step's vector; otherwise the base BC. */
+function ForceEditor({ bc, step }: { bc: Bc; step?: LoadStep }) {
+  return step ? <StepForceEditor bc={bc} step={step} /> : <BaseForceEditor bc={bc} />;
+}
+
+/** Single-step (base) force editor — owns the persisted mode + the pick/flip/
+ *  normal direction tools. */
+function BaseForceEditor({ bc }: { bc: Bc }) {
   const s = useStore(
     useShallow((s) => ({
       activeBcId: s.activeBcId,
@@ -458,91 +592,44 @@ function ForceEditor({ bc }: { bc: Bc }) {
   const dir = bc.forceDir ?? [0, 0, -1];
   const picking = active && s.tool === "pickdir";
   return (
-    <div onClick={(e) => e.stopPropagation()}>
-      <div className="seg" style={{ marginBottom: 6 }}>
-        <button
-          className={mode === "components" ? "on" : ""}
-          onClick={() => s.setForceMode(bc.id, "components")}
-          title="Define the load by its X/Y/Z components"
-        >
-          Components
-        </button>
-        <button
-          className={mode === "direction" ? "on" : ""}
-          onClick={() => s.setForceMode(bc.id, "direction")}
-          title="Define the load by a direction and a magnitude"
-        >
-          Direction
-        </button>
-      </div>
+    <div className="forceedit" onClick={(e) => e.stopPropagation()}>
+      <ForceModeToggle mode={mode} onMode={(m) => s.setForceMode(bc.id, m)} />
       {mode === "components" ? (
-        <div className="bcparams triple">
-          {(["X", "Y", "Z"] as const).map((axis, i) => (
-            <label key={axis}>
-              F{axis}
-              <NumInput
-                value={force[i]}
-                step={1}
-                onCommit={(v) => {
-                  const f = [...force] as [number, number, number];
-                  f[i] = v;
-                  s.updateBcParams(bc.id, { force: f });
-                }}
-              />
-            </label>
-          ))}
-          <span className="dim">N total</span>
-        </div>
+        <VectorInput
+          values={force}
+          label="F"
+          unit="N"
+          step={1}
+          onChange={(nf) => s.updateBcParams(bc.id, { force: nf })}
+        />
       ) : (
         <>
-          <div className="bcparams">
-            <label>
-              |F|
-              <NumInput value={bc.forceMag ?? 0} step={1} onCommit={(v) => s.setForceMag(bc.id, v)} />
-            </label>
-            <span className="dim">N total</span>
+          <div className="forcerow">
+            <span className="flabel">|F|</span>
+            <NumInput
+              className="fnum"
+              value={bc.forceMag ?? 0}
+              step={1}
+              onCommit={(v) => s.setForceMag(bc.id, v)}
+            />
+            <span className="funit">N</span>
           </div>
-          <div className="bcparams triple">
-            {(["X", "Y", "Z"] as const).map((axis, i) => (
-              <label key={axis}>
-                d{axis}
-                <NumInput
-                  value={dir[i]}
-                  step={0.1}
-                  onCommit={(v) => {
-                    const d = [...dir] as [number, number, number];
-                    d[i] = v;
-                    s.setForceDir(bc.id, d);
-                  }}
-                />
-              </label>
-            ))}
-          </div>
-          <div className="toolrow">
-            <button
-              className={picking ? "on" : ""}
-              onClick={() => {
-                s.setActiveBc(bc.id);
-                s.setTool(picking ? "orbit" : "pickdir");
-              }}
-              title="Click a triangle on the model to aim the force along its normal"
-            >
-              ⊹ Pick direction
-            </button>
-            <button
-              onClick={() => s.flipForceDir(bc.id)}
-              title="Reverse the force direction"
-            >
-              ⇄ Flip
-            </button>
-            <button
-              onClick={() => s.resetForceDirToNormal(bc.id)}
-              disabled={bc.tris.length === 0}
-              title="Aim along the selection's area-weighted average normal"
-            >
-              ↻ Surface normal
-            </button>
-          </div>
+          <VectorInput
+            values={[r4(dir[0]), r4(dir[1]), r4(dir[2])]}
+            label="d"
+            step={0.1}
+            onChange={(d) => s.setForceDir(bc.id, d)}
+          />
+          <ForceDirTools
+            picking={picking}
+            disabledNormal={bc.tris.length === 0}
+            onPick={() => {
+              s.setActiveBc(bc.id);
+              s.setTool(picking ? "orbit" : "pickdir");
+            }}
+            onFlip={() => s.flipForceDir(bc.id)}
+            onNormal={() => s.resetForceDirToNormal(bc.id)}
+          />
           <div className="dim small">
             {picking
               ? "Click a triangle on the model — its normal becomes the force direction."
@@ -556,28 +643,148 @@ function ForceEditor({ bc }: { bc: Bc }) {
   );
 }
 
-/** Displacement support editor: which global axes are pinned to zero. */
+/** Per-step force editor — edits the active load step's vector. Components, or
+ *  direction + magnitude derived from that vector. Mode is a local view choice. */
+function StepForceEditor({ bc, step }: { bc: Bc; step: LoadStep }) {
+  const s = useStore(
+    useShallow((s) => ({
+      activeBcId: s.activeBcId,
+      tool: s.tool,
+      setActiveBc: s.setActiveBc,
+      setTool: s.setTool,
+      setStepForce: s.setStepForce,
+      aimStepForceAlongNormal: s.aimStepForceAlongNormal,
+    }))
+  );
+  const [mode, setMode] = useState<ForceMode>(bc.forceMode ?? "components");
+  const f = step.overrides[bc.id]?.force ?? bc.force ?? [0, 0, 0];
+  const setVec = (v: [number, number, number]) => s.setStepForce(step.id, bc.id, v);
+  const mag = Math.hypot(f[0], f[1], f[2]);
+  const dir: [number, number, number] =
+    mag > 1e-9 ? [f[0] / mag, f[1] / mag, f[2] / mag] : bc.forceDir ?? [0, 0, -1];
+  const picking = s.activeBcId === bc.id && s.tool === "pickdir";
+  const round = (x: number) => Math.round(x * 1000) / 1000;
+  return (
+    <div className="forceedit" onClick={(e) => e.stopPropagation()}>
+      <ForceModeToggle mode={mode} onMode={setMode} />
+      {mode === "components" ? (
+        <VectorInput values={f} label="F" unit="N" step={1} onChange={setVec} />
+      ) : (
+        <>
+          <div className="forcerow">
+            <span className="flabel">|F|</span>
+            <NumInput
+              className="fnum"
+              value={round(mag)}
+              step={1}
+              onCommit={(v) => setVec([dir[0] * v, dir[1] * v, dir[2] * v])}
+            />
+            <span className="funit">N</span>
+          </div>
+          <VectorInput
+            values={[round(dir[0]), round(dir[1]), round(dir[2])]}
+            label="d"
+            step={0.1}
+            onChange={(d) => {
+              const len = Math.hypot(d[0], d[1], d[2]) || 1;
+              setVec([(d[0] / len) * mag, (d[1] / len) * mag, (d[2] / len) * mag]);
+            }}
+          />
+          <ForceDirTools
+            picking={picking}
+            disabledNormal={bc.tris.length === 0}
+            onPick={() => {
+              s.setActiveBc(bc.id);
+              s.setTool(picking ? "orbit" : "pickdir");
+            }}
+            onFlip={() => setVec([-f[0], -f[1], -f[2]])}
+            onNormal={() => s.aimStepForceAlongNormal(step.id, bc.id)}
+          />
+          <div className="dim small">
+            This step's force vector. Magnitude × direction; pick a face, flip, or snap to the
+            selection's normal.
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function ForceDirTools({
+  picking,
+  disabledNormal,
+  onPick,
+  onFlip,
+  onNormal,
+}: {
+  picking: boolean;
+  disabledNormal: boolean;
+  onPick: () => void;
+  onFlip: () => void;
+  onNormal: () => void;
+}) {
+  return (
+    <div className="toolrow">
+      <button
+        className={picking ? "on" : ""}
+        onClick={onPick}
+        title="Click a triangle on the model to aim the force along its normal"
+      >
+        ⊹ Pick direction
+      </button>
+      <button onClick={onFlip} title="Reverse the force direction">
+        ⇄ Flip
+      </button>
+      <button
+        onClick={onNormal}
+        disabled={disabledNormal}
+        title="Aim along the selection's area-weighted average normal"
+      >
+        ↻ Surface normal
+      </button>
+    </div>
+  );
+}
+
+/** Displacement support editor: per global axis, an enforce checkbox + the
+ *  prescribed displacement value (mm). Enforced + 0 = pin to zero; enforced + v
+ *  = an imposed motion; unchecked = free (roller). */
 function DisplacementEditor({ bc }: { bc: Bc }) {
-  const s = useStore(useShallow((s) => ({ toggleBcAxis: s.toggleBcAxis })));
+  const s = useStore(
+    useShallow((s) => ({ toggleBcAxis: s.toggleBcAxis, updateBcParams: s.updateBcParams }))
+  );
   const axes = bc.axes ?? [false, false, true];
+  const disp = bc.disp ?? [0, 0, 0];
   return (
     <div onClick={(e) => e.stopPropagation()}>
-      <div className="bcparams" style={{ alignItems: "center", gap: 12 }}>
-        <span className="dim">Fix</span>
+      <div className="forcegrid">
         {(["X", "Y", "Z"] as const).map((axis, i) => (
-          <label key={axis} style={{ display: "flex", alignItems: "center", gap: 4 }}>
+          <label key={axis} className="forcerow dispaxis">
             <input
               type="checkbox"
               checked={axes[i]}
               onChange={() => s.toggleBcAxis(bc.id, i as 0 | 1 | 2)}
+              title={`Enforce the global ${axis} displacement`}
             />
-            {axis}
+            <span className="flabel">{axis}</span>
+            <NumInput
+              className="fnum"
+              value={disp[i]}
+              step={0.1}
+              disabled={!axes[i]}
+              onCommit={(v) => {
+                const d = [...disp] as [number, number, number];
+                d[i] = v;
+                s.updateBcParams(bc.id, { disp: d });
+              }}
+            />
+            <span className="funit">mm</span>
           </label>
         ))}
       </div>
       <div className="dim small">
-        Locks the checked global axes to zero; unchecked axes slide free (a roller). All three ≈ a
-        fixed support.
+        Check an axis to enforce it; the value is its prescribed displacement (0 = pinned).
+        Unchecked axes slide free (a roller). All three checked ≈ a fixed support.
       </div>
     </div>
   );
@@ -1362,7 +1569,7 @@ function StepExport() {
         </div>
       )}
       {(() => {
-        const opt = s.results.find((r) => r.id === "optimized");
+        const opt = s.results.find((r) => r.kind === "optimized");
         return opt && resultStale(opt, s.resultEpochs) ? (
           <div className="warnbanner">
             ⚠ <b>Settings changed since this optimization.</b> The mesh, loads, material, or an

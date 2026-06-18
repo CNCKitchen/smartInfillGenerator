@@ -6,7 +6,7 @@ import { useShallow } from "zustand/shallow";
 import { SceneManager } from "./SceneManager";
 import { sceneEvents, useStore, resultStale, type ResultEntry } from "../store";
 import { RESULT_FIELDS } from "../types";
-import { cssGradient, jet, ramp } from "./colormaps";
+import { cssBands, cssGradient, jet, ramp } from "./colormaps";
 
 function union(a: Uint32Array, b: Uint32Array): Uint32Array {
   const s = new Set<number>(a as unknown as number[]);
@@ -87,7 +87,7 @@ export function Viewer() {
 
     sceneEvents.onModelLoaded = (m) => scene.setModel(m);
     sceneEvents.onPatchIdsChanged = (ids) => scene.setPatchIds(ids);
-    sceneEvents.onBcsChanged = (bcs, active) => scene.setBcs(bcs, active);
+    sceneEvents.onBcsChanged = (bcs, active, inactive) => scene.setBcs(bcs, active, inactive);
     sceneEvents.onAnimateMode = (mode) => scene.setRbmMode(mode);
     sceneEvents.onDisplacements = (d, stats) => scene.setDisplacements(d, stats);
     sceneEvents.onVertexDensity = (d) => scene.setVertexDensity(d);
@@ -109,11 +109,14 @@ export function Viewer() {
     sceneEvents.onResultSurface = (s) => scene.setResultSurface(s);
     sceneEvents.onLegendRange = (min, max) => scene.setLegendRange(min, max);
     sceneEvents.onShowExtremes = (on, unit) => scene.setShowExtremes(on, unit);
+    sceneEvents.onBandedContour = (on, count) => scene.setBanded(on, count);
     sceneEvents.onSectionState = (on) => scene.setSection(on);
     sceneEvents.onSectionFlip = () => scene.flipSection();
     sceneEvents.onSectionAxis = (a) => scene.setSectionAxis(a);
     sceneEvents.onModelTransformed = (p, bbox) => scene.updateModelPositions(p, bbox);
     sceneEvents.onSymmetry = (enabled, normal, c) => scene.setSymmetry(enabled, normal, c);
+    // match the session toggle + count
+    scene.setBanded(useStore.getState().bandedContour, useStore.getState().bandCount);
 
     const obs = new ResizeObserver(() => {
       const el = wrapRef.current;
@@ -206,7 +209,7 @@ function Provenance() {
   let entry: ResultEntry | undefined;
   if (s.viewMode === "deformed") entry = s.results.find((r) => r.id === s.activeResultId);
   else if (s.viewMode === "density" || s.viewMode === "infill")
-    entry = s.results.find((r) => r.id === "optimized");
+    entry = s.results.find((r) => r.kind === "optimized");
   if (!entry) return null;
   const stale = resultStale(entry, s.resultEpochs);
   return (
@@ -332,6 +335,11 @@ function Legend() {
   const legendMin = useStore((s) => s.legendMin);
   const legendMax = useStore((s) => s.legendMax);
   const setLegendRange = useStore((s) => s.setLegendRange);
+  const fitLegend = useStore((s) => s.fitLegend);
+  const bandedContour = useStore((s) => s.bandedContour);
+  const toggleBandedContour = useStore((s) => s.toggleBandedContour);
+  const bandCount = useStore((s) => s.bandCount);
+  const setBandCount = useStore((s) => s.setBandCount);
   const smoothStress = useStore((s) => s.smoothStress);
   const setSmoothStress = useStore((s) => s.setSmoothStress);
   const materialStress = useStore((s) => s.materialStress);
@@ -344,10 +352,12 @@ function Legend() {
   if (viewMode === "deformed" && (stats || activeResultId)) {
     // |u| fallback bound before the scene reports its range: the live solve
     // stat, else the active restored result's stored max.
-    const fallbackMax =
-      stats?.maxDisplacement ??
-      results.find((r) => r.id === activeResultId)?.maxDisplacement ??
-      0;
+    const activeEntry = results.find((r) => r.id === activeResultId);
+    const fallbackMax = stats?.maxDisplacement ?? activeEntry?.maxDisplacement ?? 0;
+    // The active result's kind spans several load steps → the scale is held
+    // fixed across them; offer a "fit" to rescale to the step on screen.
+    const multiStep =
+      !!activeEntry && results.filter((r) => r.kind === activeEntry.kind).length > 1;
     const total = autoScale * deformScale;
     const totalLabel = total >= 9.5 ? `×${Math.round(total)}` : `×${total.toFixed(1)}`;
     const def = RESULT_FIELDS.find((f) => f.value === resultField);
@@ -370,7 +380,27 @@ function Legend() {
       <div className="legend">
         <div className="legendtitle">{isField || isDispComp ? def!.label : "Displacement |u|"}</div>
         <div className="legendbody">
-          <div className="legendbar" style={{ background: isSf ? JET_GRADIENT_FLIP : JET_GRADIENT }} />
+          <div
+            className="legendbar legendbarclick"
+            style={{
+              background: bandedContour
+                ? cssBands(jet, isSf, bandCount)
+                : isSf
+                  ? JET_GRADIENT_FLIP
+                  : JET_GRADIENT,
+            }}
+            onClick={() => toggleBandedContour()}
+            onWheel={(e) => {
+              e.stopPropagation();
+              // Scroll up = more bands, down = fewer (turns banding on).
+              setBandCount(bandCount + (e.deltaY < 0 ? 1 : -1));
+            }}
+            title={
+              bandedContour
+                ? `${bandCount} contour bands — scroll to change, click for smooth`
+                : "Click: switch to banded (discrete contour) shading"
+            }
+          />
           <div className="legendlabels">
             <EditableBound
               value={effMax}
@@ -387,10 +417,17 @@ function Legend() {
             />
           </div>
         </div>
-        {overridden && (
-          <button className="legendreset" onClick={() => setLegendRange(null, null)}>
-            ↺ auto scale
+        {(multiStep || overridden) && (
+          <button
+            className="legendreset"
+            onClick={() => fitLegend()}
+            title="Rescale the color range to fit what's visible now. Otherwise the scale holds fixed across load steps so they compare directly."
+          >
+            ⤢ fit to visible
           </button>
+        )}
+        {bandedContour && (
+          <div className="legendnote">{bandCount} bands · scroll bar to adjust</div>
         )}
         <label className="legendcheck">
           <input

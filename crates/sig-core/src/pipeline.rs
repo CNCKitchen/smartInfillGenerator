@@ -21,7 +21,7 @@ use crate::bins::{
     RegionMesh,
 };
 use crate::simp::{
-    build_eps, classify_cells, evaluate_cached, evaluate_cached_stats, optimize_cached,
+    build_eps, classify_cells, evaluate_cached, evaluate_cached_stats, optimize_cached, LoadSet,
     OptimizeError, OptimizeParams, OptimizeProgress,
 };
 use crate::solve::{NodeProblem, SolveSettings, SolverCache};
@@ -142,6 +142,7 @@ pub fn run_optimization(
     settings: &SolveSettings,
     params: &OptimizeParams,
     cfg: &PipelineCfg,
+    loads: &LoadSet,
     mut progress: impl FnMut(&IterUpdate, &[f64], &[u32]),
 ) -> Result<OptOutcome, OptimizeError> {
     let solid = params.solid_mode;
@@ -167,7 +168,7 @@ pub fn run_optimization(
         let x_ref = vec![cfg.ref_frac; split.design.len()];
         let (c_ref, _, _) = evaluate_cached(
             slot, grid, levels, problem, settings, &split.skin, &split.design, &split.skin_frac,
-            &x_ref, eval_exp, eval_coeff,
+            &x_ref, eval_exp, eval_coeff, loads,
         )?;
         c_target = c_ref;
     }
@@ -199,6 +200,7 @@ pub fn run_optimization(
             &params_k,
             warm_x.as_deref(),
             warm_u.as_deref(),
+            loads,
             |p, x_phys, design_cells| {
                 let upd = IterUpdate { progress: p, pass, passes: max_passes, budget };
                 progress(&upd, x_phys, design_cells);
@@ -237,7 +239,7 @@ pub fn run_optimization(
         // from the optimizer's displacement; real convergence stats kept.
         let (c_b, _maxd, u_b, stats_b) = evaluate_cached_stats(
             slot, grid, levels, problem, settings, &result.skin_cells, &result.design_cells,
-            &result.skin_frac, &x_binned, eval_exp, eval_coeff,
+            &result.skin_frac, &x_binned, eval_exp, eval_coeff, loads,
         )?;
         pass_trace.push((budget_k, c_b));
 
@@ -305,7 +307,7 @@ pub fn run_optimization(
     // for the solves. Their eps (for stress recovery) is rebuilt from x.
     let (c_uniform, max_disp_uniform, u_uniform) = evaluate_cached(
         slot, grid, levels, problem, &ref_settings, &result.skin_cells, &result.design_cells,
-        &result.skin_frac, &x_uniform, eval_exp, eval_coeff,
+        &result.skin_frac, &x_uniform, eval_exp, eval_coeff, loads,
     )?;
     let eps_uniform = build_eps(
         grid, &result.skin_cells, &result.design_cells, &result.skin_frac, &x_uniform, eval_exp,
@@ -314,7 +316,7 @@ pub fn run_optimization(
     let x_solid = vec![1.0; x_binned.len()];
     let (c_solid, max_disp_solid, u_solid) = evaluate_cached(
         slot, grid, levels, problem, &ref_settings, &result.skin_cells, &result.design_cells,
-        &result.skin_frac, &x_solid, eval_exp, eval_coeff,
+        &result.skin_frac, &x_solid, eval_exp, eval_coeff, loads,
     )?;
     let eps_solid = build_eps(
         grid, &result.skin_cells, &result.design_cells, &result.skin_frac, &x_solid, eval_exp,
@@ -540,7 +542,8 @@ mod tests {
             smooth_iters: 4,
         };
         let oc = run_optimization(
-            &mut None, &grid, levels, &asm.problem, &settings, &params, &cfg, |_, _, _| {},
+            &mut None, &grid, levels, &asm.problem, &settings, &params, &cfg, &LoadSet::default(),
+            |_, _, _| {},
         )
         .expect("pipeline");
 
@@ -560,5 +563,77 @@ mod tests {
         );
         assert!(!oc.regions.is_empty(), "at least one region extracted");
         assert!(oc.max_disp > 0.0 && oc.max_disp < 50.0, "sane deflection {}", oc.max_disp);
+    }
+
+    /// MULTI-LOAD (DESIGN §13): a cantilever loaded +Z in one case and +Y in
+    /// another. Optimizing for BOTH must (a) produce a layout different from the
+    /// single-Z optimum and (b) make that layout genuinely stiffer under the Y
+    /// case than the Z-only optimum is — the whole point of the weighted sum.
+    #[test]
+    fn multiload_design_resists_both_cases() {
+        let beam = primitives::boxx([0.0; 3], [40.0, 14.0, 14.0]);
+        let grid0 = VoxelGrid::voxelize(&beam, 1.0);
+        let settings = SolveSettings { e0: 2400.0, nu: 0.35, tol: 1e-5, ..Default::default() };
+        let (grid, levels) = pad_for_levels(&grid0, settings.max_levels);
+        let asm = |dir: [f64; 3]| {
+            let bcs = vec![
+                BcSpec { kind: BcKind::Fixed, tris: vec![0, 1] },
+                BcSpec { kind: BcKind::Force(dir), tris: vec![2, 3] },
+            ];
+            assemble(&beam, &grid, &bcs, None, &settings).unwrap()
+        };
+        let asm_z = asm([0.0, 0.0, -30.0]);
+        let asm_y = asm([0.0, -30.0, 0.0]);
+        let params = OptimizeParams {
+            budget: 0.35,
+            exponent: 1.5,
+            coeff: 1.0,
+            wall_mm: 1.0,
+            max_iter: 45,
+            ..Default::default()
+        };
+        let cfg = PipelineCfg {
+            eval: EvalLaw { exp: 1.5, coeff: 1.0 },
+            goal_match: false,
+            ref_frac: 0.35,
+            n_bins: 3,
+            levels_pct: None,
+            smooth_iters: 0,
+        };
+        let run = |loads: &LoadSet| {
+            run_optimization(
+                &mut None, &grid, levels, &asm_z.problem, &settings, &params, &cfg, loads,
+                |_, _, _| {},
+            )
+            .expect("pipeline")
+        };
+        // Single-load (Z only) vs multi-load (Z + Y, equal weight).
+        let a = run(&LoadSet::default());
+        let b = run(&LoadSet { extra: vec![(asm_y.problem.clone(), 1.0)], primary_weight: 1.0 });
+
+        // (a) The second load case visibly redistributes material.
+        let mean_delta = a
+            .x_binned
+            .iter()
+            .zip(&b.x_binned)
+            .map(|(p, q)| (p - q).abs())
+            .sum::<f64>()
+            / a.x_binned.len().max(1) as f64;
+        assert!(mean_delta > 0.015, "multi-load layout should differ from single-Z: mean |Δ| = {mean_delta:.4}");
+
+        // (b) The multi-load design is stiffer under the Y case than the Z-only
+        // design is (infill mode → identical skin/design cells from the same
+        // geometry, so this is a fair x-for-x comparison).
+        let split = classify_cells(&grid, params.wall_mm, params.top_mm, params.bottom_mm, params.composite_skin);
+        let cy = |x_binned: &[f64]| {
+            crate::simp::evaluate(
+                &grid, levels, &asm_y.problem, &settings, &split.skin, &split.design,
+                &split.skin_frac, x_binned, 1.5, 1.0, None,
+            )
+            .unwrap()
+            .0
+        };
+        let (ca_y, cb_y) = (cy(&a.x_binned), cy(&b.x_binned));
+        assert!(cb_y < ca_y, "multi-load must resist the Y case better: C_B(Y)={cb_y:.3} vs C_A(Y)={ca_y:.3}");
     }
 }

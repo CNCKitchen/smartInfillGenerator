@@ -11,6 +11,9 @@ export type ForceMode = "components" | "direction";
 export interface Bc {
   id: string;
   kind: BcKind;
+  /** User-facing name (e.g. "Motor mount", "Tip load"). Defaults to an
+   *  auto-numbered kind label ("Force 1") so steps/tables read clearly. */
+  name?: string;
   /** Selected triangle indices. */
   tris: Uint32Array;
   /** Force vector in N (force only) — the resolved load the solver uses. */
@@ -19,8 +22,11 @@ export interface Bc {
   pressure?: number;
   /** Foundation bedding modulus in N/mm³, σ = k·u (elastic only). */
   stiffness?: number;
-  /** Which global axes are pinned to zero (displacement support only). */
+  /** Which global axes are enforced (displacement support only). */
   axes?: [boolean, boolean, boolean];
+  /** Prescribed displacement per global axis in mm (displacement support only);
+   *  0 = pin to zero. Only axes enabled in `axes` are enforced. */
+  disp?: [number, number, number];
   /** Force definition mode (force only); defaults to "direction". */
   forceMode?: ForceMode;
   /** Unit direction for "direction" mode (force only). */
@@ -30,6 +36,34 @@ export interface Bc {
   /** True while the direction auto-tracks the selection's area-weighted
    *  average normal; cleared once the user picks/edits a direction. */
   forceDirAuto?: boolean;
+}
+
+/** Per-load-step override of a single BC (see DESIGN §13). Absent fields
+ *  inherit the base `Bc`; `active` defaults true. For SUPPORTS only `active`
+ *  is meaningful (selection/params stay shared). LOADS additionally carry a
+ *  full per-step value — a resolved force vector or a pressure. */
+export interface LoadStepOverride {
+  /** Whether this BC participates in the step. Absent = true. */
+  active?: boolean;
+  /** Full per-step force vector in N (force BCs); absent = inherit base. */
+  force?: [number, number, number];
+  /** Per-step pressure in MPa (pressure BCs); absent = inherit base. */
+  pressure?: number;
+}
+
+/** One FEA load case. The shared `bcs` array defines geometry/selection ONCE;
+ *  each load step layers a thin override map on top. The default single-step
+ *  model keeps empty overrides — every BC active at its base value — so the
+ *  single-case setup is identical to having no load steps at all. */
+export interface LoadStep {
+  id: string;
+  name: string;
+  /** Keyed by BC id. Absent entry = that BC active at its base value. */
+  overrides: Record<string, LoadStepOverride>;
+  /** Whether this step feeds the multi-load optimizer (weighted-sum). */
+  includeInOptimize: boolean;
+  /** Relative weight in the weighted-sum optimizer objective. */
+  weight: number;
 }
 
 export interface RbmMode {

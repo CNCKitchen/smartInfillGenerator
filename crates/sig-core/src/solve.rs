@@ -382,7 +382,18 @@ pub struct SolverCache {
 }
 
 impl SolverCache {
-    fn build(
+    /// True when `problem` has the SAME constraints (fixed dofs + springs) as
+    /// this cache — i.e. it shares this hierarchy, only the RHS (forces) differs.
+    /// Used by the multi-load optimizer to group load cases by constraint
+    /// signature (one multigrid hierarchy per group).
+    pub fn same_constraints(&self, problem: &NodeProblem) -> bool {
+        self.fixed == problem.fixed && self.springs == problem.springs
+    }
+
+    /// Cold-build a hierarchy for `problem` (constraints + grid + eps). Public so
+    /// the multi-load optimizer can build a per-constraint-group cache outside the
+    /// single-`slot` reuse path.
+    pub fn build(
         grid: &VoxelGrid,
         levels: usize,
         problem: &NodeProblem,

@@ -190,6 +190,7 @@ export class EngineClient {
       pressure: bc.pressure,
       stiffness: bc.stiffness,
       axes: bc.axes,
+      disp: bc.disp,
     }));
     return this.call(
       { op: "setBcs", bcs: payload },
@@ -303,6 +304,17 @@ export class EngineClient {
   /** Drop every stashed result (geometry/grid change — all stale). */
   clearResults(): Promise<void> {
     return this.call({ op: "clearResults" });
+  }
+
+  /** Drop all registered multi-load optimization cases (DESIGN §13). */
+  clearLoadCases(): Promise<void> {
+    return this.call({ op: "clearLoadCases" });
+  }
+
+  /** Snapshot the CURRENT BCs as a weighted load case for the multi-load
+   *  optimizer. Call after `setBcs` has pushed this step's effective BCs. */
+  addLoadCase(weight: number): Promise<void> {
+    return this.call({ op: "addLoadCase", weight });
   }
 
   /** Cumulative orientation transform since import (for project save). */

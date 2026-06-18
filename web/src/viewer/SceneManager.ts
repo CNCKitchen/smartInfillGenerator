@@ -10,7 +10,7 @@ import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { TransformControls } from "three/addons/controls/TransformControls.js";
 import type { Bc, LoadedModel } from "../types";
 import type { Tool, ViewMode } from "../store";
-import { jet, ramp, type RGB } from "./colormaps";
+import { CONTOUR_BANDS, jet, ramp, type RGB } from "./colormaps";
 import type { OptRegion } from "../engine/EngineClient";
 
 /** Named orthographic camera presets (keyboard Ctrl + 0–6). Axes follow the
@@ -147,6 +147,8 @@ export class SceneManager {
 
   private bcs: Bc[] = [];
   private activeBcId: string | null = null;
+  /** BCs deactivated in the active load step — drawn translucent. */
+  private inactiveBcs: Set<string> = new Set();
   private triBcColor: (THREE.Color | null)[] = [];
   private hoverPatch: number | null = null;
   /** Set by repaint() (full color rewrite), cleared after the next render. While
@@ -172,6 +174,10 @@ export class SceneManager {
   /** Crosshair shown at the hovered surface point in the "pick direction" tool,
    *  to signal that a click here sets the force direction. */
   private pickCursor: THREE.LineSegments | null = null;
+  /** Live arrow shown at the hovered point in "pick direction", previewing the
+   *  load direction (the hovered face's outward normal) a click would set. */
+  private pickArrow: THREE.Group | null = null;
+  private pickArrowDisposables: (THREE.BufferGeometry | THREE.Material)[] = [];
 
   /** Force arrows + support glyphs (classic FEA triangles), setup view only. */
   private bcMarkers = new THREE.Group();
@@ -299,6 +305,11 @@ export class SceneManager {
   private lutRamp = makeLut(ramp);
   private uvs: Float32Array | null = null;
   private scalarMode: "none" | "jet" | "ramp" | "flat" = "none";
+  /** Discrete contour bands: the jet LUT is quantized into `bandCount` flat
+   *  steps (toggled by clicking the legend, count set by scrolling it). Result
+   *  fields only — the density ramp stays smooth. */
+  private banded = false;
+  private bandCount = CONTOUR_BANDS;
 
   private clock = new THREE.Clock();
   private callbacks: SceneCallbacks = {};
@@ -362,6 +373,7 @@ export class SceneManager {
       if (this.probeEl) this.probeEl.style.display = "none";
       if (this.brushCursor) this.brushCursor.visible = false;
       if (this.pickCursor) this.pickCursor.visible = false;
+      if (this.pickArrow) this.pickArrow.visible = false;
     });
     canvas.addEventListener("webglcontextlost", this.onGlLost);
     canvas.addEventListener("webglcontextrestored", this.onGlRestored);
@@ -444,6 +456,7 @@ export class SceneManager {
       this.wireframeLines.geometry.dispose();
       (this.wireframeLines.material as THREE.Material).dispose();
     }
+    for (const d of this.pickArrowDisposables) d.dispose();
     this.renderer?.dispose();
   }
 
@@ -533,9 +546,9 @@ export class SceneManager {
     this.brushErase = brushErase;
     this.controls.enabled = tool !== "brush";
     if (this.brushCursor) this.brushCursor.visible = tool === "brush";
-    // pickCursor follows the pointer (shown on hover in onPointerMove); just
-    // clear it when leaving the tool.
-    if (this.pickCursor && tool !== "pickdir") this.pickCursor.visible = false;
+    // The pick-direction preview arrow follows the pointer (shown on hover in
+    // onPointerMove); just clear it when leaving the tool.
+    if (this.pickArrow && tool !== "pickdir") this.pickArrow.visible = false;
     if (tool !== "select" && tool !== "place") this.setHover(null);
   }
 
@@ -715,9 +728,10 @@ export class SceneManager {
 
   // ---------- BC display ----------
 
-  setBcs(bcs: Bc[], activeBcId: string | null) {
+  setBcs(bcs: Bc[], activeBcId: string | null, inactive?: Set<string>) {
     this.bcs = bcs;
     this.activeBcId = activeBcId;
+    this.inactiveBcs = inactive ?? new Set();
     this.repaint();
     this.rebuildBcMarkers();
   }
@@ -762,6 +776,7 @@ export class SceneManager {
     if (!this.basePositions) return;
     for (const bc of this.bcs) {
       if (bc.tris.length === 0) continue;
+      const inactive = this.inactiveBcs.has(bc.id);
       if (bc.kind === "force" && bc.force) {
         const f = new THREE.Vector3(...bc.force);
         if (f.lengthSq() === 0) continue;
@@ -771,11 +786,13 @@ export class SceneManager {
         // Solid shaft + cone (NOT ArrowHelper): its line shaft disappears
         // when the arrow is viewed end-on — e.g. a -Z force from a top-down
         // camera — leaving a context-free floating dot. A shaded cylinder
-        // stays readable from every angle.
+        // stays readable from every angle. Deactivated in this step → ghosted.
         const mat = new THREE.MeshStandardMaterial({
           color: 0xff5252,
           roughness: 0.45,
           metalness: 0.05,
+          transparent: inactive,
+          opacity: inactive ? 0.25 : 1,
         });
         const shaftLen = len * 0.72;
         const shaftGeo = new THREE.CylinderGeometry(len * 0.025, len * 0.025, shaftLen, 10);
@@ -795,6 +812,7 @@ export class SceneManager {
           `${mag >= 9.95 ? mag.toFixed(0) : mag.toFixed(1)} N`,
           0xc2330e
         );
+        if (inactive) (label.material as THREE.SpriteMaterial).opacity = 0.3;
         label.position.set(0, -len * 0.02, 0);
         g.add(label);
         // Local +Y becomes the force direction (the head is the +Y end).
@@ -813,13 +831,13 @@ export class SceneManager {
         bc.kind === "displacement" ||
         bc.kind === "elastic"
       ) {
-        this.buildSupportGlyphs(bc);
+        this.buildSupportGlyphs(bc, inactive);
       }
     }
     this.updateMarkerVisibility();
   }
 
-  private buildSupportGlyphs(bc: Bc) {
+  private buildSupportGlyphs(bc: Bc, inactive = false) {
     const p = this.basePositions!;
     // Triangle centroids + outward normals + areas of the selection.
     const items: { c: THREE.Vector3; n: THREE.Vector3; a: number }[] = [];
@@ -868,6 +886,8 @@ export class SceneManager {
       roughness: 0.5,
       metalness: 0.05,
       flatShading: true,
+      transparent: inactive,
+      opacity: inactive ? 0.25 : 1,
     });
     this.markerDisposables.push(coneGeo, mat);
     const up = new THREE.Vector3(0, 1, 0);
@@ -1038,6 +1058,41 @@ export class SceneManager {
     return hits.length ? hits[0] : null;
   }
 
+  /** Outward geometric normal of a soup triangle (winding order). */
+  private triNormalOf(faceIndex: number): THREE.Vector3 | null {
+    const p = this.basePositions;
+    if (!p) return null;
+    const o = 9 * faceIndex;
+    const e1 = new THREE.Vector3(p[o + 3] - p[o], p[o + 4] - p[o + 1], p[o + 5] - p[o + 2]);
+    const e2 = new THREE.Vector3(p[o + 6] - p[o], p[o + 7] - p[o + 1], p[o + 8] - p[o + 2]);
+    const n = e1.cross(e2);
+    return n.lengthSq() > 1e-20 ? n.normalize() : null;
+  }
+
+  /** Lazily build the reusable pick-direction preview arrow (unit length along
+   *  +Y; scaled + oriented per hover). */
+  private ensurePickArrow() {
+    if (this.pickArrow) return;
+    // Drawn on top (depthTest off, high renderOrder) like the old crosshair, so
+    // the preview is always visible even when the normal aims into the part.
+    const mat = new THREE.MeshBasicMaterial({ color: 0xf76707, depthTest: false, transparent: true });
+    const shaftGeo = new THREE.CylinderGeometry(0.04, 0.04, 0.72, 12);
+    const headGeo = new THREE.ConeGeometry(0.11, 0.3, 16);
+    this.pickArrowDisposables.push(mat, shaftGeo, headGeo);
+    const shaft = new THREE.Mesh(shaftGeo, mat);
+    shaft.position.y = 0.36;
+    shaft.renderOrder = 999;
+    const head = new THREE.Mesh(headGeo, mat);
+    head.position.y = 0.86;
+    head.renderOrder = 999;
+    const g = new THREE.Group();
+    g.add(shaft, head);
+    g.renderOrder = 999;
+    g.visible = false;
+    this.pickArrow = g;
+    this.scene.add(g);
+  }
+
   private onPointerMove = (ev: PointerEvent) => {
     if (this.orbiting) return; // camera drag in progress — skip hover/brush
     if (!this.mesh) return;
@@ -1058,14 +1113,19 @@ export class SceneManager {
       }
       if (this.brushing && hit) this.applyBrush(hit.point);
     } else if (this.tool === "pickdir") {
+      // Live preview: an arrow at the hovered point along that face's outward
+      // normal — the force direction a click would set.
       const hit = this.rayTri(ev);
-      if (hit && this.pickCursor) {
-        this.pickCursor.visible = true;
-        this.pickCursor.position.copy(hit.point);
-        // ~4% of the part diagonal: visible but unobtrusive on any model.
-        this.pickCursor.scale.setScalar(this.bboxDiag * 0.04);
-      } else if (this.pickCursor) {
-        this.pickCursor.visible = false;
+      const n = hit && hit.faceIndex != null ? this.triNormalOf(hit.faceIndex) : null;
+      if (hit && n) {
+        this.ensurePickArrow();
+        const a = this.pickArrow!;
+        a.visible = true;
+        a.position.copy(hit.point);
+        a.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), n);
+        a.scale.setScalar(this.bboxDiag * 0.18);
+      } else if (this.pickArrow) {
+        this.pickArrow.visible = false;
       }
     }
   };
@@ -1087,18 +1147,10 @@ export class SceneManager {
       }
     } else if (this.tool === "place" || this.tool === "pickdir") {
       const hit = this.rayTri(ev);
-      if (hit && hit.faceIndex != null && this.basePositions) {
-        // Outward geometric normal of the clicked triangle (soup winding).
-        const p = this.basePositions;
-        const o = 9 * hit.faceIndex;
-        const e1 = new THREE.Vector3(p[o + 3] - p[o], p[o + 4] - p[o + 1], p[o + 5] - p[o + 2]);
-        const e2 = new THREE.Vector3(p[o + 6] - p[o], p[o + 7] - p[o + 1], p[o + 8] - p[o + 2]);
-        const n = e1.cross(e2);
-        if (n.lengthSq() > 1e-20) {
-          n.normalize();
-          if (this.tool === "place") this.callbacks.onPlaceFace?.([n.x, n.y, n.z]);
-          else this.callbacks.onPickDir?.([n.x, n.y, n.z]);
-        }
+      const n = hit && hit.faceIndex != null ? this.triNormalOf(hit.faceIndex) : null;
+      if (n) {
+        if (this.tool === "place") this.callbacks.onPlaceFace?.([n.x, n.y, n.z]);
+        else this.callbacks.onPickDir?.([n.x, n.y, n.z]);
       }
     } else if (this.tool === "brush") {
       this.brushing = true;
@@ -1207,6 +1259,7 @@ export class SceneManager {
       if (moved < 3) return; // tolerate a click without flashing the marker
       this.orbiting = true;
       this.showPivotMarker();
+      if (this.pickArrow) this.pickArrow.visible = false; // don't freeze it mid-orbit
     }
     const dx = ev.clientX - this.orbitLast.x;
     const dy = ev.clientY - this.orbitLast.y;
@@ -2649,6 +2702,35 @@ export class SceneManager {
     this.refreshClipping(); // mesh view exempts the ghost STL from the cut
     this.applyPositions();
     this.applyColors();
+  }
+
+  /** Set discrete contour banding + the band count. Rewrites the SHARED jet LUT
+   *  in place (both the smooth surface and the voxel-result surface sample it, so
+   *  they update together) — quantized into `count` flat steps with nearest
+   *  sampling for crisp band edges, or the smooth ramp when off. */
+  setBanded(on: boolean, count = this.bandCount) {
+    if (this.banded === on && this.bandCount === count) return;
+    this.banded = on;
+    this.bandCount = count;
+    const tex = this.lutJet;
+    const data = tex.image.data as Uint8Array;
+    const n = data.length / 4;
+    for (let i = 0; i < n; i++) {
+      let t = i / (n - 1);
+      if (on) {
+        const b = Math.min(count - 1, Math.floor(t * count));
+        t = (b + 0.5) / count; // band-center color
+      }
+      const [r, g, bl] = jet(t);
+      data[4 * i] = Math.round(255 * r);
+      data[4 * i + 1] = Math.round(255 * g);
+      data[4 * i + 2] = Math.round(255 * bl);
+      data[4 * i + 3] = 255;
+    }
+    tex.magFilter = on ? THREE.NearestFilter : THREE.LinearFilter;
+    tex.minFilter = on ? THREE.NearestFilter : THREE.LinearFilter;
+    tex.needsUpdate = true;
+    this.repaint();
   }
 
   /** Switch the part material between BC vertex colors, a scalar LUT, or a flat

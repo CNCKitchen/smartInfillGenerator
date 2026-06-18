@@ -250,9 +250,9 @@ fn displacement_axis_locks_reproduce_roller_patch_test() {
     let (grid, levels) = pad_for_levels(&grid0, 1);
 
     let bcs = vec![
-        BcSpec { kind: BcKind::Displacement([true, false, false]), tris: face_tris(0) }, // lock X on x=0
-        BcSpec { kind: BcKind::Displacement([false, true, false]), tris: face_tris(2) }, // lock Y on y=0
-        BcSpec { kind: BcKind::Displacement([false, false, true]), tris: face_tris(4) }, // lock Z on z=0
+        BcSpec { kind: BcKind::Displacement([true, false, false], [0.0; 3]), tris: face_tris(0) }, // lock X on x=0
+        BcSpec { kind: BcKind::Displacement([false, true, false], [0.0; 3]), tris: face_tris(2) }, // lock Y on y=0
+        BcSpec { kind: BcKind::Displacement([false, false, true], [0.0; 3]), tris: face_tris(4) }, // lock Z on z=0
         BcSpec { kind: BcKind::Force([40.0, 0.0, 0.0]), tris: face_tris(1) }, // sigma=10 MPa * 4 mm^2
     ];
     let asm = assemble(&bar, &grid, &bcs, None, &settings).unwrap();
@@ -273,7 +273,7 @@ fn displacement_axis_locks_reproduce_roller_patch_test() {
     // A lone single-axis lock must NOT fully constrain (Y/Z still free) —
     // guards against the axis selection silently pinning everything.
     let under = vec![
-        BcSpec { kind: BcKind::Displacement([true, false, false]), tris: face_tris(0) },
+        BcSpec { kind: BcKind::Displacement([true, false, false], [0.0; 3]), tris: face_tris(0) },
         BcSpec { kind: BcKind::Force([40.0, 0.0, 0.0]), tris: face_tris(1) },
     ];
     let asm2 = assemble(&bar, &grid, &under, None, &settings).unwrap();

@@ -409,6 +409,11 @@ pub struct Model {
     /// surface patches to exact CAD faces (`use_cad_faces`). None for STL/3MF.
     cad_face_of_orig: Option<Vec<u32>>,
     bcs: Vec<BcSpec>,
+    /// Registered MULTI-LOAD optimization cases (DESIGN §13): each a snapshot of
+    /// `bcs` + its weight. Empty ⇒ single-load optimize (the byte-identical
+    /// path). The first case is the primary; the rest are weighted extras. The
+    /// front end rebuilds this (clear + add per included step) before optimizing.
+    load_cases: Vec<(Vec<BcSpec>, f64)>,
     settings: SolveSettings,
     /// tonne/mm³
     density: f64,
@@ -677,6 +682,7 @@ impl Model {
             seg,
             cad_face_of_orig,
             bcs: Vec::new(),
+            load_cases: Vec::new(),
             settings: SolveSettings::default(),
             density: 1.24e-9,  // PLA
             strength: 50.0,    // PLA tensile, MPa
@@ -897,6 +903,19 @@ impl Model {
         self.opt = None;
     }
 
+    /// Drop all registered multi-load optimization cases (DESIGN §13). The front
+    /// end calls this before EACH optimize, then `add_load_case` per included
+    /// step (none ⇒ single-load).
+    pub fn clear_load_cases(&mut self) {
+        self.load_cases.clear();
+    }
+
+    /// Snapshot the CURRENT `bcs` as a weighted load case for the multi-load
+    /// optimizer. Call after `set_bcs`/`add_*` have populated this step's BCs.
+    pub fn add_load_case(&mut self, weight: f64) {
+        self.load_cases.push((self.bcs.clone(), weight.max(0.0)));
+    }
+
     pub fn add_fixed(&mut self, tris: &[u32]) {
         self.bcs.push(BcSpec { kind: BcKind::Fixed, tris: tris.to_vec() });
         self.solution = None;
@@ -909,11 +928,23 @@ impl Model {
         self.opt = None;
     }
 
-    /// Displacement support: pin the selected global axes (x/y/z) to zero,
-    /// leaving the unselected ones free.
-    pub fn add_displacement(&mut self, tris: &[u32], fx: bool, fy: bool, fz: bool) {
-        self.bcs
-            .push(BcSpec { kind: BcKind::Displacement([fx, fy, fz]), tris: tris.to_vec() });
+    /// Displacement support: prescribe the selected global axes (x/y/z) to a
+    /// value in mm (0 = pin to zero), leaving the unselected ones free.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_displacement(
+        &mut self,
+        tris: &[u32],
+        fx: bool,
+        fy: bool,
+        fz: bool,
+        vx: f64,
+        vy: f64,
+        vz: f64,
+    ) {
+        self.bcs.push(BcSpec {
+            kind: BcKind::Displacement([fx, fy, fz], [vx, vy, vz]),
+            tris: tris.to_vec(),
+        });
         self.solution = None;
         self.opt = None;
     }
@@ -1477,13 +1508,31 @@ impl Model {
         let smooth_iters = (opts.smooth_iters as usize).min(60);
         let n_bins = (opts.n_bins as usize).clamp(2, 4);
 
-        // Assemble + check before burning time.
+        // Assemble + check before burning time. MULTI-LOAD (DESIGN §13): when
+        // load cases are registered, the FIRST is the primary (drives the cache
+        // + skin classification) and the rest are weighted extras; the optimizer
+        // minimizes the weighted-sum compliance. No cases ⇒ single-load via
+        // `self.bcs` (the byte-identical path).
         let (grid, levels) = self.grid.as_ref().unwrap();
-        let asm = assemble(&self.mesh, grid, &self.bcs, self.gravity_arg(), &self.settings)
+        let primary_bcs: &[BcSpec] =
+            if self.load_cases.is_empty() { &self.bcs } else { &self.load_cases[0].0 };
+        let asm = assemble(&self.mesh, grid, primary_bcs, self.gravity_arg(), &self.settings)
             .map_err(err)?;
         let report = check_problem(grid, &asm);
         if !report.ok {
             return Err(err("model is under-constrained — fix the setup first (run Check)"));
+        }
+        let mut load_set = sig_core::simp::LoadSet::default();
+        if !self.load_cases.is_empty() {
+            load_set.primary_weight = self.load_cases[0].1;
+            for (case_bcs, w) in &self.load_cases[1..] {
+                let a = assemble(&self.mesh, grid, case_bcs, self.gravity_arg(), &self.settings)
+                    .map_err(err)?;
+                if !check_problem(grid, &a).ok {
+                    return Err(err("a load case is under-constrained — fix the setup first (run Check)"));
+                }
+                load_set.extra.push((a.problem, *w));
+            }
         }
 
         let params = OptimizeParams {
@@ -1568,6 +1617,7 @@ impl Model {
             &self.settings,
             &params,
             &cfg,
+            &load_set,
             |upd, x_phys, design_cells| {
                 let mut field: std::collections::HashMap<u32, f64> =
                     std::collections::HashMap::with_capacity(design_cells.len());

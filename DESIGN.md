@@ -26,7 +26,7 @@ Reference points:
 | 2 | Discretization | **Voxel grid** from **fast winding-number voxelization** (robust to triangle soup: holes, self-intersections, non-manifold). Matrix-free FEA with geometric multigrid. No tet meshing. |
 | 3 | Input formats | **STL + 3MF in v1. STEP added 2026-06 via the `truck` CAD kernel** (Apache-2.0, pure-Rust → wasm-clean; OpenCASCADE was rejected — LGPL breaks the commercial-exception model, see #14). truck parses the BREP exactly and tessellates it; BREP faces are preserved as one-click selectable surfaces (the segmentation "CAD faces" source). **Known truck limitation:** its tessellation can TWIST trimmed periodic faces (cylinders) and emits developable-surface slivers — display artifacts only (the mesh is voxelized, so analysis is unaffected). We mitigate the slivers with longest-edge/aspect refinement, but the twist made it unshippable, so **STEP import is DEACTIVATED in the build as of 2026-06** — all code stays behind the `step` cargo feature; re-enable via `web/scripts/build-wasm.mjs` (add `step` to `--features`) + restore the `.step/.stp` accept lists in the UI. See §9. |
 | 4 | Surface selection | **Auto-segmentation** (region-growing across edges with dihedral angle < ~30°, slider-adjustable) makes CAD-derived patches one-click selectable. **Brush/lasso + click-to-grow fallback** for organic meshes. |
-| 5 | Loads & BCs (v1) | Fixed support, **elastic support** (Winkler foundation, bedding modulus k in N/mm³, σ = k·u — area-consistent axis springs per node; added 2026-06 because rigid Fixed patches artificially stiffen the part and produce edge stress singularities), **displacement support** (pin any subset of the global X/Y/Z axes to zero via stiff axis penalty springs — a roller/slider; `[true;3]` ≈ Fixed; added 2026-06), surface force (total N over patch, defined as **X/Y/Z components OR a direction + magnitude**; the direction defaults to the selection's area-weighted average normal and is re-aimable by clicking a triangle on the model), pressure, gravity/self-weight, **frictionless support** (renamed 2026-06 from "slide"). *Note: frictionless on arbitrary (non-axis-aligned) patches via penalty/transformed constraints along averaged patch normal.* |
+| 5 | Loads & BCs (v1) | Fixed support, **elastic support** (Winkler foundation, bedding modulus k in N/mm³, σ = k·u — area-consistent axis springs per node; added 2026-06 because rigid Fixed patches artificially stiffen the part and produce edge stress singularities), **displacement support** (enforce any subset of the global X/Y/Z axes via stiff axis penalty springs — a roller/slider; `[true;3]` ≈ Fixed; added 2026-06. **2026-06: per-axis PRESCRIBED VALUE in mm** — 0 = the classic pin-to-zero, a non-zero value is an enforced motion (e.g. 1 mm in X), applied as an equivalent `k·value` penalty force so it rides the force RHS path and never invalidates the cached matrix; per-axis activate/deactivate + a value, since 0 ≠ off), surface force (total N over patch, defined as **X/Y/Z components OR a direction + magnitude**; the direction defaults to the selection's area-weighted average normal and is re-aimable by clicking a triangle on the model), pressure, gravity/self-weight, **frictionless support** (renamed 2026-06 from "slide"). *Note: frictionless on arbitrary (non-axis-aligned) patches via penalty/transformed constraints along averaged patch normal.* |
 | 6 | Under-constraint check | Pre-solve: rank test of the 6 rigid-body modes against the constraint set + connected-component (floating island) check. On failure: **block the run and animate the offending rigid-body motion** so the user sees what's unconstrained. |
 | 7 | Material model | **Walls + infill core.** Boundary voxels get solid-material skin stiffness (wall count × line width; defaults 2 × 0.45 mm, plus top/bottom shells). Interior voxels get per-pattern Gibson-Ashby law **E(ρ) = E₀ · c · ρⁿ**. |
 | 8 | Optimization | **Continuous SIMP-style compliance minimization** under mass constraint using the *physical* E(ρ) (no artificial penalization — graded infill is the one case where intermediate density is printable). Optimality-criteria updates, ~50–100 multigrid solves. Then discretize to bins → **final verification solve** with binned densities + walls → report. |
@@ -578,3 +578,53 @@ already-computed fields).
 restored design's verification + baselines instead of a full re-optimize) — the fallback
 today is re-running Optimize. The on-disk format is uncompressed (stored zip); add DEFLATE
 if file size becomes a concern.
+
+## 13. Multiple load steps (interview 2026-06-17)
+
+**Problem.** A part lives as ONE flat `bcs: Bc[]` (store.ts) — every BC applied in a single
+simultaneous solve. Real parts see several distinct load situations (a bracket pushed, then
+pulled, then twisted), and an infill design should survive ALL of them, not just one. There
+was no way to define several load cases, run them in one pass, step through their results, or
+optimize one design against the set. (The "Step" in the wizard rail is a workflow STATION, and
+`step.rs` is the STEP CAD format — neither is an FEA load step; this section adds the real
+thing.)
+
+| # | Topic | Decision |
+|---|-------|----------|
+| 1 | Data model | **One shared `bcs: Bc[]` (geometry/selection/baseline defined ONCE) + a thin per-step OVERRIDE layer — never duplicate BCs.** Add `loadSteps: LoadStep[]` + `activeLoadStepId` to the store; `LoadStep = {id, name, overrides: Record<bcId, {active, force?, pressure?}>, includeInOptimize, weight}`. An absent override field inherits the base BC; `active` defaults true. The effective BC for a step = base `Bc` merged with its override. |
+| 2 | Single-case stays trivial | A new/imported model has exactly ONE step with empty overrides. While `loadSteps.length === 1` the Loads panel renders **exactly as today** and NO table appears — editing a force writes the base `Bc` directly. The table only materializes when the user adds step 2. Zero friction for the common case. |
+| 3 | Per-step constraints | **Supports toggle active/inactive per step, everywhere — including optimization** (cost accepted). Their selection and parameters (pinned axes, elastic stiffness) stay SHARED; only on/off varies per step. (Per-step support *parameters* would be a wider override — deferred, see below.) |
+| 4 | Per-step forces | **Full components per step** — the override stores a complete `[Fx,Fy,Fz]` (and a per-step pressure value), not a scalar multiplier. No scalar-vs-vector ambiguity; a step's load is edited outright. |
+| 5 | Solve cost / grouping | Group steps by **constraint signature** (the active support set + params). The solver cache keys on `fixed`/`springs` but deliberately **NOT** `forces` (solve.rs:433-434), so steps that share fixtures share ONE stiffness-hierarchy build and differ only by a cheap RHS swap + warm-started MGCG (solve.rs:492-503). Keep a **per-step** `last_u` (not the single shared one) so a tension step doesn't warm-start from a torsion step and inflate iterations. Worst case = N rebuilds when every step pins a different DOF set. |
+| 6 | Optimizer objective | **Weighted-sum compliance with editable per-step weights** + a per-step **"include in optimization"** toggle (both in the weight panel). Aggregate `se = Σ(wᵢ/Σw)·seᵢ` at the strain-energy stage (simp.rs:853-867) BEFORE the density filter / symmetry / self-support so those run once; the OC bisection + stiffness-match secant (pipeline.rs:137-277) and `update_eps` (mg.rs:921) are untouched. NOT min-max (non-smooth, deferred). |
+| 7 | Per-step scope | **Only loads/BCs vary per step.** Material, mesh resolution, infill budget and optimization mode stay GLOBAL — one part, one material, one mesh, loads vary. |
+| 8 | Results & step-through | One `ResultEntry` per **(kind, step)**, tagged with an optional `loadStepId` (existing entries → null/global). A **load-step selector** in the Results view, orthogonal to the kind picker; reuses `activate_result`. Per-step buffers preloaded when steps ≤ 5, lazy beyond. |
+| 9 | Envelope result | A client-side reduction over the per-step buffers → per-vertex **max von Mises / min safety factor** ("does the part survive ANY load?"), shown as a pseudo-step in the selector. The view the user usually acts on. |
+| 10 | Legend | **Shared fixed color range across all steps** so magnitudes compare honestly (today the legend auto-ranges per result, Viewer.tsx:362-365) + a small **"fit" button** by the legend that rescales to the current step on demand. Deform exaggeration stays global (`referenceMaxDisp`, store.ts:1039) so deflections are comparable. |
+| 11 | Persistence | **STAY at `PROJECT_SCHEMA = 1`** (the loader hard-rejects schemaVersion > 1, store.ts:2610); add an **optional** `loadSteps` field to the manifest. The loader synthesizes a single step from `mf.bcs` when it's absent → existing `.infeall` files AND single-step new files interoperate across versions; only multi-step files need new code. BCs are re-id'd on load (store.ts:2623), so serialize override keys by BC order and remap after re-id; re-id step ids too. |
+| 12 | Naming | Internally rename the wizard "Step" concept to **"Station"** (`activeStation`, etc.) to kill the clash with the FEA "Load step"; user-facing FEA term stays **"Load step"**. (Falls back to "Load case" for the FEA term if a code-wide rename is too invasive in the moment.) |
+
+**Build order** (each milestone shippable, each gated by regbench + the wasm smoke test per
+the §11 / architecture-hardening convention): **(1) data model + persistence** ✅ DONE — store fields,
+additive save/load, single-step default; no behavior change. **(2) standard multi-step solve** ✅ DONE
+(2026-06-18) — the load-step table UI, per-step results, the viewer selector, shared legend + fit
+button. Done as: `runSolve` branches to `solveAllSteps` only when `loadSteps.length > 1` (single-step
+path is byte-identical, not just regbench-identical — it's the same code); result identity became
+**(kind, step)** with stash key `resultStashId` = bare kind for one step else `kind::stepId`; the
+viewer got a kind dropdown + a `.stepsel` step dropdown; the legend PINS its range across a same-kind
+step switch (auto-fit on kind switch) with a "⤢ fit to step" button. Step ids are now persisted so
+`kind::stepId` result keys survive reload. **(3) envelope result** ✅ DONE (2026-06-18) — an "Envelope ·
+worst case" pseudo-step (sentinel `loadStepId`) is appended to any kind with ≥2 steps. It has NO stashed
+solution: selecting it renders the part UNDEFORMED, colored by a client-side per-vertex reduction over
+the steps (MIN for safety factors — "does it survive any load" — MAX for everything else incl. |u|,
+σᵥᴹ). Computed lazily by activating each step's stash + reducing, cached and invalidated on re-solve;
+banding/fit/legend all work since it's a scalar-field path. Stripped on save, re-derived on load.
+**(4) multi-load optimizer** ← NEXT — weighted-sum, include toggles + weights, `se` aggregation;
+optimize is still single-load (active step) until then. Milestone 4 touches the optimizer and must stay
+regbench-byte-identical for the single-step path. Also bonus (2026-06-18): **discrete contour banding** —
+click the result legend bar to quantize the color scale into hard steps (classic FEA bands), scroll the
+bar to change the count (2–20). Shared LUT rewrite; session-only, not persisted.
+
+**Deferred.** Per-step support *parameters* (different pinned axes or elastic stiffness per
+step) — only on/off varies in v1; a fuller override is a later decision. Min-max (worst-case)
+optimization objective. A hard cap / eviction policy for very large step counts on fine meshes.

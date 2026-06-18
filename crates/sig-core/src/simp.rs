@@ -137,6 +137,27 @@ pub struct OptimizeResult {
     pub se: Vec<f64>,
 }
 
+/// Extra weighted load cases for MULTI-LOAD optimization (DESIGN §13). The
+/// primary load case is the `problem` argument passed alongside this; `extra`
+/// carries the rest. The optimizer minimizes the weighted-sum compliance, i.e.
+/// aggregates the per-cell strain energy as `se = Σ(wᵢ/Σw)·seᵢ` over all cases
+/// (primary + extra). An EMPTY `extra` is the single-load case and takes the
+/// byte-identical original path (the guards below are all `if !extra.is_empty()`).
+#[derive(Default)]
+pub struct LoadSet {
+    /// (problem, weight) for every case BEYOND the primary.
+    pub extra: Vec<(crate::solve::NodeProblem, f64)>,
+    /// Weight of the primary `problem`. Ignored when `extra` is empty.
+    pub primary_weight: f64,
+}
+
+impl LoadSet {
+    /// Total weight Σw across the primary and the extra cases.
+    fn total(&self) -> f64 {
+        self.primary_weight + self.extra.iter().map(|(_, w)| *w).sum::<f64>()
+    }
+}
+
 #[derive(Debug)]
 pub enum OptimizeError {
     Solve(crate::solve::SolveError),
@@ -699,7 +720,18 @@ pub fn optimize(
     u0: Option<&[f64]>,
     progress: impl FnMut(&OptimizeProgress, &[f64], &[u32]),
 ) -> Result<OptimizeResult, OptimizeError> {
-    optimize_cached(&mut None, grid, levels, problem, settings, params, x0, u0, progress)
+    optimize_cached(
+        &mut None,
+        grid,
+        levels,
+        problem,
+        settings,
+        params,
+        x0,
+        u0,
+        &LoadSet::default(),
+        progress,
+    )
 }
 
 /// `optimize` reusing (and leaving behind) the hierarchy + displacement in
@@ -715,6 +747,7 @@ pub fn optimize_cached(
     params: &OptimizeParams,
     x0: Option<&[f64]>,
     u0: Option<&[f64]>,
+    loads: &LoadSet,
     mut progress: impl FnMut(&OptimizeProgress, &[f64], &[u32]),
 ) -> Result<OptimizeResult, OptimizeError> {
     // SOLID topology mode bypasses the skin band: the auto-frozen load/support
@@ -723,9 +756,21 @@ pub fn optimize_cached(
     // skin model.
     let SkinSplit { skin, design: design_cells, skin_frac } = if params.solid_mode {
         // Retain ON: freeze the load/support cells solid (keep regions). OFF:
-        // no frozen cells — the whole part is free to be carved.
-        let frozen =
-            if params.retain_bc { frozen_cells_from_problem(grid, problem) } else { Vec::new() };
+        // no frozen cells — the whole part is free to be carved. Multi-load:
+        // freeze the UNION of every case's anchors (single-load = unchanged).
+        let frozen = if !params.retain_bc {
+            Vec::new()
+        } else if loads.extra.is_empty() {
+            frozen_cells_from_problem(grid, problem)
+        } else {
+            let mut f = frozen_cells_from_problem(grid, problem);
+            for (p, _) in &loads.extra {
+                f.extend(frozen_cells_from_problem(grid, p));
+            }
+            f.sort_unstable();
+            f.dedup();
+            f
+        };
         build_solid_split(grid, &frozen)
     } else {
         classify_cells(
@@ -824,6 +869,48 @@ pub fn optimize_cached(
         }
     }
 
+    // ---- MULTI-LOAD setup (DESIGN §13). For each EXTRA case: a hierarchy
+    // (grouped by constraint signature — `None` shares the primary's, else an
+    // index into `extra_caches`), its constrained-zeroed RHS, its weight, and a
+    // warm-start displacement carried across iterations. Empty for single-load,
+    // so everything below this is skipped and the path is byte-identical. ----
+    let mut extra_caches: Vec<SolverCache> = Vec::new();
+    let mut extra_group: Vec<Option<usize>> = Vec::new();
+    let mut extra_bb: Vec<Vec<f64>> = Vec::new();
+    let mut extra_u: Vec<Vec<f64>> = Vec::new();
+    let mut extra_w: Vec<f64> = Vec::new();
+    for (p, wj) in &loads.extra {
+        let group = if cache.same_constraints(p) {
+            None
+        } else if let Some(i) = extra_caches.iter().position(|c| c.same_constraints(p)) {
+            Some(i)
+        } else {
+            let eps_j =
+                build_eps(grid, &skin, &design_cells, &skin_frac, &x, params.exponent, params.coeff);
+            extra_caches.push(SolverCache::build(grid, levels, p, settings, eps_j));
+            Some(extra_caches.len() - 1)
+        };
+        let mut bbj = build_rhs(grid, p);
+        {
+            let constrained = match group {
+                None => &cache.solver.levels[0].constrained,
+                Some(i) => &extra_caches[i].solver.levels[0].constrained,
+            };
+            for (idx, c) in constrained.iter().enumerate() {
+                if *c {
+                    bbj[idx] = 0.0;
+                }
+            }
+        }
+        extra_group.push(group);
+        extra_bb.push(bbj);
+        extra_u.push(vec![0f64; ndof]);
+        extra_w.push(*wj);
+    }
+    let w_primary = if loads.extra.is_empty() { 1.0 } else { loads.primary_weight };
+    let w_total = loads.total();
+    let mut se_tmp = vec![0f64; design_cells.len()]; // scratch for an extra case's se
+
     // Reused across outer iterations — every entry is rewritten by the OC
     // update before it is read, so a per-iteration alloc (up to max_iter ×
     // design_cells f64) is pure waste.
@@ -833,6 +920,10 @@ pub fn optimize_cached(
         project(&filter, ss.as_ref(), &x, &mut x_tilde, &mut x_phys, params.floor, params.cap);
         let eps =
             build_eps(grid, &skin, &design_cells, &skin_frac, &x_phys, params.exponent, params.coeff);
+        // Multi-load: the same stiffness goes into every group's hierarchy.
+        for c in extra_caches.iter_mut() {
+            c.solver.update_eps(eps.clone());
+        }
         cache.solver.update_eps(eps);
         // Inexact inner solves are standard in topology optimization: while
         // the layout is forming, sensitivity noise is tolerated (filter +
@@ -845,12 +936,53 @@ pub fn optimize_cached(
         if crate::cancel::requested() {
             return Err(OptimizeError::Cancelled);
         }
+        // Multi-load: solve every extra case on its group's hierarchy (same
+        // inner schedule), each warm-started from its own running displacement.
+        for j in 0..extra_bb.len() {
+            match extra_group[j] {
+                None => {
+                    cache.solver.solve_warm(&extra_bb[j], &mut extra_u[j], tol_i, cap_i);
+                }
+                Some(i) => {
+                    extra_caches[i].solver.solve_warm(&extra_bb[j], &mut extra_u[j], tol_i, cap_i);
+                }
+            }
+        }
         compliance = 0.0;
         for i in 0..ndof {
             compliance += bb[i] * u[i];
         }
 
         cell_strain_energy(&cache.solver.levels[0], &ke64, &u, &design_cells, &mut se);
+        // MULTI-LOAD: aggregate the weighted-sum compliance objective. The
+        // per-cell sensitivity is the strain-energy weighted sum
+        // se = Σ(wᵢ/Σw)·seᵢ (DESIGN §13) — done BEFORE the composite-cell scale
+        // below, the filter, symmetry and self-support, exactly as if it were a
+        // single load case. Skipped (and byte-identical) for single-load.
+        if !extra_bb.is_empty() {
+            let inv = 1.0 / w_total;
+            let f0 = w_primary * inv;
+            compliance *= f0;
+            for k in 0..se.len() {
+                se[k] *= f0;
+            }
+            for j in 0..extra_bb.len() {
+                let mut cj = 0.0;
+                for i in 0..ndof {
+                    cj += extra_bb[j][i] * extra_u[j][i];
+                }
+                let fj = extra_w[j] * inv;
+                compliance += fj * cj;
+                let lvl = match extra_group[j] {
+                    None => &cache.solver.levels[0],
+                    Some(i) => &extra_caches[i].solver.levels[0],
+                };
+                cell_strain_energy(lvl, &ke64, &extra_u[j], &design_cells, &mut se_tmp);
+                for k in 0..se.len() {
+                    se[k] += fj * se_tmp[k];
+                }
+            }
+        }
         // Composite cells: only the infill share of the cell responds to x —
         // scaling the energy by it makes se the honest dC/dx weight (also
         // for the bin placement that reuses the stored se).
@@ -1010,7 +1142,7 @@ pub fn evaluate(
     }
     evaluate_cached(
         &mut slot, grid, levels, problem, settings, skin, design_cells, skin_frac, x, exponent,
-        coeff,
+        coeff, &LoadSet::default(),
     )
 }
 
@@ -1028,9 +1160,11 @@ pub fn evaluate_cached(
     x: &[f64],
     exponent: f64,
     coeff: f64,
+    loads: &LoadSet,
 ) -> Result<(f64, f64, Vec<f64>), crate::solve::SolveError> {
     let (c, maxd, u, _) = evaluate_cached_stats(
         slot, grid, levels, problem, settings, skin, design_cells, skin_frac, x, exponent, coeff,
+        loads,
     )?;
     Ok((c, maxd, u))
 }
@@ -1054,6 +1188,7 @@ pub fn evaluate_cached_stats(
     x: &[f64],
     exponent: f64,
     coeff: f64,
+    loads: &LoadSet,
 ) -> Result<(f64, f64, Vec<f64>, crate::mg::SolveStats), crate::solve::SolveError> {
     let eps = build_eps(grid, skin, design_cells, skin_frac, x, exponent, coeff);
     // Hitting the cap is acceptable here: the verification/baseline solves
@@ -1069,7 +1204,21 @@ pub fn evaluate_cached_stats(
             + r.u[3 * n + 2] * r.u[3 * n + 2];
         max2 = max2.max(m);
     }
-    Ok((r.compliance, max2.sqrt(), r.u, r.stats))
+    // MULTI-LOAD: the reported compliance is the weighted sum over every case
+    // (so the goal-match secant + the comparison numbers match the objective).
+    // The returned displacement field stays the PRIMARY case's (the one the
+    // Results view deforms by). Single-load skips this → byte-identical.
+    let mut compliance = r.compliance;
+    if !loads.extra.is_empty() {
+        let inv = 1.0 / loads.total();
+        compliance *= loads.primary_weight * inv;
+        for (p, wj) in &loads.extra {
+            let eps_j = build_eps(grid, skin, design_cells, skin_frac, x, exponent, coeff);
+            let rj = solve_cached(&mut None, grid, levels, p, settings, eps_j, settings.tol, 2000)?;
+            compliance += (wj * inv) * rj.compliance;
+        }
+    }
+    Ok((compliance, max2.sqrt(), r.u, r.stats))
 }
 
 /// Solve with an explicit per-cell stiffness field and return a full

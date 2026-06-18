@@ -31,6 +31,13 @@ export function jet(x: number): RGB {
 
 const byte = (v: number) => Math.round(255 * clamp01(v));
 
+/** DEFAULT band count for the discrete ("contour banded") result display — the
+ *  GPU LUT and the legend bar both quantize into the live count, so they stay in
+ *  sync. The user scrolls the legend bar to change it, clamped to MIN..MAX. */
+export const CONTOUR_BANDS = 10;
+export const CONTOUR_BANDS_MIN = 2;
+export const CONTOUR_BANDS_MAX = 20;
+
 /** `rgb(r,g,b)` string for a colormap at parameter `t`. */
 export function cssColor(fn: (t: number) => RGB, t: number): string {
   const [r, g, b] = fn(t);
@@ -46,6 +53,21 @@ export function cssGradient(fn: (t: number) => RGB, flip = false, steps = 8): st
   for (let i = 0; i <= steps; i++) {
     const pos = i / steps;
     stops.push(`${cssColor(fn, flip ? 1 - pos : pos)} ${(100 * pos).toFixed(1)}%`);
+  }
+  return `linear-gradient(to top, ${stops.join(", ")})`;
+}
+
+/**
+ * Discrete (banded) version of {@link cssGradient}: `n` flat color blocks with
+ * hard edges, each painted at its band-center color — the legend twin of the
+ * quantized GPU LUT. `flip` reverses it (safety factor).
+ */
+export function cssBands(fn: (t: number) => RGB, flip = false, n = CONTOUR_BANDS): string {
+  const stops: string[] = [];
+  for (let b = 0; b < n; b++) {
+    const tc = (b + 0.5) / n; // band-center color
+    const col = cssColor(fn, flip ? 1 - tc : tc);
+    stops.push(`${col} ${((100 * b) / n).toFixed(2)}%`, `${col} ${((100 * (b + 1)) / n).toFixed(2)}%`);
   }
   return `linear-gradient(to top, ${stops.join(", ")})`;
 }

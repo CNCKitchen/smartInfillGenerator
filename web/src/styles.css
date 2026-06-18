@@ -683,6 +683,334 @@ input[type="number"] {
   min-width: 0;
 }
 
+/* load steps (FEA load cases) — DESIGN §13 */
+.lsadd button {
+  flex: none;
+  font-size: 11.5px;
+  padding: 4px 9px;
+  color: var(--dim);
+  background: transparent;
+  border-style: dashed;
+}
+
+.lsadd button:hover {
+  color: var(--ink);
+  border-color: var(--orange);
+}
+
+/* compact step selector (Loads panel) */
+.lsbar .g-label {
+  justify-content: space-between;
+}
+
+.lsmanage {
+  font-family: var(--ui);
+  font-size: 11px;
+  letter-spacing: 0;
+  text-transform: none;
+  padding: 2px 9px;
+  color: var(--ink);
+  border-color: var(--orange);
+}
+
+.lsmanage:hover {
+  background: var(--orange-soft);
+}
+
+/* force editor: uniform vertical rhythm between mode toggle / fields / tools */
+.forceedit {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.lspills {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.lspill {
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--dim);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.lspill.on {
+  border-color: var(--orange);
+  color: var(--ink);
+  box-shadow: 0 0 0 1px var(--orange);
+  font-weight: 600;
+}
+
+.lspill.add {
+  border-style: dashed;
+}
+
+.lsactive {
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+/* stacked force components — full-width inputs so 1000 ≠ 100 */
+.forcegrid {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.forcerow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.forcerow .flabel {
+  flex: none;
+  width: 26px;
+  font-size: 12px;
+  color: var(--dim);
+  font-family: var(--mono);
+}
+
+.forcerow.dispaxis input[type="checkbox"] {
+  flex: none;
+  margin: 0;
+}
+
+.forcerow .fnum {
+  flex: 1;
+  min-width: 0;
+  text-align: right;
+}
+
+/* hide the number spinners on load inputs — they steal digits of width */
+.forcerow .fnum::-webkit-outer-spin-button,
+.forcerow .fnum::-webkit-inner-spin-button {
+  appearance: none;
+  margin: 0;
+}
+
+.forcerow .fnum {
+  appearance: textfield;
+}
+
+/* editable condition name in a BC row header */
+.bcnameinput {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  font-weight: 600;
+  color: var(--ink);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  padding: 1px 4px;
+}
+
+.bcnameinput:hover {
+  border-color: var(--line);
+}
+
+.bcnameinput:focus {
+  border-color: var(--orange);
+  background: var(--panel);
+  outline: none;
+}
+
+/* unit behind a force field (now that the fields are wide) */
+.forcerow .funit {
+  flex: none;
+  width: 24px;
+  font-size: 11px;
+  color: var(--dim);
+  font-family: var(--mono);
+}
+
+.bcoff {
+  font-size: 10px;
+  font-family: var(--cond);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #fff;
+  background: var(--dim);
+  padding: 1px 5px;
+  border-radius: 3px;
+}
+
+.bc.off {
+  opacity: 0.55;
+}
+
+.bc.off.active {
+  opacity: 1;
+}
+
+/* Load-steps modal: a wide shell that grows to fit the grid (so it doesn't
+   scroll horizontally for a handful of conditions), capped at the viewport. */
+.modal.wide {
+  width: max-content;
+  max-width: 96vw;
+}
+
+/* keep the intro paragraph wrapping so it doesn't dictate the modal width */
+.modal.wide > .dim.small {
+  max-width: 620px;
+}
+
+.lsgridwrap {
+  overflow-x: auto;
+  margin-top: 6px;
+}
+
+.lsgrid {
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.lsgrid th,
+.lsgrid td {
+  border: 1px solid var(--line);
+  padding: 3px 5px;
+  text-align: center;
+}
+
+.lsgrid thead th {
+  color: var(--dim);
+  font-weight: 500;
+  vertical-align: bottom;
+  white-space: nowrap;
+}
+
+.lsgrid th.lscorner {
+  text-align: left;
+  font-family: var(--cond);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 9.5px;
+}
+
+.lsgrid th.lsgrouphead .dot {
+  display: inline-block;
+  vertical-align: middle;
+  margin-right: 5px;
+}
+
+.lscolunit {
+  color: var(--dim);
+  font-family: var(--mono);
+  font-size: 10px;
+  margin-left: 3px;
+}
+
+.lsgrid th.lssub {
+  font-family: var(--mono);
+  font-weight: 400;
+  font-size: 10.5px;
+}
+
+.lsgrid tbody tr.on {
+  background: var(--orange-soft);
+}
+
+.lsgrid td.lssteprow {
+  text-align: left;
+  white-space: nowrap;
+}
+
+.lsgrid td.lssteprow .x {
+  margin-left: 4px;
+}
+
+.lsgrid .gridnum {
+  width: 60px;
+  text-align: right;
+  appearance: textfield;
+}
+
+.lsgrid .gridnum::-webkit-outer-spin-button,
+.lsgrid .gridnum::-webkit-inner-spin-button {
+  appearance: none;
+  margin: 0;
+}
+
+.lsgrid .gridnum:disabled {
+  opacity: 0.4;
+}
+
+.lsname {
+  width: 110px;
+  min-width: 0;
+  font: inherit;
+  padding: 4px 7px;
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  background: var(--panel);
+}
+
+.modalfoot {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+/* multi-load optimization weight panel (Manage load steps modal) */
+.lsopt {
+  margin-top: 16px;
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+}
+
+.lsopthead {
+  font-family: var(--cond);
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--ink);
+  margin-bottom: 5px;
+}
+
+.lsoptgrid {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 9px;
+}
+
+.lsoptrow {
+  display: grid;
+  grid-template-columns: 1fr 84px 42px;
+  align-items: center;
+  gap: 10px;
+}
+
+.lsoptrow.off {
+  opacity: 0.5;
+}
+
+.lsoptinc {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.lsoptpct {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--dim);
+  text-align: right;
+}
+
 /* check/solve status box */
 
 .status {
@@ -951,6 +1279,16 @@ input[type="number"] {
   border: 1px solid rgba(0, 0, 0, 0.22);
 }
 
+/* the result legend bar doubles as a smooth/banded toggle (hidden affordance) */
+.legendbarclick {
+  pointer-events: auto;
+  cursor: pointer;
+}
+
+.legendbarclick:hover {
+  border-color: var(--orange);
+}
+
 .legendlabels {
   display: flex;
   flex-direction: column;
@@ -1023,6 +1361,12 @@ input[type="number"] {
 .fieldchip .resultsel {
   font-weight: 600;
   max-width: 210px;
+}
+
+/* per-load-step switcher, sits beside the kind switcher when multi-step */
+.fieldchip .resultsel.stepsel {
+  font-weight: 500;
+  max-width: 150px;
 }
 
 /* hairline divider between the result switcher and the surface toggle */

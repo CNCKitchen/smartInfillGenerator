@@ -22,10 +22,13 @@ const ATTACH_DIST_CELLS: f64 = 0.9;
 pub enum BcKind {
     Fixed,
     Frictionless,
-    /// Displacement support: pin any subset of the GLOBAL axes (x/y/z) to zero
-    /// with stiff axis penalty springs — a roller/slider that locks only the
-    /// chosen world directions. `[true; 3]` behaves like Fixed (penalty form).
-    Displacement([bool; 3]),
+    /// Displacement support: prescribe any subset of the GLOBAL axes (x/y/z) to
+    /// a value (mm) with stiff axis penalty springs — a roller/slider that locks
+    /// only the chosen world directions. First array = which axes are enforced;
+    /// second = the prescribed displacement per axis (0 = the classic pin-to-
+    /// zero; a non-zero value is an enforced motion). `([true;3],[0;3])` behaves
+    /// like Fixed (penalty form).
+    Displacement([bool; 3], [f64; 3]),
     /// Elastic ("soft") support: Winkler foundation with bedding modulus k in
     /// N/mm³ (surface pressure per unit displacement, σ = k·u). Each attached
     /// node gets three axis springs of k × its tributary selection area —
@@ -169,9 +172,13 @@ pub fn assemble(
                     constraints.push(ConstraintDir { pos: p, dir: normal });
                 }
             }
-            BcKind::Displacement(axes) => {
+            BcKind::Displacement(axes, values) => {
                 // Stiff axis springs on the selected global directions only —
-                // the unselected axes stay free (roller/slider).
+                // the unselected axes stay free (roller/slider). A non-zero
+                // prescribed value is enforced by an equivalent penalty force
+                // k*value along that axis, so the pinned DOF settles at `value`.
+                // This rides the force RHS path, so the value never invalidates
+                // the cached matrix (only the constrained-axis SET does).
                 let k = SPRING_FACTOR * settings.e0 * h;
                 for &n in &nodes {
                     let p = node_pos(n);
@@ -181,6 +188,11 @@ pub fn assemble(
                             dir[d] = 1.0;
                             problem.springs.push((n, dir, k));
                             constraints.push(ConstraintDir { pos: p, dir });
+                            if values[d] != 0.0 {
+                                let mut f = [0f64; 3];
+                                f[d] = k * values[d];
+                                problem.forces.push((n, f));
+                            }
                         }
                     }
                 }

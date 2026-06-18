@@ -87,6 +87,7 @@ type Req =
         pressure?: number;
         stiffness?: number;
         axes?: boolean[];
+        disp?: number[];
       }[];
     }
   | { id: number; op: "voxelInfo" }
@@ -131,6 +132,8 @@ type Req =
   | { id: number; op: "stashResult"; resultId: string }
   | { id: number; op: "activateResult"; resultId: string }
   | { id: number; op: "clearResults" }
+  | { id: number; op: "clearLoadCases" }
+  | { id: number; op: "addLoadCase"; weight: number }
   | { id: number; op: "transformMatrix" }
   | { id: number; op: "exportProject"; manifest: string; modelEntry: string; includeResults: boolean }
   | { id: number; op: "openProjectModel"; bytes: ArrayBuffer }
@@ -256,7 +259,8 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
           else if (bc.kind === "frictionless") m.add_frictionless(bc.tris);
           else if (bc.kind === "displacement") {
             const a = bc.axes ?? [false, false, true];
-            m.add_displacement(bc.tris, !!a[0], !!a[1], !!a[2]);
+            const v = bc.disp ?? [0, 0, 0];
+            m.add_displacement(bc.tris, !!a[0], !!a[1], !!a[2], v[0] ?? 0, v[1] ?? 0, v[2] ?? 0);
           } else if (bc.kind === "elastic") m.add_elastic(bc.tris, bc.stiffness ?? 100);
           else if (bc.kind === "force") {
             const f = bc.force ?? [0, 0, 0];
@@ -443,6 +447,12 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
       }
       case "clearResults":
         requireModel().clear_results();
+        break;
+      case "clearLoadCases":
+        requireModel().clear_load_cases();
+        break;
+      case "addLoadCase":
+        requireModel().add_load_case(msg.weight);
         break;
       case "transformMatrix": {
         const mtx = Array.from(requireModel().transform_matrix());
