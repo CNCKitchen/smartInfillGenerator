@@ -141,6 +141,16 @@ type Req =
   | { id: number; op: "openProjectRestore" }
   | { id: number; op: "vertexDensity" }
   | { id: number; op: "exportThreeMf"; slicer: string; thumbnail: Uint8Array | null }
+  | {
+      id: number;
+      op: "exportColorThreeMf";
+      kind: string;
+      lo: number;
+      hi: number;
+      steps: number;
+      colors: string[];
+      thumbnail: Uint8Array | null;
+    }
   | { id: number; op: "exportStls" }
   | { id: number; op: "exportSolidStl" };
 
@@ -534,6 +544,21 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
       case "exportThreeMf": {
         const thumb = msg.thumbnail ?? new Uint8Array(0);
         const bytes = requireModel().export_3mf(msg.slicer, thumb);
+        (self as unknown as Worker).postMessage({ id: msg.id, ok: true, data: bytes }, [
+          bytes.buffer,
+        ]);
+        return;
+      }
+      case "exportColorThreeMf": {
+        const thumb = msg.thumbnail ?? new Uint8Array(0);
+        const bytes = requireModel().export_color_3mf(
+          msg.kind,
+          msg.lo,
+          msg.hi,
+          msg.steps,
+          JSON.stringify(msg.colors),
+          thumb
+        );
         (self as unknown as Worker).postMessage({ id: msg.id, ok: true, data: bytes }, [
           bytes.buffer,
         ]);

@@ -21,6 +21,12 @@ use sig_core::threemf::{export_orca_3mf, export_stl_zip, import_3mf, weld};
 use sig_core::voxel::VoxelGrid;
 use wasm_bindgen::prelude::*;
 
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = console, js_name = warn)]
+    fn console_warn(s: &str);
+}
+
 /// Threaded builds expose `initThreadPool(n)` on the JS side; the worker
 /// must await it before constructing a Model. Plain builds don't have it.
 #[cfg(feature = "parallel")]
@@ -2181,6 +2187,183 @@ impl Model {
                 thumb,
             ),
         })
+    }
+
+    /// Standalone colored 3MF of the active result field, painted into
+    /// `steps` discrete bands on the ORIGINAL undeformed surface. The field
+    /// `kind` matches `result_field` (the on-screen field); `lo`/`hi` are the
+    /// active contour min/max; `colors_json` is a JSON array of `#RRGGBB`
+    /// strings (one per band, low value first) the caller sampled from the
+    /// contour ramp. Each display triangle is CUT along the field's iso-lines at
+    /// the band boundaries (`isoband_cut`), so every emitted sub-triangle lies
+    /// wholly inside one band — razor-sharp, watertight transitions instead of
+    /// the streaky whole-triangle banding. Each piece is painted with its band's
+    /// filament (Bambu/Orca `paint_color`); N filaments in the embedded
+    /// `project_settings.config` carry the colors. No infill modifiers.
+    pub fn export_color_3mf(
+        &self,
+        kind: &str,
+        lo: f32,
+        hi: f32,
+        steps: u32,
+        colors_json: &str,
+        thumbnail: &[u8],
+    ) -> Result<Vec<u8>, JsValue> {
+        let steps = steps.max(1);
+        let colors: Vec<String> =
+            serde_json::from_str(colors_json).map_err(|e| err(&e.to_string()))?;
+        if colors.len() != steps as usize {
+            return Err(err("colors length must equal steps"));
+        }
+        // Paint the ORIGINAL CAD tessellation (the display mesh is non-watertight
+        // — T-junctions from render subdivision — so iso-cutting it cracks). But
+        // mesh_orig's CCW soup has huge CAD slivers; iso-cutting those gives crude
+        // straight band edges across each big triangle. So first weld it and
+        // CONFORMINGLY refine to a fine edge length: watertight AND fine, so the
+        // band lines follow the field smoothly. Then sample the field at the
+        // refined corners and cut along the iso-lines.
+        let welded = weld(&self.mesh_orig);
+        let diag = {
+            let (mut lo3, mut hi3) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
+            for v in &welded.vertices {
+                for d in 0..3 {
+                    lo3[d] = lo3[d].min(v[d]);
+                    hi3[d] = hi3[d].max(v[d]);
+                }
+            }
+            ((hi3[0] - lo3[0]).powi(2) + (hi3[1] - lo3[1]).powi(2) + (hi3[2] - lo3[2]).powi(2)).sqrt()
+        };
+        // Phase 1: conformingly refine everywhere to a coarse-ish edge so the
+        // field is well sampled and there are no big triangles. Phase 2:
+        // FIELD-ADAPTIVE — refine only edges whose endpoints fall in different
+        // bands (i.e. a band seam runs near them) down to a much finer edge, so
+        // the iso-cut band lines are smooth exactly where the eye looks, while
+        // flat-field interiors stay coarse. Both phases use the SAME conforming
+        // red-green machinery (shared edge midpoints) → still watertight.
+        let coarse = (diag / 120.0).max(1e-4);
+        let fine_edge = (diag / 240.0).max(1e-4);
+        let fine2 = fine_edge * fine_edge;
+        const MAX_TRIS: usize = 700_000;
+        let (mut mesh, met) =
+            sig_core::threemf::subdivide_to_edge_checked(&welded, coarse, MAX_TRIS);
+        if !met {
+            console_warn("color-3MF: surface too large to refine fully; band edges may coarsen");
+        }
+        for _ in 0..7 {
+            if mesh.triangles.len().saturating_mul(4) >= MAX_TRIS {
+                break;
+            }
+            // Band index of each refined vertex (re-sampled every round so new
+            // midpoints get their band; reuses the tested per-corner sampler).
+            let mut pts: Vec<f32> = Vec::with_capacity(mesh.vertices.len() * 3);
+            for v in &mesh.vertices {
+                pts.extend_from_slice(v);
+            }
+            let vfield = self.field_at_points(kind, &pts)?;
+            let band: Vec<u32> = vfield
+                .iter()
+                .map(|&s| sig_core::threemf::band_index(lo, hi, steps, s))
+                .collect();
+            let (next, split) = sig_core::threemf::subdivide_pass(&mesh, |v, a, b| {
+                if band[a as usize] == band[b as usize] {
+                    return false; // not on a band seam
+                }
+                let (p, q) = (v[a as usize], v[b as usize]);
+                (p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2) > fine2
+            });
+            if !split {
+                break;
+            }
+            mesh = next;
+        }
+        // Per-vertex field on the refined indexed mesh (one value per shared
+        // vertex → consistent across edges). Cut along the band iso-lines with
+        // shared per-edge crossings: sharp AND exactly watertight bands.
+        let mut pts: Vec<f32> = Vec::with_capacity(mesh.vertices.len() * 3);
+        for v in &mesh.vertices {
+            pts.extend_from_slice(v);
+        }
+        let vscalars = self.field_at_points(kind, &pts)?;
+        let (cut_pos, cut_band) = sig_core::threemf::isoband_cut_indexed(
+            &mesh.vertices,
+            &mesh.triangles,
+            &vscalars,
+            lo,
+            hi,
+            steps,
+        );
+        let name = if self.name.is_empty() { "part" } else { &self.name };
+        let thumb = if thumbnail.is_empty() { None } else { Some(thumbnail) };
+        Ok(sig_core::threemf::export_color_3mf(name, &cut_pos, &cut_band, &colors, thumb))
+    }
+
+    /// Per-corner scalar field (3 values/triangle) sampled at an arbitrary
+    /// surface `tris` (9 floats/tri). Mirrors `result_field` but on a supplied
+    /// mesh: displacement kinds come from the nodal displacement (the viewer
+    /// colors these client-side), all others from the per-cell engine field
+    /// (recovered to nodes + interpolated when `smooth_stress` is on).
+    fn field_on_tris(&self, kind: &str, tris: &[[f32; 9]]) -> Result<Vec<f32>, JsValue> {
+        let disp_comp = match kind {
+            "u" => Some(-1i32),
+            "ux" => Some(0),
+            "uy" => Some(1),
+            "uz" => Some(2),
+            _ => None,
+        };
+        if let Some(comp) = disp_comp {
+            let sol =
+                self.solution.as_ref().ok_or_else(|| err("no solution — run Solve or Optimize"))?;
+            let mut f = Vec::with_capacity(tris.len() * 3);
+            for t in tris {
+                for v in 0..3 {
+                    let p = [t[3 * v] as f64, t[3 * v + 1] as f64, t[3 * v + 2] as f64];
+                    let u = sol.sample_displacement(p);
+                    let val = if comp < 0 {
+                        (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt() as f32
+                    } else {
+                        u[comp as usize] as f32
+                    };
+                    f.push(val);
+                }
+            }
+            return Ok(f);
+        }
+        let cells = self.cell_values(kind)?;
+        let (grid, _) = self.grid.as_ref().ok_or_else(|| err("no grid"))?;
+        if self.smooth_stress {
+            let nodal = recover_nodal(grid, &cells);
+            Ok(sample_nodal_values(tris, grid, &nodal, &cells))
+        } else {
+            Ok(sample_cell_values(tris, grid, &cells))
+        }
+    }
+
+    /// The field scalar at each xyz point (3 floats/point). Reuses the tested
+    /// per-corner sampler (`field_on_tris`) by packing points into dummy
+    /// triangles — each corner is sampled independently, so the grouping is
+    /// irrelevant. Used by the color-3MF field-adaptive refinement to band each
+    /// refined vertex.
+    fn field_at_points(&self, kind: &str, points: &[f32]) -> Result<Vec<f32>, JsValue> {
+        let n = points.len() / 3;
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let mut padded = points.to_vec();
+        // Pad to a whole number of 3-corner triangles.
+        while (padded.len() / 3) % 3 != 0 {
+            padded.extend_from_slice(&[0.0, 0.0, 0.0]);
+        }
+        let tris: Vec<[f32; 9]> = padded
+            .chunks_exact(9)
+            .map(|c| {
+                let mut t = [0.0f32; 9];
+                t.copy_from_slice(c);
+                t
+            })
+            .collect();
+        let mut vals = self.field_on_tris(kind, &tris)?;
+        vals.truncate(n);
+        Ok(vals)
     }
 
     /// Voxel mesh for the Mesh view, optionally cut by a plane: cells whose

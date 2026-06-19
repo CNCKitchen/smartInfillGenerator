@@ -26,7 +26,11 @@ import type {
   VoxelInfo,
 } from "./types";
 import { DEFAULT_CURVES, DEFAULT_MATERIALS, RESOLUTIONS, RESULT_FIELDS } from "./types";
-import { CONTOUR_BANDS, CONTOUR_BANDS_MIN, CONTOUR_BANDS_MAX } from "./viewer/colormaps";
+import { CONTOUR_BANDS, CONTOUR_BANDS_MIN, CONTOUR_BANDS_MAX, jet, bandHexColors } from "./viewer/colormaps";
+
+/** Color 3MF export bands map 1:1 to slicer filament slots — Bambu/Orca cap. */
+export const COLOR_STEPS_MIN = 2;
+export const COLOR_STEPS_MAX = 16;
 
 export type Tool = "orbit" | "select" | "brush" | "place" | "pickdir";
 export type ViewMode = "setup" | "mesh" | "deformed" | "density" | "infill";
@@ -621,6 +625,14 @@ interface AppState {
   downloadStls(): Promise<void>;
   /** Solid topology mode: download the optimized shape as one STL. */
   downloadShape(): Promise<void>;
+  /** Number of discrete color steps for the color-3MF export (= filament
+   *  slots), clamped to COLOR_STEPS_MIN..MAX. */
+  colorSteps: number;
+  setColorSteps(n: number): void;
+  /** Export the active result field as a standalone color 3MF: `colorSteps`
+   *  discrete Bambu/Orca filament bands across the active contour min/max, on
+   *  the original undeformed mesh. Only meaningful in the results view. */
+  downloadColorThreeMf(): Promise<void>;
   /** Save the whole project as a `.infeall` file. `includeResults` embeds the
    *  FEA displacement buffers (instant reopen) — off keeps the file small and
    *  restores the optimized design only. */
@@ -2079,6 +2091,7 @@ export const useStore = create<AppState>((set, get) => ({
   materialStress: true,
   bandedContour: false,
   bandCount: CONTOUR_BANDS,
+  colorSteps: CONTOUR_BANDS,
   smoothIters: 15,
   nBins: 3,
   minMemberMm: null, // auto = 2× line width
@@ -3603,6 +3616,39 @@ export const useStore = create<AppState>((set, get) => ({
       const bytes = await engine.exportSolidStl();
       const base = (get().fileName ?? "part").replace(/\.(stl|3mf)$/i, "");
       download(bytes, `${base}_optimized.stl`, "model/stl");
+    } catch (e) {
+      set({ error: e instanceof Error ? e.message : String(e) });
+    }
+  },
+
+  setColorSteps(n) {
+    const v = Math.max(COLOR_STEPS_MIN, Math.min(COLOR_STEPS_MAX, Math.round(n)));
+    set({ colorSteps: v });
+  },
+
+  async downloadColorThreeMf() {
+    const s = get();
+    if (!s.activeResultId) return;
+    const field = s.resultField;
+    // The active contour range = user override (legendMin/Max) else the field's
+    // auto range (fieldRange, |u| anchored at 0). Same numbers the legend shows.
+    const fr = s.fieldRange;
+    const lo = s.legendMin ?? fr?.min ?? null;
+    const hi = s.legendMax ?? fr?.max ?? null;
+    if (lo === null || hi === null || !(hi > lo)) {
+      set({ error: "No contour range to band — open the result in the Results view first." });
+      return;
+    }
+    const steps = Math.max(COLOR_STEPS_MIN, Math.min(COLOR_STEPS_MAX, Math.round(s.colorSteps)));
+    // Bake the band colors from the SAME ramp the viewer paints: all result
+    // fields use jet; safety factors flip it (red = critical low). The engine
+    // cuts each triangle along the band iso-lines for sharp, watertight bands.
+    const colors = bandHexColors(jet, field.startsWith("sf"), steps);
+    try {
+      const thumbnail = sceneEvents.captureThumbnail?.() ?? null;
+      const bytes = await engine.exportColorThreeMf(field, lo, hi, steps, colors, thumbnail);
+      const fname = (s.fileName ?? "part").replace(/\.(stl|3mf)$/i, "");
+      download(bytes, `${fname}_${field}_color.3mf`, "model/3mf");
     } catch (e) {
       set({ error: e instanceof Error ? e.message : String(e) });
     }

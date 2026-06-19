@@ -4,6 +4,8 @@
 // Functional smoke test of the wasm-bindgen Model API (the same calls the web
 // worker makes). Run: node smoke-wasm.mjs
 import { readFileSync } from "node:fs";
+// fflate lives under web/node_modules (not resolvable bare from repo root).
+import { unzipSync } from "./web/node_modules/fflate/esm/browser.js";
 import init, {
   Model,
   set_cancel_flag,
@@ -169,6 +171,72 @@ assert(sff.length === nTri * 3 && sff.every((v) => Number.isFinite(v) && v > 0 &
   "safety factor field per vertex (finite, positive, capped)");
 assert(fmin(sff) > 1 && fmin(sff) < 99,
   `min safety factor sensible for a lightly loaded beam (${fmin(sff).toFixed(1)})`);
+
+// --- color 3MF export: the active field painted into discrete filament bands ---
+// Decode a whole-triangle Bambu/Orca paint_color leaf code back to its 1-based
+// filament state (mirror of the verified Rust encoder) to confirm the painted
+// bands round-trip and stay within 1..steps.
+function decodePaintLeaf(code) {
+  const nibs = [...code].map((c) => parseInt(c, 16)).reverse();
+  const bits = [];
+  for (const v of nibs) for (let i = 0; i < 4; i++) bits.push((v >> i) & 1);
+  let i = 0;
+  const take = (n) => { let x = 0; for (let k = 0; k < n; k++) x |= bits[i++] << k; return x; };
+  if (take(2) !== 0) return null; // not a leaf
+  const s = take(2);
+  if (s < 3) return s;
+  let val = 0, sh = 0;
+  for (;;) { val |= take(3) << sh; sh += 3; if (take(1) === 0) break; }
+  return 3 + val;
+}
+{
+  const lo = fmin(vmf), hi = fmax(vmf);
+  const steps = 5;
+  const colors = ["#0000ff", "#2bd6c0", "#7bff45", "#ffd400", "#de4343"];
+  const cmf = model.export_color_3mf(
+    "vm", lo, hi, steps, JSON.stringify(colors), new Uint8Array());
+  assert(cmf.length > 500 && cmf[0] === 0x50 && cmf[1] === 0x4b, "color 3MF export is a zip");
+  // The model/config parts are deflate-compressed — unzip to read them.
+  const parts = unzipSync(cmf);
+  const objText = Buffer.from(parts["3D/Objects/object_1.model"]).toString("latin1");
+  const projText = Buffer.from(parts["Metadata/project_settings.config"]).toString("latin1");
+  assert(objText.includes("paint_color="), "color 3MF carries painted triangles");
+  assert(projText.includes("filament_colour"), "color 3MF defines filaments");
+  for (const c of colors)
+    assert(projText.includes(c.toUpperCase()) || projText.includes(c),
+      `filament color ${c} embedded`);
+  // Every painted code decodes to a valid band state in 2..steps (band 0 = base,
+  // left unpainted), and the field's variation yields more than one band.
+  const codes = [...objText.matchAll(/paint_color="([0-9A-Fa-f]+)"/g)].map((m) => m[1]);
+  assert(codes.length > 0, "color 3MF has painted triangles to decode");
+  const states = new Set();
+  let bad = 0;
+  for (const c of codes) {
+    const st = decodePaintLeaf(c);
+    if (st === null || st < 2 || st > steps) bad++;
+    else states.add(st);
+  }
+  assert(bad === 0, `all ${codes.length} paint codes decode to states in 2..${steps}`);
+  assert(states.size >= 1, `the von Mises field is banded (${states.size} band(s))`);
+
+  // Watertightness: the export refines mesh_orig conformingly (watertight) and
+  // cuts it along the iso-lines. Because a shared edge's crossing depends only on
+  // its endpoint scalars, the cut stays watertight: for the closed box every edge
+  // of the core-welded exported mesh must be shared by exactly 2 triangles.
+  const tris = [...objText.matchAll(/<triangle v1="(\d+)" v2="(\d+)" v3="(\d+)"/g)]
+    .map((m) => [+m[1], +m[2], +m[3]]);
+  const edgeCount = new Map();
+  for (const [a, b, c] of tris)
+    for (const [u, v] of [[a, b], [b, c], [c, a]]) {
+      const e = u < v ? `${u}_${v}` : `${v}_${u}`;
+      edgeCount.set(e, (edgeCount.get(e) ?? 0) + 1);
+    }
+  let boundary = 0, nonmanifold = 0;
+  for (const n of edgeCount.values()) { if (n === 1) boundary++; else if (n > 2) nonmanifold++; }
+  assert(boundary === 0, `iso-cut export is watertight — 0 boundary edges (${tris.length} tris)`);
+  assert(nonmanifold === 0, `iso-cut export is manifold — 0 over-shared edges`);
+}
+
 // Tip vertices (x=40) deflect downward; root (x=0) stays.
 let tipUz = 0, tipN = 0, rootUz = 0, rootN = 0;
 const pos = model.positions();

@@ -6,9 +6,16 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useShallow } from "zustand/shallow";
-import { budgetBounds, resultStale, symLabel, useStore } from "../store";
+import {
+  budgetBounds,
+  resultStale,
+  symLabel,
+  useStore,
+  COLOR_STEPS_MIN,
+  COLOR_STEPS_MAX,
+} from "../store";
 import { NumInput } from "./NumInput";
-import type { Bc, ForceMode, LoadStep, PatternKey } from "../types";
+import { RESULT_FIELDS, type Bc, type ForceMode, type LoadStep, type PatternKey } from "../types";
 import { fmtDisp, fmtLen, rampCss } from "./fmt";
 import { bcLabel, KIND_DOT, KIND_LABEL, SUPPORT_KINDS } from "./bcmeta";
 
@@ -1466,6 +1473,11 @@ function StepExport() {
       setExportSlicer: s.setExportSlicer,
       downloadThreeMf: s.downloadThreeMf,
       downloadStls: s.downloadStls,
+      activeResultId: s.activeResultId,
+      resultField: s.resultField,
+      colorSteps: s.colorSteps,
+      setColorSteps: s.setColorSteps,
+      downloadColorThreeMf: s.downloadColorThreeMf,
     }))
   );
   return (
@@ -1662,6 +1674,37 @@ function StepExport() {
             overridden — walls, shells, and everything else come from your own profiles.
           </div>
         </>
+      )}
+      {s.hasResult && (
+        <div className="group">
+          <div className="g-label">
+            <span>Color 3MF</span>
+          </div>
+          <label className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
+            <span className="dim small">Color steps</span>
+            <NumInput
+              value={s.colorSteps}
+              min={COLOR_STEPS_MIN}
+              max={COLOR_STEPS_MAX}
+              step={1}
+              onCommit={(v) => s.setColorSteps(v)}
+            />
+          </label>
+          <button
+            className="primary"
+            disabled={!s.activeResultId}
+            onClick={() => void s.downloadColorThreeMf()}
+          >
+            Download color 3MF (.3mf)
+          </button>
+          <div className="hint">
+            The active result —{" "}
+            <b>{RESULT_FIELDS.find((f) => f.value === s.resultField)?.label ?? s.resultField}</b> —
+            painted into {s.colorSteps} discrete filament bands across the current contour min/max.
+            Triangles are cut along the band iso-lines for sharp, watertight transitions. Opens
+            painted in Bambu Studio / OrcaSlicer.
+          </div>
+        </div>
       )}
     </>
   );

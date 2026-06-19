@@ -4,6 +4,7 @@
 //! Minimal ZIP container support for 3MF: stored-entry writer (3MF readers
 //! accept uncompressed archives) and a reader that handles stored + deflate.
 
+use miniz_oxide::deflate::compress_to_vec;
 use miniz_oxide::inflate::decompress_to_vec_with_limit;
 
 // Untrusted-input guards (read_zip is the entry point for user 3MF uploads,
@@ -18,9 +19,18 @@ const MAX_TOTAL: usize = 768 * 1024 * 1024;
 /// Hard ceiling on entry count (a real 3MF has a handful of parts).
 const MAX_ENTRIES: usize = 4096;
 
+struct ZipEntry {
+    name: String,
+    crc: u32,
+    csize: u32, // compressed (== usize for stored)
+    usize_: u32, // uncompressed
+    offset: u32,
+    method: u16, // 0 = stored, 8 = deflate
+}
+
 pub struct ZipWriter {
     data: Vec<u8>,
-    entries: Vec<(String, u32, u32, u32)>, // name, crc, size, local offset
+    entries: Vec<ZipEntry>,
 }
 
 impl Default for ZipWriter {
@@ -34,48 +44,77 @@ impl ZipWriter {
         Self { data: Vec::new(), entries: Vec::new() }
     }
 
+    /// Add a STORED (uncompressed) entry. Byte layout is unchanged from the
+    /// original writer — the golden 3MF tests depend on it.
     pub fn add(&mut self, name: &str, bytes: &[u8]) {
-        let offset = self.data.len() as u32;
         let crc = crc32(bytes);
         let size = bytes.len() as u32;
+        self.write_entry(name, crc, size, size, 0, bytes);
+    }
+
+    /// Add a DEFLATE-compressed entry. The verbose model/config XML compresses
+    /// ~10×, which matters once iso-cut + refinement push the part to hundreds of
+    /// thousands of triangles. The reader (`read_zip`) already handles method 8,
+    /// as do Bambu/Orca/Prusa.
+    pub fn add_deflated(&mut self, name: &str, bytes: &[u8]) {
+        let crc = crc32(bytes);
+        let usize_ = bytes.len() as u32;
+        let comp = compress_to_vec(bytes, 8);
+        // Fall back to stored if deflate somehow didn't help (tiny inputs).
+        if comp.len() as u32 >= usize_ {
+            self.write_entry(name, crc, usize_, usize_, 0, bytes);
+        } else {
+            self.write_entry(name, crc, comp.len() as u32, usize_, 8, &comp);
+        }
+    }
+
+    fn write_entry(&mut self, name: &str, crc: u32, csize: u32, usize_: u32, method: u16, payload: &[u8]) {
+        let offset = self.data.len() as u32;
         // Local file header.
         self.data.extend_from_slice(&[0x50, 0x4b, 0x03, 0x04]);
         self.data.extend_from_slice(&20u16.to_le_bytes()); // version needed
         self.data.extend_from_slice(&0u16.to_le_bytes()); // flags
-        self.data.extend_from_slice(&0u16.to_le_bytes()); // method: stored
+        self.data.extend_from_slice(&method.to_le_bytes()); // method
         self.data.extend_from_slice(&0u16.to_le_bytes()); // mod time
         self.data.extend_from_slice(&0x21u16.to_le_bytes()); // mod date (1980-01-01)
         self.data.extend_from_slice(&crc.to_le_bytes());
-        self.data.extend_from_slice(&size.to_le_bytes()); // compressed
-        self.data.extend_from_slice(&size.to_le_bytes()); // uncompressed
+        self.data.extend_from_slice(&csize.to_le_bytes()); // compressed
+        self.data.extend_from_slice(&usize_.to_le_bytes()); // uncompressed
         self.data.extend_from_slice(&(name.len() as u16).to_le_bytes());
         self.data.extend_from_slice(&0u16.to_le_bytes()); // extra len
         self.data.extend_from_slice(name.as_bytes());
-        self.data.extend_from_slice(bytes);
-        self.entries.push((name.to_string(), crc, size, offset));
+        self.data.extend_from_slice(payload);
+        self.entries.push(ZipEntry {
+            name: name.to_string(),
+            crc,
+            csize,
+            usize_,
+            offset,
+            method,
+        });
     }
 
     pub fn finish(mut self) -> Vec<u8> {
         let cd_start = self.data.len() as u32;
-        for (name, crc, size, offset) in &self.entries {
+        for e in &self.entries {
             self.data.extend_from_slice(&[0x50, 0x4b, 0x01, 0x02]);
             self.data.extend_from_slice(&20u16.to_le_bytes()); // version made by
             self.data.extend_from_slice(&20u16.to_le_bytes()); // version needed
             self.data.extend_from_slice(&0u16.to_le_bytes()); // flags
-            self.data.extend_from_slice(&0u16.to_le_bytes()); // method
+            self.data.extend_from_slice(&e.method.to_le_bytes()); // method
             self.data.extend_from_slice(&0u16.to_le_bytes()); // time
             self.data.extend_from_slice(&0x21u16.to_le_bytes()); // date
-            self.data.extend_from_slice(&crc.to_le_bytes());
-            self.data.extend_from_slice(&size.to_le_bytes());
-            self.data.extend_from_slice(&size.to_le_bytes());
-            self.data.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            self.data.extend_from_slice(&e.crc.to_le_bytes());
+            self.data.extend_from_slice(&e.csize.to_le_bytes());
+            self.data.extend_from_slice(&e.usize_.to_le_bytes());
+            self.data.extend_from_slice(&(e.name.len() as u16).to_le_bytes());
             self.data.extend_from_slice(&0u16.to_le_bytes()); // extra
             self.data.extend_from_slice(&0u16.to_le_bytes()); // comment
             self.data.extend_from_slice(&0u16.to_le_bytes()); // disk
             self.data.extend_from_slice(&0u16.to_le_bytes()); // internal attrs
             self.data.extend_from_slice(&0u32.to_le_bytes()); // external attrs
-            self.data.extend_from_slice(&offset.to_le_bytes());
-            self.data.extend_from_slice(name.as_bytes());
+            self.data.extend_from_slice(&e.offset.to_le_bytes());
+            self.data.extend_from_slice(e.name.as_bytes());
         }
         let cd_size = self.data.len() as u32 - cd_start;
         let n = self.entries.len() as u16;

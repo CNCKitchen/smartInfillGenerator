@@ -363,6 +363,28 @@ export class EngineClient {
     return this.call({ op: "exportThreeMf", slicer, thumbnail: thumbnail ?? null });
   }
 
+  /** Standalone colored 3MF of the active result field, painted into `steps`
+   *  discrete Bambu/Orca filament bands. `kind` is the on-screen field, `lo`/`hi`
+   *  the active contour min/max, `colors` the per-band `#RRGGBB` ramp (low first). */
+  exportColorThreeMf(
+    kind: string,
+    lo: number,
+    hi: number,
+    steps: number,
+    colors: string[],
+    thumbnail?: Uint8Array | null
+  ): Promise<Uint8Array> {
+    return this.call({
+      op: "exportColorThreeMf",
+      kind,
+      lo,
+      hi,
+      steps,
+      colors,
+      thumbnail: thumbnail ?? null,
+    });
+  }
+
   exportStls(): Promise<Uint8Array> {
     return this.call({ op: "exportStls" });
   }

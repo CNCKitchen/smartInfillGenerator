@@ -44,6 +44,26 @@ export function cssColor(fn: (t: number) => RGB, t: number): string {
   return `rgb(${byte(r)},${byte(g)},${byte(b)})`;
 }
 
+/** `#rrggbb` hex for a colormap at parameter `t` — for baking 3MF filament
+ *  colors that exactly match the on-screen contour ramp. */
+export function hexColor(fn: (t: number) => RGB, t: number): string {
+  const h = (v: number) => byte(v).toString(16).padStart(2, "0");
+  const [r, g, b] = fn(t);
+  return `#${h(r)}${h(g)}${h(b)}`;
+}
+
+/** The N band-center colors of a discrete contour, low value first — the same
+ *  colors {@link cssBands} paints, as `#rrggbb`. `flip` matches the safety-factor
+ *  inversion (red = critical LOW). */
+export function bandHexColors(fn: (t: number) => RGB, flip: boolean, n: number): string[] {
+  const out: string[] = [];
+  for (let b = 0; b < n; b++) {
+    const tc = (b + 0.5) / n;
+    out.push(hexColor(fn, flip ? 1 - tc : tc));
+  }
+  return out;
+}
+
 /**
  * CSS `linear-gradient(to top, …)` sampling a colormap at `steps`+1 stops.
  * `flip` reverses it (e.g. safety factor: red marks the LOW/critical end).
