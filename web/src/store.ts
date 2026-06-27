@@ -3227,8 +3227,13 @@ export const useStore = create<AppState>((set, get) => ({
         await solveAllSteps(set, get);
         return;
       }
-      await pushBcs(get);
-      await logGridInfo(set);
+      // Build sim ignores BCs and runs on its OWN coarse grid (built inside the
+      // engine), so skip pushing BCs and the analysis-grid info/build here —
+      // building the fine analysis grid is exactly the cost we're avoiding.
+      if (!buildsim) {
+        await pushBcs(get);
+        await logGridInfo(set);
+      }
       const report = buildsim ? null : await engine.check();
       if (report) set({ check: report });
       if (report && !report.ok) {
@@ -3296,13 +3301,11 @@ export const useStore = create<AppState>((set, get) => ({
         );
       } else if (buildsim) {
         const shrink = -Math.abs(st0.material.shrink); // material property; eigenstrain shrinks
-        const vi = get().voxelInfo;
         appendLog(
           set,
           `Build sim — ${st0.material.name}, ${(Math.abs(shrink) * 100).toFixed(2)}% shrink (material), ` +
             `${st0.buildState === "released" ? "released (off-bed)" : "on-bed"} state` +
-            (vi ? `, grid ${vi.nx}×${vi.ny}×${vi.nz} (${Math.round(vi.solid / 1000)}k cells, h ${vi.h.toFixed(2)} mm)` : "") +
-            " — sequential inherent-strain warp + bed peel …"
+            " — sequential inherent-strain warp + bed peel (coarse grid) …"
         );
         // Live preview on the VOXEL hull at 10× exaggeration: only the printed
         // (activated) cells, jet-colored by |u|, with the displacement legend —
@@ -3329,6 +3332,8 @@ export const useStore = create<AppState>((set, get) => ({
           hasResult: true,
           viewMode: "deformed",
           resultField: "u",
+          // Build sim is STL-only (its coarse grid ≠ the analysis voxels).
+          resultSurface: "stl",
           stats: previewStats(0),
         });
         sceneEvents.onViewState?.("deformed", exag);
@@ -3376,7 +3381,7 @@ export const useStore = create<AppState>((set, get) => ({
         } as SolveStats;
         appendLog(
           set,
-          `  ${out.stats.layers} layers activated · MGCG ${Math.round(out.stats.itersMean)} mean / ${out.stats.itersMax} max iters/layer · ${out.stats.seconds.toFixed(1)} s`
+          `  coarse build grid ${out.stats.nx}×${out.stats.ny}×${out.stats.nz} (${Math.round(out.stats.cells / 1000)}k cells, h ${out.stats.h.toFixed(2)} mm) · ${out.stats.layers} layers · MGCG ${Math.round(out.stats.itersMean)} mean / ${out.stats.itersMax} max iters/layer · ${out.stats.seconds.toFixed(1)} s`
         );
         appendLog(
           set,

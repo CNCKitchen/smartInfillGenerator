@@ -430,6 +430,48 @@ fn cell_activated(grid: &VoxelGrid, ci: usize, active: &[bool]) -> bool {
     true
 }
 
+/// Resample a per-cell stiffness field (`fine_eps`, on the finer analysis grid)
+/// onto a coarser `coarse` grid, by nearest-cell sampling at each coarse cell's
+/// centre. Both grids share the part's world frame (same `origin`), so the
+/// centre maps directly to a fine-grid index. A coarse solid cell whose centre
+/// falls over fine void (a thin boundary feature) keeps its occupancy stiffness
+/// (`grid_eps`) rather than collapsing to zero. Void coarse cells stay 0. Used
+/// to carry the optimized infill density into the coarser build-sim grid.
+fn resample_eps(fine: &VoxelGrid, fine_eps: &[f32], coarse: &VoxelGrid) -> Vec<f32> {
+    let occ = sig_core::solve::grid_eps(coarse);
+    let mut out = vec![0f32; coarse.cell_count()];
+    for cz in 0..coarse.nz {
+        for cy in 0..coarse.ny {
+            for cx in 0..coarse.nx {
+                let ci = (cz * coarse.ny + cy) * coarse.nx + cx;
+                if occ[ci] <= 0.0 {
+                    continue;
+                }
+                let p = [
+                    coarse.origin[0] + (cx as f64 + 0.5) * coarse.h,
+                    coarse.origin[1] + (cy as f64 + 0.5) * coarse.h,
+                    coarse.origin[2] + (cz as f64 + 0.5) * coarse.h,
+                ];
+                let fx = ((p[0] - fine.origin[0]) / fine.h).floor();
+                let fy = ((p[1] - fine.origin[1]) / fine.h).floor();
+                let fz = ((p[2] - fine.origin[2]) / fine.h).floor();
+                let sampled = if fx >= 0.0 && fy >= 0.0 && fz >= 0.0 {
+                    let (ix, iy, iz) = (fx as usize, fy as usize, fz as usize);
+                    if ix < fine.nx && iy < fine.ny && iz < fine.nz {
+                        fine_eps[(iz * fine.ny + iy) * fine.nx + ix]
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                };
+                out[ci] = if sampled > 0.0 { sampled } else { occ[ci] };
+            }
+        }
+    }
+    out
+}
+
 /// Voxel hull of the ALREADY-ACTIVATED cells (the live build-preview geometry,
 /// grows + warps as layers activate). Returns the deformed positions (flat xyz,
 /// `exag·u` applied), the per-vertex displacement magnitude NORMALISED to
@@ -1081,13 +1123,25 @@ impl Model {
         // Build-sim states are tied to the old cell layout too.
         self.build_bonded = None;
         self.build_released = None;
+        let grid = VoxelGrid::voxelize(&self.mesh, self.analysis_h()?);
+        if grid.solid_count() == 0 {
+            return Err(err("voxelization produced no solid cells — model too thin for this resolution"));
+        }
+        let (padded, levels) = pad_for_levels(&grid, self.settings.max_levels);
+        self.grid = Some((padded, levels));
+        Ok(())
+    }
+
+    /// The analysis cell size `h` (mm) for the current resolution setting.
+    /// Sizes the grid from the part's ACTUAL volume so a part that fills only
+    /// part of its bounding box still gets ~target solid cells. A floor at 2% of
+    /// the bbox guards degenerate/open meshes whose signed volume is near zero
+    /// from exploding the cell count. Shared by `ensure_grid` and the build sim
+    /// (which scales it up for a coarser grid).
+    fn analysis_h(&self) -> Result<f64, JsValue> {
         let (lo, hi) = self.mesh.bounds().ok_or_else(|| err("empty mesh"))?;
         let bbox_vol =
             (hi[0] - lo[0]).max(1e-6) * (hi[1] - lo[1]).max(1e-6) * (hi[2] - lo[2]).max(1e-6);
-        // Size the grid from the part's ACTUAL volume so a part that fills only
-        // part of its bounding box still gets ~target solid cells (precise
-        // resolution). A floor at 2% of the bbox guards degenerate/open meshes
-        // whose signed volume is near zero from exploding the cell count.
         let h = if let Some(fh) = self.fixed_h {
             // Custom mode: the user's exact cell size, snapped to the wall when
             // snapping is on, floored so it can't blow the cell budget.
@@ -1112,13 +1166,7 @@ impl Model {
                 self.snap_wall,
             )
         };
-        let grid = VoxelGrid::voxelize(&self.mesh, h);
-        if grid.solid_count() == 0 {
-            return Err(err("voxelization produced no solid cells — model too thin for this resolution"));
-        }
-        let (padded, levels) = pad_for_levels(&grid, self.settings.max_levels);
-        self.grid = Some((padded, levels));
-        Ok(())
+        Ok(h)
     }
 
     /// JSON: { nx, ny, nz, h, cells, solid }
@@ -1216,18 +1264,32 @@ impl Model {
         on_layer: &js_sys::Function,
     ) -> Result<String, JsValue> {
         let opts: BuildSimOpts = serde_json::from_str(opts_json).map_err(err)?;
-        self.ensure_grid()?;
-        let (grid, _levels) = self.grid.as_ref().unwrap();
         let eigen = [opts.shrink, opts.shrink, opts.shrink];
         let exag = opts.exaggeration;
+        // The sequential build does one multigrid solve PER layer, so cell count
+        // drives the cost. Run on a deliberately COARSER grid than analysis:
+        // cbrt(2) ≈ 1.26× the cell size → ~half the cells. The warp shape is
+        // resolution-robust, so this buys a much faster preview cheaply. (Kept
+        // local — never touches self.grid / opt_eps, which stay at analysis res.)
+        let h_build = self.analysis_h()? * 2f64.cbrt();
+        let braw = VoxelGrid::voxelize(&self.mesh, h_build);
+        if braw.solid_count() == 0 {
+            return Err(err("voxelization produced no solid cells — model too thin for this resolution"));
+        }
+        let (grid, _levels) = pad_for_levels(&braw, self.settings.max_levels);
         // Drive the build sim with the as-printed infill density when an
         // optimized design exists (sparse infill is softer AND lays down less
-        // contracting material — both scale by the same per-cell eps). Falls
-        // back to the solid hull (None) when nothing has been optimized.
-        let density_aware = self.opt_eps.is_some();
-        let eps_override = self.opt_eps.clone();
+        // contracting material — both scale by the same per-cell eps). The
+        // optimized field lives on the FINER analysis grid, so resample it onto
+        // the coarse build grid. Falls back to the solid hull when nothing has
+        // been optimized.
+        let eps_override: Option<Vec<f32>> = match (&self.opt_eps, &self.grid) {
+            (Some(fine_eps), Some((fine, _))) => Some(resample_eps(fine, fine_eps, &grid)),
+            _ => None,
+        };
+        let density_aware = eps_override.is_some();
         let r = sig_core::buildsim::solve_build_progress(
-            grid,
+            &grid,
             eigen,
             &self.settings,
             eps_override.as_deref(),
@@ -1237,7 +1299,7 @@ impl Model {
                 // (positions + normalised |u| + max |u|); empty otherwise.
                 let stride = (total / 30).max(1);
                 let (pos, mags, maxu) = if done == total || done % stride == 0 {
-                    deformed_activated_hull(grid, sol, exag)
+                    deformed_activated_hull(&grid, sol, exag)
                 } else {
                     (Vec::new(), Vec::new(), 0.0)
                 };
@@ -1265,7 +1327,7 @@ impl Model {
         } else {
             r.iters.iter().sum::<usize>() as f64 / r.iters.len() as f64
         };
-        let cells = self.grid.as_ref().map(|(g, _)| g.solid_count()).unwrap_or(0);
+        let cells = grid.solid_count();
         // Keep BOTH states so the UI can flip on bed ⇄ released with no re-solve.
         self.build_bonded = Some(r.bonded);
         self.build_released = Some(r.released);
@@ -1281,6 +1343,8 @@ impl Model {
             "itersMean": iters_mean,
             "cells": cells,
             "densityAware": density_aware,
+            // Coarse build-grid dims (≠ analysis grid) for the log.
+            "nx": grid.nx, "ny": grid.ny, "nz": grid.nz, "h": grid.h,
         })
         .to_string();
         self.solution = Some(sol);

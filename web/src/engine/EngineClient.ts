@@ -486,6 +486,11 @@ export interface BuildSimStats {
   seconds: number;
   /** True when the sim used the optimized as-printed infill density; false = solid hull. */
   densityAware: boolean;
+  /** Coarse build-grid dimensions (distinct from the analysis grid). */
+  nx: number;
+  ny: number;
+  nz: number;
+  h: number;
 }
 
 /** Mirrors the wasm OptimizeOpts (serialized to JSON in the worker). */

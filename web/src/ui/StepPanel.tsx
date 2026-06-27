@@ -1141,7 +1141,6 @@ function StepBuildSim() {
     useShallow((s) => ({
       material: s.material,
       buildState: s.buildState,
-      setBuildState: s.setBuildState,
       runSolve: s.runSolve,
       busy: s.busy,
       stats: s.stats,
@@ -1157,25 +1156,6 @@ function StepBuildSim() {
   return (
     <>
       <div className="group">
-        <div className="g-label">
-          <span>Show state</span>
-        </div>
-        <div className="seg">
-          <button
-            className={s.buildState === "bonded" ? "on" : ""}
-            onClick={() => void s.setBuildState("bonded")}
-            title="Distortion while still held on the bed"
-          >
-            On bed
-          </button>
-          <button
-            className={s.buildState === "released" ? "on" : ""}
-            onClick={() => void s.setBuildState("released")}
-            title="Off-bed sprung shape — the predeform target"
-          >
-            Released
-          </button>
-        </div>
         <div className="dim small">
           Inherent-strain warp via sequential layer activation. Shrink is a material property (
           <b>{s.material.name}</b>: {(s.material.shrink * 100).toFixed(2)}%) — edit it in{" "}
@@ -1224,7 +1204,7 @@ function StepBuildSim() {
       )}
       {!bp && br && (
         <div className="dim small">
-          Both states saved — the toggle above switches instantly. On bed{" "}
+          Both states saved — switch On&nbsp;bed / Released on the <b>Results</b> bar (top). On bed{" "}
           <b>{fmtDisp(br.bondedMax)}</b> · released <b>{fmtDisp(br.releasedMax)}</b>. Stiffness &amp;
           strain field:{" "}
           <b>{br.densityAware ? "as-printed infill density" : "solid hull"}</b>
@@ -1233,9 +1213,9 @@ function StepBuildSim() {
       )}
       <div className="hint">
         Build sim ignores supports/loads — its only inputs are the part, the material shrink, the
-        as-printed infill density (when optimized), and the build plate. Solve lands in the deformed{" "}
-        <b>Results</b> view; after a run, switch Released / On&nbsp;bed above to compare with no
-        re-solve.
+        as-printed infill density (when optimized), and the build plate. It runs on a coarser grid
+        than analysis for speed. Solve lands in the deformed <b>Results</b> view; switch On&nbsp;bed /
+        Released there to compare with no re-solve.
       </div>
     </>
   );
