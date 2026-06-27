@@ -231,12 +231,20 @@ export class EngineClient {
 
   /** FDM build simulation (inherent strain): warping + bed peel. Leaves the
    *  chosen state (released/bonded) as the live solution, so the returned
-   *  displacements deform the real mesh in the existing deformed view. */
+   *  displacements deform the real mesh in the existing deformed view.
+   *  `onProgress(p, displacements)` fires per activated layer — `p` is the
+   *  layer count (done/total) for the progress bar, `displacements` is the
+   *  accumulating warp on throttled frames (length 0 on progress-only frames). */
   buildSim(
-    opts: BuildSimOptions
+    opts: BuildSimOptions,
+    onProgress?: (p: { done: number; total: number }, displacements: Float32Array) => void
   ): Promise<{ stats: BuildSimStats; displacements: Float32Array }> {
     this.resetProgress();
-    return this.call({ op: "buildSim", opts: opts as unknown as Record<string, unknown> });
+    return this.call(
+      { op: "buildSim", opts: opts as unknown as Record<string, unknown> },
+      [],
+      onProgress as ((data: unknown, density: Float32Array) => void) | undefined
+    );
   }
 
   optimize(

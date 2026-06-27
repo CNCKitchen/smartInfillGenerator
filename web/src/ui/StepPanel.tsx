@@ -1146,9 +1146,12 @@ function StepBuildSim() {
       busy: s.busy,
       stats: s.stats,
       hasResult: s.hasResult,
+      buildProgress: s.buildProgress,
       openSettings: s.openSettings,
     }))
   );
+  const bp = s.buildProgress;
+  const pct = bp && bp.total > 0 ? Math.round((bp.done / bp.total) * 100) : 0;
   return (
     <>
       <div className="group">
@@ -1185,7 +1188,32 @@ function StepBuildSim() {
           Run build simulation
         </button>
       </div>
-      {s.stats && s.hasResult && (
+      {bp && (
+        <div className="group">
+          <div className="g-label">
+            <span>Simulating — layer {bp.done}{bp.total > 0 ? ` of ${bp.total}` : ""}</span>
+            {bp.total > 0 && <b>{pct}%</b>}
+          </div>
+          <div
+            style={{
+              height: 6,
+              borderRadius: 3,
+              background: "rgba(0,0,0,0.12)",
+              overflow: "hidden",
+            }}
+          >
+            <div
+              style={{
+                height: "100%",
+                width: `${pct}%`,
+                background: "var(--accent, #e8722b)",
+                transition: "width 0.1s linear",
+              }}
+            />
+          </div>
+        </div>
+      )}
+      {!bp && s.stats && s.hasResult && (
         <div className="status ok">
           Max warp <b>{fmtDisp(s.stats.maxDisplacement)}</b> ·{" "}
           {s.buildState === "released" ? "released (off-bed)" : "on bed"} ·{" "}

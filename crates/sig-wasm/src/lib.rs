@@ -411,6 +411,21 @@ impl Default for BuildSimOpts {
     }
 }
 
+/// Sample a solution's displacement onto each soup vertex (9 floats/triangle) —
+/// the warp mapped onto the REAL mesh. Shared by `vertex_displacements` and the
+/// build-sim live preview.
+fn map_displacements(mesh: &TriMesh, sol: &Solution) -> Vec<f32> {
+    let mut out = Vec::with_capacity(mesh.tris.len() * 9);
+    for t in &mesh.tris {
+        for v in 0..3 {
+            let p = [t[3 * v] as f64, t[3 * v + 1] as f64, t[3 * v + 2] as f64];
+            let u = sol.sample_displacement(p);
+            out.extend_from_slice(&[u[0] as f32, u[1] as f32, u[2] as f32]);
+        }
+    }
+    out
+}
+
 #[wasm_bindgen]
 pub struct Model {
     /// Working mesh: display + segmentation + BC attachment + voxelization.
@@ -1134,12 +1149,43 @@ impl Model {
     /// the chosen state (released = off-bed sprung shape, or bonded) as the live
     /// solution, so `vertex_displacements()` maps the warp onto the REAL mesh and
     /// the existing deformed view renders it. JSON: max displacements + peel peaks.
-    pub fn solve_build_sim(&mut self, opts_json: &str) -> Result<String, JsValue> {
+    /// `on_layer(layersDone, totalLayers, displacements)` is called per activated
+    /// layer for the live progress bar + warp preview. `displacements` is the
+    /// accumulating bonded warp mapped onto the mesh, but only on throttled frames
+    /// (~30 over the build); it is an empty array on the other layers (progress-
+    /// only). A stopped run (cancel flag) propagates as an error.
+    pub fn solve_build_sim(
+        &mut self,
+        opts_json: &str,
+        on_layer: &js_sys::Function,
+    ) -> Result<String, JsValue> {
         let opts: BuildSimOpts = serde_json::from_str(opts_json).map_err(err)?;
         self.ensure_grid()?;
         let (grid, _levels) = self.grid.as_ref().unwrap();
         let eigen = [opts.shrink, opts.shrink, opts.shrink];
-        let r = sig_core::buildsim::solve_build(grid, eigen, &self.settings).map_err(err)?;
+        let mesh = &self.mesh;
+        let r = sig_core::buildsim::solve_build_progress(
+            grid,
+            eigen,
+            &self.settings,
+            |done, total, sol| {
+                // Throttle the (expensive) mesh mapping to ~30 preview frames.
+                let stride = (total / 30).max(1);
+                let disp = if done == total || done % stride == 0 {
+                    map_displacements(mesh, sol)
+                } else {
+                    Vec::new()
+                };
+                let arr = js_sys::Float32Array::from(disp.as_slice());
+                let _ = on_layer.call3(
+                    &JsValue::NULL,
+                    &JsValue::from(done as u32),
+                    &JsValue::from(total as u32),
+                    &JsValue::from(arr),
+                );
+            },
+        )
+        .map_err(err)?;
 
         let mut peak_lift = 0f64;
         let mut peak_shear = 0f64;
@@ -1300,15 +1346,7 @@ impl Model {
     /// Displacement vector (mm) per soup vertex: 9 floats per triangle.
     pub fn vertex_displacements(&self) -> Result<Vec<f32>, JsValue> {
         let sol = self.solution.as_ref().ok_or_else(|| err("no solution — call solve() first"))?;
-        let mut out = Vec::with_capacity(self.mesh.tris.len() * 9);
-        for t in &self.mesh.tris {
-            for v in 0..3 {
-                let p = [t[3 * v] as f64, t[3 * v + 1] as f64, t[3 * v + 2] as f64];
-                let u = sol.sample_displacement(p);
-                out.extend_from_slice(&[u[0] as f32, u[1] as f32, u[2] as f32]);
-            }
-        }
-        Ok(out)
+        Ok(map_displacements(&self.mesh, sol))
     }
 
     /// Snapshot the CURRENT live solution under `id` so the Results view can

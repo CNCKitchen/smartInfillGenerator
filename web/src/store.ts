@@ -364,6 +364,8 @@ interface AppState {
   appMode: "optimize" | "buildsim";
   /** Build-sim: which state to deform by (off-bed sprung shape or on the bed). */
   buildState: "released" | "bonded";
+  /** Build-sim live progress (activated layers); null when not running. */
+  buildProgress: { done: number; total: number } | null;
   /** Extras of the last as-printed solve (results dock); null = solid run. */
   printedStats: PrintedSummary | null;
   /** Mesh view: color each cell by its element density (0–1: skin = 1,
@@ -2127,6 +2129,7 @@ export const useStore = create<AppState>((set, get) => ({
   analyzeMode: "printed",
   appMode: "optimize",
   buildState: "released",
+  buildProgress: null,
   printedStats: null,
   meshDensity: false,
   smoothStress: true,
@@ -3252,7 +3255,15 @@ export const useStore = create<AppState>((set, get) => ({
           set,
           `Build sim (inherent strain): ${st0.material.name} ${(Math.abs(shrink) * 100).toFixed(2)}% shrink, ${st0.buildState} state — warping + bed peel …`
         );
-        const out = await engine.buildSim({ shrink, state: st0.buildState });
+        // Land in the deformed view up front so the warp can animate as it builds.
+        set({ busy: "Build sim…", buildProgress: { done: 0, total: 0 }, viewMode: "deformed" });
+        sceneEvents.onViewState?.("deformed", get().deformScale);
+        const out = await engine.buildSim({ shrink, state: st0.buildState }, (p, disp) => {
+          set({ buildProgress: { done: p.done, total: p.total } });
+          // Throttled frames carry the accumulating warp — render it live.
+          if (disp && disp.length > 0) sceneEvents.onDisplacements?.(disp, null);
+        });
+        set({ buildProgress: null });
         displacements = out.displacements;
         // Synthesize a SolveStats so the deformed view + dock render uniformly.
         stats = {
@@ -3388,6 +3399,7 @@ export const useStore = create<AppState>((set, get) => ({
       }
     } finally {
       stopResidualPoll(); // also covers the error/cancel paths
+      set({ buildProgress: null }); // covers build-sim cancel/error
       session.endRun();
     }
   },

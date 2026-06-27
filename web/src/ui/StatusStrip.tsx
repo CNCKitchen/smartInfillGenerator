@@ -17,6 +17,7 @@ export function StatusStrip() {
       fileName: s.fileName,
       voxelInfo: s.voxelInfo,
       optProgress: s.optProgress,
+      buildProgress: s.buildProgress,
       stats: s.stats,
       optSummary: s.optSummary,
       openImprint: s.openImprint,
@@ -28,6 +29,7 @@ export function StatusStrip() {
   const state = s.busy ? s.busy.replace(/…$/, "").toUpperCase() : s.error ? "ERROR" : "READY";
   const v = s.voxelInfo;
   const p = s.optProgress;
+  const bp = s.buildProgress;
   const m = s.model;
   return (
     <footer className="strip">
@@ -47,6 +49,21 @@ export function StatusStrip() {
             {v.nx}×{v.ny}×{v.nz}
           </b>{" "}
           · <b>{Math.round(v.solid / 1000)}k</b> cells · h <b>{v.h.toFixed(2)} mm</b>
+        </div>
+      )}
+      {bp && (
+        <div>
+          SIM layer{" "}
+          <b>
+            {bp.done}
+            {bp.total > 0 ? ` of ${bp.total}` : ""}
+          </b>
+          {bp.total > 0 && (
+            <>
+              {" "}
+              · <b>{Math.round((bp.done / bp.total) * 100)}%</b>
+            </>
+          )}
         </div>
       )}
       {p ? (

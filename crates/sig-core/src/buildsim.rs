@@ -237,6 +237,7 @@ fn build_bonded_inner(
     grid: &VoxelGrid,
     eigen: [f64; 3],
     s: &SolveSettings,
+    on_layer: &mut dyn FnMut(usize, usize, &Solution),
 ) -> Result<(VoxelGrid, usize, Vec<f64>, Vec<f64>, Vec<f64>, Vec<usize>), SolveError> {
     let (g, levels) = pad_for_levels(grid, s.max_levels);
     let (nx, ny, nz) = (g.nx, g.ny, g.nz);
@@ -265,6 +266,12 @@ fn build_bonded_inner(
 
     let mut slot: Option<SolverCache> = None;
     let mut iters = Vec::new();
+
+    // Total SOLID layers, for progress reporting (empty layers are skipped).
+    let total_layers = (0..nz)
+        .filter(|&k| (0..ny * nx).any(|c| eps_full[k * ny * nx + c] > 0.0))
+        .count();
+    let mut layers_done = 0usize;
 
     for k in 0..nz {
         // Mark this layer's nodes active. New top nodes stay at NOMINAL (their
@@ -348,6 +355,11 @@ fn build_bonded_inner(
             }
         }
         iters.push(res.stats.iterations);
+
+        // Report progress + the warp accumulated so far (live preview).
+        layers_done += 1;
+        let max_it = iters.iter().copied().max().unwrap_or(0);
+        on_layer(layers_done, total_layers, &solution_from(&g, u_total.clone(), max_it));
     }
 
     Ok((g, levels, u_total, f_eig, f_lock, iters))
@@ -424,7 +436,7 @@ pub fn solve_sequential_bonded(
     eigen: [f64; 3],
     s: &SolveSettings,
 ) -> Result<(Solution, Vec<usize>), SolveError> {
-    let (g, _levels, u, _fe, _fl, iters) = build_bonded_inner(grid, eigen, s)?;
+    let (g, _levels, u, _fe, _fl, iters) = build_bonded_inner(grid, eigen, s, &mut |_, _, _| {})?;
     let it = *iters.iter().max().unwrap_or(&0);
     Ok((solution_from(&g, u, it), iters))
 }
@@ -452,7 +464,21 @@ pub fn solve_build(
     eigen: [f64; 3],
     s: &SolveSettings,
 ) -> Result<BuildResult, SolveError> {
-    let (g, levels, u_b, f_eig, f_lock, iters) = build_bonded_inner(grid, eigen, s)?;
+    solve_build_progress(grid, eigen, s, |_, _, _| {})
+}
+
+/// Like [`solve_build`], but `on_layer(layers_done, total_layers, &bonded_so_far)`
+/// is invoked after each activated layer — for a live progress bar + warp
+/// preview. The bonded build is also where cancellation lands (a stopped solve
+/// propagates `SolveError::Cancelled` out).
+pub fn solve_build_progress(
+    grid: &VoxelGrid,
+    eigen: [f64; 3],
+    s: &SolveSettings,
+    mut on_layer: impl FnMut(usize, usize, &Solution),
+) -> Result<BuildResult, SolveError> {
+    let (g, levels, u_b, f_eig, f_lock, iters) =
+        build_bonded_inner(grid, eigen, s, &mut on_layer)?;
     let it = *iters.iter().max().unwrap_or(&0);
     let eps_full = grid_eps(&g);
     let ke = ke_hex(s.e0, s.nu, g.h);

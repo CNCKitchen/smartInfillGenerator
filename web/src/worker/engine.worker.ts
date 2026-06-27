@@ -369,7 +369,19 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
       case "buildSim": {
         if (cancelArr) Atomics.store(cancelArr, 0, 0); // arm fresh
         const t0 = performance.now();
-        const stats = JSON.parse(requireModel().solve_build_sim(JSON.stringify(msg.opts)));
+        const stats = JSON.parse(
+          requireModel().solve_build_sim(
+            JSON.stringify(msg.opts),
+            // Per-layer: progress (done/total) + throttled warp preview (empty
+            // displacements on non-preview frames). Reuses the `density` slot.
+            (done: number, total: number, disp: Float32Array) => {
+              (self as unknown as Worker).postMessage(
+                { id: msg.id, progress: true, data: { done, total }, density: disp },
+                disp.length > 0 ? [disp.buffer] : []
+              );
+            }
+          )
+        );
         const displacements = requireModel().vertex_displacements();
         stats.seconds = (performance.now() - t0) / 1000;
         (self as unknown as Worker).postMessage(
