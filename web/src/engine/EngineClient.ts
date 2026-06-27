@@ -321,6 +321,14 @@ export class EngineClient {
     return this.call({ op: "peelField", kind });
   }
 
+  /** Build-sim bed-peel as a flat heatmap on the plate: triangle-soup positions
+   *  over the footprint + a per-vertex value (lift or shear, N). */
+  peelMap(
+    kind: "peel" | "peelshear"
+  ): Promise<{ positions: Float32Array; values: Float32Array }> {
+    return this.call({ op: "peelMap", kind });
+  }
+
   /** Voxel hull with exact nodal displacements (results-on-voxel-mesh view). */
   voxelResults(): Promise<{
     positions: Float32Array;

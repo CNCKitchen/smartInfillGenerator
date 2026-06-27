@@ -1459,6 +1459,53 @@ impl Model {
         Ok(serde_json::json!({ "maxDisplacement": max }).to_string())
     }
 
+    /// Bed-peel as a flat heatmap sitting ON the build plate: a triangle soup
+    /// covering the part's FOOTPRINT (bottom-layer solid cells of the coarse
+    /// build grid) at z = bed, plus a per-vertex value (lift or shear). Lets the
+    /// risk be read from a normal top/iso view instead of from under the part.
+    /// Returns `[positions Float32Array (9/tri), values Float32Array (3/tri)]`.
+    pub fn peel_map(&self, kind: &str) -> Result<js_sys::Array, JsValue> {
+        let pf = self
+            .build_peel
+            .as_ref()
+            .ok_or_else(|| err("no peel data — run the build sim first"))?;
+        let bg = self.build_grid.as_ref().ok_or_else(|| err("no build grid"))?;
+        let src = if kind == "peelshear" { &pf.shear } else { &pf.lift };
+        let (nx, ny) = (bg.nx, bg.ny);
+        let mx = pf.mx;
+        // Float the map a hair above the plate so it doesn't z-fight the grid.
+        let z = (pf.origin[2] + 0.02 * pf.h) as f32;
+        let node = |ix: usize, iy: usize| -> ([f32; 3], f32) {
+            (
+                [
+                    (pf.origin[0] + ix as f64 * pf.h) as f32,
+                    (pf.origin[1] + iy as f64 * pf.h) as f32,
+                    z,
+                ],
+                src[iy * mx + ix].max(0.0), // only upward lift = risk
+            )
+        };
+        let mut pos: Vec<f32> = Vec::new();
+        let mut val: Vec<f32> = Vec::new();
+        for cy in 0..ny {
+            for cx in 0..nx {
+                if bg.scale[cy * nx + cx] <= 0.0 {
+                    continue; // bottom layer (cz = 0): index is cy*nx + cx
+                }
+                let corners = [(cx, cy), (cx + 1, cy), (cx + 1, cy + 1), (cx, cy + 1)];
+                let n: Vec<([f32; 3], f32)> = corners.iter().map(|&(a, b)| node(a, b)).collect();
+                for &i in &[0usize, 1, 2, 0, 2, 3] {
+                    pos.extend_from_slice(&n[i].0);
+                    val.push(n[i].1);
+                }
+            }
+        }
+        let arr = js_sys::Array::new();
+        arr.push(&js_sys::Float32Array::from(pos.as_slice()));
+        arr.push(&js_sys::Float32Array::from(val.as_slice()));
+        Ok(arr)
+    }
+
     /// Bed-peel risk as a per-mesh-vertex scalar (3 per display triangle, same
     /// layout as `result_field`), sampled from the last build sim's bed
     /// reactions. `kind`: "peel" = upward lift (+Z, the peel driver), "peelshear"

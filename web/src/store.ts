@@ -821,19 +821,21 @@ async function pushScalarField(set: SetState, get: () => AppState) {
   const kind = get().resultField;
   // Displacement fields are colored client-side from the displacement buffer:
   // |u| magnitude (-1) or a signed X/Y/Z component (0/1/2). No engine fetch.
-  // Build-sim bed-peel risk fields: a per-vertex scalar in N (uncalibrated),
-  // anchored at 0 (no peel) so the colormap reads risk = warmer. Fetched fresh
-  // each time (build-specific, not in the analysis field cache).
+  // Build-sim bed-peel: shown as a flat heatmap lying ON the plate (visible
+  // from above), NOT painted on the part — so leave the part in its plain
+  // deformed shade and drop any stress coloring. Anchored at 0, N, uncalibrated.
   if (kind === "peel" || kind === "peelshear") {
     sceneEvents.onScalarField?.(null);
-    const values = await engine.peelField(kind as "peel" | "peelshear");
+    const { positions, values } = await engine.peelMap(kind as "peel" | "peelshear");
     if (get().resultField !== kind) return;
     let max = 0;
     for (let i = 0; i < values.length; i++) if (values[i] > max) max = values[i];
     set({ fieldRange: { min: 0, max } });
-    sceneEvents.onScalarField?.(values, false, false);
+    sceneEvents.onPeelMap?.(positions, values, max);
     return;
   }
+  // Any non-peel field: make sure a previous bed-peel heatmap is gone.
+  sceneEvents.onPeelMap?.(null, null, 0);
   const dispComp = kind === "u" ? -1 : kind === "ux" ? 0 : kind === "uy" ? 1 : kind === "uz" ? 2 : null;
   if (dispComp !== null) {
     sceneEvents.onScalarField?.(null);
@@ -1046,6 +1048,13 @@ export interface SceneEvents {
   /** Build-sim live preview: growing deformed active hull (printed voxels),
    *  jet-colored by normalised |u| (`mags`). */
   onBuildActive?: (positions: Float32Array | null, mags?: Float32Array | null) => void;
+  /** Build-sim bed-peel heatmap on the plate (flat soup + per-vertex value,
+   *  jet-normalised to `max`). null clears it. */
+  onPeelMap?: (
+    positions: Float32Array | null,
+    values: Float32Array | null,
+    max: number
+  ) => void;
   /** Same part, new pose (orientation tools): swap positions in place. */
   onModelTransformed?: (positions: Float32Array, bbox: LoadedModel["bbox"]) => void;
   /** Symmetry plane state for the viewport: enabled + plane n·p = c. */
@@ -1371,6 +1380,7 @@ function clearLiveResultView(set: (p: Partial<AppState>) => void, get: () => App
   session.invalidateSolution();
   sceneEvents.onLegendRange?.(null, null);
   sceneEvents.onScalarField?.(null);
+  sceneEvents.onPeelMap?.(null, null, 0);
   sceneEvents.onRegions?.(null);
   sceneEvents.onResultSolid?.(false);
   sceneEvents.onVertexDensity?.(null);
@@ -3363,6 +3373,7 @@ export const useStore = create<AppState>((set, get) => ({
           stats: previewStats(0),
         });
         sceneEvents.onViewState?.("deformed", exag);
+        sceneEvents.onPeelMap?.(null, null, 0); // clear any prior run's bed map
         const out = await engine.buildSim(
           { shrink, state: st0.buildState, exaggeration: exag },
           (p, positions, mags) => {
@@ -4157,6 +4168,13 @@ export const useStore = create<AppState>((set, get) => ({
     sceneEvents.onVoxelCutActive?.(false);
     set({ viewMode: mode });
     sceneEvents.onViewState?.(mode, get().deformScale);
+    // The bed-peel heatmap belongs only to the deformed result view.
+    if (mode !== "deformed") {
+      sceneEvents.onPeelMap?.(null, null, 0);
+    } else if (get().resultSurface !== "voxel" && get().hasResult) {
+      // STL deformed view: re-assert the active field (repaints peel/stress).
+      void pushScalarField(set, get);
+    }
     // Entering results with the voxel surface chosen: (re)load lazily —
     // an optimize lands on the density view, so the hull may be stale.
     if (mode === "deformed" && get().resultSurface === "voxel" && !session.isVoxelLoaded) {

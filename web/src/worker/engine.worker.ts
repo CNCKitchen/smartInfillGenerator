@@ -141,6 +141,7 @@ type Req =
   | { id: number; op: "setIsoThreshold"; threshold: number; smoothIters: number }
   | { id: number; op: "resultField"; kind: string }
   | { id: number; op: "peelField"; kind: string }
+  | { id: number; op: "peelMap"; kind: string }
   | { id: number; op: "voxelResults" }
   | { id: number; op: "voxelResultField"; kind: string }
   | { id: number; op: "stashResult"; resultId: string }
@@ -499,6 +500,16 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
         (self as unknown as Worker).postMessage({ id: msg.id, ok: true, data: values }, [
           values.buffer,
         ]);
+        return;
+      }
+      case "peelMap": {
+        const arr = requireModel().peel_map(msg.kind);
+        const positions = arr[0] as Float32Array;
+        const values = arr[1] as Float32Array;
+        (self as unknown as Worker).postMessage(
+          { id: msg.id, ok: true, data: { positions, values } },
+          [positions.buffer, values.buffer]
+        );
         return;
       }
       case "voxelResults": {

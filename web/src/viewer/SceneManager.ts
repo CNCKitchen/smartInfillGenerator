@@ -198,6 +198,8 @@ export class SceneManager {
   private buildGroup = new THREE.Group();
   private buildGhost: THREE.Object3D | null = null;
   private buildActive: THREE.Object3D | null = null;
+  // Build-sim bed-peel heatmap: a flat jet-colored soup lying on the plate.
+  private peelMap: THREE.Object3D | null = null;
 
   // Rigid-body-mode animation
   private rbmMode: { t: number[]; r: number[]; center: number[] } | null = null;
@@ -607,6 +609,7 @@ export class SceneManager {
     this.setVoxelMesh(null, null);
     this.setBuildGhost(null);
     this.setBuildActive(null);
+    this.setPeelMap(null, null, 0);
     this.setOptShape(null, null);
 
     this.geometry = new THREE.BufferGeometry();
@@ -1875,6 +1878,38 @@ export class SceneManager {
   /** refreshView handles preview vs normal visibility (see its early branch). */
   private updateBuildVisibility() {
     this.refreshView();
+  }
+
+  /** Build-sim bed-peel heatmap: a flat triangle soup at the plate, jet-colored
+   *  by `values / max`. Sits in world space under the part so the peel reads
+   *  from a top/iso view. null clears it. */
+  setPeelMap(positions: Float32Array | null, values: Float32Array | null, max: number) {
+    if (this.peelMap) {
+      this.scene.remove(this.peelMap);
+      this.disposeMesh(this.peelMap);
+      this.peelMap = null;
+    }
+    if (positions && positions.length) {
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+      const n = positions.length / 3;
+      const colors = new Float32Array(positions.length);
+      const inv = max > 0 ? 1 / max : 0;
+      for (let i = 0; i < n; i++) {
+        const [r, g, b] = jet(values && i < values.length ? values[i] * inv : 0);
+        colors[3 * i] = r;
+        colors[3 * i + 1] = g;
+        colors[3 * i + 2] = b;
+      }
+      geo.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+      const mat = new THREE.MeshBasicMaterial({
+        vertexColors: true,
+        side: THREE.DoubleSide,
+        clippingPlanes: this.sectionOn ? [this.sectionPlane] : null,
+      });
+      this.peelMap = new THREE.Mesh(geo, mat);
+      this.scene.add(this.peelMap);
+    }
   }
 
   setVoxelMesh(
