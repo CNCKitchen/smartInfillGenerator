@@ -8,13 +8,22 @@
 import { useShallow } from "zustand/shallow";
 import { useStore } from "../store";
 
-const STEPS: { n: number; label: string; title: string }[] = [
+const OPTIMIZE_STEPS: { n: number; label: string; title: string }[] = [
   { n: 1, label: "Model", title: "1 · Model" },
   { n: 2, label: "Loads", title: "2 · Boundary conditions" },
   { n: 3, label: "Properties", title: "3 · Properties — material, print settings, analysis grid" },
   { n: 4, label: "Verify", title: "4 · Verify setup" },
   { n: 5, label: "Optimize", title: "5 · Optimize infill" },
   { n: 6, label: "Export", title: "6 · View & export" },
+];
+
+// Build Sim ignores structural loads/verify/optimize — only the part, its
+// material/grid, the simulation, and export.
+const BUILDSIM_STEPS: { n: number; label: string; title: string }[] = [
+  { n: 1, label: "Model", title: "1 · Model" },
+  { n: 2, label: "Properties", title: "2 · Material & analysis grid" },
+  { n: 3, label: "Simulate", title: "3 · Build simulation — warping & bed peel" },
+  { n: 4, label: "Export", title: "4 · View & export" },
 ];
 
 export function StepRail() {
@@ -25,10 +34,13 @@ export function StepRail() {
       check: s.check,
       hasResult: s.hasResult,
       optSummary: s.optSummary,
+      appMode: s.appMode,
       activeStep: s.activeStep,
       setActiveStep: s.setActiveStep,
     }))
   );
+  const buildsim = s.appMode === "buildsim";
+  const STEPS = buildsim ? BUILDSIM_STEPS : OPTIMIZE_STEPS;
   const hasSupport = s.bcs.some(
     (b) =>
       (b.kind === "fixed" ||
@@ -40,14 +52,21 @@ export function StepRail() {
   const hasLoad = s.bcs.some(
     (b) => (b.kind === "force" || b.kind === "pressure") && b.tris.length > 0
   );
-  const done: Record<number, boolean> = {
-    1: !!s.model,
-    2: hasSupport && hasLoad,
-    3: !!s.model, // material & resolution always carry valid defaults
-    4: !!s.check?.ok || s.hasResult,
-    5: !!s.optSummary,
-    6: false,
-  };
+  const done: Record<number, boolean> = buildsim
+    ? {
+        1: !!s.model,
+        2: !!s.model, // material & grid always carry valid defaults
+        3: s.hasResult, // a build sim has been run
+        4: false,
+      }
+    : {
+        1: !!s.model,
+        2: hasSupport && hasLoad,
+        3: !!s.model, // material & resolution always carry valid defaults
+        4: !!s.check?.ok || s.hasResult,
+        5: !!s.optSummary,
+        6: false,
+      };
   const active = s.model ? s.activeStep : 1;
   return (
     <nav className="rail" aria-label="Workflow">

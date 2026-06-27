@@ -4,7 +4,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useShallow } from "zustand/shallow";
 import { useStore } from "../store";
-import { fmtLen } from "./fmt";
 
 const GITHUB_URL = "https://github.com/CNCKitchen/smartInfillGenerator";
 
@@ -14,6 +13,8 @@ export function TopBar() {
       model: s.model,
       fileName: s.fileName,
       busy: s.busy,
+      appMode: s.appMode,
+      setAppMode: s.setAppMode,
       openSettings: s.openSettings,
       saveProject: s.saveProject,
       openProject: s.openProject,
@@ -53,20 +54,16 @@ export function TopBar() {
         <b>InFEAll</b>
         <span>CNC Kitchen · browser FEA</span>
       </div>
-      <div className="partchip">
-        {m ? (
-          <>
-            <b>{s.fileName}</b>
-            <span>
-              {fmtLen(m.bbox[3] - m.bbox[0])} × {fmtLen(m.bbox[4] - m.bbox[1])} ×{" "}
-              {fmtLen(m.bbox[5] - m.bbox[2])} mm
-            </span>
-            <span>{m.triCount.toLocaleString()} tris</span>
-          </>
-        ) : (
-          <span>no model — open or drop an STL / 3MF</span>
-        )}
-      </div>
+      <label className="workspace" title="Switch workspace">
+        <select
+          value={s.appMode}
+          onChange={(e) => s.setAppMode(e.target.value as "optimize" | "buildsim")}
+          disabled={!!s.busy}
+        >
+          <option value="optimize">Simulate &amp; Optimize</option>
+          <option value="buildsim">Build Simulation</option>
+        </select>
+      </label>
       <div className="grow" />
       <input
         ref={openRef}

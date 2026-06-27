@@ -132,13 +132,17 @@ export interface Material {
    *  (σzz, Z-up build direction). Typically 50–80% of σₜ — drives the
    *  conservative "worst case" safety factor. */
   strengthZ: number;
+  /** Build-sim: isotropic process shrink as a fraction (0.004 = 0.4%). The
+   *  inherent-strain warp scales linearly with it. Uncalibrated rough defaults;
+   *  this is a MATERIAL property, not a per-run knob. */
+  shrink: number;
 }
 
 export const DEFAULT_MATERIALS: Material[] = [
-  { name: "PLA", e0: 3500, nu: 0.35, density: 1.24, strength: 50, strengthZ: 35 },
-  { name: "PETG", e0: 2100, nu: 0.37, density: 1.27, strength: 45, strengthZ: 34 },
-  { name: "ABS", e0: 2250, nu: 0.37, density: 1.05, strength: 38, strengthZ: 25 },
-  { name: "ASA", e0: 2400, nu: 0.37, density: 1.07, strength: 43, strengthZ: 29 },
+  { name: "PLA", e0: 3500, nu: 0.35, density: 1.24, strength: 50, strengthZ: 35, shrink: 0.004 },
+  { name: "PETG", e0: 2100, nu: 0.37, density: 1.27, strength: 45, strengthZ: 34, shrink: 0.004 },
+  { name: "ABS", e0: 2250, nu: 0.37, density: 1.05, strength: 38, strengthZ: 25, shrink: 0.008 },
+  { name: "ASA", e0: 2400, nu: 0.37, density: 1.07, strength: 43, strengthZ: 29, shrink: 0.006 },
 ];
 
 export type PatternKey = "gyroid" | "cubic" | "grid";

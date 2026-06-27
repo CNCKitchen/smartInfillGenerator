@@ -38,6 +38,13 @@ const HEAD: Record<number, { title: string; sub: string }> = {
   6: { title: "View & export", sub: "Inspect the result, hand off to the slicer." },
 };
 
+const BUILD_HEAD: Record<number, { title: string; sub: string }> = {
+  1: { title: "Model", sub: "Drop an STL or 3MF — units are mm." },
+  2: { title: "Material & grid", sub: "Material (incl. shrink) and the analysis grid." },
+  3: { title: "Build simulation", sub: "Inherent-strain warping & bed peel, layer by layer." },
+  4: { title: "View & export", sub: "Inspect the warp, hand off the predeformed mesh." },
+};
+
 /** Surface-patch source: dihedral crease angle (the slider) or, for STEP
  *  imports, the exact BREP faces. Shared by the Model and BC steps so the
  *  "Pick surface" tool selects whole CAD faces when chosen. */
@@ -103,8 +110,9 @@ function SurfacePatchControl() {
 
 export function StepPanel() {
   const s = useStore(
-    useShallow((s) => ({ model: s.model, activeStep: s.activeStep }))
+    useShallow((s) => ({ model: s.model, activeStep: s.activeStep, appMode: s.appMode }))
   );
+  const buildsim = s.appMode === "buildsim";
   const step = s.model ? s.activeStep : 1;
 
   // Leaving the boundary-conditions workspace (clicking another step) or
@@ -133,21 +141,32 @@ export function StepPanel() {
     };
   }, []);
 
-  const head = HEAD[step];
+  const head = (buildsim ? BUILD_HEAD : HEAD)[step];
   return (
-    <section className="panel" data-bcsection={step === 2 ? true : undefined}>
+    <section className="panel" data-bcsection={!buildsim && step === 2 ? true : undefined}>
       <div className="p-head">
         <b>
           {step} · {head.title}
         </b>
         <span>{head.sub}</span>
       </div>
-      {step === 1 && <StepModel />}
-      {step === 2 && <StepBcs />}
-      {step === 3 && <StepProperties />}
-      {step === 4 && <StepVerify />}
-      {step === 5 && <StepOptimize />}
-      {step === 6 && <StepExport />}
+      {buildsim ? (
+        <>
+          {step === 1 && <StepModel />}
+          {step === 2 && <StepProperties />}
+          {step === 3 && <StepBuildSim />}
+          {step === 4 && <StepExport />}
+        </>
+      ) : (
+        <>
+          {step === 1 && <StepModel />}
+          {step === 2 && <StepBcs />}
+          {step === 3 && <StepProperties />}
+          {step === 4 && <StepVerify />}
+          {step === 5 && <StepOptimize />}
+          {step === 6 && <StepExport />}
+        </>
+      )}
     </section>
   );
 }
@@ -1039,10 +1058,6 @@ function StepVerify() {
     useShallow((s) => ({
       analyzeMode: s.analyzeMode,
       setAnalyzeMode: s.setAnalyzeMode,
-      buildShrink: s.buildShrink,
-      setBuildShrink: s.setBuildShrink,
-      buildState: s.buildState,
-      setBuildState: s.setBuildState,
       perimeters: s.perimeters,
       lineWidth: s.lineWidth,
       printInfill: s.printInfill,
@@ -1078,51 +1093,12 @@ function StepVerify() {
           >
             Solid material
           </button>
-          <button
-            className={s.analyzeMode === "buildsim" ? "on" : ""}
-            onClick={() => s.setAnalyzeMode("buildsim")}
-            title="FDM build simulation: inherent-strain warping + bed peel (sequential layer activation)"
-          >
-            Build sim
-          </button>
         </div>
         <div className="dim small">
           {s.analyzeMode === "printed"
             ? `Skin ${s.perimeters} × ${s.lineWidth} mm at 100%, interior ${s.printInfill}% ${s.pattern} — accuracy is the accuracy of the calibrated E(ρ) curve.`
-            : s.analyzeMode === "solid"
-              ? "Fully dense E₀ everywhere — answers \"how much stiffness does printing cost me?\" next to an as-printed run."
-              : "Inherent-strain build simulation: predicts warping (Solve lands in the deformed view) and bed peel. Ignores supports/loads. Uncalibrated — shape is meaningful, absolute magnitude is not."}
+            : "Fully dense E₀ everywhere — answers \"how much stiffness does printing cost me?\" next to an as-printed run."}
         </div>
-        {s.analyzeMode === "buildsim" && (
-          <div className="toolrow">
-            <label className="dim small" style={{ display: "flex", alignItems: "center", gap: 4 }}>
-              Shrink %
-              <input
-                type="number"
-                step={0.1}
-                value={(-s.buildShrink * 100).toFixed(1)}
-                onChange={(e) => s.setBuildShrink(-Math.abs(parseFloat(e.target.value) || 0) / 100)}
-                style={{ width: 64 }}
-              />
-            </label>
-            <div className="seg">
-              <button
-                className={s.buildState === "released" ? "on" : ""}
-                onClick={() => s.setBuildState("released")}
-                title="Off-bed sprung shape (the predeform target)"
-              >
-                Released
-              </button>
-              <button
-                className={s.buildState === "bonded" ? "on" : ""}
-                onClick={() => s.setBuildState("bonded")}
-                title="Distortion while still held on the bed"
-              >
-                On bed
-              </button>
-            </div>
-          </div>
-        )}
       </div>
       <div className="toolrow">
         <button onClick={() => void s.runCheck()} disabled={!!s.busy}>
@@ -1144,12 +1120,7 @@ function StepVerify() {
       {s.stats && s.hasResult && !s.optSummary && (
         <div className="status ok">
           Max deflection <b>{fmtDisp(s.stats.maxDisplacement)}</b> ·{" "}
-          {s.analyzeMode === "buildsim"
-            ? "build sim (warp)"
-            : s.printedStats
-              ? `as printed (${s.printedStats.infillPct}% ${s.printedStats.pattern})`
-              : "solid"}{" "}
-          ·{" "}
+          {s.printedStats ? `as printed (${s.printedStats.infillPct}% ${s.printedStats.pattern})` : "solid"} ·{" "}
           {s.stats.iterations} iters · {s.stats.seconds.toFixed(1)} s
         </div>
       )}
@@ -1158,6 +1129,73 @@ function StepVerify() {
         the field picker sits under the view tabs, playback at the bottom, min/max markers and
         click-to-edit scale & exaggeration in the legend. As-printed results land in the dock on
         the right (mass, deflection, min safety factor).
+      </div>
+    </>
+  );
+}
+
+// ---------------- Build Sim · 3 · Simulate ----------------
+
+function StepBuildSim() {
+  const s = useStore(
+    useShallow((s) => ({
+      material: s.material,
+      buildState: s.buildState,
+      setBuildState: s.setBuildState,
+      runSolve: s.runSolve,
+      busy: s.busy,
+      stats: s.stats,
+      hasResult: s.hasResult,
+      openSettings: s.openSettings,
+    }))
+  );
+  return (
+    <>
+      <div className="group">
+        <div className="g-label">
+          <span>Show state</span>
+        </div>
+        <div className="seg">
+          <button
+            className={s.buildState === "released" ? "on" : ""}
+            onClick={() => s.setBuildState("released")}
+            title="Off-bed sprung shape — the predeform target"
+          >
+            Released
+          </button>
+          <button
+            className={s.buildState === "bonded" ? "on" : ""}
+            onClick={() => s.setBuildState("bonded")}
+            title="Distortion while still held on the bed"
+          >
+            On bed
+          </button>
+        </div>
+        <div className="dim small">
+          Inherent-strain warp via sequential layer activation. Shrink is a material property (
+          <b>{s.material.name}</b>: {(s.material.shrink * 100).toFixed(2)}%) — edit it in{" "}
+          <button className="linkbtn" onClick={() => s.openSettings(true)}>
+            ⚙ Settings
+          </button>
+          . Uncalibrated: the warp shape is meaningful, the absolute magnitude is not.
+        </div>
+      </div>
+      <div className="toolrow">
+        <button className="primary" onClick={() => void s.runSolve()} disabled={!!s.busy}>
+          Run build simulation
+        </button>
+      </div>
+      {s.stats && s.hasResult && (
+        <div className="status ok">
+          Max warp <b>{fmtDisp(s.stats.maxDisplacement)}</b> ·{" "}
+          {s.buildState === "released" ? "released (off-bed)" : "on bed"} ·{" "}
+          {s.stats.seconds.toFixed(1)} s
+        </div>
+      )}
+      <div className="hint">
+        Build sim ignores supports/loads — its only inputs are the part, the material shrink, and
+        the build plate. Solve lands in the deformed <b>Results</b> view; switch Released / On&nbsp;bed
+        above and re-run to compare. (Live per-layer progress and saved dual results are coming next.)
       </div>
     </>
   );

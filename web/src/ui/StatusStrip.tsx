@@ -6,12 +6,15 @@
 
 import { useShallow } from "zustand/shallow";
 import { useStore } from "../store";
+import { fmtLen } from "./fmt";
 
 export function StatusStrip() {
   const s = useStore(
     useShallow((s) => ({
       error: s.error,
       busy: s.busy,
+      model: s.model,
+      fileName: s.fileName,
       voxelInfo: s.voxelInfo,
       optProgress: s.optProgress,
       stats: s.stats,
@@ -25,11 +28,18 @@ export function StatusStrip() {
   const state = s.busy ? s.busy.replace(/…$/, "").toUpperCase() : s.error ? "ERROR" : "READY";
   const v = s.voxelInfo;
   const p = s.optProgress;
+  const m = s.model;
   return (
     <footer className="strip">
       <div>
         <span className={lamp} /> {state}
       </div>
+      {m && (
+        <div className="partinfo" title={s.fileName ?? undefined}>
+          <b>{s.fileName}</b> · {fmtLen(m.bbox[3] - m.bbox[0])} × {fmtLen(m.bbox[4] - m.bbox[1])} ×{" "}
+          {fmtLen(m.bbox[5] - m.bbox[2])} mm · {m.triCount.toLocaleString()} tris
+        </div>
+      )}
       {v && (
         <div>
           GRID{" "}

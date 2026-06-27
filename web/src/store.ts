@@ -98,6 +98,8 @@ function loadSettings(): PersistedSettings {
               typeof m.strengthZ === "number" && m.strengthZ > 0
                 ? m.strengthZ
                 : Math.round(0.7 * strength),
+            // Pre-build-sim saves: default to a ~0.5% process shrink.
+            shrink: typeof m.shrink === "number" && m.shrink > 0 ? m.shrink : 0.005,
           };
         });
       if (!fallback.materials.length) fallback.materials = DEFAULT_MATERIALS.map((m) => ({ ...m }));
@@ -358,8 +360,8 @@ interface AppState {
   /** What "Solve once" analyzes: the print, the CAD-ideal solid, or the FDM
    *  build simulation (inherent-strain warp + bed peel). */
   analyzeMode: "printed" | "solid" | "buildsim";
-  /** Build-sim: isotropic per-layer shrink fraction (negative = shrink). */
-  buildShrink: number;
+  /** Active top-level workspace: structural Simulate & Optimize, or Build Sim. */
+  appMode: "optimize" | "buildsim";
   /** Build-sim: which state to deform by (off-bed sprung shape or on the bed). */
   buildState: "released" | "bonded";
   /** Extras of the last as-printed solve (results dock); null = solid run. */
@@ -580,7 +582,7 @@ interface AppState {
   setSnapVoxel(on: boolean): void;
   setCompositeSkin(on: boolean): void;
   setAnalyzeMode(m: "printed" | "solid" | "buildsim"): void;
-  setBuildShrink(v: number): void;
+  setAppMode(m: "optimize" | "buildsim"): void;
   setBuildState(s: "released" | "bonded"): void;
   setMeshDensity(on: boolean): void;
   setSmoothStress(on: boolean): void;
@@ -2092,7 +2094,7 @@ export const useStore = create<AppState>((set, get) => ({
   snapVoxel: true,
   compositeSkin: true,
   analyzeMode: "printed",
-  buildShrink: -0.003,
+  appMode: "optimize",
   buildState: "released",
   printedStats: null,
   meshDensity: false,
@@ -2155,7 +2157,8 @@ export const useStore = create<AppState>((set, get) => ({
   solveTol: 0,
 
   setActiveStep(n) {
-    set({ activeStep: Math.min(6, Math.max(1, Math.round(n))) });
+    const maxStep = get().appMode === "buildsim" ? 4 : 6;
+    set({ activeStep: Math.min(maxStep, Math.max(1, Math.round(n))) });
     // The symmetry plane is an Optimize-step editing aid — hide it elsewhere.
     pushSymmetry(get);
   },
@@ -2667,7 +2670,7 @@ export const useStore = create<AppState>((set, get) => ({
   addMaterial() {
     const mats = [
       ...get().materials,
-      { name: "Custom", e0: 2000, nu: 0.35, density: 1.2, strength: 40, strengthZ: 28 },
+      { name: "Custom", e0: 2000, nu: 0.35, density: 1.2, strength: 40, strengthZ: 28, shrink: 0.005 },
     ];
     set({ materials: mats });
     saveSettings(mats, get().curves, get().levelSettings);
@@ -2822,8 +2825,10 @@ export const useStore = create<AppState>((set, get) => ({
     invalidateGrid(set, get);
     if (get().model) void engine.setCompositeSkin(on);
   },
-  setBuildShrink(v) {
-    set({ buildShrink: v });
+  setAppMode(m) {
+    // Build Sim has a 4-station rail; clamp the carriage when switching in.
+    const maxStep = m === "buildsim" ? 4 : 6;
+    set({ appMode: m, activeStep: Math.min(get().activeStep, maxStep) });
   },
   setBuildState(s) {
     set({ buildState: s });
@@ -3131,7 +3136,7 @@ export const useStore = create<AppState>((set, get) => ({
     // Build sim ignores structural BCs (its only "loads" are the per-layer
     // eigenstrain + the build plate), so it skips the multi-step path and the
     // under-constraint gate, and isn't retained as a switchable structural result.
-    const buildsim = get().analyzeMode === "buildsim";
+    const buildsim = get().appMode === "buildsim";
     try {
       // Multiple load steps: solve them all (each manages its own residual poll
       // and result stash). Single step falls through to the byte-identical path.
@@ -3170,7 +3175,7 @@ export const useStore = create<AppState>((set, get) => ({
       // engine reset its shared buffer when the solve call below was issued).
       set({ solveResiduals: [] });
       stopResidualPoll = session.startResidualPoll((r) => set({ solveResiduals: r }));
-      if (printed) {
+      if (!buildsim && printed) {
         appendLog(
           set,
           `Solve as printed: ${m.name}, skin ${st0.perimeters}×${st0.lineWidth} mm solid, ` +
@@ -3207,11 +3212,12 @@ export const useStore = create<AppState>((set, get) => ({
               : `skin resolved by ${out.stats.skinLayers} cell layer${out.stats.skinLayers === 1 ? "" : "s"}`)
         );
       } else if (buildsim) {
+        const shrink = -Math.abs(st0.material.shrink); // material property; eigenstrain shrinks
         appendLog(
           set,
-          `Build sim (inherent strain): ${(st0.buildShrink * 100).toFixed(2)}% shrink, ${st0.buildState} state — warping + bed peel …`
+          `Build sim (inherent strain): ${st0.material.name} ${(Math.abs(shrink) * 100).toFixed(2)}% shrink, ${st0.buildState} state — warping + bed peel …`
         );
-        const out = await engine.buildSim({ shrink: st0.buildShrink, state: st0.buildState });
+        const out = await engine.buildSim({ shrink, state: st0.buildState });
         displacements = out.displacements;
         // Synthesize a SolveStats so the deformed view + dock render uniformly.
         stats = {
