@@ -37,6 +37,12 @@ export function ViewportChips() {
       selectResult: s.selectResult,
       wireframe: s.wireframe,
       setWireframe: s.setWireframe,
+      strainView: s.strainView,
+      setStrainView: s.setStrainView,
+      strainLayer: s.strainLayer,
+      strainLayerMax: s.strainLayerMax,
+      strainPeakMPa: s.strainPeakMPa,
+      setStrainLayer: s.setStrainLayer,
       resultSurface: s.resultSurface,
       setResultSurface: s.setResultSurface,
       resultField: s.resultField,
@@ -70,6 +76,37 @@ export function ViewportChips() {
           >
             Wireframe
           </button>
+          {/* Build Sim: inherent-strain layer view — scrub the build height and
+              color cells by their per-element strain source. */}
+          {s.appMode === "buildsim" && s.viewMode === "mesh" && (
+            <button
+              className={s.strainView ? "on" : ""}
+              onClick={() => void s.setStrainView(!s.strainView)}
+              title="Color cells by the inherent-strain source the build sim applies (∝ density), and scrub the build layers"
+            >
+              Inherent strain
+            </button>
+          )}
+        </div>
+      )}
+
+      {s.viewMode === "mesh" && s.strainView && s.strainLayerMax > 0 && (
+        <div className="fieldchip strainscrub">
+          <span title="Show the part built up to this voxel layer">
+            Layer <b>{Math.min(s.strainLayer || s.strainLayerMax, s.strainLayerMax)}</b> /{" "}
+            {s.strainLayerMax}
+          </span>
+          <input
+            type="range"
+            min={1}
+            max={s.strainLayerMax}
+            value={Math.min(s.strainLayer || s.strainLayerMax, s.strainLayerMax)}
+            onChange={(e) => void s.setStrainLayer(Number(e.target.value))}
+          />
+          <span className="chipdiv" />
+          <span title="Peak per-element inherent-strain source (uncalibrated)">
+            peak <b>{s.strainPeakMPa.toFixed(2)} MPa</b>
+          </span>
         </div>
       )}
 

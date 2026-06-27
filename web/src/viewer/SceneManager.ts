@@ -286,6 +286,8 @@ export class SceneManager {
    *  interior = infill ratio / optimized density, composite cells blended). */
   private voxelDensity: Float32Array | null = null;
   private meshDensity = false;
+  // Force the density ramp on mesh cells (inherent-strain layer view).
+  private meshFieldColor = false;
   /** The voxel hull already carries the section cut in its geometry. */
   private voxelCutActive = false;
   private capDisposables: { dispose(): void }[] = [];
@@ -2030,6 +2032,14 @@ export class SceneManager {
     this.applyMeshTint();
   }
 
+  /** Force the 0–1 ramp on the mesh-view cells regardless of the density toggle
+   *  — used by the inherent-strain layer view (the value channel carries the
+   *  normalised source strength). */
+  setMeshFieldColor(on: boolean) {
+    this.meshFieldColor = on;
+    this.applyMeshTint();
+  }
+
   /** Voxel-true section active: the cut lives in the geometry, so the voxel
    *  group must NOT also be plane-clipped (and its stencil cap hides). */
   setVoxelCutActive(on: boolean) {
@@ -2053,7 +2063,7 @@ export class SceneManager {
     // flat chassis gray-blue.
     const c = new THREE.Color();
     for (let v = 0; v < arr.length / 3; v++) {
-      if (this.meshDensity && density) {
+      if ((this.meshDensity || this.meshFieldColor) && density) {
         c.setRGB(...ramp(Math.min(1, Math.max(0, density[v]))));
         arr[3 * v] = c.r;
         arr[3 * v + 1] = c.g;

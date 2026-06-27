@@ -98,6 +98,7 @@ export function Viewer() {
     sceneEvents.onBuildActive = (p, m) => scene.setBuildActive(p, m);
     sceneEvents.onPeelMap = (p, v, max) => scene.setPeelMap(p, v, max);
     sceneEvents.onMeshDensity = (on) => scene.setMeshDensity(on);
+    sceneEvents.onMeshFieldColor = (on) => scene.setMeshFieldColor(on);
     sceneEvents.onWireframe = (on) => scene.setWireframe(on);
     sceneEvents.onVoxelCutActive = (on) => scene.setVoxelCutActive(on);
     sceneEvents.onAnimateDeformed = (on) => scene.setDeformAnimate(on);

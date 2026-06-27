@@ -329,6 +329,17 @@ export class EngineClient {
     return this.call({ op: "peelMap", kind });
   }
 
+  /** Inherent-strain preview: the voxel hull up to build layer `layerMax`, with
+   *  a per-vertex source value (0..1 normalised) + edges, peak (MPa) and the
+   *  layer count `nz`. */
+  inherentStrainVoxels(
+    layerMax: number,
+    shrinkXy: number,
+    shrinkZ: number
+  ): Promise<{ hull: Float32Array; values: Float32Array; edges: Float32Array; max: number; nz: number }> {
+    return this.call({ op: "inherentStrainVoxels", layerMax, shrinkXy, shrinkZ });
+  }
+
   /** Voxel hull with exact nodal displacements (results-on-voxel-mesh view). */
   voxelResults(): Promise<{
     positions: Float32Array;

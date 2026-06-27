@@ -142,6 +142,13 @@ type Req =
   | { id: number; op: "resultField"; kind: string }
   | { id: number; op: "peelField"; kind: string }
   | { id: number; op: "peelMap"; kind: string }
+  | {
+      id: number;
+      op: "inherentStrainVoxels";
+      layerMax: number;
+      shrinkXy: number;
+      shrinkZ: number;
+    }
   | { id: number; op: "voxelResults" }
   | { id: number; op: "voxelResultField"; kind: string }
   | { id: number; op: "stashResult"; resultId: string }
@@ -509,6 +516,19 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
         (self as unknown as Worker).postMessage(
           { id: msg.id, ok: true, data: { positions, values } },
           [positions.buffer, values.buffer]
+        );
+        return;
+      }
+      case "inherentStrainVoxels": {
+        const arr = requireModel().inherent_strain_voxels(msg.layerMax, msg.shrinkXy, msg.shrinkZ);
+        const hull = arr[0] as Float32Array;
+        const values = arr[1] as Float32Array;
+        const edges = arr[2] as Float32Array;
+        const max = arr[3] as number;
+        const nz = arr[4] as number;
+        (self as unknown as Worker).postMessage(
+          { id: msg.id, ok: true, data: { hull, values, edges, max, nz } },
+          [hull.buffer, values.buffer, edges.buffer]
         );
         return;
       }

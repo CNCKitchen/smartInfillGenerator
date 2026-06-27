@@ -2867,6 +2867,68 @@ impl Model {
         ))
     }
 
+    /// Inherent-strain preview on the analysis grid: the voxel hull of solid
+    /// cells UP TO build layer `layer_max` (exclusive in Z), with a per-vertex
+    /// scalar = the per-element inherent-strain SOURCE strength,
+    /// `eps_cell · |σ₀_in-plane|` (MPa) where σ₀ = D:ε₀ is the eigenstress of the
+    /// uniform shrink `[εxy, εxy, εz]`. Because the eigenstrain is uniform, the
+    /// per-cell variation is the density (skin = full, infill = its ratio) — so
+    /// this doubles as a layer-by-layer view of WHERE and HOW STRONGLY the build
+    /// sim pulls. Returns `[hull f32 (9/tri), normValue f32 (3/tri, 0..1 for the
+    /// ramp), edges f32, maxValueMPa f64, nz u32]`.
+    pub fn inherent_strain_voxels(
+        &mut self,
+        layer_max: u32,
+        shrink_xy: f64,
+        shrink_z: f64,
+    ) -> Result<js_sys::Array, JsValue> {
+        self.ensure_grid()?;
+        let (grid, _) = self.grid.as_ref().unwrap();
+        let (gnx, gny, gnz) = (grid.nx, grid.ny, grid.nz);
+        // Unit in-plane eigenstress |λ·tr(ε₀) + 2μ·εxy| at full modulus (E=e0);
+        // density then scales it per cell. exy/ez are negative (shrink) — sign
+        // doesn't matter for the magnitude shown.
+        let (e0, nu) = (self.settings.e0, self.settings.nu);
+        let lam = e0 * nu / ((1.0 + nu) * (1.0 - 2.0 * nu));
+        let mu = e0 / (2.0 * (1.0 + nu));
+        let tr = 2.0 * shrink_xy + shrink_z;
+        let s0_unit = (lam * tr + 2.0 * mu * shrink_xy).abs() as f32;
+        // Per-cell density (occupancy × infill): the optimized field when present,
+        // else full (a solid part has a uniform source).
+        let opt_density = self.opt.as_ref().map(|o| &o.cell_density);
+        let mut value = vec![0f32; grid.cell_count()];
+        let mut maxv = 0f32;
+        for c in 0..grid.cell_count() {
+            let occ = grid.scale[c];
+            if occ <= 0.0 {
+                continue;
+            }
+            let infill = opt_density.and_then(|m| m.get(&(c as u32)).copied()).unwrap_or(1.0) as f32;
+            let v = occ * infill * s0_unit;
+            value[c] = v;
+            maxv = maxv.max(v);
+        }
+        let lmax = layer_max.min(gnz as u32) as usize;
+        let keep = move |ci: usize| -> bool {
+            let cz = ci / (gnx * gny);
+            cz < lmax
+        };
+        let (tris, edges, cell_of_tri) = grid.surface_mesh_where(&keep);
+        let inv = if maxv > 0.0 { 1.0 / maxv } else { 0.0 };
+        let mut norm = Vec::with_capacity(cell_of_tri.len() * 3);
+        for &c in &cell_of_tri {
+            let v = value[c as usize] * inv;
+            norm.extend_from_slice(&[v, v, v]);
+        }
+        let arr = js_sys::Array::new();
+        arr.push(&js_sys::Float32Array::from(tris.as_slice()));
+        arr.push(&js_sys::Float32Array::from(norm.as_slice()));
+        arr.push(&js_sys::Float32Array::from(edges.as_slice()));
+        arr.push(&JsValue::from_f64(maxv as f64));
+        arr.push(&JsValue::from_f64(gnz as f64));
+        Ok(arr)
+    }
+
     /// Exposed-face hull of the analysis voxel grid (triangle soup, xyz f32).
     pub fn voxel_hull(&mut self) -> Result<Vec<f32>, JsValue> {
         self.ensure_grid()?;

@@ -387,6 +387,15 @@ interface AppState {
   /** Mesh view: color each cell by its element density (0–1: skin = 1,
    *  interior = infill ratio / optimized density, composite cells blended). */
   meshDensity: boolean;
+  /** Mesh view (Build Sim): inherent-strain layer view — color cells by the
+   *  per-element strain SOURCE and scrub the build height with `strainLayer`. */
+  strainView: boolean;
+  /** Current build layer shown in the inherent-strain view (1..strainLayerMax). */
+  strainLayer: number;
+  /** Total voxel layers (Z) of the analysis grid — the strain scrubber range. */
+  strainLayerMax: number;
+  /** Peak inherent-strain source in the current view (MPa, for the label). */
+  strainPeakMPa: number;
   /** Smoothed stress display: fields nodal-averaged and evaluated on the
    *  true surface instead of flat per-cell (post-processing only). */
   smoothStress: boolean;
@@ -603,6 +612,8 @@ interface AppState {
   setAppMode(m: "optimize" | "buildsim"): void;
   setBuildState(s: "released" | "bonded"): void | Promise<void>;
   setMeshDensity(on: boolean): void;
+  setStrainView(on: boolean): Promise<void>;
+  setStrainLayer(layer: number): Promise<void>;
   setSmoothStress(on: boolean): void;
   setMaterialStress(on: boolean): void;
   /** Flip between smooth and discrete (banded) result contours. */
@@ -1066,6 +1077,8 @@ export interface SceneEvents {
   onSymmetry?: (enabled: boolean, normal: [number, number, number], c: number) => void;
   /** Color mesh-view cells by element density. */
   onMeshDensity?: (on: boolean) => void;
+  /** Force the density ramp on mesh cells (inherent-strain layer view). */
+  onMeshFieldColor?: (on: boolean) => void;
   /** Toggle the triangle-mesh wireframe overlay on the model. */
   onWireframe?: (on: boolean) => void;
   /** Voxel-true section active: the scene must NOT plane-clip the voxel
@@ -1280,6 +1293,35 @@ async function pushSnap(get: () => AppState) {
 async function refreshMeshView(set: SetState, get: () => AppState): Promise<boolean> {
   const st = get();
   if (!st.model || st.viewMode !== "mesh") return true;
+  // Inherent-strain layer view: voxel hull up to the scrubbed build layer,
+  // cells colored by their per-element strain source (∝ density). Uses the
+  // material shrink (XY/Z) to scale the reported source magnitude.
+  if (st.strainView) {
+    try {
+      const shrinkXy = Math.abs(st.material.shrink);
+      const shrinkZ = Math.abs(st.material.shrinkZ ?? st.material.shrink);
+      const layer = st.strainLayer > 0 ? st.strainLayer : 1_000_000;
+      const { hull, values, edges, max, nz } = await engine.inherentStrainVoxels(
+        layer,
+        shrinkXy,
+        shrinkZ
+      );
+      if (get().viewMode !== "mesh" || !get().strainView) return true;
+      set({
+        strainLayerMax: nz,
+        strainLayer: get().strainLayer > 0 ? Math.min(get().strainLayer, nz) : nz,
+        strainPeakMPa: max,
+      });
+      sceneEvents.onVoxelCutActive?.(false);
+      sceneEvents.onMeshFieldColor?.(true);
+      sceneEvents.onVoxelMesh?.(hull, edges, values);
+      return true;
+    } catch (e) {
+      set({ error: e instanceof Error ? e.message : String(e) });
+      return false;
+    }
+  }
+  sceneEvents.onMeshFieldColor?.(false);
   const wall = st.perimeters * st.lineWidth;
   const cutting = st.sectionOn && lastSectionPlane !== null;
   try {
@@ -2179,6 +2221,10 @@ export const useStore = create<AppState>((set, get) => ({
   buildResult: null,
   printedStats: null,
   meshDensity: false,
+  strainView: false,
+  strainLayer: 0,
+  strainLayerMax: 0,
+  strainPeakMPa: 0,
   smoothStress: true,
   materialStress: true,
   bandedContour: false,
@@ -2913,6 +2959,11 @@ export const useStore = create<AppState>((set, get) => ({
     clearLiveResultView(set, get);
     // Build Sim has a 4-station rail; clamp the carriage when switching in.
     const maxStep = m === "buildsim" ? 4 : 6;
+    // The inherent-strain mesh view is Build-Sim only.
+    if (m !== "buildsim" && get().strainView) {
+      set({ strainView: false });
+      sceneEvents.onMeshFieldColor?.(false);
+    }
     set({ appMode: m, activeStep: Math.min(get().activeStep, maxStep) });
   },
   async setBuildState(s) {
@@ -2964,6 +3015,18 @@ export const useStore = create<AppState>((set, get) => ({
   setMeshDensity(on) {
     set({ meshDensity: on });
     sceneEvents.onMeshDensity?.(on);
+  },
+
+  async setStrainView(on) {
+    // Turning it on resets the scrubber to "all layers" (0 → resolved to nz).
+    set({ strainView: on, strainLayer: on ? 0 : get().strainLayer });
+    if (!on) sceneEvents.onMeshFieldColor?.(false);
+    if (get().viewMode === "mesh") await refreshMeshView(set, get);
+  },
+
+  async setStrainLayer(layer) {
+    set({ strainLayer: Math.max(1, Math.round(layer)) });
+    if (get().viewMode === "mesh" && get().strainView) await refreshMeshView(set, get);
   },
 
   toggleBandedContour() {
