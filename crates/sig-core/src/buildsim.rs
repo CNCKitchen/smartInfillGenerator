@@ -744,6 +744,35 @@ mod tests {
         );
     }
 
+    /// Residual stress must subtract the eigenstrain: a freely-shrunk body is
+    /// stress-FREE (`ε(u) = ε₀` everywhere), so the residual σzz (eigen
+    /// subtracted) is ~0, while the naive `C:ε(u)` (eigen = 0) reads large. (von
+    /// Mises can't show this — an isotropic shrink is purely hydrostatic, so its
+    /// von Mises is zero either way; a normal component is the right probe.)
+    #[test]
+    fn residual_stress_of_free_shrink_is_zero() {
+        use crate::stress::{cell_field_eigen, FieldKind};
+        let (nx, ny, nz, h) = (16usize, 8usize, 8usize, 1.0f64);
+        let grid = VoxelGrid::solid_box(nx, ny, nz, h);
+        let beta = -0.01;
+        let s = SolveSettings { e0: 2400.0, nu: 0.35, ..Default::default() };
+
+        let (g, _lv) = pad_for_levels(&grid, s.max_levels);
+        let eps = grid_eps(&g);
+        let sol = solve_warp(&grid, [beta, beta, beta], &s).expect("warp");
+
+        let resid =
+            cell_field_eigen(&g, &sol.u, s.e0, s.nu, &eps, [beta, beta, beta], FieldKind::Szz);
+        let plain = cell_field_eigen(&g, &sol.u, s.e0, s.nu, &eps, [0.0; 3], FieldKind::Szz);
+        let mx = |v: &[f32]| v.iter().copied().fold(0f32, |a, b| a.max(b.abs()));
+        let (rmax, pmax) = (mx(&resid), mx(&plain));
+        assert!(pmax > 1.0, "naive σzz should be large, got {pmax:.3} MPa");
+        assert!(
+            rmax < 0.02 * pmax,
+            "residual σzz of a free shrink must be ~0: {rmax:.4} vs naive {pmax:.4} MPa"
+        );
+    }
+
     /// Feeding the as-printed infill density (a graded `eps_override`) must
     /// change the BONDED warp versus the solid hull: a soft sparse core is more
     /// compliant, so the constrained shrink redistributes. (The free RELEASED

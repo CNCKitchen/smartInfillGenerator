@@ -16,7 +16,7 @@ use sig_core::simp::OptimizeParams;
 use sig_core::solve::{
     active_nodes, pad_for_levels, solve_nodes_cached, SolveSettings, Solution, SolverCache,
 };
-use sig_core::stress::{cell_field, material_factor, recover_nodal, FieldKind};
+use sig_core::stress::{cell_field_eigen, material_factor, recover_nodal, FieldKind};
 use sig_core::threemf::{export_orca_3mf, export_stl_zip, import_3mf, weld};
 use sig_core::voxel::VoxelGrid;
 use wasm_bindgen::prelude::*;
@@ -604,6 +604,14 @@ pub struct Model {
     /// per-bed-node lift / shear, as a 2D grid over the coarse build footprint
     /// so it can be sampled onto the mesh for the "peel risk" result field.
     build_peel: Option<PeelField>,
+    /// The coarse build grid + the per-cell eps it was solved with, kept so
+    /// build-sim stress fields (residual print stress) can be evaluated on the
+    /// SAME grid the build solution lives on. `build_eigen` is the eigenstrain
+    /// that was applied — subtracted from the total strain to get residual
+    /// stress. Cleared with the other build state.
+    build_grid: Option<VoxelGrid>,
+    build_eps: Option<Vec<f32>>,
+    build_eigen: [f64; 3],
     /// Cumulative orientation transform applied since import (3×3 row-major +
     /// translation). Saved in a project so re-importing the original file +
     /// replaying this one matrix reproduces the exact oriented working mesh
@@ -861,6 +869,9 @@ impl Model {
             build_bonded: None,
             build_released: None,
             build_peel: None,
+            build_grid: None,
+            build_eps: None,
+            build_eigen: [0.0; 3],
             transform_accum: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
         })
     }
@@ -1145,6 +1156,8 @@ impl Model {
         self.build_bonded = None;
         self.build_released = None;
         self.build_peel = None;
+        self.build_grid = None;
+        self.build_eps = None;
         let grid = VoxelGrid::voxelize(&self.mesh, self.analysis_h()?);
         if grid.solid_count() == 0 {
             return Err(err("voxelization produced no solid cells — model too thin for this resolution"));
@@ -1373,6 +1386,12 @@ impl Model {
             r.iters.iter().sum::<usize>() as f64 / r.iters.len() as f64
         };
         let cells = grid.solid_count();
+        let (gnx, gny, gnz, gh) = (grid.nx, grid.ny, grid.nz, grid.h);
+        // Keep the coarse grid + the eps/eigen it was solved with so residual
+        // print-stress fields can be evaluated on the SAME grid + state later.
+        self.build_eps = Some(eps_override.unwrap_or_else(|| sig_core::solve::grid_eps(&grid)));
+        self.build_eigen = eigen;
+        self.build_grid = Some(grid);
         // Keep BOTH states so the UI can flip on bed ⇄ released with no re-solve.
         self.build_bonded = Some(r.bonded);
         self.build_released = Some(r.released);
@@ -1389,12 +1408,32 @@ impl Model {
             "cells": cells,
             "densityAware": density_aware,
             // Coarse build-grid dims (≠ analysis grid) for the log.
-            "nx": grid.nx, "ny": grid.ny, "nz": grid.nz, "h": grid.h,
+            "nx": gnx, "ny": gny, "nz": gnz, "h": gh,
         })
         .to_string();
         self.solution = Some(sol);
         self.solution_eps = None;
         Ok(out)
+    }
+
+    /// The (grid, eps, eigenstrain) the CURRENT solution lives on. For a
+    /// build-sim result — detected because the solution's node dims match the
+    /// coarse build grid — that's the coarse grid, its build eps, and the
+    /// applied eigenstrain (so stress evaluates as the RESIDUAL print stress,
+    /// `σ = C:(ε(u) − ε₀)`). Otherwise the analysis grid + its solve eps + no
+    /// eigenstrain (ordinary structural stress).
+    fn solution_grid(&self) -> Result<(&VoxelGrid, Option<&[f32]>, [f64; 3]), JsValue> {
+        let sol = self
+            .solution
+            .as_ref()
+            .ok_or_else(|| err("no solution — run Solve or Optimize"))?;
+        if let Some(bg) = &self.build_grid {
+            if bg.nx + 1 == sol.mx && bg.ny + 1 == sol.my && bg.nz + 1 == sol.mz {
+                return Ok((bg, self.build_eps.as_deref(), self.build_eigen));
+            }
+        }
+        let (g, _) = self.grid.as_ref().ok_or_else(|| err("no grid"))?;
+        Ok((g, self.solution_eps.as_deref(), [0.0; 3]))
     }
 
     /// Pick the stored build-sim solution for a state string ("bonded" → on
@@ -1627,6 +1666,8 @@ impl Model {
         self.build_bonded = None;
         self.build_released = None;
         self.build_peel = None;
+        self.build_grid = None;
+        self.build_eps = None;
     }
 
     /// Assemble a `.infeall` project zip: the original model bytes, the JS-built
@@ -2342,9 +2383,11 @@ impl Model {
     fn cell_values(&self, kind: &str) -> Result<Vec<f32>, JsValue> {
         let sol =
             self.solution.as_ref().ok_or_else(|| err("no solution — run Solve or Optimize"))?;
-        let (grid, _) = self.grid.as_ref().ok_or_else(|| err("no grid"))?;
+        // Build-sim results carry a per-cell eigenstrain so stress comes out as
+        // the residual print stress; analysis solves get eigen = 0 (unchanged).
+        let (grid, eps_opt, eigen) = self.solution_grid()?;
         let scale_eps;
-        let eps: &[f32] = match &self.solution_eps {
+        let eps: &[f32] = match eps_opt {
             Some(e) => e,
             None => {
                 scale_eps = grid.scale.clone();
@@ -2372,8 +2415,8 @@ impl Model {
         // compression doesn't delaminate); "sf" is the per-cell worst of
         // both. All capped at 99.
         let sf_material = || -> Vec<f32> {
-            let mut c = cell_field(
-                grid, &sol.u, self.settings.e0, self.settings.nu, factor, FieldKind::VonMises,
+            let mut c = cell_field_eigen(
+                grid, &sol.u, self.settings.e0, self.settings.nu, factor, eigen, FieldKind::VonMises,
             );
             for (i, v) in c.iter_mut().enumerate() {
                 let allow = self.strength as f32 * factor[i];
@@ -2384,7 +2427,7 @@ impl Model {
         let sf_layer = || -> Result<Vec<f32>, JsValue> {
             let szz = FieldKind::parse("szz").ok_or_else(|| err("szz field missing"))?;
             let mut c =
-                cell_field(grid, &sol.u, self.settings.e0, self.settings.nu, factor, szz);
+                cell_field_eigen(grid, &sol.u, self.settings.e0, self.settings.nu, factor, eigen, szz);
             for (i, v) in c.iter_mut().enumerate() {
                 let allow = self.strength_z as f32 * factor[i];
                 *v = if *v <= 1e-9 { 99.0 } else { (allow / *v).min(99.0) };
@@ -2404,7 +2447,7 @@ impl Model {
             }
             _ => {
                 let k = FieldKind::parse(kind).ok_or_else(|| err("unknown result field"))?;
-                cell_field(grid, &sol.u, self.settings.e0, self.settings.nu, factor, k)
+                cell_field_eigen(grid, &sol.u, self.settings.e0, self.settings.nu, factor, eigen, k)
             }
         })
     }
@@ -2423,7 +2466,7 @@ impl Model {
     /// onto the surface.
     pub fn result_field(&self, kind: &str) -> Result<Vec<f32>, JsValue> {
         let cells = self.cell_values(kind)?;
-        let (grid, _) = self.grid.as_ref().ok_or_else(|| err("no grid"))?;
+        let (grid, _eps, _eigen) = self.solution_grid()?;
         if self.smooth_stress {
             let nodal = recover_nodal(grid, &cells);
             Ok(sample_nodal_values(&self.mesh.tris, grid, &nodal, &cells))

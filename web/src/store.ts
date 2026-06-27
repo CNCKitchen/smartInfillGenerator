@@ -2928,6 +2928,11 @@ export const useStore = create<AppState>((set, get) => ({
         maxDisplacement: referenceMaxDisp(get().results, maxDisp),
       });
       sceneEvents.onViewState?.("deformed", deformScale);
+      // Stress fields are state-dependent (residual stress differs on bed vs
+      // released) and cached per solution — drop the cache and repaint the
+      // active field for the new state. (|u| repaints from the new disp buffer.)
+      session.clearFields();
+      await pushScalarField(set, get);
       appendLog(
         set,
         `Build state → ${s === "released" ? "released (off bed)" : "on bed"} · max |u| ${maxDisp.toExponential(2)} mm ×10`

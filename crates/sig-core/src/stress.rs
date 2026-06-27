@@ -160,6 +160,24 @@ pub fn cell_field(
     eps: &[f32],
     kind: FieldKind,
 ) -> Vec<f32> {
+    cell_field_eigen(grid, u, e0, nu, eps, [0.0; 3], kind)
+}
+
+/// Like [`cell_field`], but subtracts a uniform **eigenstrain** `eigen`
+/// (`[εx, εy, εz]`, shear-free) from the total strain before evaluating, so the
+/// result is the **residual elastic** state `σ = C : (ε(u) − ε₀)` (and the
+/// returned strains are the elastic strains). This is what the build sim needs:
+/// the locked-in print stress that drives delamination (σzz tension across
+/// layers). With `eigen = [0,0,0]` it is identical to [`cell_field`].
+pub fn cell_field_eigen(
+    grid: &VoxelGrid,
+    u: &[f32],
+    e0: f64,
+    nu: f64,
+    eps: &[f32],
+    eigen: [f64; 3],
+    kind: FieldKind,
+) -> Vec<f32> {
     let (nx, ny, nz) = (grid.nx, grid.ny, grid.nz);
     let (mx, my) = (nx + 1, ny + 1);
     let inv4h = 1.0 / (4.0 * grid.h);
@@ -193,6 +211,10 @@ pub fn cell_field(
                 gxy *= inv4h;
                 gyz *= inv4h;
                 gzx *= inv4h;
+                // Residual ELASTIC strain = total − eigenstrain (shear-free ε₀).
+                exx -= eigen[0];
+                eyy -= eigen[1];
+                ezz -= eigen[2];
 
                 let v = match kind {
                     FieldKind::Exx => exx,
