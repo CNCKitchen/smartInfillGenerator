@@ -3268,13 +3268,28 @@ export const useStore = create<AppState>((set, get) => ({
         // (activated) cells, jet-colored by |u|, with the displacement legend —
         // so it reads like the final result as it builds.
         const exag = 10;
+        const previewStats = (maxU: number) =>
+          ({
+            iterations: 0,
+            relResidual: 0,
+            converged: true,
+            maxDisplacement: maxU,
+            seconds: 0,
+            residuals: [],
+            tol: get().solveTol,
+          }) as SolveStats;
+        // The live preview hull bakes 10× geometric exaggeration. Pin autoScale=1
+        // so the legend reads exactly ×10 (autoScale·deformScale) and `stats` so
+        // the legend even shows (it gates on viewMode==="deformed" && stats).
         set({
           busy: "Build sim…",
           buildProgress: { done: 0, total: 0 },
           deformScale: exag,
+          autoScale: 1,
           hasResult: true,
           viewMode: "deformed",
           resultField: "u",
+          stats: previewStats(0),
         });
         sceneEvents.onViewState?.("deformed", exag);
         const out = await engine.buildSim(
@@ -3285,7 +3300,12 @@ export const useStore = create<AppState>((set, get) => ({
             // it and keep the legend in sync with the running max.
             if (positions && positions.length > 0) {
               sceneEvents.onBuildActive?.(positions, mags);
-              set({ legendMin: 0, legendMax: p.maxU, fieldRange: { min: 0, max: p.maxU } });
+              set({
+                stats: previewStats(p.maxU),
+                legendMin: 0,
+                legendMax: p.maxU,
+                fieldRange: { min: 0, max: p.maxU },
+              });
               sceneEvents.onLegendRange?.(0, p.maxU);
             }
           }
@@ -3294,6 +3314,16 @@ export const useStore = create<AppState>((set, get) => ({
         sceneEvents.onBuildActive?.(null);
         set({ buildProgress: null });
         displacements = out.displacements;
+        // Final exaggeration: match the preview's 10× GEOMETRIC. The scene's
+        // autoScale = 0.08·diag/maxDisp, and the shown factor is autoScale·
+        // deformScale, so deformScale = 10/autoScale → exactly ×10 (not the
+        // ~230× that deformScale=10 would give on top of autoScale).
+        const bb = get().model?.bbox;
+        if (bb) {
+          const diag = Math.hypot(bb[3] - bb[0], bb[4] - bb[1], bb[5] - bb[2]);
+          const autoS = (0.08 * diag) / Math.max(out.stats.maxDisplacement, 1e-9);
+          set({ deformScale: 10 / autoS });
+        }
         // Synthesize a SolveStats so the deformed view + dock render uniformly.
         stats = {
           iterations: out.stats.layers,

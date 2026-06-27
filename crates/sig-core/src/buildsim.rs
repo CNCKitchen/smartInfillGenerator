@@ -32,9 +32,10 @@ use crate::solve::{
 use crate::voxel::VoxelGrid;
 
 /// Penalty stiffness for a 3-2-1 pin DOF, relative to a cell's stiffness
-/// (`~e0·h`). Large enough that the pinned displacement error is ~1e-6 of the
-/// shrinkage, small enough not to wreck MGCG conditioning.
-const PIN_REL: f64 = 1.0e6;
+/// (`~e0·h`). Large enough that the pinned displacement error is negligible
+/// (~1e-4 of the shrinkage), small enough that the rigid-body penalty doesn't
+/// wreck MGCG conditioning on the free-body release solve.
+const PIN_REL: f64 = 1.0e4;
 
 /// Stiffness factor for not-yet-printed "quiet" cells in sequential activation.
 /// Small enough to be mechanically negligible, large enough to keep the
@@ -525,7 +526,12 @@ pub fn solve_build_progress(
     if ground_rigid_body(&g, &mut np).is_none() {
         return Err(SolveError::NoFixedNodes);
     }
-    let released = solve_nodes(&g, levels, &np, s)?;
+    // The release is a free body (only the 3-2-1 pin), so its operator is
+    // near-singular in the rigid-body modes and MGCG converges slowly. The warp
+    // SHAPE is fine well before machine tolerance, so relax it and cap the
+    // iterations rather than grinding to the global cap.
+    let s_release = SolveSettings { tol: s.tol.max(2.0e-3), max_iter: s.max_iter.min(600), ..*s };
+    let released = solve_nodes(&g, levels, &np, &s_release)?;
 
     Ok(BuildResult {
         bonded: solution_from(&g, u_b, it),

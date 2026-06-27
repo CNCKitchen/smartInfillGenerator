@@ -1872,18 +1872,9 @@ export class SceneManager {
     this.updateBuildVisibility();
   }
 
-  /** While the preview is up, hide the normal model/voxel/BC views; on clear,
-   *  restore them via refreshView. */
+  /** refreshView handles preview vs normal visibility (see its early branch). */
   private updateBuildVisibility() {
-    const on = !!(this.buildGhost || this.buildActive);
-    this.buildGroup.visible = on;
-    if (on) {
-      if (this.mesh) this.mesh.visible = false;
-      this.voxelGroup.visible = false;
-      this.bcMarkers.visible = false;
-    } else {
-      this.refreshView();
-    }
+    this.refreshView();
   }
 
   setVoxelMesh(
@@ -2760,6 +2751,18 @@ export class SceneManager {
   /** Re-derive positions, colors, part opacity, and overlay visibility. */
   private refreshView() {
     if (!this.mesh) return;
+    // Build-sim live preview overrides everything: only the growing active hull
+    // is shown; the normal model/voxel/result surfaces are hidden.
+    if (this.buildActive || this.buildGhost) {
+      this.buildGroup.visible = true;
+      this.mesh.visible = false;
+      this.voxelGroup.visible = false;
+      if (this.voxRes) this.voxRes.group.visible = false;
+      if (this.wireframeLines) this.wireframeLines.visible = false;
+      this.bcMarkers.visible = false;
+      return;
+    }
+    this.buildGroup.visible = false;
     const mat = this.mesh.material as THREE.MeshStandardMaterial;
     const infill = this.viewMode === "infill";
     // Density view with an opt shape (live skeleton / cutaway): ghost the
