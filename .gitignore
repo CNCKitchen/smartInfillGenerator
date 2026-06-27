@@ -53,3 +53,4 @@ _sample_extracted/
 Thumbs.db
 *.swp
 *~
+buildsim_out/
