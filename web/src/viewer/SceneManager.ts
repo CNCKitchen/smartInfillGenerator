@@ -1838,15 +1838,35 @@ export class SceneManager {
   }
 
   /** Growing deformed active hull (already-printed voxels, exaggeration baked
-   *  in). Replaced each preview frame; null clears it. */
-  setBuildActive(positions: Float32Array | null) {
+   *  in), jet-colored by normalised |u| (`mags`, 0–1). Replaced each preview
+   *  frame; null clears it. */
+  setBuildActive(positions: Float32Array | null, mags?: Float32Array | null) {
     if (this.buildActive) {
       this.buildGroup.remove(this.buildActive);
       this.disposeMesh(this.buildActive);
       this.buildActive = null;
     }
     if (positions && positions.length) {
-      this.buildActive = this.buildHullMesh(positions, false);
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+      geo.computeVertexNormals();
+      const n = positions.length / 3;
+      const colors = new Float32Array(positions.length);
+      for (let i = 0; i < n; i++) {
+        const [r, g, b] = jet(mags && i < mags.length ? mags[i] : 0);
+        colors[3 * i] = r;
+        colors[3 * i + 1] = g;
+        colors[3 * i + 2] = b;
+      }
+      geo.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+      const mat = new THREE.MeshStandardMaterial({
+        vertexColors: true,
+        roughness: 0.85,
+        metalness: 0.05,
+        flatShading: true,
+        side: THREE.DoubleSide,
+      });
+      this.buildActive = new THREE.Mesh(geo, mat);
       this.buildGroup.add(this.buildActive);
     }
     this.updateBuildVisibility();

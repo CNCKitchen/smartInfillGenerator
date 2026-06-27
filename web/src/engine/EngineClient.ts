@@ -237,13 +237,17 @@ export class EngineClient {
    *  accumulating warp on throttled frames (length 0 on progress-only frames). */
   buildSim(
     opts: BuildSimOptions,
-    onProgress?: (p: { done: number; total: number }, displacements: Float32Array) => void
+    onProgress?: (
+      p: { done: number; total: number; maxU: number },
+      positions: Float32Array,
+      mags: Float32Array
+    ) => void
   ): Promise<{ stats: BuildSimStats; displacements: Float32Array }> {
     this.resetProgress();
     return this.call(
       { op: "buildSim", opts: opts as unknown as Record<string, unknown> },
       [],
-      onProgress as ((data: unknown, density: Float32Array) => void) | undefined
+      onProgress as unknown as ((data: unknown, density: Float32Array) => void) | undefined
     );
   }
 
@@ -467,6 +471,9 @@ export interface BuildSimStats {
   peakLift: number;
   peakShear: number;
   layers: number;
+  itersMax: number;
+  itersMean: number;
+  cells: number;
   seconds: number;
 }
 

@@ -430,20 +430,30 @@ fn cell_activated(grid: &VoxelGrid, ci: usize, active: &[bool]) -> bool {
     true
 }
 
-/// Voxel hull of the ALREADY-ACTIVATED cells, each vertex displaced by `exag·u`
-/// — the live build-preview geometry (grows + warps as layers activate). Flat
-/// xyz soup.
-fn deformed_activated_hull(grid: &VoxelGrid, sol: &Solution, exag: f64) -> Vec<f32> {
+/// Voxel hull of the ALREADY-ACTIVATED cells (the live build-preview geometry,
+/// grows + warps as layers activate). Returns the deformed positions (flat xyz,
+/// `exag·u` applied), the per-vertex displacement magnitude NORMALISED to
+/// `[0,1]` (for jet coloring), and the raw max |u| in mm (for the legend).
+fn deformed_activated_hull(grid: &VoxelGrid, sol: &Solution, exag: f64) -> (Vec<f32>, Vec<f32>, f64) {
     let (tris, _e, _c) = grid.surface_mesh_where(&|ci| cell_activated(grid, ci, &sol.active));
-    let mut out = Vec::with_capacity(tris.len());
+    let mut pos = Vec::with_capacity(tris.len());
+    let mut mags = Vec::with_capacity(tris.len() / 3);
+    let mut maxu = 0f64;
     for c in tris.chunks_exact(3) {
         let p = [c[0] as f64, c[1] as f64, c[2] as f64];
         let u = sol.sample_displacement(p);
-        out.push((p[0] + exag * u[0]) as f32);
-        out.push((p[1] + exag * u[1]) as f32);
-        out.push((p[2] + exag * u[2]) as f32);
+        pos.push((p[0] + exag * u[0]) as f32);
+        pos.push((p[1] + exag * u[1]) as f32);
+        pos.push((p[2] + exag * u[2]) as f32);
+        let mag = (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt();
+        mags.push(mag as f32);
+        maxu = maxu.max(mag);
     }
-    out
+    let inv = if maxu > 0.0 { 1.0 / maxu } else { 0.0 };
+    for m in &mut mags {
+        *m = (*m as f64 * inv) as f32;
+    }
+    (pos, mags, maxu)
 }
 
 /// Sample a solution's displacement onto each soup vertex (9 floats/triangle) —
@@ -1206,20 +1216,20 @@ impl Model {
             |done, total, sol| {
                 // Throttle the (expensive) hull build to ~30 preview frames. On
                 // sent frames the payload is the deformed ACTIVATED voxel hull
-                // (grows + warps); empty otherwise (progress-only).
+                // (positions + normalised |u| + max |u|); empty otherwise.
                 let stride = (total / 30).max(1);
-                let pos = if done == total || done % stride == 0 {
+                let (pos, mags, maxu) = if done == total || done % stride == 0 {
                     deformed_activated_hull(grid, sol, exag)
                 } else {
-                    Vec::new()
+                    (Vec::new(), Vec::new(), 0.0)
                 };
-                let arr = js_sys::Float32Array::from(pos.as_slice());
-                let _ = on_layer.call3(
-                    &JsValue::NULL,
-                    &JsValue::from(done as u32),
-                    &JsValue::from(total as u32),
-                    &JsValue::from(arr),
-                );
+                let args = js_sys::Array::new();
+                args.push(&JsValue::from(done as u32));
+                args.push(&JsValue::from(total as u32));
+                args.push(&JsValue::from(js_sys::Float32Array::from(pos.as_slice())));
+                args.push(&JsValue::from(js_sys::Float32Array::from(mags.as_slice())));
+                args.push(&JsValue::from(maxu));
+                let _ = on_layer.apply(&JsValue::NULL, &args);
             },
         )
         .map_err(err)?;
@@ -1231,6 +1241,13 @@ impl Model {
             peak_shear = peak_shear.max((rv[0] * rv[0] + rv[1] * rv[1]).sqrt());
         }
         let (bonded_max, released_max) = (r.bonded.max_displacement(), r.released.max_displacement());
+        let iters_max = r.iters.iter().copied().max().unwrap_or(0);
+        let iters_mean = if r.iters.is_empty() {
+            0.0
+        } else {
+            r.iters.iter().sum::<usize>() as f64 / r.iters.len() as f64
+        };
+        let cells = self.grid.as_ref().map(|(g, _)| g.solid_count()).unwrap_or(0);
         let sol = if opts.state == "bonded" { r.bonded } else { r.released };
         let out = serde_json::json!({
             "maxDisplacement": sol.max_displacement(),
@@ -1239,6 +1256,9 @@ impl Model {
             "peakLift": peak_lift,
             "peakShear": peak_shear,
             "layers": r.iters.len(),
+            "itersMax": iters_max,
+            "itersMean": iters_mean,
+            "cells": cells,
         })
         .to_string();
         self.solution = Some(sol);

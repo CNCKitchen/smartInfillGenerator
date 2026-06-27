@@ -372,12 +372,19 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
         const stats = JSON.parse(
           requireModel().solve_build_sim(
             JSON.stringify(msg.opts),
-            // Per-layer: progress (done/total) + throttled warp preview (empty
-            // displacements on non-preview frames). Reuses the `density` slot.
-            (done: number, total: number, disp: Float32Array) => {
+            // Per-layer: progress + (on throttled frames) the deformed activated
+            // voxel hull (positions in `density`, normalised |u| in
+            // `skelPositions`, max |u| in `data.maxU`).
+            (done: number, total: number, pos: Float32Array, mags: Float32Array, maxU: number) => {
               (self as unknown as Worker).postMessage(
-                { id: msg.id, progress: true, data: { done, total }, density: disp },
-                disp.length > 0 ? [disp.buffer] : []
+                {
+                  id: msg.id,
+                  progress: true,
+                  data: { done, total, maxU },
+                  density: pos,
+                  skelPositions: mags,
+                },
+                pos.length > 0 ? [pos.buffer, mags.buffer] : []
               );
             }
           )

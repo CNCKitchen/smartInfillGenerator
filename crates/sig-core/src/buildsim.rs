@@ -356,10 +356,25 @@ fn build_bonded_inner(
         }
         iters.push(res.stats.iterations);
 
-        // Report progress + the warp accumulated so far (live preview).
+        // Report progress + the warp accumulated so far (live preview). The
+        // solution carries the BUILD activation mask (active_node), NOT the
+        // geometric one, so the preview shows only already-printed cells.
         layers_done += 1;
         let max_it = iters.iter().copied().max().unwrap_or(0);
-        on_layer(layers_done, total_layers, &solution_from(&g, u_total.clone(), max_it));
+        let sol = Solution {
+            u: u_total.iter().map(|&v| v as f32).collect(),
+            mx,
+            my,
+            mz,
+            h: g.h,
+            origin: g.origin,
+            active: active_node.clone(),
+            iterations: max_it,
+            rel_residual: 0.0,
+            converged: true,
+            residuals: Vec::new(),
+        };
+        on_layer(layers_done, total_layers, &sol);
     }
 
     Ok((g, levels, u_total, f_eig, f_lock, iters))

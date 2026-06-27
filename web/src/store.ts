@@ -1018,8 +1018,9 @@ export interface SceneEvents {
   ) => void;
   /** Build-sim live preview: faint full-hull ghost (deactivated voxels). */
   onBuildGhost?: (positions: Float32Array | null) => void;
-  /** Build-sim live preview: growing deformed active hull (printed voxels). */
-  onBuildActive?: (positions: Float32Array | null) => void;
+  /** Build-sim live preview: growing deformed active hull (printed voxels),
+   *  jet-colored by normalised |u| (`mags`). */
+  onBuildActive?: (positions: Float32Array | null, mags?: Float32Array | null) => void;
   /** Same part, new pose (orientation tools): swap positions in place. */
   onModelTransformed?: (positions: Float32Array, bbox: LoadedModel["bbox"]) => void;
   /** Symmetry plane state for the viewport: enabled + plane n·p = c. */
@@ -3255,31 +3256,41 @@ export const useStore = create<AppState>((set, get) => ({
         );
       } else if (buildsim) {
         const shrink = -Math.abs(st0.material.shrink); // material property; eigenstrain shrinks
+        const vi = get().voxelInfo;
         appendLog(
           set,
-          `Build sim (inherent strain): ${st0.material.name} ${(Math.abs(shrink) * 100).toFixed(2)}% shrink, ${st0.buildState} state — warping + bed peel …`
+          `Build sim — ${st0.material.name}, ${(Math.abs(shrink) * 100).toFixed(2)}% shrink (material), ` +
+            `${st0.buildState === "released" ? "released (off-bed)" : "on-bed"} state` +
+            (vi ? `, grid ${vi.nx}×${vi.ny}×${vi.nz} (${Math.round(vi.solid / 1000)}k cells, h ${vi.h.toFixed(2)} mm)` : "") +
+            " — sequential inherent-strain warp + bed peel …"
         );
-        // Live preview on the VOXEL hull at 10× exaggeration: a faint full-hull
-        // ghost (deactivated voxels) + a growing deformed active hull that warps
-        // as layers activate.
+        // Live preview on the VOXEL hull at 10× exaggeration: only the printed
+        // (activated) cells, jet-colored by |u|, with the displacement legend —
+        // so it reads like the final result as it builds.
         const exag = 10;
-        set({ busy: "Build sim…", buildProgress: { done: 0, total: 0 }, deformScale: exag });
-        try {
-          const { hull } = await engine.voxelMesh();
-          sceneEvents.onBuildGhost?.(hull);
-        } catch {
-          /* ghost is optional — proceed without it */
-        }
+        set({
+          busy: "Build sim…",
+          buildProgress: { done: 0, total: 0 },
+          deformScale: exag,
+          hasResult: true,
+          viewMode: "deformed",
+          resultField: "u",
+        });
+        sceneEvents.onViewState?.("deformed", exag);
         const out = await engine.buildSim(
           { shrink, state: st0.buildState, exaggeration: exag },
-          (p, positions) => {
+          (p, positions, mags) => {
             set({ buildProgress: { done: p.done, total: p.total } });
-            // Throttled frames carry the deformed active voxel hull — render it.
-            if (positions && positions.length > 0) sceneEvents.onBuildActive?.(positions);
+            // Throttled frames carry the deformed active voxel hull + |u| — paint
+            // it and keep the legend in sync with the running max.
+            if (positions && positions.length > 0) {
+              sceneEvents.onBuildActive?.(positions, mags);
+              set({ legendMin: 0, legendMax: p.maxU, fieldRange: { min: 0, max: p.maxU } });
+              sceneEvents.onLegendRange?.(0, p.maxU);
+            }
           }
         );
         // Tear down the preview; the final result renders via the deformed view.
-        sceneEvents.onBuildGhost?.(null);
         sceneEvents.onBuildActive?.(null);
         set({ buildProgress: null });
         displacements = out.displacements;
@@ -3295,8 +3306,15 @@ export const useStore = create<AppState>((set, get) => ({
         } as SolveStats;
         appendLog(
           set,
-          `  bonded |u| ${out.stats.bondedMax.toExponential(2)} mm, released |u| ${out.stats.releasedMax.toExponential(2)} mm · ` +
-            `peel: lift ${out.stats.peakLift.toFixed(1)} N, shear ${out.stats.peakShear.toFixed(1)} N (uncalibrated) over ${out.stats.layers} layers`
+          `  ${out.stats.layers} layers activated · MGCG ${Math.round(out.stats.itersMean)} mean / ${out.stats.itersMax} max iters/layer · ${out.stats.seconds.toFixed(1)} s`
+        );
+        appendLog(
+          set,
+          `  warp |u|: bonded (on bed) ${out.stats.bondedMax.toExponential(2)} mm, released (off bed) ${out.stats.releasedMax.toExponential(2)} mm — showing ${st0.buildState} ×${exag}`
+        );
+        appendLog(
+          set,
+          `  bed peel: peak lift ${out.stats.peakLift.toFixed(1)} N (+Z), peak shear ${out.stats.peakShear.toFixed(1)} N — uncalibrated, relative indicator only`
         );
       } else {
         appendLog(set, `Solve solid: ${m.name} (E₀ ${m.e0} MPa, ν ${m.nu}) …`);
