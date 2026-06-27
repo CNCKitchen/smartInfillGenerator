@@ -1318,6 +1318,37 @@ function invalidateResults(set: (p: Partial<AppState>) => void, get: () => AppSt
   }
 }
 
+/** Clear the LIVE result + deformed view (stats, hasResult, the deformed scene)
+ *  WITHOUT dropping the stashed roster — used when switching workspaces so one
+ *  workspace's output can't masquerade as the other's (Build Sim warp leaking
+ *  into Verify, etc.). Roster results stay re-selectable. */
+function clearLiveResultView(set: (p: Partial<AppState>) => void, get: () => AppState) {
+  set({
+    check: null,
+    stats: null,
+    hasResult: false,
+    optSummary: null,
+    printedStats: null,
+    activeResultId: null,
+    resultField: "u",
+    fieldRange: null,
+    legendMin: null,
+    legendMax: null,
+  });
+  session.invalidateSolution();
+  sceneEvents.onLegendRange?.(null, null);
+  sceneEvents.onScalarField?.(null);
+  sceneEvents.onRegions?.(null);
+  sceneEvents.onResultSolid?.(false);
+  sceneEvents.onVertexDensity?.(null);
+  sceneEvents.onDisplacements?.(null, null);
+  sceneEvents.onOptShape?.(null, null);
+  if (get().viewMode !== "setup" && get().viewMode !== "mesh") {
+    set({ viewMode: "setup" });
+    sceneEvents.onViewState?.("setup", get().deformScale);
+  }
+}
+
 /** NON-destructive — bump the given input epochs so the dependent retained
  *  results badge "re-run needed" while staying viewable on the same grid.
  *  No-op when nothing is retained. */
@@ -2826,6 +2857,10 @@ export const useStore = create<AppState>((set, get) => ({
     if (get().model) void engine.setCompositeSkin(on);
   },
   setAppMode(m) {
+    if (m === get().appMode) return;
+    // Results are workspace-specific: clear the live result + deformed view so
+    // Build Sim's warp can't show (or mark Verify "done") in the other workspace.
+    clearLiveResultView(set, get);
     // Build Sim has a 4-station rail; clamp the carriage when switching in.
     const maxStep = m === "buildsim" ? 4 : 6;
     set({ appMode: m, activeStep: Math.min(get().activeStep, maxStep) });
