@@ -229,6 +229,16 @@ export class EngineClient {
     return this.call({ op: "solvePrinted", opts: opts as unknown as Record<string, unknown> });
   }
 
+  /** FDM build simulation (inherent strain): warping + bed peel. Leaves the
+   *  chosen state (released/bonded) as the live solution, so the returned
+   *  displacements deform the real mesh in the existing deformed view. */
+  buildSim(
+    opts: BuildSimOptions
+  ): Promise<{ stats: BuildSimStats; displacements: Float32Array }> {
+    this.resetProgress();
+    return this.call({ op: "buildSim", opts: opts as unknown as Record<string, unknown> });
+  }
+
   optimize(
     opts: OptimizeOptions,
     onProgress: (
@@ -428,6 +438,26 @@ export interface PrintedStats extends SolveStats {
   skinLayers: number;
   /** True when the solve used the composite (blended) skin model. */
   compositeSkin: boolean;
+}
+
+/** Mirrors the wasm BuildSimOpts (serialized to JSON in the worker). */
+export interface BuildSimOptions {
+  /** Isotropic per-layer shrink fraction (negative = shrink). */
+  shrink: number;
+  /** Which state to deform the mesh by: off-bed sprung shape or held on bed. */
+  state: "released" | "bonded";
+}
+
+/** Build-sim stats. `maxDisplacement` is the shown state; bonded/released give
+ *  both states' peak, peak* are the bed peel reaction maxima (uncalibrated N). */
+export interface BuildSimStats {
+  maxDisplacement: number;
+  bondedMax: number;
+  releasedMax: number;
+  peakLift: number;
+  peakShear: number;
+  layers: number;
+  seconds: number;
 }
 
 /** Mirrors the wasm OptimizeOpts (serialized to JSON in the worker). */

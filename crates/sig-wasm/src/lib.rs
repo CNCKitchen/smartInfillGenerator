@@ -395,6 +395,22 @@ impl Default for PrintedOpts {
     }
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct BuildSimOpts {
+    /// Isotropic shrink fraction applied per layer (negative = shrink).
+    shrink: f64,
+    /// Which state to leave as the live solution for the deformed view:
+    /// "released" (off-bed sprung shape) or "bonded" (held on the bed).
+    state: String,
+}
+
+impl Default for BuildSimOpts {
+    fn default() -> Self {
+        Self { shrink: -0.003, state: "released".into() }
+    }
+}
+
 #[wasm_bindgen]
 pub struct Model {
     /// Working mesh: display + segmentation + BC attachment + voxelization.
@@ -1109,6 +1125,41 @@ impl Model {
         .to_string();
         self.solution = Some(sol);
         self.solution_eps = None; // plain solid solve: eps = grid.scale
+        Ok(out)
+    }
+
+    /// FDM build simulation (inherent strain, see `sig_core::buildsim`): predict
+    /// warping + bed peel from the current voxelization. Ignores structural BCs —
+    /// the only "loads" are the per-layer eigenstrain and the build plate. Leaves
+    /// the chosen state (released = off-bed sprung shape, or bonded) as the live
+    /// solution, so `vertex_displacements()` maps the warp onto the REAL mesh and
+    /// the existing deformed view renders it. JSON: max displacements + peel peaks.
+    pub fn solve_build_sim(&mut self, opts_json: &str) -> Result<String, JsValue> {
+        let opts: BuildSimOpts = serde_json::from_str(opts_json).map_err(err)?;
+        self.ensure_grid()?;
+        let (grid, _levels) = self.grid.as_ref().unwrap();
+        let eigen = [opts.shrink, opts.shrink, opts.shrink];
+        let r = sig_core::buildsim::solve_build(grid, eigen, &self.settings).map_err(err)?;
+
+        let mut peak_lift = 0f64;
+        let mut peak_shear = 0f64;
+        for (_, rv) in &r.bed_reaction {
+            peak_lift = peak_lift.max(rv[2]);
+            peak_shear = peak_shear.max((rv[0] * rv[0] + rv[1] * rv[1]).sqrt());
+        }
+        let (bonded_max, released_max) = (r.bonded.max_displacement(), r.released.max_displacement());
+        let sol = if opts.state == "bonded" { r.bonded } else { r.released };
+        let out = serde_json::json!({
+            "maxDisplacement": sol.max_displacement(),
+            "bondedMax": bonded_max,
+            "releasedMax": released_max,
+            "peakLift": peak_lift,
+            "peakShear": peak_shear,
+            "layers": r.iters.len(),
+        })
+        .to_string();
+        self.solution = Some(sol);
+        self.solution_eps = None;
         Ok(out)
     }
 

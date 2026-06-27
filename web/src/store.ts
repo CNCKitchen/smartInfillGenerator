@@ -355,8 +355,13 @@ interface AppState {
    *  of rounding the skin to whole voxel layers — thin walls stay
    *  representable on coarse grids. Off = legacy whole-layer skin. */
   compositeSkin: boolean;
-  /** What "Solve once" analyzes: the print or the CAD-ideal solid. */
-  analyzeMode: "printed" | "solid";
+  /** What "Solve once" analyzes: the print, the CAD-ideal solid, or the FDM
+   *  build simulation (inherent-strain warp + bed peel). */
+  analyzeMode: "printed" | "solid" | "buildsim";
+  /** Build-sim: isotropic per-layer shrink fraction (negative = shrink). */
+  buildShrink: number;
+  /** Build-sim: which state to deform by (off-bed sprung shape or on the bed). */
+  buildState: "released" | "bonded";
   /** Extras of the last as-printed solve (results dock); null = solid run. */
   printedStats: PrintedSummary | null;
   /** Mesh view: color each cell by its element density (0–1: skin = 1,
@@ -574,7 +579,9 @@ interface AppState {
   setPrintInfill(v: number): void;
   setSnapVoxel(on: boolean): void;
   setCompositeSkin(on: boolean): void;
-  setAnalyzeMode(m: "printed" | "solid"): void;
+  setAnalyzeMode(m: "printed" | "solid" | "buildsim"): void;
+  setBuildShrink(v: number): void;
+  setBuildState(s: "released" | "bonded"): void;
   setMeshDensity(on: boolean): void;
   setSmoothStress(on: boolean): void;
   setMaterialStress(on: boolean): void;
@@ -2085,6 +2092,8 @@ export const useStore = create<AppState>((set, get) => ({
   snapVoxel: true,
   compositeSkin: true,
   analyzeMode: "printed",
+  buildShrink: -0.003,
+  buildState: "released",
   printedStats: null,
   meshDensity: false,
   smoothStress: true,
@@ -2813,6 +2822,12 @@ export const useStore = create<AppState>((set, get) => ({
     invalidateGrid(set, get);
     if (get().model) void engine.setCompositeSkin(on);
   },
+  setBuildShrink(v) {
+    set({ buildShrink: v });
+  },
+  setBuildState(s) {
+    set({ buildState: s });
+  },
   setAnalyzeMode(m) {
     set({ analyzeMode: m });
   },
@@ -3113,18 +3128,22 @@ export const useStore = create<AppState>((set, get) => ({
     set({ busy: "Solving…", error: null });
     sceneEvents.onAnimateMode?.(null);
     let stopResidualPoll = () => {};
+    // Build sim ignores structural BCs (its only "loads" are the per-layer
+    // eigenstrain + the build plate), so it skips the multi-step path and the
+    // under-constraint gate, and isn't retained as a switchable structural result.
+    const buildsim = get().analyzeMode === "buildsim";
     try {
       // Multiple load steps: solve them all (each manages its own residual poll
       // and result stash). Single step falls through to the byte-identical path.
-      if (get().loadSteps.length > 1) {
+      if (!buildsim && get().loadSteps.length > 1) {
         await solveAllSteps(set, get);
         return;
       }
       await pushBcs(get);
       await logGridInfo(set);
-      const report = await engine.check();
-      set({ check: report });
-      if (!report.ok) {
+      const report = buildsim ? null : await engine.check();
+      if (report) set({ check: report });
+      if (report && !report.ok) {
         const bad = report.components.find((c) => !c.constrained && c.mode);
         sceneEvents.onAnimateMode?.(bad?.mode ?? null);
         appendLog(set, "Solve aborted: model is under-constrained");
@@ -3186,6 +3205,28 @@ export const useStore = create<AppState>((set, get) => ({
             (out.stats.compositeSkin
               ? `skin spans ${out.stats.skinLayers.toFixed(2)} cell layers (composite blend)`
               : `skin resolved by ${out.stats.skinLayers} cell layer${out.stats.skinLayers === 1 ? "" : "s"}`)
+        );
+      } else if (buildsim) {
+        appendLog(
+          set,
+          `Build sim (inherent strain): ${(st0.buildShrink * 100).toFixed(2)}% shrink, ${st0.buildState} state — warping + bed peel …`
+        );
+        const out = await engine.buildSim({ shrink: st0.buildShrink, state: st0.buildState });
+        displacements = out.displacements;
+        // Synthesize a SolveStats so the deformed view + dock render uniformly.
+        stats = {
+          iterations: out.stats.layers,
+          relResidual: 0,
+          converged: true,
+          maxDisplacement: out.stats.maxDisplacement,
+          seconds: out.stats.seconds,
+          residuals: [],
+          tol: get().solveTol,
+        } as SolveStats;
+        appendLog(
+          set,
+          `  bonded |u| ${out.stats.bondedMax.toExponential(2)} mm, released |u| ${out.stats.releasedMax.toExponential(2)} mm · ` +
+            `peel: lift ${out.stats.peakLift.toFixed(1)} N, shear ${out.stats.peakShear.toFixed(1)} N (uncalibrated) over ${out.stats.layers} layers`
         );
       } else {
         appendLog(set, `Solve solid: ${m.name} (E₀ ${m.e0} MPa, ν ${m.nu}) …`);
@@ -3252,8 +3293,9 @@ export const useStore = create<AppState>((set, get) => ({
         }
       }
       // Retain this solve as a switchable result (as-printed or solid baseline)
-      // so the Results view can compare it against the optimized design.
-      {
+      // so the Results view can compare it against the optimized design. Build
+      // sim shows live but isn't a switchable structural result.
+      if (!buildsim) {
         const rid: ResultKind = printedSummary ? "asprinted" : "solid";
         try {
           await engine.stashResult(rid);

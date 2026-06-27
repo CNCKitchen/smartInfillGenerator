@@ -120,6 +120,12 @@ type Req =
     }
   | {
       id: number;
+      op: "buildSim";
+      /** BuildSimOpts object — serialized to JSON for the wasm API. */
+      opts: Record<string, unknown>;
+    }
+  | {
+      id: number;
       op: "optimize";
       /** OptimizeOptions object — serialized to JSON for the wasm API. */
       opts: Record<string, unknown>;
@@ -352,6 +358,18 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
         if (cancelArr) Atomics.store(cancelArr, 0, 0); // arm fresh
         const t0 = performance.now();
         const stats = JSON.parse(requireModel().solve_printed(JSON.stringify(msg.opts)));
+        const displacements = requireModel().vertex_displacements();
+        stats.seconds = (performance.now() - t0) / 1000;
+        (self as unknown as Worker).postMessage(
+          { id: msg.id, ok: true, data: { stats, displacements } },
+          [displacements.buffer]
+        );
+        return;
+      }
+      case "buildSim": {
+        if (cancelArr) Atomics.store(cancelArr, 0, 0); // arm fresh
+        const t0 = performance.now();
+        const stats = JSON.parse(requireModel().solve_build_sim(JSON.stringify(msg.opts)));
         const displacements = requireModel().vertex_displacements();
         stats.seconds = (performance.now() - t0) / 1000;
         (self as unknown as Worker).postMessage(

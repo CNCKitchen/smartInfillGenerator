@@ -1039,6 +1039,10 @@ function StepVerify() {
     useShallow((s) => ({
       analyzeMode: s.analyzeMode,
       setAnalyzeMode: s.setAnalyzeMode,
+      buildShrink: s.buildShrink,
+      setBuildShrink: s.setBuildShrink,
+      buildState: s.buildState,
+      setBuildState: s.setBuildState,
       perimeters: s.perimeters,
       lineWidth: s.lineWidth,
       printInfill: s.printInfill,
@@ -1074,12 +1078,51 @@ function StepVerify() {
           >
             Solid material
           </button>
+          <button
+            className={s.analyzeMode === "buildsim" ? "on" : ""}
+            onClick={() => s.setAnalyzeMode("buildsim")}
+            title="FDM build simulation: inherent-strain warping + bed peel (sequential layer activation)"
+          >
+            Build sim
+          </button>
         </div>
         <div className="dim small">
           {s.analyzeMode === "printed"
             ? `Skin ${s.perimeters} × ${s.lineWidth} mm at 100%, interior ${s.printInfill}% ${s.pattern} — accuracy is the accuracy of the calibrated E(ρ) curve.`
-            : "Fully dense E₀ everywhere — answers \"how much stiffness does printing cost me?\" next to an as-printed run."}
+            : s.analyzeMode === "solid"
+              ? "Fully dense E₀ everywhere — answers \"how much stiffness does printing cost me?\" next to an as-printed run."
+              : "Inherent-strain build simulation: predicts warping (Solve lands in the deformed view) and bed peel. Ignores supports/loads. Uncalibrated — shape is meaningful, absolute magnitude is not."}
         </div>
+        {s.analyzeMode === "buildsim" && (
+          <div className="toolrow">
+            <label className="dim small" style={{ display: "flex", alignItems: "center", gap: 4 }}>
+              Shrink %
+              <input
+                type="number"
+                step={0.1}
+                value={(-s.buildShrink * 100).toFixed(1)}
+                onChange={(e) => s.setBuildShrink(-Math.abs(parseFloat(e.target.value) || 0) / 100)}
+                style={{ width: 64 }}
+              />
+            </label>
+            <div className="seg">
+              <button
+                className={s.buildState === "released" ? "on" : ""}
+                onClick={() => s.setBuildState("released")}
+                title="Off-bed sprung shape (the predeform target)"
+              >
+                Released
+              </button>
+              <button
+                className={s.buildState === "bonded" ? "on" : ""}
+                onClick={() => s.setBuildState("bonded")}
+                title="Distortion while still held on the bed"
+              >
+                On bed
+              </button>
+            </div>
+          </div>
+        )}
       </div>
       <div className="toolrow">
         <button onClick={() => void s.runCheck()} disabled={!!s.busy}>
@@ -1101,7 +1144,12 @@ function StepVerify() {
       {s.stats && s.hasResult && !s.optSummary && (
         <div className="status ok">
           Max deflection <b>{fmtDisp(s.stats.maxDisplacement)}</b> ·{" "}
-          {s.printedStats ? `as printed (${s.printedStats.infillPct}% ${s.printedStats.pattern})` : "solid"} ·{" "}
+          {s.analyzeMode === "buildsim"
+            ? "build sim (warp)"
+            : s.printedStats
+              ? `as printed (${s.printedStats.infillPct}% ${s.printedStats.pattern})`
+              : "solid"}{" "}
+          ·{" "}
           {s.stats.iterations} iters · {s.stats.seconds.toFixed(1)} s
         </div>
       )}
