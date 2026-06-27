@@ -1147,10 +1147,12 @@ function StepBuildSim() {
       stats: s.stats,
       hasResult: s.hasResult,
       buildProgress: s.buildProgress,
+      buildResult: s.buildResult,
       openSettings: s.openSettings,
     }))
   );
   const bp = s.buildProgress;
+  const br = s.buildResult;
   const pct = bp && bp.total > 0 ? Math.round((bp.done / bp.total) * 100) : 0;
   return (
     <>
@@ -1220,10 +1222,20 @@ function StepBuildSim() {
           {s.stats.seconds.toFixed(1)} s
         </div>
       )}
+      {!bp && br && (
+        <div className="dim small">
+          Both states saved — the toggle above switches instantly. On bed{" "}
+          <b>{fmtDisp(br.bondedMax)}</b> · released <b>{fmtDisp(br.releasedMax)}</b>. Stiffness &amp;
+          strain field:{" "}
+          <b>{br.densityAware ? "as-printed infill density" : "solid hull"}</b>
+          {br.densityAware ? "" : " (optimize the part first to use the printed infill)"}.
+        </div>
+      )}
       <div className="hint">
-        Build sim ignores supports/loads — its only inputs are the part, the material shrink, and
-        the build plate. Solve lands in the deformed <b>Results</b> view; switch Released / On&nbsp;bed
-        above and re-run to compare. (Live per-layer progress and saved dual results are coming next.)
+        Build sim ignores supports/loads — its only inputs are the part, the material shrink, the
+        as-printed infill density (when optimized), and the build plate. Solve lands in the deformed{" "}
+        <b>Results</b> view; after a run, switch Released / On&nbsp;bed above to compare with no
+        re-solve.
       </div>
     </>
   );

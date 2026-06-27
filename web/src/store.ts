@@ -366,6 +366,10 @@ interface AppState {
   buildState: "released" | "bonded";
   /** Build-sim live progress (activated layers); null when not running. */
   buildProgress: { done: number; total: number } | null;
+  /** Both states of the last completed build sim, kept so the Show-state toggle
+   *  can flip on bed ⇄ released with no re-solve. null until a build finishes
+   *  (and after a workspace switch / new geometry). */
+  buildResult: { bondedMax: number; releasedMax: number; densityAware: boolean } | null;
   /** Extras of the last as-printed solve (results dock); null = solid run. */
   printedStats: PrintedSummary | null;
   /** Mesh view: color each cell by its element density (0–1: skin = 1,
@@ -585,7 +589,7 @@ interface AppState {
   setCompositeSkin(on: boolean): void;
   setAnalyzeMode(m: "printed" | "solid" | "buildsim"): void;
   setAppMode(m: "optimize" | "buildsim"): void;
-  setBuildState(s: "released" | "bonded"): void;
+  setBuildState(s: "released" | "bonded"): void | Promise<void>;
   setMeshDensity(on: boolean): void;
   setSmoothStress(on: boolean): void;
   setMaterialStress(on: boolean): void;
@@ -1341,6 +1345,7 @@ function clearLiveResultView(set: (p: Partial<AppState>) => void, get: () => App
     fieldRange: null,
     legendMin: null,
     legendMax: null,
+    buildResult: null,
   });
   session.invalidateSolution();
   sceneEvents.onLegendRange?.(null, null);
@@ -2135,6 +2140,7 @@ export const useStore = create<AppState>((set, get) => ({
   appMode: "optimize",
   buildState: "released",
   buildProgress: null,
+  buildResult: null,
   printedStats: null,
   meshDensity: false,
   smoothStress: true,
@@ -2873,8 +2879,42 @@ export const useStore = create<AppState>((set, get) => ({
     const maxStep = m === "buildsim" ? 4 : 6;
     set({ appMode: m, activeStep: Math.min(get().activeStep, maxStep) });
   },
-  setBuildState(s) {
+  async setBuildState(s) {
+    const prev = get().buildState;
     set({ buildState: s });
+    // Before a run (or in the other workspace) the toggle just picks which state
+    // the NEXT run shows. When a build result is on screen, flip it live: both
+    // states are cached in the engine, so this is a re-map, not a re-solve.
+    if (prev === s || get().busy || get().appMode !== "buildsim" || !get().buildResult) return;
+    try {
+      const out = await engine.setBuildState(s);
+      const maxDisp = out.stats.maxDisplacement;
+      // Hold the ×10 geometric exaggeration: shown factor = autoScale·deformScale,
+      // autoScale = 0.08·diag/maxDisp, so deformScale = 10/autoScale.
+      const bb = get().model?.bbox;
+      let deformScale = get().deformScale;
+      if (bb) {
+        const diag = Math.hypot(bb[3] - bb[0], bb[4] - bb[1], bb[5] - bb[2]);
+        const autoS = (0.08 * diag) / Math.max(maxDisp, 1e-9);
+        deformScale = 10 / autoS;
+      }
+      const cur = get().stats;
+      set({
+        stats: cur ? { ...cur, maxDisplacement: maxDisp } : cur,
+        deformScale,
+      });
+      sceneEvents.onDisplacements?.(out.displacements, {
+        maxDisplacement: referenceMaxDisp(get().results, maxDisp),
+      });
+      sceneEvents.onViewState?.("deformed", deformScale);
+      appendLog(
+        set,
+        `Build state → ${s === "released" ? "released (off bed)" : "on bed"} · max |u| ${maxDisp.toExponential(2)} mm ×10`
+      );
+    } catch {
+      // The cached states no longer match the current grid — force a re-run.
+      set({ buildResult: null });
+    }
   },
   setAnalyzeMode(m) {
     set({ analyzeMode: m });
@@ -3340,12 +3380,24 @@ export const useStore = create<AppState>((set, get) => ({
         );
         appendLog(
           set,
+          `  stiffness/strain field: ${out.stats.densityAware ? "as-printed infill density (optimized)" : "solid hull — run the optimizer first to use the printed infill"}`
+        );
+        appendLog(
+          set,
           `  warp |u|: bonded (on bed) ${out.stats.bondedMax.toExponential(2)} mm, released (off bed) ${out.stats.releasedMax.toExponential(2)} mm — showing ${st0.buildState} ×${exag}`
         );
         appendLog(
           set,
           `  bed peel: peak lift ${out.stats.peakLift.toFixed(1)} N (+Z), peak shear ${out.stats.peakShear.toFixed(1)} N — uncalibrated, relative indicator only`
         );
+        // Both states are now cached in the engine → enable instant switching.
+        set({
+          buildResult: {
+            bondedMax: out.stats.bondedMax,
+            releasedMax: out.stats.releasedMax,
+            densityAware: out.stats.densityAware,
+          },
+        });
       } else {
         appendLog(set, `Solve solid: ${m.name} (E₀ ${m.e0} MPa, ν ${m.nu}) …`);
         const out = await engine.solve();

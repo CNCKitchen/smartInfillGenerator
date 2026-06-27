@@ -251,6 +251,15 @@ export class EngineClient {
     );
   }
 
+  /** Flip the saved build-sim result between on-bed and released without a
+   *  re-solve; returns the new max displacement + the re-mapped mesh
+   *  displacements for the deformed view. */
+  setBuildState(
+    state: "released" | "bonded"
+  ): Promise<{ stats: { maxDisplacement: number }; displacements: Float32Array }> {
+    return this.call({ op: "setBuildState", state });
+  }
+
   optimize(
     opts: OptimizeOptions,
     onProgress: (
@@ -475,6 +484,8 @@ export interface BuildSimStats {
   itersMean: number;
   cells: number;
   seconds: number;
+  /** True when the sim used the optimized as-printed infill density; false = solid hull. */
+  densityAware: boolean;
 }
 
 /** Mirrors the wasm OptimizeOpts (serialized to JSON in the worker). */

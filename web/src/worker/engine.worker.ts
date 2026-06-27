@@ -126,6 +126,12 @@ type Req =
     }
   | {
       id: number;
+      op: "setBuildState";
+      /** "bonded" (on bed) | "released" (off bed). */
+      state: string;
+    }
+  | {
+      id: number;
       op: "optimize";
       /** OptimizeOptions object — serialized to JSON for the wasm API. */
       opts: Record<string, unknown>;
@@ -391,6 +397,17 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
         );
         const displacements = requireModel().vertex_displacements();
         stats.seconds = (performance.now() - t0) / 1000;
+        (self as unknown as Worker).postMessage(
+          { id: msg.id, ok: true, data: { stats, displacements } },
+          [displacements.buffer]
+        );
+        return;
+      }
+      case "setBuildState": {
+        // Flip on bed ⇄ released without re-solving; re-map the chosen field
+        // onto the mesh for the deformed view.
+        const stats = JSON.parse(requireModel().set_build_state(msg.state));
+        const displacements = requireModel().vertex_displacements();
         (self as unknown as Worker).postMessage(
           { id: msg.id, ok: true, data: { stats, displacements } },
           [displacements.buffer]

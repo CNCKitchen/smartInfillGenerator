@@ -552,6 +552,12 @@ pub struct Model {
     /// stress eps. Dropped when the geometry/grid changes (`clear_results`).
     results: std::collections::HashMap<String, StashedResult>,
     opt: Option<OptOutput>,
+    /// Both build-sim states from the last `solve_build_sim`, kept so the UI can
+    /// flip between "on bed" and "released" without re-running the (expensive)
+    /// sequential build. `set_build_state` swaps the chosen one into `solution`.
+    /// Cleared whenever the grid/geometry changes (`clear_results`).
+    build_bonded: Option<Solution>,
+    build_released: Option<Solution>,
     /// Cumulative orientation transform applied since import (3×3 row-major +
     /// translation). Saved in a project so re-importing the original file +
     /// replaying this one matrix reproduces the exact oriented working mesh
@@ -790,6 +796,8 @@ impl Model {
             opt_eps: None,
             results: std::collections::HashMap::new(),
             opt: None,
+            build_bonded: None,
+            build_released: None,
             transform_accum: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
         })
     }
@@ -1070,6 +1078,9 @@ impl Model {
         // A grid rebuild means any cached optimized stiffness field no longer
         // matches the cell layout — drop it (re-optimizing sets a fresh one).
         self.opt_eps = None;
+        // Build-sim states are tied to the old cell layout too.
+        self.build_bonded = None;
+        self.build_released = None;
         let (lo, hi) = self.mesh.bounds().ok_or_else(|| err("empty mesh"))?;
         let bbox_vol =
             (hi[0] - lo[0]).max(1e-6) * (hi[1] - lo[1]).max(1e-6) * (hi[2] - lo[2]).max(1e-6);
@@ -1209,10 +1220,17 @@ impl Model {
         let (grid, _levels) = self.grid.as_ref().unwrap();
         let eigen = [opts.shrink, opts.shrink, opts.shrink];
         let exag = opts.exaggeration;
+        // Drive the build sim with the as-printed infill density when an
+        // optimized design exists (sparse infill is softer AND lays down less
+        // contracting material — both scale by the same per-cell eps). Falls
+        // back to the solid hull (None) when nothing has been optimized.
+        let density_aware = self.opt_eps.is_some();
+        let eps_override = self.opt_eps.clone();
         let r = sig_core::buildsim::solve_build_progress(
             grid,
             eigen,
             &self.settings,
+            eps_override.as_deref(),
             |done, total, sol| {
                 // Throttle the (expensive) hull build to ~30 preview frames. On
                 // sent frames the payload is the deformed ACTIVATED voxel hull
@@ -1248,7 +1266,10 @@ impl Model {
             r.iters.iter().sum::<usize>() as f64 / r.iters.len() as f64
         };
         let cells = self.grid.as_ref().map(|(g, _)| g.solid_count()).unwrap_or(0);
-        let sol = if opts.state == "bonded" { r.bonded } else { r.released };
+        // Keep BOTH states so the UI can flip on bed ⇄ released with no re-solve.
+        self.build_bonded = Some(r.bonded);
+        self.build_released = Some(r.released);
+        let sol = self.build_state_solution(&opts.state).clone();
         let out = serde_json::json!({
             "maxDisplacement": sol.max_displacement(),
             "bondedMax": bonded_max,
@@ -1259,11 +1280,35 @@ impl Model {
             "itersMax": iters_max,
             "itersMean": iters_mean,
             "cells": cells,
+            "densityAware": density_aware,
         })
         .to_string();
         self.solution = Some(sol);
         self.solution_eps = None;
         Ok(out)
+    }
+
+    /// Pick the stored build-sim solution for a state string ("bonded" → on
+    /// bed, anything else → released). Build-sim only; assumes a build ran.
+    fn build_state_solution(&self, state: &str) -> &Solution {
+        let s = if state == "bonded" { &self.build_bonded } else { &self.build_released };
+        s.as_ref().unwrap()
+    }
+
+    /// Flip the active build-sim result between "bonded" (on bed) and "released"
+    /// (off bed) WITHOUT re-running the build — both were saved by the last
+    /// `solve_build_sim`. The chosen field becomes `self.solution`, so the
+    /// deformed Results view (and `vertex_displacements`) re-renders it.
+    /// JSON: `{ maxDisplacement }`. Errors if no build has been run.
+    pub fn set_build_state(&mut self, state: &str) -> Result<String, JsValue> {
+        if self.build_released.is_none() {
+            return Err(err("no build simulation result to switch — run the build sim first"));
+        }
+        let sol = self.build_state_solution(state).clone();
+        let max = sol.max_displacement();
+        self.solution = Some(sol);
+        self.solution_eps = None;
+        Ok(serde_json::json!({ "maxDisplacement": max }).to_string())
     }
 
     /// Analyze the part AS PRINTED: skin (perimeters × line width) at 100%,
@@ -1440,6 +1485,8 @@ impl Model {
     /// node grid they sample no longer matches the part).
     pub fn clear_results(&mut self) {
         self.results.clear();
+        self.build_bonded = None;
+        self.build_released = None;
     }
 
     /// Assemble a `.infeall` project zip: the original model bytes, the JS-built

@@ -101,6 +101,24 @@ pub fn eigen_forces(
         .collect()
 }
 
+/// Per-cell stiffness/eigen-strain field for the padded build grid.
+///
+/// Default (`None`): the geometric occupancy → eps map (`grid_eps`), i.e. the
+/// part as a **solid hull** (every interior voxel full density). When the
+/// optimizer has produced a graded infill field, that field is passed as
+/// `over` so the build sim sees the **as-printed density**: sparse infill is
+/// both softer *and* lays down less contracting material, so both its stiffness
+/// and its inherent-strain force scale by the same per-cell `eps` — which the
+/// assembly already does (see [`eigen_forces`] and the birth-lock loop). The
+/// override must match the padded cell count; otherwise we fall back to the
+/// hull so a stale field can never desync the grid.
+fn resolve_eps(g: &VoxelGrid, over: Option<&[f32]>) -> Vec<f32> {
+    match over {
+        Some(e) if e.len() == g.cell_count() => e.to_vec(),
+        _ => grid_eps(g),
+    }
+}
+
 #[inline]
 fn node_idx(grid: &VoxelGrid, x: usize, y: usize, z: usize) -> usize {
     let (mx, my) = (grid.nx + 1, grid.ny + 1);
@@ -238,13 +256,14 @@ fn build_bonded_inner(
     grid: &VoxelGrid,
     eigen: [f64; 3],
     s: &SolveSettings,
+    eps_override: Option<&[f32]>,
     on_layer: &mut dyn FnMut(usize, usize, &Solution),
 ) -> Result<(VoxelGrid, usize, Vec<f64>, Vec<f64>, Vec<f64>, Vec<usize>), SolveError> {
     let (g, levels) = pad_for_levels(grid, s.max_levels);
     let (nx, ny, nz) = (g.nx, g.ny, g.nz);
     let (mx, my, mz) = (nx + 1, ny + 1, nz + 1);
     let ndof = 3 * mx * my * mz;
-    let eps_full = grid_eps(&g);
+    let eps_full = resolve_eps(&g, eps_override);
     let ke = ke_hex(s.e0, s.nu, g.h); // reference element stiffness (for E=e0)
 
     // Quiet base: every solid cell present at near-zero stiffness; void = 0. The
@@ -452,7 +471,8 @@ pub fn solve_sequential_bonded(
     eigen: [f64; 3],
     s: &SolveSettings,
 ) -> Result<(Solution, Vec<usize>), SolveError> {
-    let (g, _levels, u, _fe, _fl, iters) = build_bonded_inner(grid, eigen, s, &mut |_, _, _| {})?;
+    let (g, _levels, u, _fe, _fl, iters) =
+        build_bonded_inner(grid, eigen, s, None, &mut |_, _, _| {})?;
     let it = *iters.iter().max().unwrap_or(&0);
     Ok((solution_from(&g, u, it), iters))
 }
@@ -480,23 +500,28 @@ pub fn solve_build(
     eigen: [f64; 3],
     s: &SolveSettings,
 ) -> Result<BuildResult, SolveError> {
-    solve_build_progress(grid, eigen, s, |_, _, _| {})
+    solve_build_progress(grid, eigen, s, None, |_, _, _| {})
 }
 
 /// Like [`solve_build`], but `on_layer(layers_done, total_layers, &bonded_so_far)`
 /// is invoked after each activated layer — for a live progress bar + warp
 /// preview. The bonded build is also where cancellation lands (a stopped solve
 /// propagates `SolveError::Cancelled` out).
+///
+/// `eps_override` lets the caller drive the build sim with the **as-printed
+/// infill density** (the optimizer's stiffness field) instead of the solid
+/// hull; see [`resolve_eps`]. `None` = solid hull.
 pub fn solve_build_progress(
     grid: &VoxelGrid,
     eigen: [f64; 3],
     s: &SolveSettings,
+    eps_override: Option<&[f32]>,
     mut on_layer: impl FnMut(usize, usize, &Solution),
 ) -> Result<BuildResult, SolveError> {
     let (g, levels, u_b, f_eig, f_lock, iters) =
-        build_bonded_inner(grid, eigen, s, &mut on_layer)?;
+        build_bonded_inner(grid, eigen, s, eps_override, &mut on_layer)?;
     let it = *iters.iter().max().unwrap_or(&0);
-    let eps_full = grid_eps(&g);
+    let eps_full = resolve_eps(&g, eps_override);
     let ke = ke_hex(s.e0, s.nu, g.h);
 
     // Peel: bed reaction R = K·u_bonded − (f_eig + f_lock), at the held bed nodes.
@@ -716,6 +741,52 @@ mod tests {
         assert!(
             (sq_top - ss_top).abs() < 0.5 * ss_top.abs().max(1e-9),
             "sequential should track single-shot here: seq {sq_top:.4} vs ss {ss_top:.4}"
+        );
+    }
+
+    /// Feeding the as-printed infill density (a graded `eps_override`) must
+    /// change the BONDED warp versus the solid hull: a soft sparse core is more
+    /// compliant, so the constrained shrink redistributes. (The free RELEASED
+    /// shape is the compatible uniform shrink `u = ε₀·x`, stress-free and hence
+    /// stiffness-independent — so the override only bites where the part is
+    /// constrained, which is exactly the bonded state and the bed peel.) This is
+    /// the end-to-end check that the override actually reaches the assembly.
+    #[test]
+    fn density_field_changes_bonded_warp() {
+        let (nx, ny, nz, h) = (16usize, 8usize, 24usize, 1.0f64);
+        let grid = VoxelGrid::solid_box(nx, ny, nz, h);
+        let beta = -0.01;
+        let s = SolveSettings { e0: 2400.0, nu: 0.35, ..Default::default() };
+
+        // Solid-hull baseline (override = None).
+        let base = solve_build(&grid, [beta, beta, beta], &s).expect("base");
+
+        // As-printed: a soft 20%-density core inside a full-density skin, built on
+        // the PADDED grid so the override length matches the assembly.
+        let (g, _lv) = pad_for_levels(&grid, s.max_levels);
+        let mut eps = grid_eps(&g);
+        for cz in 0..g.nz {
+            for cy in 0..g.ny {
+                for cx in 0..g.nx {
+                    let ci = (cz * g.ny + cy) * g.nx + cx;
+                    if eps[ci] <= 0.0 {
+                        continue;
+                    }
+                    let core = cx >= 2 && cx + 2 < nx && cy >= 1 && cy + 1 < ny;
+                    if core {
+                        eps[ci] = 0.2;
+                    }
+                }
+            }
+        }
+        let graded =
+            solve_build_progress(&grid, [beta, beta, beta], &s, Some(&eps), |_, _, _| {})
+                .expect("graded");
+
+        let (db, dg) = (base.bonded.max_displacement(), graded.bonded.max_displacement());
+        assert!(
+            (db - dg).abs() > 1.0e-3 * db.max(1e-9),
+            "infill density should change the bonded warp: solid {db:.4} vs graded {dg:.4}"
         );
     }
 
