@@ -368,8 +368,15 @@ interface AppState {
   buildProgress: { done: number; total: number } | null;
   /** Both states of the last completed build sim, kept so the Show-state toggle
    *  can flip on bed ⇄ released with no re-solve. null until a build finishes
-   *  (and after a workspace switch / new geometry). */
-  buildResult: { bondedMax: number; releasedMax: number; densityAware: boolean } | null;
+   *  (and after a workspace switch / new geometry). peakLift/peakShear are the
+   *  bed-peel reaction maxima (N, uncalibrated relative indicator). */
+  buildResult: {
+    bondedMax: number;
+    releasedMax: number;
+    densityAware: boolean;
+    peakLift: number;
+    peakShear: number;
+  } | null;
   /** Extras of the last as-printed solve (results dock); null = solid run. */
   printedStats: PrintedSummary | null;
   /** Mesh view: color each cell by its element density (0–1: skin = 1,
@@ -814,6 +821,19 @@ async function pushScalarField(set: SetState, get: () => AppState) {
   const kind = get().resultField;
   // Displacement fields are colored client-side from the displacement buffer:
   // |u| magnitude (-1) or a signed X/Y/Z component (0/1/2). No engine fetch.
+  // Build-sim bed-peel risk fields: a per-vertex scalar in N (uncalibrated),
+  // anchored at 0 (no peel) so the colormap reads risk = warmer. Fetched fresh
+  // each time (build-specific, not in the analysis field cache).
+  if (kind === "peel" || kind === "peelshear") {
+    sceneEvents.onScalarField?.(null);
+    const values = await engine.peelField(kind as "peel" | "peelshear");
+    if (get().resultField !== kind) return;
+    let max = 0;
+    for (let i = 0; i < values.length; i++) if (values[i] > max) max = values[i];
+    set({ fieldRange: { min: 0, max } });
+    sceneEvents.onScalarField?.(values, false, false);
+    return;
+  }
   const dispComp = kind === "u" ? -1 : kind === "ux" ? 0 : kind === "uy" ? 1 : kind === "uz" ? 2 : null;
   if (dispComp !== null) {
     sceneEvents.onScalarField?.(null);
@@ -997,6 +1017,7 @@ async function logGridInfo(set: SetState) {
 
 function fieldUnit(kind: string): string {
   if (kind.startsWith("sf")) return "×"; // marker labels show a plain factor
+  if (kind === "peel" || kind === "peelshear") return "N"; // build-sim bed reaction
   return RESULT_FIELDS.find((f) => f.value === kind)?.unit ?? "";
 }
 
@@ -3401,6 +3422,8 @@ export const useStore = create<AppState>((set, get) => ({
             bondedMax: out.stats.bondedMax,
             releasedMax: out.stats.releasedMax,
             densityAware: out.stats.densityAware,
+            peakLift: out.stats.peakLift,
+            peakShear: out.stats.peakShear,
           },
         });
       } else {

@@ -140,6 +140,7 @@ type Req =
   | { id: number; op: "resmooth"; iters: number }
   | { id: number; op: "setIsoThreshold"; threshold: number; smoothIters: number }
   | { id: number; op: "resultField"; kind: string }
+  | { id: number; op: "peelField"; kind: string }
   | { id: number; op: "voxelResults" }
   | { id: number; op: "voxelResultField"; kind: string }
   | { id: number; op: "stashResult"; resultId: string }
@@ -488,6 +489,13 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
       }
       case "resultField": {
         const values = requireModel().result_field(msg.kind);
+        (self as unknown as Worker).postMessage({ id: msg.id, ok: true, data: values }, [
+          values.buffer,
+        ]);
+        return;
+      }
+      case "peelField": {
+        const values = requireModel().peel_field(msg.kind);
         (self as unknown as Worker).postMessage({ id: msg.id, ok: true, data: values }, [
           values.buffer,
         ]);

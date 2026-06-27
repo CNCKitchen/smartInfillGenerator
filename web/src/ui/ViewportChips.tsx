@@ -170,43 +170,66 @@ export function ViewportChips() {
               </button>
             </div>
           )}
-          <select
-            value={s.resultField}
-            onChange={(e) => void s.setResultField(e.target.value)}
-            title={
-              s.resultField.startsWith("sf")
-                ? "Allowables from the material table; graded infill scales with the same E(ρ) law as its stiffness. Worst case = min(material σᵥᴹ check, layer-adhesion σzz-tension check). Advisory."
-                : "Scalar plotted on the deformed shape"
-            }
-          >
-            <option value="u">Displacement |u|</option>
-            <optgroup label="Displacement (mm)">
-              {RESULT_FIELDS.filter((f) => ["ux", "uy", "uz"].includes(f.value)).map((f) => (
-                <option key={f.value} value={f.value}>
-                  {f.label}
-                </option>
-              ))}
-            </optgroup>
-            <optgroup label="Safety factor">
-              <option value="sf">Safety factor — worst case</option>
-              <option value="sfm">Safety factor — material σₜ/σᵥᴹ</option>
-              <option value="sfz">Safety factor — layer adhesion</option>
-            </optgroup>
-            <optgroup label="Stress (MPa)">
-              {RESULT_FIELDS.filter((f) => f.unit === "MPa").map((f) => (
-                <option key={f.value} value={f.value}>
-                  {f.label}
-                </option>
-              ))}
-            </optgroup>
-            <optgroup label="Strain">
-              {RESULT_FIELDS.filter((f) => f.unit === "" && !f.value.startsWith("sf")).map((f) => (
-                <option key={f.value} value={f.value}>
-                  {f.label}
-                </option>
-              ))}
-            </optgroup>
-          </select>
+          {s.appMode === "buildsim" ? (
+            // Build sim has no stress/SF solve — only the warp and the bed-peel
+            // reaction fields make sense here.
+            <select
+              value={s.resultField}
+              onChange={(e) => void s.setResultField(e.target.value)}
+              title="Field plotted on the warped shape — displacement, or the bed-peel reaction (uncalibrated relative indicator)"
+            >
+              <option value="u">Displacement |u|</option>
+              <optgroup label="Displacement (mm)">
+                {RESULT_FIELDS.filter((f) => ["ux", "uy", "uz"].includes(f.value)).map((f) => (
+                  <option key={f.value} value={f.value}>
+                    {f.label}
+                  </option>
+                ))}
+              </optgroup>
+              <optgroup label="Bed peel (N · relative)">
+                <option value="peel">Peel lift (+Z)</option>
+                <option value="peelshear">Bed shear</option>
+              </optgroup>
+            </select>
+          ) : (
+            <select
+              value={s.resultField}
+              onChange={(e) => void s.setResultField(e.target.value)}
+              title={
+                s.resultField.startsWith("sf")
+                  ? "Allowables from the material table; graded infill scales with the same E(ρ) law as its stiffness. Worst case = min(material σᵥᴹ check, layer-adhesion σzz-tension check). Advisory."
+                  : "Scalar plotted on the deformed shape"
+              }
+            >
+              <option value="u">Displacement |u|</option>
+              <optgroup label="Displacement (mm)">
+                {RESULT_FIELDS.filter((f) => ["ux", "uy", "uz"].includes(f.value)).map((f) => (
+                  <option key={f.value} value={f.value}>
+                    {f.label}
+                  </option>
+                ))}
+              </optgroup>
+              <optgroup label="Safety factor">
+                <option value="sf">Safety factor — worst case</option>
+                <option value="sfm">Safety factor — material σₜ/σᵥᴹ</option>
+                <option value="sfz">Safety factor — layer adhesion</option>
+              </optgroup>
+              <optgroup label="Stress (MPa)">
+                {RESULT_FIELDS.filter((f) => f.unit === "MPa").map((f) => (
+                  <option key={f.value} value={f.value}>
+                    {f.label}
+                  </option>
+                ))}
+              </optgroup>
+              <optgroup label="Strain">
+                {RESULT_FIELDS.filter((f) => f.unit === "" && !f.value.startsWith("sf")).map((f) => (
+                  <option key={f.value} value={f.value}>
+                    {f.label}
+                  </option>
+                ))}
+              </optgroup>
+            </select>
+          )}
         </div>
       )}
 

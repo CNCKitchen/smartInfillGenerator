@@ -315,6 +315,12 @@ export class EngineClient {
     return this.call({ op: "resultField", kind });
   }
 
+  /** Build-sim bed-peel scalar per surface vertex: "peel" = upward lift,
+   *  "peelshear" = bed shear. Newtons, uncalibrated relative indicator. */
+  peelField(kind: "peel" | "peelshear"): Promise<Float32Array> {
+    return this.call({ op: "peelField", kind });
+  }
+
   /** Voxel hull with exact nodal displacements (results-on-voxel-mesh view). */
   voxelResults(): Promise<{
     positions: Float32Array;

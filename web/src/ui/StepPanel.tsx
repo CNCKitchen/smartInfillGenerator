@@ -1209,6 +1209,10 @@ function StepBuildSim() {
           strain field:{" "}
           <b>{br.densityAware ? "as-printed infill density" : "solid hull"}</b>
           {br.densityAware ? "" : " (optimize the part first to use the printed infill)"}.
+          <br />
+          Bed peel — peak lift <b>{br.peakLift.toFixed(1)} N</b> · shear{" "}
+          <b>{br.peakShear.toFixed(1)} N</b>. Pick <b>Peel lift</b> on the Results bar's field menu
+          to see where the part wants to lift (uncalibrated relative indicator).
         </div>
       )}
       <div className="hint">

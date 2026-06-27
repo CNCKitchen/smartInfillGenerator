@@ -600,6 +600,10 @@ pub struct Model {
     /// Cleared whenever the grid/geometry changes (`clear_results`).
     build_bonded: Option<Solution>,
     build_released: Option<Solution>,
+    /// Bed-peel reaction field from the last build sim (on-bed state): the
+    /// per-bed-node lift / shear, as a 2D grid over the coarse build footprint
+    /// so it can be sampled onto the mesh for the "peel risk" result field.
+    build_peel: Option<PeelField>,
     /// Cumulative orientation transform applied since import (3×3 row-major +
     /// translation). Saved in a project so re-importing the original file +
     /// replaying this one matrix reproduces the exact oriented working mesh
@@ -612,6 +616,22 @@ pub struct Model {
 struct StashedResult {
     sol: Solution,
     eps: Option<Vec<f32>>,
+}
+
+/// Bed-peel reaction sampled as a 2D field over the build footprint (the coarse
+/// build grid's z=0 node plane). `lift`/`shear` are `mx·my` flat arrays in
+/// newtons (lift = +Z, the part pulling up = peel; shear = in-plane magnitude).
+/// `peel_field` samples these onto the mesh, ramped to zero over `falloff` mm of
+/// height so the risk concentrates on the first layers. Uncalibrated — a
+/// relative indicator, not an absolute force.
+struct PeelField {
+    mx: usize,
+    my: usize,
+    origin: [f64; 3],
+    h: f64,
+    lift: Vec<f32>,
+    shear: Vec<f32>,
+    falloff: f64,
 }
 
 fn err(e: impl std::fmt::Display) -> JsValue {
@@ -840,6 +860,7 @@ impl Model {
             opt: None,
             build_bonded: None,
             build_released: None,
+            build_peel: None,
             transform_accum: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
         })
     }
@@ -1123,6 +1144,7 @@ impl Model {
         // Build-sim states are tied to the old cell layout too.
         self.build_bonded = None;
         self.build_released = None;
+        self.build_peel = None;
         let grid = VoxelGrid::voxelize(&self.mesh, self.analysis_h()?);
         if grid.solid_count() == 0 {
             return Err(err("voxelization produced no solid cells — model too thin for this resolution"));
@@ -1320,6 +1342,29 @@ impl Model {
             peak_lift = peak_lift.max(rv[2]);
             peak_shear = peak_shear.max((rv[0] * rv[0] + rv[1] * rv[1]).sqrt());
         }
+        // Lay the bed reactions out as a 2D lift/shear field over the footprint
+        // (the z=0 node plane of the coarse build grid) for the peel-risk view.
+        let (mx, my) = (grid.nx + 1, grid.ny + 1);
+        let mut lift = vec![0f32; mx * my];
+        let mut shear = vec![0f32; mx * my];
+        for (n, rv) in &r.bed_reaction {
+            let i = *n as usize; // z=0 plane: i = iy*mx + ix
+            if i < mx * my {
+                lift[i] = rv[2] as f32;
+                shear[i] = (rv[0] * rv[0] + rv[1] * rv[1]).sqrt() as f32;
+            }
+        }
+        self.build_peel = Some(PeelField {
+            mx,
+            my,
+            origin: grid.origin,
+            h: grid.h,
+            lift,
+            shear,
+            // Ramp the risk to zero over the first ~5 coarse layers, capped so a
+            // short part still fades within itself.
+            falloff: (grid.h * 5.0).min(0.3 * grid.nz as f64 * grid.h).max(grid.h),
+        });
         let (bonded_max, released_max) = (r.bonded.max_displacement(), r.released.max_displacement());
         let iters_max = r.iters.iter().copied().max().unwrap_or(0);
         let iters_mean = if r.iters.is_empty() {
@@ -1373,6 +1418,36 @@ impl Model {
         self.solution = Some(sol);
         self.solution_eps = None;
         Ok(serde_json::json!({ "maxDisplacement": max }).to_string())
+    }
+
+    /// Bed-peel risk as a per-mesh-vertex scalar (3 per display triangle, same
+    /// layout as `result_field`), sampled from the last build sim's bed
+    /// reactions. `kind`: "peel" = upward lift (+Z, the peel driver), "peelshear"
+    /// = in-plane bed shear magnitude. Each vertex takes the reaction at its
+    /// nearest footprint node, ramped to zero over the first layers so the risk
+    /// reads at the base. Newtons, uncalibrated (a RELATIVE indicator). Errors
+    /// if no build sim has been run.
+    pub fn peel_field(&self, kind: &str) -> Result<Vec<f32>, JsValue> {
+        let pf = self
+            .build_peel
+            .as_ref()
+            .ok_or_else(|| err("no peel data — run the build sim first"))?;
+        let src = if kind == "peelshear" { &pf.shear } else { &pf.lift };
+        let mut out = Vec::with_capacity(self.mesh.tris.len() * 3);
+        for t in &self.mesh.tris {
+            for v in 0..3 {
+                let (px, py, pz) = (t[3 * v] as f64, t[3 * v + 1] as f64, t[3 * v + 2] as f64);
+                let ix = (((px - pf.origin[0]) / pf.h).round() as i64)
+                    .clamp(0, pf.mx as i64 - 1) as usize;
+                let iy = (((py - pf.origin[1]) / pf.h).round() as i64)
+                    .clamp(0, pf.my as i64 - 1) as usize;
+                let base = src[iy * pf.mx + ix].max(0.0); // only positive lift = risk
+                let d = (pz - pf.origin[2]).max(0.0);
+                let att = (1.0 - d / pf.falloff).clamp(0.0, 1.0) as f32;
+                out.push(base * att);
+            }
+        }
+        Ok(out)
     }
 
     /// Analyze the part AS PRINTED: skin (perimeters × line width) at 100%,
@@ -1551,6 +1626,7 @@ impl Model {
         self.results.clear();
         self.build_bonded = None;
         self.build_released = None;
+        self.build_peel = None;
     }
 
     /// Assemble a `.infeall` project zip: the original model bytes, the JS-built
