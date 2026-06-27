@@ -57,7 +57,8 @@ export function SettingsModal() {
               <th>ρ (g/cm³)</th>
               <th>σₜ (MPa)</th>
               <th>σₜᶻ (MPa)</th>
-              <th title="Build-sim isotropic process shrink (inherent strain)">Shrink %</th>
+              <th title="Build-sim IN-PLANE (XY) process shrink — the dominant warp driver (inherent strain)">Shrink % (XY)</th>
+              <th title="Build-sim THROUGH-LAYER (Z) process shrink — transverse isotropy; usually less than in-plane">Shrink % (Z)</th>
               <th />
             </tr>
           </thead>
@@ -132,6 +133,16 @@ export function SettingsModal() {
                     step={0.1}
                     onCommit={(v) =>
                       s.updateMaterial(i, { ...m, shrink: Math.max(0, v) / 100 })
+                    }
+                  />
+                </td>
+                <td>
+                  <NumInput
+                    value={(m.shrinkZ ?? m.shrink) * 100}
+                    min={0}
+                    step={0.1}
+                    onCommit={(v) =>
+                      s.updateMaterial(i, { ...m, shrinkZ: Math.max(0, v) / 100 })
                     }
                   />
                 </td>

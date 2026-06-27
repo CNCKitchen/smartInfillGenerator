@@ -1158,7 +1158,8 @@ function StepBuildSim() {
       <div className="group">
         <div className="dim small">
           Inherent-strain warp via sequential layer activation. Shrink is a material property (
-          <b>{s.material.name}</b>: {(s.material.shrink * 100).toFixed(2)}%) — edit it in{" "}
+          <b>{s.material.name}</b>: XY {(s.material.shrink * 100).toFixed(2)}% · Z{" "}
+          {((s.material.shrinkZ ?? s.material.shrink) * 100).toFixed(2)}%) — edit it in{" "}
           <button className="linkbtn" onClick={() => s.openSettings(true)}>
             ⚙ Settings
           </button>

@@ -100,6 +100,11 @@ function loadSettings(): PersistedSettings {
                 : Math.round(0.7 * strength),
             // Pre-build-sim saves: default to a ~0.5% process shrink.
             shrink: typeof m.shrink === "number" && m.shrink > 0 ? m.shrink : 0.005,
+            // Pre-anisotropy saves: Z shrink ≈ half the in-plane value.
+            shrinkZ:
+              typeof m.shrinkZ === "number" && m.shrinkZ > 0
+                ? m.shrinkZ
+                : 0.5 * (typeof m.shrink === "number" && m.shrink > 0 ? m.shrink : 0.005),
           };
         });
       if (!fallback.materials.length) fallback.materials = DEFAULT_MATERIALS.map((m) => ({ ...m }));
@@ -2746,7 +2751,7 @@ export const useStore = create<AppState>((set, get) => ({
   addMaterial() {
     const mats = [
       ...get().materials,
-      { name: "Custom", e0: 2000, nu: 0.35, density: 1.2, strength: 40, strengthZ: 28, shrink: 0.005 },
+      { name: "Custom", e0: 2000, nu: 0.35, density: 1.2, strength: 40, strengthZ: 28, shrink: 0.005, shrinkZ: 0.0025 },
     ];
     set({ materials: mats });
     saveSettings(mats, get().curves, get().levelSettings);
@@ -3336,10 +3341,13 @@ export const useStore = create<AppState>((set, get) => ({
               : `skin resolved by ${out.stats.skinLayers} cell layer${out.stats.skinLayers === 1 ? "" : "s"}`)
         );
       } else if (buildsim) {
-        const shrink = -Math.abs(st0.material.shrink); // material property; eigenstrain shrinks
+        // Material property; eigenstrain shrinks. Transverse isotropy: in-plane
+        // (XY) vs through-layer (Z) shrink.
+        const shrink = -Math.abs(st0.material.shrink);
+        const shrinkZ = -Math.abs(st0.material.shrinkZ ?? st0.material.shrink);
         appendLog(
           set,
-          `Build sim — ${st0.material.name}, ${(Math.abs(shrink) * 100).toFixed(2)}% shrink (material), ` +
+          `Build sim — ${st0.material.name}, shrink XY ${(Math.abs(shrink) * 100).toFixed(2)}% · Z ${(Math.abs(shrinkZ) * 100).toFixed(2)}% (material), ` +
             `${st0.buildState === "released" ? "released (off-bed)" : "on-bed"} state` +
             " — sequential inherent-strain warp + bed peel (coarse grid) …"
         );
@@ -3375,7 +3383,7 @@ export const useStore = create<AppState>((set, get) => ({
         sceneEvents.onViewState?.("deformed", exag);
         sceneEvents.onPeelMap?.(null, null, 0); // clear any prior run's bed map
         const out = await engine.buildSim(
-          { shrink, state: st0.buildState, exaggeration: exag },
+          { shrink, shrinkZ, state: st0.buildState, exaggeration: exag },
           (p, positions, mags) => {
             set({ buildProgress: { done: p.done, total: p.total } });
             // Throttled frames carry the deformed active voxel hull + |u| — paint

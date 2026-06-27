@@ -477,8 +477,10 @@ export interface PrintedStats extends SolveStats {
 
 /** Mirrors the wasm BuildSimOpts (serialized to JSON in the worker). */
 export interface BuildSimOptions {
-  /** Isotropic per-layer shrink fraction (negative = shrink). */
+  /** In-plane (XY) per-layer shrink fraction (negative = shrink). */
   shrink: number;
+  /** Through-layer (Z) per-layer shrink fraction (transverse isotropy). */
+  shrinkZ: number;
   /** Which state to deform the mesh by: off-bed sprung shape or held on bed. */
   state: "released" | "bonded";
   /** Display exaggeration baked into the live preview hull positions. */

@@ -398,8 +398,11 @@ impl Default for PrintedOpts {
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct BuildSimOpts {
-    /// Isotropic shrink fraction applied per layer (negative = shrink).
+    /// In-plane (XY) shrink fraction applied per layer (negative = shrink).
     shrink: f64,
+    /// Through-layer (Z) shrink fraction — transverse isotropy. Defaults to the
+    /// in-plane value (isotropic) when omitted.
+    shrink_z: Option<f64>,
     /// Which state to leave as the live solution for the deformed view:
     /// "released" (off-bed sprung shape) or "bonded" (held on the bed).
     state: String,
@@ -409,7 +412,7 @@ struct BuildSimOpts {
 
 impl Default for BuildSimOpts {
     fn default() -> Self {
-        Self { shrink: -0.003, state: "released".into(), exaggeration: 10.0 }
+        Self { shrink: -0.003, shrink_z: None, state: "released".into(), exaggeration: 10.0 }
     }
 }
 
@@ -1299,7 +1302,7 @@ impl Model {
         on_layer: &js_sys::Function,
     ) -> Result<String, JsValue> {
         let opts: BuildSimOpts = serde_json::from_str(opts_json).map_err(err)?;
-        let eigen = [opts.shrink, opts.shrink, opts.shrink];
+        let eigen = [opts.shrink, opts.shrink, opts.shrink_z.unwrap_or(opts.shrink)];
         let exag = opts.exaggeration;
         // The sequential build does one multigrid solve PER layer, so cell count
         // drives the cost. Run on a deliberately COARSER grid than analysis:
