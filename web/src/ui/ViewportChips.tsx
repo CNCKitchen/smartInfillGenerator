@@ -27,6 +27,10 @@ export function ViewportChips() {
       viewMode: s.viewMode,
       hasResult: s.hasResult,
       optSummary: s.optSummary,
+      appMode: s.appMode,
+      buildState: s.buildState,
+      setBuildState: s.setBuildState,
+      buildResult: s.buildResult,
       results: s.results,
       activeResultId: s.activeResultId,
       resultEpochs: s.resultEpochs,
@@ -71,6 +75,28 @@ export function ViewportChips() {
 
       {resultsView && (
         <div className="fieldchip">
+          {/* Build Sim: the on-bed ⇄ released switch lives where the load-case
+              selector sits in the analysis workspace. Both states are cached,
+              so this is an instant re-map (no re-solve). */}
+          {s.appMode === "buildsim" && s.buildResult && (
+            <>
+              <div className="seg" title="Switch the warped shape between held on the build plate and released (sprung) — the predeform target">
+                <button
+                  className={s.buildState === "bonded" ? "on" : ""}
+                  onClick={() => void s.setBuildState("bonded")}
+                >
+                  On bed
+                </button>
+                <button
+                  className={s.buildState === "released" ? "on" : ""}
+                  onClick={() => void s.setBuildState("released")}
+                >
+                  Released
+                </button>
+              </div>
+              <span className="chipdiv" />
+            </>
+          )}
           {s.results.length > 0 && (() => {
             // Results are pre-sorted (kind order, then load-step order). Collapse
             // to DISTINCT kinds for the first dropdown; the second dropdown steps

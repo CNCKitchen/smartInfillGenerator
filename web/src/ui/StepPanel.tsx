@@ -1162,18 +1162,18 @@ function StepBuildSim() {
         </div>
         <div className="seg">
           <button
-            className={s.buildState === "released" ? "on" : ""}
-            onClick={() => s.setBuildState("released")}
-            title="Off-bed sprung shape — the predeform target"
-          >
-            Released
-          </button>
-          <button
             className={s.buildState === "bonded" ? "on" : ""}
-            onClick={() => s.setBuildState("bonded")}
+            onClick={() => void s.setBuildState("bonded")}
             title="Distortion while still held on the bed"
           >
             On bed
+          </button>
+          <button
+            className={s.buildState === "released" ? "on" : ""}
+            onClick={() => void s.setBuildState("released")}
+            title="Off-bed sprung shape — the predeform target"
+          >
+            Released
           </button>
         </div>
         <div className="dim small">
