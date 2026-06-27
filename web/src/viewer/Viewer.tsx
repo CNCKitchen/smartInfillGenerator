@@ -94,6 +94,8 @@ export function Viewer() {
     sceneEvents.onRegions = (r) => scene.setRegions(r);
     sceneEvents.onViewState = (mode, scale) => scene.setViewState(mode, scale);
     sceneEvents.onVoxelMesh = (hull, edges, density) => scene.setVoxelMesh(hull, edges, density);
+    sceneEvents.onBuildGhost = (p) => scene.setBuildGhost(p);
+    sceneEvents.onBuildActive = (p) => scene.setBuildActive(p);
     sceneEvents.onMeshDensity = (on) => scene.setMeshDensity(on);
     sceneEvents.onWireframe = (on) => scene.setWireframe(on);
     sceneEvents.onVoxelCutActive = (on) => scene.setVoxelCutActive(on);

@@ -1016,6 +1016,10 @@ export interface SceneEvents {
     edges: Float32Array | null,
     density?: Float32Array | null
   ) => void;
+  /** Build-sim live preview: faint full-hull ghost (deactivated voxels). */
+  onBuildGhost?: (positions: Float32Array | null) => void;
+  /** Build-sim live preview: growing deformed active hull (printed voxels). */
+  onBuildActive?: (positions: Float32Array | null) => void;
   /** Same part, new pose (orientation tools): swap positions in place. */
   onModelTransformed?: (positions: Float32Array, bbox: LoadedModel["bbox"]) => void;
   /** Symmetry plane state for the viewport: enabled + plane n·p = c. */
@@ -3255,14 +3259,28 @@ export const useStore = create<AppState>((set, get) => ({
           set,
           `Build sim (inherent strain): ${st0.material.name} ${(Math.abs(shrink) * 100).toFixed(2)}% shrink, ${st0.buildState} state — warping + bed peel …`
         );
-        // Land in the deformed view up front so the warp can animate as it builds.
-        set({ busy: "Build sim…", buildProgress: { done: 0, total: 0 }, viewMode: "deformed" });
-        sceneEvents.onViewState?.("deformed", get().deformScale);
-        const out = await engine.buildSim({ shrink, state: st0.buildState }, (p, disp) => {
-          set({ buildProgress: { done: p.done, total: p.total } });
-          // Throttled frames carry the accumulating warp — render it live.
-          if (disp && disp.length > 0) sceneEvents.onDisplacements?.(disp, null);
-        });
+        // Live preview on the VOXEL hull at 10× exaggeration: a faint full-hull
+        // ghost (deactivated voxels) + a growing deformed active hull that warps
+        // as layers activate.
+        const exag = 10;
+        set({ busy: "Build sim…", buildProgress: { done: 0, total: 0 }, deformScale: exag });
+        try {
+          const { hull } = await engine.voxelMesh();
+          sceneEvents.onBuildGhost?.(hull);
+        } catch {
+          /* ghost is optional — proceed without it */
+        }
+        const out = await engine.buildSim(
+          { shrink, state: st0.buildState, exaggeration: exag },
+          (p, positions) => {
+            set({ buildProgress: { done: p.done, total: p.total } });
+            // Throttled frames carry the deformed active voxel hull — render it.
+            if (positions && positions.length > 0) sceneEvents.onBuildActive?.(positions);
+          }
+        );
+        // Tear down the preview; the final result renders via the deformed view.
+        sceneEvents.onBuildGhost?.(null);
+        sceneEvents.onBuildActive?.(null);
         set({ buildProgress: null });
         displacements = out.displacements;
         // Synthesize a SolveStats so the deformed view + dock render uniformly.
@@ -3399,7 +3417,12 @@ export const useStore = create<AppState>((set, get) => ({
       }
     } finally {
       stopResidualPoll(); // also covers the error/cancel paths
-      set({ buildProgress: null }); // covers build-sim cancel/error
+      if (get().buildProgress) {
+        // Build-sim cancel/error: drop the live preview + progress.
+        sceneEvents.onBuildGhost?.(null);
+        sceneEvents.onBuildActive?.(null);
+        set({ buildProgress: null });
+      }
       session.endRun();
     }
   },

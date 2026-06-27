@@ -403,12 +403,47 @@ struct BuildSimOpts {
     /// Which state to leave as the live solution for the deformed view:
     /// "released" (off-bed sprung shape) or "bonded" (held on the bed).
     state: String,
+    /// Display exaggeration baked into the live preview hull positions.
+    exaggeration: f64,
 }
 
 impl Default for BuildSimOpts {
     fn default() -> Self {
-        Self { shrink: -0.003, state: "released".into() }
+        Self { shrink: -0.003, state: "released".into(), exaggeration: 10.0 }
     }
+}
+
+/// True when all 8 nodes of cell `ci` are active (the cell has been printed).
+fn cell_activated(grid: &VoxelGrid, ci: usize, active: &[bool]) -> bool {
+    let (nx, ny) = (grid.nx, grid.ny);
+    let (cz, cy, cx) = (ci / (nx * ny), (ci / nx) % ny, ci % nx);
+    let (mx, my) = (nx + 1, ny + 1);
+    for oz in 0..2 {
+        for oy in 0..2 {
+            for ox in 0..2 {
+                if !active[((cz + oz) * my + cy + oy) * mx + cx + ox] {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Voxel hull of the ALREADY-ACTIVATED cells, each vertex displaced by `exag·u`
+/// — the live build-preview geometry (grows + warps as layers activate). Flat
+/// xyz soup.
+fn deformed_activated_hull(grid: &VoxelGrid, sol: &Solution, exag: f64) -> Vec<f32> {
+    let (tris, _e, _c) = grid.surface_mesh_where(&|ci| cell_activated(grid, ci, &sol.active));
+    let mut out = Vec::with_capacity(tris.len());
+    for c in tris.chunks_exact(3) {
+        let p = [c[0] as f64, c[1] as f64, c[2] as f64];
+        let u = sol.sample_displacement(p);
+        out.push((p[0] + exag * u[0]) as f32);
+        out.push((p[1] + exag * u[1]) as f32);
+        out.push((p[2] + exag * u[2]) as f32);
+    }
+    out
 }
 
 /// Sample a solution's displacement onto each soup vertex (9 floats/triangle) —
@@ -1163,20 +1198,22 @@ impl Model {
         self.ensure_grid()?;
         let (grid, _levels) = self.grid.as_ref().unwrap();
         let eigen = [opts.shrink, opts.shrink, opts.shrink];
-        let mesh = &self.mesh;
+        let exag = opts.exaggeration;
         let r = sig_core::buildsim::solve_build_progress(
             grid,
             eigen,
             &self.settings,
             |done, total, sol| {
-                // Throttle the (expensive) mesh mapping to ~30 preview frames.
+                // Throttle the (expensive) hull build to ~30 preview frames. On
+                // sent frames the payload is the deformed ACTIVATED voxel hull
+                // (grows + warps); empty otherwise (progress-only).
                 let stride = (total / 30).max(1);
-                let disp = if done == total || done % stride == 0 {
-                    map_displacements(mesh, sol)
+                let pos = if done == total || done % stride == 0 {
+                    deformed_activated_hull(grid, sol, exag)
                 } else {
                     Vec::new()
                 };
-                let arr = js_sys::Float32Array::from(disp.as_slice());
+                let arr = js_sys::Float32Array::from(pos.as_slice());
                 let _ = on_layer.call3(
                     &JsValue::NULL,
                     &JsValue::from(done as u32),

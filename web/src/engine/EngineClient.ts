@@ -454,6 +454,8 @@ export interface BuildSimOptions {
   shrink: number;
   /** Which state to deform the mesh by: off-bed sprung shape or held on bed. */
   state: "released" | "bonded";
+  /** Display exaggeration baked into the live preview hull positions. */
+  exaggeration: number;
 }
 
 /** Build-sim stats. `maxDisplacement` is the shown state; bonded/released give

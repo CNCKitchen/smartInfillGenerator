@@ -193,6 +193,12 @@ export class SceneManager {
   private voxelGroup = new THREE.Group();
   private voxelDisposables: { dispose(): void }[] = [];
 
+  // Build-sim live preview: faint full-hull ghost (deactivated voxels) + a
+  // growing deformed active hull (already-printed voxels, exaggeration baked in).
+  private buildGroup = new THREE.Group();
+  private buildGhost: THREE.Object3D | null = null;
+  private buildActive: THREE.Object3D | null = null;
+
   // Rigid-body-mode animation
   private rbmMode: { t: number[]; r: number[]; center: number[] } | null = null;
   private rbmAmp = 1;
@@ -363,6 +369,7 @@ export class SceneManager {
 
     this.scene.add(this.bcMarkers);
     this.scene.add(this.voxelGroup);
+    this.scene.add(this.buildGroup);
     this.buildGizmo();
 
     canvas.addEventListener("pointermove", this.onPointerMove);
@@ -598,6 +605,8 @@ export class SceneManager {
     this.viewMode = "setup";
     this.setRegions(null);
     this.setVoxelMesh(null, null);
+    this.setBuildGhost(null);
+    this.setBuildActive(null);
     this.setOptShape(null, null);
 
     this.geometry = new THREE.BufferGeometry();
@@ -1786,6 +1795,75 @@ export class SceneManager {
   setDeformAnimate(on: boolean) {
     this.deformAnimate = on;
     if (!on) this.applyPositions(); // restore full deflection
+  }
+
+  /** Flat-shaded soup mesh for the live build preview. */
+  private buildHullMesh(positions: Float32Array, ghost: boolean): THREE.Mesh {
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    geo.computeVertexNormals();
+    const mat = new THREE.MeshStandardMaterial({
+      color: ghost ? 0x9aa0a6 : 0xe8722b,
+      roughness: 0.85,
+      metalness: 0.05,
+      flatShading: true,
+      side: THREE.DoubleSide,
+      transparent: ghost,
+      opacity: ghost ? 0.12 : 1,
+      depthWrite: !ghost,
+    });
+    return new THREE.Mesh(geo, mat);
+  }
+
+  private disposeMesh(obj: THREE.Object3D | null) {
+    if (!obj) return;
+    const m = obj as THREE.Mesh;
+    m.geometry?.dispose();
+    (m.material as THREE.Material | undefined)?.dispose();
+  }
+
+  /** Faint full-hull ghost (the deactivated voxels) for the build preview.
+   *  null clears it. */
+  setBuildGhost(positions: Float32Array | null) {
+    if (this.buildGhost) {
+      this.buildGroup.remove(this.buildGhost);
+      this.disposeMesh(this.buildGhost);
+      this.buildGhost = null;
+    }
+    if (positions && positions.length) {
+      this.buildGhost = this.buildHullMesh(positions, true);
+      this.buildGroup.add(this.buildGhost);
+    }
+    this.updateBuildVisibility();
+  }
+
+  /** Growing deformed active hull (already-printed voxels, exaggeration baked
+   *  in). Replaced each preview frame; null clears it. */
+  setBuildActive(positions: Float32Array | null) {
+    if (this.buildActive) {
+      this.buildGroup.remove(this.buildActive);
+      this.disposeMesh(this.buildActive);
+      this.buildActive = null;
+    }
+    if (positions && positions.length) {
+      this.buildActive = this.buildHullMesh(positions, false);
+      this.buildGroup.add(this.buildActive);
+    }
+    this.updateBuildVisibility();
+  }
+
+  /** While the preview is up, hide the normal model/voxel/BC views; on clear,
+   *  restore them via refreshView. */
+  private updateBuildVisibility() {
+    const on = !!(this.buildGhost || this.buildActive);
+    this.buildGroup.visible = on;
+    if (on) {
+      if (this.mesh) this.mesh.visible = false;
+      this.voxelGroup.visible = false;
+      this.bcMarkers.visible = false;
+    } else {
+      this.refreshView();
+    }
   }
 
   setVoxelMesh(
