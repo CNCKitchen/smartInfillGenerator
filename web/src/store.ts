@@ -105,6 +105,11 @@ function loadSettings(): PersistedSettings {
               typeof m.shrinkZ === "number" && m.shrinkZ > 0
                 ? m.shrinkZ
                 : 0.5 * (typeof m.shrink === "number" && m.shrink > 0 ? m.shrink : 0.005),
+            // Pre-plasticity saves: yield ≈ 90% of σₜ (rough printed value).
+            yieldStrength:
+              typeof m.yieldStrength === "number" && m.yieldStrength > 0
+                ? m.yieldStrength
+                : Math.round(0.9 * strength),
           };
         });
       if (!fallback.materials.length) fallback.materials = DEFAULT_MATERIALS.map((m) => ({ ...m }));
@@ -374,7 +379,7 @@ interface AppState {
   /** Both states of the last completed build sim, kept so the Show-state toggle
    *  can flip on bed ⇄ released with no re-solve. null until a build finishes
    *  (and after a workspace switch / new geometry). peakLift/peakShear are the
-   *  bed-peel reaction maxima (N, uncalibrated relative indicator). */
+   *  bed-peel traction maxima (MPa, mesh-independent, uncalibrated). */
   buildResult: {
     bondedMax: number;
     releasedMax: number;
@@ -1035,7 +1040,7 @@ async function logGridInfo(set: SetState) {
 
 function fieldUnit(kind: string): string {
   if (kind.startsWith("sf")) return "×"; // marker labels show a plain factor
-  if (kind === "peel" || kind === "peelshear") return "N"; // build-sim bed reaction
+  if (kind === "peel" || kind === "peelshear") return "MPa"; // build-sim bed traction
   return RESULT_FIELDS.find((f) => f.value === kind)?.unit ?? "";
 }
 
@@ -2797,7 +2802,7 @@ export const useStore = create<AppState>((set, get) => ({
   addMaterial() {
     const mats = [
       ...get().materials,
-      { name: "Custom", e0: 2000, nu: 0.35, density: 1.2, strength: 40, strengthZ: 28, shrink: 0.005, shrinkZ: 0.0025 },
+      { name: "Custom", e0: 2000, nu: 0.35, density: 1.2, strength: 40, strengthZ: 28, shrink: 0.005, shrinkZ: 0.0025, yieldStrength: 36 },
     ];
     set({ materials: mats });
     saveSettings(mats, get().curves, get().levelSettings);
@@ -3408,9 +3413,13 @@ export const useStore = create<AppState>((set, get) => ({
         // (XY) vs through-layer (Z) shrink.
         const shrink = -Math.abs(st0.material.shrink);
         const shrinkZ = -Math.abs(st0.material.shrinkZ ?? st0.material.shrink);
+        // Yield enables the plastic step that makes the released warp depend on
+        // infill density (without it a uniform shrink releases density-blind).
+        const yieldStrength = Math.max(0, st0.material.yieldStrength ?? 0);
         appendLog(
           set,
           `Build sim — ${st0.material.name}, shrink XY ${(Math.abs(shrink) * 100).toFixed(2)}% · Z ${(Math.abs(shrinkZ) * 100).toFixed(2)}% (material), ` +
+            `${yieldStrength > 0 ? `yield ${yieldStrength} MPa (plastic)` : "elastic"}, ` +
             `${st0.buildState === "released" ? "released (off-bed)" : "on-bed"} state` +
             " — sequential inherent-strain warp + bed peel (coarse grid) …"
         );
@@ -3446,7 +3455,7 @@ export const useStore = create<AppState>((set, get) => ({
         sceneEvents.onViewState?.("deformed", exag);
         sceneEvents.onPeelMap?.(null, null, 0); // clear any prior run's bed map
         const out = await engine.buildSim(
-          { shrink, shrinkZ, state: st0.buildState, exaggeration: exag },
+          { shrink, shrinkZ, state: st0.buildState, exaggeration: exag, yieldStrength },
           (p, positions, mags) => {
             set({ buildProgress: { done: p.done, total: p.total } });
             // Throttled frames carry the deformed active voxel hull + |u| — paint
@@ -3501,7 +3510,7 @@ export const useStore = create<AppState>((set, get) => ({
         );
         appendLog(
           set,
-          `  bed peel: peak lift ${out.stats.peakLift.toFixed(1)} N (+Z), peak shear ${out.stats.peakShear.toFixed(1)} N — uncalibrated, relative indicator only`
+          `  bed peel: peak traction ${out.stats.peakLift.toFixed(3)} MPa (+Z), peak shear ${out.stats.peakShear.toFixed(3)} MPa — mesh-independent, uncalibrated indicator`
         );
         // Both states are now cached in the engine → enable instant switching.
         set({

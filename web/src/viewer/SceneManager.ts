@@ -1912,6 +1912,8 @@ export class SceneManager {
       this.peelMap = new THREE.Mesh(geo, mat);
       this.scene.add(this.peelMap);
     }
+    // Part visibility depends on whether the peel map is shown.
+    this.refreshView();
   }
 
   setVoxelMesh(
@@ -2828,7 +2830,9 @@ export class SceneManager {
     // coincident body surface (the carved regions sit inside it; the retained
     // faces sit exactly on it).
     const hideHull = this.resultSolid && (this.viewMode === "density" || infill);
-    this.mesh.visible = !voxResult && !hideHull;
+    // Bed-peel heatmap on screen: hide the part so the plate map reads cleanly
+    // (no need to look under or through the model).
+    this.mesh.visible = !voxResult && !hideHull && !this.peelMap;
     this.voxelGroup.visible = this.viewMode === "mesh";
     if (this.voxRes) this.voxRes.group.visible = voxResult;
     // Wireframe overlay: undeformed model views only (its lines are built from

@@ -155,7 +155,7 @@ export function Viewer() {
       } else if (resultField.startsWith("sf")) {
         fmt = (v) => `${v.toFixed(2)}×`;
       } else if (resultField === "peel" || resultField === "peelshear") {
-        fmt = (v) => fmtField(v, "N");
+        fmt = (v) => fmtField(v, "MPa");
       } else {
         const unit = RESULT_FIELDS.find((f) => f.value === resultField)?.unit ?? "";
         fmt = (v) => fmtField(v, unit);
@@ -260,7 +260,6 @@ function fmtField(v: number, unit: string): string {
     if (a >= 0.01 || a === 0) return `${v.toPrecision(3)} MPa`;
     return `${v.toExponential(1)} MPa`;
   }
-  if (unit === "N") return `${v.toFixed(1)} N`; // bed-peel reaction
   // strain: dimensionless, engineering notation
   return v === 0 ? "0" : v.toExponential(2);
 }
@@ -376,7 +375,7 @@ function Legend() {
     // Engine-fetched stress/strain/safety/peel field (NOT a displacement quantity).
     const isField = resultField !== "u" && !isDispComp && (!!def || isPeel) && !!fieldRange;
     const isSf = resultField.startsWith("sf");
-    const unit = isPeel ? "N" : isField ? def!.unit : "mm"; // displacement (|u| or component) is mm
+    const unit = isPeel ? "MPa" : isField ? def!.unit : "mm"; // displacement (|u| or component) is mm
     // Every displacement plot (|u| anchored at 0, or a signed component) takes
     // its bounds from the scene-reported range so the legend follows the ACTIVE
     // result; the solve stat is only a first-paint fallback before the report.
@@ -386,8 +385,7 @@ function Legend() {
     const effMax = legendMax ?? autoMax;
     const overridden = legendMin !== null || legendMax !== null;
     const fmt = (v: number) => (isSf ? v.toFixed(2) : isField ? fmtField(v, unit) : fmtDisp(v));
-    const hint =
-      unit === "MPa" ? "MPa" : unit === "mm" ? "mm" : unit === "N" ? "N" : isSf ? "factor" : "strain";
+    const hint = unit === "MPa" ? "MPa" : unit === "mm" ? "mm" : isSf ? "factor" : "strain";
     return (
       <div className="legend">
         <div className="legendtitle">
@@ -486,7 +484,7 @@ function Legend() {
         )}
         {isPeel && (
           <div className="legendnote">
-            bed reaction · uncalibrated relative indicator · concentrated on the first layers
+            bed traction (force ÷ area, mesh-independent) · uncalibrated · first layers
           </div>
         )}
         {resultField === "svm" && (

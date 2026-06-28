@@ -57,7 +57,7 @@ fn main() {
     let t_ss = t1.elapsed().as_secs_f64();
 
     let t2 = Instant::now();
-    let r = solve_build(&grid, [beta, beta, beta], &s).expect("build"); // State 1+2 + peel
+    let r = solve_build(&grid, [beta, beta, beta], &s, None).expect("build"); // State 1+2 + peel
     let t_sq = t2.elapsed().as_secs_f64();
 
     let write = |name: &str, bytes: Vec<u8>| {

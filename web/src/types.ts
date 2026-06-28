@@ -142,13 +142,19 @@ export interface Material {
    *  out and what survives is in-plane vs build-direction. Usually < in-plane
    *  (the interlayer accommodates Z). Equal to `shrink` ⇒ isotropic. */
   shrinkZ: number;
+  /** Build-sim: yield stress in MPa. Drives the elastic–perfectly-plastic step
+   *  that locks in the incompatible plastic strain near the bed — without it a
+   *  uniform-eigenstrain release is the stress-free compatible shrink, which is
+   *  density-blind (0 % and 100 % infill warp identically). Rough printed value;
+   *  uncalibrated. 0 ⇒ pure-elastic release. */
+  yieldStrength: number;
 }
 
 export const DEFAULT_MATERIALS: Material[] = [
-  { name: "PLA", e0: 3500, nu: 0.35, density: 1.24, strength: 50, strengthZ: 35, shrink: 0.004, shrinkZ: 0.002 },
-  { name: "PETG", e0: 2100, nu: 0.37, density: 1.27, strength: 45, strengthZ: 34, shrink: 0.004, shrinkZ: 0.002 },
-  { name: "ABS", e0: 2250, nu: 0.37, density: 1.05, strength: 38, strengthZ: 25, shrink: 0.008, shrinkZ: 0.004 },
-  { name: "ASA", e0: 2400, nu: 0.37, density: 1.07, strength: 43, strengthZ: 29, shrink: 0.006, shrinkZ: 0.003 },
+  { name: "PLA", e0: 3500, nu: 0.35, density: 1.24, strength: 50, strengthZ: 35, shrink: 0.004, shrinkZ: 0.002, yieldStrength: 45 },
+  { name: "PETG", e0: 2100, nu: 0.37, density: 1.27, strength: 45, strengthZ: 34, shrink: 0.004, shrinkZ: 0.002, yieldStrength: 40 },
+  { name: "ABS", e0: 2250, nu: 0.37, density: 1.05, strength: 38, strengthZ: 25, shrink: 0.008, shrinkZ: 0.004, yieldStrength: 33 },
+  { name: "ASA", e0: 2400, nu: 0.37, density: 1.07, strength: 43, strengthZ: 29, shrink: 0.006, shrinkZ: 0.003, yieldStrength: 38 },
 ];
 
 export type PatternKey = "gyroid" | "cubic" | "grid";

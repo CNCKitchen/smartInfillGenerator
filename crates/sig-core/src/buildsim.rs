@@ -42,6 +42,15 @@ const PIN_REL: f64 = 1.0e4;
 /// active/dormant contrast (here 1e4) from wrecking multigrid conditioning.
 const QUIET_EPS: f32 = 1.0e-4;
 
+/// Max passes of the plastic (radial-return) fixed-point correction (§ yield).
+/// The initial-strain method uses the *elastic* operator (so the cached
+/// hierarchy is reused), which converges linearly — capped here for cost.
+const MAX_PLASTIC_ITERS: usize = 12;
+
+/// Convergence tol for the plastic loop: stop once the largest plastic-strain
+/// increment in a pass drops below this fraction of the eigenstrain magnitude.
+const PLASTIC_TOL: f64 = 1.0e-2;
+
 /// Assemble the equivalent nodal force of a uniform eigenstrain `eigen`
 /// (`[εx, εy, εz]`, engineering normal strains; shear-free in the MVP) over
 /// every solid cell of `grid`.
@@ -453,6 +462,213 @@ fn apply_k(g: &VoxelGrid, eps: &[f32], ke: &[[f64; 24]; 24], u: &[f64]) -> Vec<f
     ku
 }
 
+/// Engineering normal+shear strain `[εxx, εyy, εzz, γxy, γyz, γzx]` at the
+/// centre of cell `(cx,cy,cz)` from the padded nodal field `u` (mirror of
+/// `stress::cell_field_eigen`'s strain evaluation).
+fn cell_strain(g: &VoxelGrid, u: &[f64], cx: usize, cy: usize, cz: usize) -> [f64; 6] {
+    let (mx, my) = (g.nx + 1, g.ny + 1);
+    let inv4h = 1.0 / (4.0 * g.h);
+    let mut e = [0f64; 6];
+    for l in 0..8 {
+        let [ox, oy, oz] = NODE_OFFSETS[l];
+        let [sx, sy, sz] = NODE_SIGNS[l];
+        let n = ((cz + oz) * my + (cy + oy)) * mx + (cx + ox);
+        let (ux, uy, uz) = (u[3 * n], u[3 * n + 1], u[3 * n + 2]);
+        e[0] += sx * ux;
+        e[1] += sy * uy;
+        e[2] += sz * uz;
+        e[3] += sy * ux + sx * uy;
+        e[4] += sz * uy + sy * uz;
+        e[5] += sx * uz + sz * ux;
+    }
+    for v in &mut e {
+        *v *= inv4h;
+    }
+    e
+}
+
+/// Isotropic stress `σ = D : ε` (engineering strain in, `[σxx,σyy,σzz,σxy,σyz,σzx]`
+/// out) for cell modulus `e` and Poisson `nu`.
+fn stress_from_strain(eng: [f64; 6], e: f64, nu: f64) -> [f64; 6] {
+    let lam = e * nu / ((1.0 + nu) * (1.0 - 2.0 * nu));
+    let mu = e / (2.0 * (1.0 + nu));
+    let tr = eng[0] + eng[1] + eng[2];
+    [
+        lam * tr + 2.0 * mu * eng[0],
+        lam * tr + 2.0 * mu * eng[1],
+        lam * tr + 2.0 * mu * eng[2],
+        mu * eng[3],
+        mu * eng[4],
+        mu * eng[5],
+    ]
+}
+
+/// J2 (von Mises) radial return for **perfect plasticity**. Given a cell's
+/// trial stress `sig` (`[σxx,σyy,σzz,σxy,σyz,σzx]`), shear modulus `mu` and
+/// yield `sy`, return the increment of **plastic strain** (engineering comps)
+/// that brings the stress back onto the yield surface, or `None` if still
+/// elastic. Pure J2 is pressure-insensitive, so a perfectly-constrained
+/// *isotropic* shrink (hydrostatic) never yields — the warp source is the
+/// deviatoric stress the bed/anisotropy create near the plate.
+fn return_map(sig: [f64; 6], mu: f64, sy: f64) -> Option<[f64; 6]> {
+    let p = (sig[0] + sig[1] + sig[2]) / 3.0;
+    let s = [sig[0] - p, sig[1] - p, sig[2] - p, sig[3], sig[4], sig[5]];
+    let sds =
+        s[0] * s[0] + s[1] * s[1] + s[2] * s[2] + 2.0 * (s[3] * s[3] + s[4] * s[4] + s[5] * s[5]);
+    let vm = (1.5 * sds).sqrt();
+    if vm <= sy || vm <= 1.0e-12 {
+        return None;
+    }
+    let dlam = (vm - sy) / (3.0 * mu); // perfect plasticity (no hardening)
+    // Δεᵖ (tensor) = Δλ·(3/2)·s/σvm; engineering shear = 2× the tensor shear.
+    let c = 1.5 * dlam / vm;
+    Some([c * s[0], c * s[1], c * s[2], 2.0 * c * s[3], 2.0 * c * s[4], 2.0 * c * s[5]])
+}
+
+/// Equivalent nodal force of a per-cell **plastic eigenstrain** `ep`
+/// (engineering comps), accumulated into `f`. Same `f = ∫ Bᵀ(D εᵖ) dV` path as
+/// [`eigen_forces`] but carrying the shear components, so it can be added to
+/// `f_eig + f_lock` on the RHS exactly like the inherent strain.
+fn add_plastic_forces(g: &VoxelGrid, eps: &[f32], e0: f64, nu: f64, ep: &[[f64; 6]], f: &mut [f64]) {
+    let (nx, ny, nz) = (g.nx, g.ny, g.nz);
+    let (mx, my) = (nx + 1, ny + 1);
+    let coeff = g.h * g.h / 4.0;
+    for cz in 0..nz {
+        for cy in 0..ny {
+            for cx in 0..nx {
+                let ci = (cz * ny + cy) * nx + cx;
+                let e = eps[ci] as f64;
+                if e <= 0.0 {
+                    continue;
+                }
+                let sp = stress_from_strain(ep[ci], e0 * e, nu);
+                for l in 0..8 {
+                    let [ox, oy, oz] = NODE_OFFSETS[l];
+                    let [sx, sy, sz] = NODE_SIGNS[l];
+                    let n = ((cz + oz) * my + (cy + oy)) * mx + (cx + ox);
+                    f[3 * n] += coeff * (sp[0] * sx + sp[3] * sy + sp[5] * sz);
+                    f[3 * n + 1] += coeff * (sp[1] * sy + sp[3] * sx + sp[4] * sz);
+                    f[3 * n + 2] += coeff * (sp[2] * sz + sp[4] * sy + sp[5] * sx);
+                }
+            }
+        }
+    }
+}
+
+/// Elastic–perfectly-plastic correction on the **bonded** state (§ yield, the
+/// physical fix for infill-blind warp). The free released shrink of a *uniform*
+/// eigenstrain is the stress-free compatible field `u = ε₀·x`, independent of
+/// the stiffness/density distribution — so a pure-elastic release warps the same
+/// for 0 % and 100 % infill. Plasticity breaks that: while bonded to the plate
+/// the part is constrained, the deviatoric stress near the bed exceeds yield,
+/// and the locked-in **incompatible** plastic strain `εᵖ` does *not* relax on
+/// release → density-dependent curl.
+///
+/// Solved as the classic initial-strain (modified-Newton) fixed point on the
+/// *final* bonded state: radial-return each cell against `sy`, accumulate `εᵖ`,
+/// re-solve `K u = f_eig + f_lock + f_plastic(εᵖ)` (bed fixed, RHS-only so the
+/// cached hierarchy is never invalidated), repeat. Yield is compared on the
+/// MACRO (homogenized) stress vs a single material `sy`; per-density strength
+/// homogenization is a follow-up. Returns the updated bonded field, locked `εᵖ`,
+/// and the assembled plastic force.
+#[allow(clippy::too_many_arguments)]
+fn plastic_correct_bonded(
+    g: &VoxelGrid,
+    levels: usize,
+    s: &SolveSettings,
+    eps_full: &[f32],
+    fixed: &[u32],
+    eigen: [f64; 3],
+    f_eig: &[f64],
+    f_lock: &[f64],
+    sy: f64,
+    u_b: Vec<f64>,
+) -> Result<(Vec<f64>, Vec<[f64; 6]>, Vec<f64>), SolveError> {
+    let (nx, ny, nz) = (g.nx, g.ny, g.nz);
+    let ndof = f_eig.len();
+    let mut u_b = u_b;
+    let mut ep = vec![[0f64; 6]; g.cell_count()];
+    let mut f_plastic = vec![0f64; ndof];
+    let eigen_mag =
+        1.0e-9_f64.max(eigen[0].abs().max(eigen[1].abs()).max(eigen[2].abs()));
+    let mut slot: Option<SolverCache> = None;
+
+    for _it in 0..MAX_PLASTIC_ITERS {
+        // Radial-return every cell against the current bonded stress, growing
+        // the locked-in plastic strain.
+        let mut max_dep = 0f64;
+        let mut changed = false;
+        for cz in 0..nz {
+            for cy in 0..ny {
+                for cx in 0..nx {
+                    let ci = (cz * ny + cy) * nx + cx;
+                    let ec = eps_full[ci] as f64;
+                    if ec <= 0.0 {
+                        continue;
+                    }
+                    let e = s.e0 * ec;
+                    let mu = e / (2.0 * (1.0 + s.nu));
+                    let tot = cell_strain(g, &u_b, cx, cy, cz);
+                    // Elastic strain = total − eigenstrain − locked plastic strain.
+                    let el = [
+                        tot[0] - eigen[0] - ep[ci][0],
+                        tot[1] - eigen[1] - ep[ci][1],
+                        tot[2] - eigen[2] - ep[ci][2],
+                        tot[3] - ep[ci][3],
+                        tot[4] - ep[ci][4],
+                        tot[5] - ep[ci][5],
+                    ];
+                    let sig = stress_from_strain(el, e, s.nu);
+                    if let Some(dep) = return_map(sig, mu, sy) {
+                        for k in 0..6 {
+                            ep[ci][k] += dep[k];
+                            max_dep = max_dep.max(dep[k].abs());
+                        }
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+
+        // Re-equilibrate the bonded structure with the updated plastic load.
+        f_plastic.iter_mut().for_each(|v| *v = 0.0);
+        add_plastic_forces(g, eps_full, s.e0, s.nu, &ep, &mut f_plastic);
+        let forces: Vec<(u32, [f64; 3])> = (0..ndof / 3)
+            .filter_map(|n| {
+                let f = [
+                    f_eig[3 * n] + f_lock[3 * n] + f_plastic[3 * n],
+                    f_eig[3 * n + 1] + f_lock[3 * n + 1] + f_plastic[3 * n + 1],
+                    f_eig[3 * n + 2] + f_lock[3 * n + 2] + f_plastic[3 * n + 2],
+                ];
+                (f[0] != 0.0 || f[1] != 0.0 || f[2] != 0.0).then_some((n as u32, f))
+            })
+            .collect();
+        let problem = NodeProblem { fixed: fixed.to_vec(), forces, ..Default::default() };
+        // Intermediate iterates feed the next return-map, not the final field, so
+        // a relaxed tol + iteration cap keeps each pass cheap (warm-started from
+        // the previous pass via `slot`). The final release runs its own solve.
+        let res = solve_cached(
+            &mut slot,
+            g,
+            levels,
+            &problem,
+            s,
+            eps_full.to_vec(),
+            s.tol.max(2.0e-3),
+            s.max_iter.min(400),
+        )?;
+        u_b = res.u;
+
+        if max_dep < PLASTIC_TOL * eigen_mag {
+            break;
+        }
+    }
+    Ok((u_b, ep, f_plastic))
+}
+
 /// **State 1 — sequential bonded build** (layer-by-layer inherent strain, §3a).
 ///
 /// Activates voxel-Z-layers bottom-up using the standard AM element-activation
@@ -495,12 +711,18 @@ pub struct BuildResult {
 /// State 2 (release to the free warped shape). The release reuses the final
 /// accumulated `f_eig + f_lock` from the build, swapping the bonded bed for a
 /// minimal 3-2-1 rigid-body pin (the part is now free).
+///
+/// `yield_strength` (MPa): when `Some`, an elastic–perfectly-plastic correction
+/// runs on the bonded state so the released warp depends on geometry/density
+/// (see [`plastic_correct_bonded`]). `None` = the pure-elastic model, whose free
+/// release is the density-independent compatible shrink.
 pub fn solve_build(
     grid: &VoxelGrid,
     eigen: [f64; 3],
     s: &SolveSettings,
+    yield_strength: Option<f64>,
 ) -> Result<BuildResult, SolveError> {
-    solve_build_progress(grid, eigen, s, None, |_, _, _| {})
+    solve_build_progress(grid, eigen, s, None, yield_strength, |_, _, _| {})
 }
 
 /// Like [`solve_build`], but `on_layer(layers_done, total_layers, &bonded_so_far)`
@@ -510,19 +732,39 @@ pub fn solve_build(
 ///
 /// `eps_override` lets the caller drive the build sim with the **as-printed
 /// infill density** (the optimizer's stiffness field) instead of the solid
-/// hull; see [`resolve_eps`]. `None` = solid hull.
+/// hull; see [`resolve_eps`]. `None` = solid hull. `yield_strength` enables the
+/// plastic correction (see [`solve_build`]).
 pub fn solve_build_progress(
     grid: &VoxelGrid,
     eigen: [f64; 3],
     s: &SolveSettings,
     eps_override: Option<&[f32]>,
+    yield_strength: Option<f64>,
     mut on_layer: impl FnMut(usize, usize, &Solution),
 ) -> Result<BuildResult, SolveError> {
-    let (g, levels, u_b, f_eig, f_lock, iters) =
+    let (g, levels, u_b, f_eig, mut f_lock, iters) =
         build_bonded_inner(grid, eigen, s, eps_override, &mut on_layer)?;
     let it = *iters.iter().max().unwrap_or(&0);
     let eps_full = resolve_eps(&g, eps_override);
     let ke = ke_hex(s.e0, s.nu, g.h);
+
+    // Plastic correction (§ yield): lock in the incompatible plastic strain the
+    // bonded constraint generates, so the released warp stops being the
+    // density-blind stress-free shrink. Folded into `f_lock` as an extra
+    // inelastic source so peel + release see it identically to the elastic terms.
+    let u_b = match yield_strength {
+        Some(sy) if sy > 0.0 => {
+            let bottom = bottom_nodes(&g);
+            let (u_p, _ep, f_plastic) = plastic_correct_bonded(
+                &g, levels, s, &eps_full, &bottom, eigen, &f_eig, &f_lock, sy, u_b,
+            )?;
+            for (l, fp) in f_lock.iter_mut().zip(&f_plastic) {
+                *l += *fp;
+            }
+            u_p
+        }
+        _ => u_b,
+    };
 
     // Peel: bed reaction R = K·u_bonded − (f_eig + f_lock), at the held bed nodes.
     let ku = apply_k(&g, &eps_full, &ke, &u_b);
@@ -539,7 +781,8 @@ pub fn solve_build_progress(
         })
         .collect();
 
-    // Release: free body (3-2-1 pin) under the locked-in build loads.
+    // Release: free body (3-2-1 pin) under the locked-in build loads (now
+    // including the plastic source folded into f_lock above).
     let nnodes = (g.nx + 1) * (g.ny + 1) * (g.nz + 1);
     let forces: Vec<(u32, [f64; 3])> = (0..nnodes)
         .filter_map(|n| {
@@ -788,7 +1031,7 @@ mod tests {
         let s = SolveSettings { e0: 2400.0, nu: 0.35, ..Default::default() };
 
         // Solid-hull baseline (override = None).
-        let base = solve_build(&grid, [beta, beta, beta], &s).expect("base");
+        let base = solve_build(&grid, [beta, beta, beta], &s, None).expect("base");
 
         // As-printed: a soft 20%-density core inside a full-density skin, built on
         // the PADDED grid so the override length matches the assembly.
@@ -809,7 +1052,7 @@ mod tests {
             }
         }
         let graded =
-            solve_build_progress(&grid, [beta, beta, beta], &s, Some(&eps), |_, _, _| {})
+            solve_build_progress(&grid, [beta, beta, beta], &s, Some(&eps), None, |_, _, _| {})
                 .expect("graded");
 
         let (db, dg) = (base.bonded.max_displacement(), graded.bonded.max_displacement());
@@ -828,7 +1071,7 @@ mod tests {
         let grid = h_grid(40, 8, 60, 1.0, 8, 26, 8);
         let beta = -0.005;
         let s = SolveSettings { e0: 2400.0, nu: 0.35, ..Default::default() };
-        let r = solve_build(&grid, [beta, beta, beta], &s).expect("build");
+        let r = solve_build(&grid, [beta, beta, beta], &s, None).expect("build");
 
         // Released free shape is valid and not identical to bonded.
         let (db, dr) = (r.bonded.max_displacement(), r.released.max_displacement());
@@ -853,6 +1096,101 @@ mod tests {
             "bed reaction should be self-equilibrated in Z: net {:.2e} vs scale {:.2e}",
             net[2],
             scale
+        );
+    }
+
+    /// Largest nodal displacement difference between two solutions on the same
+    /// grid, over nodes active in BOTH — a "how much did the warp change" metric
+    /// that cancels the common uniform shrink and isolates the curl.
+    fn max_node_diff(a: &Solution, b: &Solution) -> f64 {
+        let mut worst = 0f64;
+        for n in 0..a.node_count().min(b.node_count()) {
+            if !a.active[n] || !b.active[n] {
+                continue;
+            }
+            for d in 0..3 {
+                worst = worst.max((a.u[3 * n + d] as f64 - b.u[3 * n + d] as f64).abs());
+            }
+        }
+        worst
+    }
+
+    /// The fix for Stefan's infill bug: a pure-elastic release of a uniform
+    /// eigenstrain is the stress-free compatible shrink `u = ε₀·x`, so it is
+    /// stiffness-independent and warps the same regardless of infill. Turning on
+    /// a yield stress locks in incompatible plastic strain near the bonded bed,
+    /// which does NOT relax on release → the released warp genuinely changes.
+    #[test]
+    fn plasticity_changes_released_warp() {
+        let (nx, ny, nz, h) = (12usize, 4usize, 16usize, 1.0f64);
+        let grid = VoxelGrid::solid_box(nx, ny, nz, h);
+        // Transversely isotropic shrink (Z = half XY) → a deviatoric source the
+        // bed constraint can drive past yield (pure isotropic + full constraint
+        // is hydrostatic, which J2 never yields).
+        let eigen = [-0.01, -0.01, -0.005];
+        let s = SolveSettings { e0: 2400.0, nu: 0.35, ..Default::default() };
+
+        let elastic = solve_build(&grid, eigen, &s, None).expect("elastic");
+        // Yield well below the constrained stress (~E·β ≈ 24 MPa) so it bites.
+        let plastic = solve_build(&grid, eigen, &s, Some(8.0)).expect("plastic");
+
+        let d = max_node_diff(&elastic.released, &plastic.released);
+        let scale = elastic.released.max_displacement();
+        assert!(
+            d > 0.02 * scale,
+            "plastic release must differ from elastic: diff {d:.4} vs scale {scale:.4}"
+        );
+    }
+
+    /// With plasticity on, the locked-in warp source scales with how much
+    /// constrained material there is: a solid part curls more than the same part
+    /// with a soft, sparse infill core. (Elastically the two release IDENTICALLY,
+    /// which is exactly the bug — so the test also asserts the elastic gap is
+    /// negligible next to the plastic one.)
+    #[test]
+    fn plastic_warp_scales_with_density() {
+        let (nx, ny, nz, h) = (12usize, 4usize, 16usize, 1.0f64);
+        let grid = VoxelGrid::solid_box(nx, ny, nz, h);
+        let eigen = [-0.01, -0.01, -0.005];
+        let s = SolveSettings { e0: 2400.0, nu: 0.35, ..Default::default() };
+        let sy = Some(8.0);
+
+        // Soft 15%-density core inside a full-density skin (padded grid).
+        let (g, _lv) = pad_for_levels(&grid, s.max_levels);
+        let mut eps = grid_eps(&g);
+        for cz in 0..g.nz {
+            for cy in 0..g.ny {
+                for cx in 0..g.nx {
+                    let ci = (cz * g.ny + cy) * g.nx + cx;
+                    if eps[ci] > 0.0 && cx >= 2 && cx + 2 < nx && cy >= 1 && cy + 1 < ny {
+                        eps[ci] = 0.15;
+                    }
+                }
+            }
+        }
+
+        let solid = solve_build(&grid, eigen, &s, sy).expect("solid");
+        let hollow = solve_build_progress(&grid, eigen, &s, Some(&eps), sy, |_, _, _| {})
+            .expect("hollow");
+        let solid_e = solve_build(&grid, eigen, &s, None).expect("solid elastic");
+        let hollow_e = solve_build_progress(&grid, eigen, &s, Some(&eps), None, |_, _, _| {})
+            .expect("hollow elastic");
+
+        // Plastic curl = how far each released shape departs from its elastic
+        // (stress-free) counterpart. Solid locks in more than the sparse core.
+        let curl_solid = max_node_diff(&solid.released, &solid_e.released);
+        let curl_hollow = max_node_diff(&hollow.released, &hollow_e.released);
+        assert!(
+            curl_solid > curl_hollow * 1.15,
+            "denser part should curl more: solid {curl_solid:.4} vs hollow {curl_hollow:.4}"
+        );
+
+        // The elastic releases barely differ (the bug): density is invisible
+        // without plasticity.
+        let elastic_gap = max_node_diff(&solid_e.released, &hollow_e.released);
+        assert!(
+            elastic_gap < curl_solid,
+            "elastic release should be ~density-blind: gap {elastic_gap:.4} vs plastic curl {curl_solid:.4}"
         );
     }
 }

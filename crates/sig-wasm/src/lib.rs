@@ -408,11 +408,21 @@ struct BuildSimOpts {
     state: String,
     /// Display exaggeration baked into the live preview hull positions.
     exaggeration: f64,
+    /// Material yield stress (MPa). `> 0` enables the elastic–perfectly-plastic
+    /// correction so the released warp depends on geometry/infill density;
+    /// `0`/omitted falls back to the pure-elastic (density-blind) release.
+    yield_strength: f64,
 }
 
 impl Default for BuildSimOpts {
     fn default() -> Self {
-        Self { shrink: -0.003, shrink_z: None, state: "released".into(), exaggeration: 10.0 }
+        Self {
+            shrink: -0.003,
+            shrink_z: None,
+            state: "released".into(),
+            exaggeration: 10.0,
+            yield_strength: 0.0,
+        }
     }
 }
 
@@ -630,11 +640,11 @@ struct StashedResult {
 }
 
 /// Bed-peel reaction sampled as a 2D field over the build footprint (the coarse
-/// build grid's z=0 node plane). `lift`/`shear` are `mx·my` flat arrays in
-/// newtons (lift = +Z, the part pulling up = peel; shear = in-plane magnitude).
-/// `peel_field` samples these onto the mesh, ramped to zero over `falloff` mm of
-/// height so the risk concentrates on the first layers. Uncalibrated — a
-/// relative indicator, not an absolute force.
+/// build grid's z=0 node plane). `lift`/`shear` are `mx·my` flat arrays of
+/// TRACTION in MPa (reaction force ÷ nodal tributary bed area — mesh-independent,
+/// unlike the raw nodal force). lift = +Z, the part pulling up = peel; shear =
+/// in-plane magnitude. `peel_field`/`peel_map` sample these, ramped to zero over
+/// `falloff` mm of height. Uncalibrated — a relative indicator.
 struct PeelField {
     mx: usize,
     my: usize,
@@ -1326,11 +1336,16 @@ impl Model {
             _ => None,
         };
         let density_aware = eps_override.is_some();
+        // Yield stress (>0) turns on the plastic correction so the released warp
+        // responds to geometry/infill density (otherwise a uniform eigenstrain
+        // releases to the same density-blind compatible shrink).
+        let yield_strength = (opts.yield_strength > 0.0).then_some(opts.yield_strength);
         let r = sig_core::buildsim::solve_build_progress(
             &grid,
             eigen,
             &self.settings,
             eps_override.as_deref(),
+            yield_strength,
             |done, total, sol| {
                 // Throttle the (expensive) hull build to ~30 preview frames. On
                 // sent frames the payload is the deformed ACTIVATED voxel hull
@@ -1352,23 +1367,48 @@ impl Model {
         )
         .map_err(err)?;
 
-        let mut peak_lift = 0f64;
-        let mut peak_shear = 0f64;
-        for (_, rv) in &r.bed_reaction {
-            peak_lift = peak_lift.max(rv[2]);
-            peak_shear = peak_shear.max((rv[0] * rv[0] + rv[1] * rv[1]).sqrt());
-        }
         // Lay the bed reactions out as a 2D lift/shear field over the footprint
         // (the z=0 node plane of the coarse build grid) for the peel-risk view.
-        let (mx, my) = (grid.nx + 1, grid.ny + 1);
+        // Convert each NODAL reaction force to a TRACTION (stress) by dividing by
+        // the node's tributary bed area — the mesh-INDEPENDENT quantity: a finer
+        // grid splits the same total reaction over more nodes (force per node
+        // shrinks ∝ area) but the traction converges. Tributary area = (number of
+        // adjacent bottom-layer solid cells) × h²/4. Units: N/mm² = MPa.
+        let (nx, ny) = (grid.nx, grid.ny);
+        let (mx, my) = (nx + 1, ny + 1);
+        let cell_area = (grid.h * grid.h) as f32;
         let mut lift = vec![0f32; mx * my];
         let mut shear = vec![0f32; mx * my];
         for (n, rv) in &r.bed_reaction {
             let i = *n as usize; // z=0 plane: i = iy*mx + ix
-            if i < mx * my {
-                lift[i] = rv[2] as f32;
-                shear[i] = (rv[0] * rv[0] + rv[1] * rv[1]).sqrt() as f32;
+            if i >= mx * my {
+                continue;
             }
+            let (ix, iy) = (i % mx, i / mx);
+            let mut cells = 0u32;
+            for (ox, oy) in [(-1i64, -1i64), (0, -1), (-1, 0), (0, 0)] {
+                let (cx, cy) = (ix as i64 + ox, iy as i64 + oy);
+                if cx >= 0
+                    && cy >= 0
+                    && cx < nx as i64
+                    && cy < ny as i64
+                    && grid.scale[cy as usize * nx + cx as usize] > 0.0
+                {
+                    cells += 1;
+                }
+            }
+            let area = cells as f32 * cell_area * 0.25;
+            if area <= 0.0 {
+                continue;
+            }
+            lift[i] = rv[2] as f32 / area;
+            shear[i] = (rv[0] * rv[0] + rv[1] * rv[1]).sqrt() as f32 / area;
+        }
+        let mut peak_lift = 0f64;
+        let mut peak_shear = 0f64;
+        for i in 0..mx * my {
+            peak_lift = peak_lift.max(lift[i] as f64);
+            peak_shear = peak_shear.max(shear[i] as f64);
         }
         self.build_peel = Some(PeelField {
             mx,
@@ -1514,8 +1554,8 @@ impl Model {
     /// reactions. `kind`: "peel" = upward lift (+Z, the peel driver), "peelshear"
     /// = in-plane bed shear magnitude. Each vertex takes the reaction at its
     /// nearest footprint node, ramped to zero over the first layers so the risk
-    /// reads at the base. Newtons, uncalibrated (a RELATIVE indicator). Errors
-    /// if no build sim has been run.
+    /// reads at the base. Traction in MPa, uncalibrated (a RELATIVE indicator).
+    /// Errors if no build sim has been run.
     pub fn peel_field(&self, kind: &str) -> Result<Vec<f32>, JsValue> {
         let pf = self
             .build_peel

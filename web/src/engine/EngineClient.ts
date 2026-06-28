@@ -315,14 +315,14 @@ export class EngineClient {
     return this.call({ op: "resultField", kind });
   }
 
-  /** Build-sim bed-peel scalar per surface vertex: "peel" = upward lift,
-   *  "peelshear" = bed shear. Newtons, uncalibrated relative indicator. */
+  /** Build-sim bed-peel traction per surface vertex: "peel" = upward lift,
+   *  "peelshear" = bed shear. MPa, mesh-independent, uncalibrated indicator. */
   peelField(kind: "peel" | "peelshear"): Promise<Float32Array> {
     return this.call({ op: "peelField", kind });
   }
 
   /** Build-sim bed-peel as a flat heatmap on the plate: triangle-soup positions
-   *  over the footprint + a per-vertex value (lift or shear, N). */
+   *  over the footprint + a per-vertex traction (lift or shear, MPa). */
   peelMap(
     kind: "peel" | "peelshear"
   ): Promise<{ positions: Float32Array; values: Float32Array }> {
@@ -496,10 +496,13 @@ export interface BuildSimOptions {
   state: "released" | "bonded";
   /** Display exaggeration baked into the live preview hull positions. */
   exaggeration: number;
+  /** Material yield stress (MPa); >0 enables the plastic step so the released
+   *  warp depends on infill density. 0/omitted = pure-elastic (density-blind). */
+  yieldStrength?: number;
 }
 
 /** Build-sim stats. `maxDisplacement` is the shown state; bonded/released give
- *  both states' peak, peak* are the bed peel reaction maxima (uncalibrated N). */
+ *  both states' peak, peak* are the bed-peel TRACTION maxima (MPa, uncalibrated). */
 export interface BuildSimStats {
   maxDisplacement: number;
   bondedMax: number;

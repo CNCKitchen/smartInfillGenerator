@@ -1211,9 +1211,9 @@ function StepBuildSim() {
           <b>{br.densityAware ? "as-printed infill density" : "solid hull"}</b>
           {br.densityAware ? "" : " (optimize the part first to use the printed infill)"}.
           <br />
-          Bed peel — peak lift <b>{br.peakLift.toFixed(1)} N</b> · shear{" "}
-          <b>{br.peakShear.toFixed(1)} N</b>. Pick <b>Peel lift</b> on the Results bar's field menu
-          to see where the part wants to lift (uncalibrated relative indicator).
+          Bed peel — peak traction <b>{br.peakLift.toFixed(3)} MPa</b> · shear{" "}
+          <b>{br.peakShear.toFixed(3)} MPa</b>. Pick <b>Peel traction</b> on the Results bar's field
+          menu to see where the part wants to lift (mesh-independent, uncalibrated indicator).
         </div>
       )}
       <div className="hint">

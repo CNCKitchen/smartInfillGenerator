@@ -57,6 +57,7 @@ export function SettingsModal() {
               <th>ρ (g/cm³)</th>
               <th>σₜ (MPa)</th>
               <th>σₜᶻ (MPa)</th>
+              <th title="Build-sim yield stress — enables the elastic–perfectly-plastic step so the released warp responds to infill density (0 = pure-elastic, density-blind)">σy (MPa)</th>
               <th title="Build-sim IN-PLANE (XY) process shrink — the dominant warp driver (inherent strain)">Shrink % (XY)</th>
               <th title="Build-sim THROUGH-LAYER (Z) process shrink — transverse isotropy; usually less than in-plane">Shrink % (Z)</th>
               <th />
@@ -123,6 +124,16 @@ export function SettingsModal() {
                     step={1}
                     onCommit={(v) =>
                       s.updateMaterial(i, { ...m, strengthZ: Math.max(1, v) })
+                    }
+                  />
+                </td>
+                <td>
+                  <NumInput
+                    value={m.yieldStrength ?? 0}
+                    min={0}
+                    step={1}
+                    onCommit={(v) =>
+                      s.updateMaterial(i, { ...m, yieldStrength: Math.max(0, v) })
                     }
                   />
                 </td>

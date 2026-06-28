@@ -229,9 +229,9 @@ export function ViewportChips() {
                 <option value="sxx">σxx</option>
                 <option value="syy">σyy</option>
               </optgroup>
-              <optgroup label="Bed peel (N · relative)">
-                <option value="peel">Peel lift (+Z)</option>
-                <option value="peelshear">Bed shear</option>
+              <optgroup label="Bed peel (MPa · relative)">
+                <option value="peel">Peel traction (+Z)</option>
+                <option value="peelshear">Bed shear traction</option>
               </optgroup>
             </select>
           ) : (
