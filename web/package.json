@@ -10,6 +10,7 @@
     "wasm:mt": "node scripts/build-wasm.mjs mt",
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "check:units": "node scripts/check-units.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

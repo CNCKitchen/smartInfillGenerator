@@ -60,11 +60,17 @@ impl VoxelGrid {
         let nx = (((hi[0] - lo[0]) / h).ceil() as usize).max(1);
         let ny = (((hi[1] - lo[1]) / h).ceil() as usize).max(1);
         let nz = (((hi[2] - lo[2]) / h).ceil() as usize).max(1);
-        // Center the grid on the bounds (ceil rounding adds <1 cell of margin total).
+        // Center the grid in X/Y on the bounds (ceil rounding adds <1 cell of
+        // margin total). In Z, snap the origin to the part's bottom so the first
+        // element row sits flush on the build plate (full density) rather than
+        // straddling the bed plane as a cut cell — the bottom layer is where the
+        // fixed-to-plate BC and bed-peel traction are applied. The <1 cell of Z
+        // slack therefore lands at the top (a free surface), where a cut cell is
+        // physically correct.
         let origin = [
             lo[0] - 0.5 * (nx as f64 * h - (hi[0] - lo[0])),
             lo[1] - 0.5 * (ny as f64 * h - (hi[1] - lo[1])),
-            lo[2] - 0.5 * (nz as f64 * h - (hi[2] - lo[2])),
+            lo[2],
         ];
         let bvh = WindingBvh::build(mesh);
         let mut scale = vec![0f32; nx * ny * nz];

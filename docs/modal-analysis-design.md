@@ -9,8 +9,8 @@ has clean analytic ground truth, so it is held to the existing analytic + Calcul
 
 Add a **constrained, undamped modal analysis** to the Verify tab. The user picks a number of modes
 (1–20, default 6); the solver returns the lowest N natural frequencies (Hz) + their mode shapes,
-computed by **LOBPCG preconditioned with the existing geometric-multigrid V-cycle**, against a
-**lumped, density-scaled mass matrix**. Each mode is surfaced as an **output result-case** under a
+computed by **subspace inverse iteration (the robust LOBPCG cousin) reusing the existing
+geometric-multigrid solve as the `K⁻¹` operator**, against a **lumped, density-scaled mass matrix**. Each mode is surfaced as an **output result-case** under a
 new `kind: "modal"`, riding the existing `ResultEntry` / result-stash / viewer-switcher infra — so
 mode switching, the deformed view, and animation come for free. Looking at a mode **auto-starts the
 animation** (fixed visual rate, symmetric ± swing). The work reuses the static-FEA pipeline
@@ -20,10 +20,12 @@ end-to-end; the only genuinely new code is the eigensolver + lumped mass in `sig
 
 | In | Out (deferred / rejected) |
 |----|----|
-| Constrained modal (uses Loads-step supports) | Free-free / inertia-relief modal (future; plumbing exists from build-sim §3a) |
-| Undamped natural frequencies (Hz) + mode shapes | Damping (Rayleigh/ζ), forced/frequency response, transient |
-| User-selected mode count (1–20, default 6) | Modal stress in calibrated MPa (magnitude is arbitrary) |
-| Printed **or** solid, honoring the existing `analyzeMode` toggle | Safety factor on a mode shape |
+| Constrained modal (uses Loads-step supports) | Exact mass-shift / inertia-relief free-free (see §11 — shipped the soft-anchor variant instead) |
+| **Free-free modal** (unconstrained part, soft-anchored, rigid-body modes dropped — §11) | Damping (Rayleigh/ζ), forced/frequency response, transient |
+| Undamped natural frequencies (Hz) + mode shapes | Modal stress in calibrated MPa (magnitude is arbitrary) |
+| User-selected mode count (1–20, default 6) | Safety factor on a mode shape |
+| Printed **or** solid, honoring the existing `analyzeMode` toggle | — |
+| **Live progress + MGCG convergence trace** (§12) | — |
 | Reuse static FEA pipeline + result/viewer infra | — |
 
 ## 2. Physics & method (decided)
@@ -35,12 +37,18 @@ end-to-end; the only genuinely new code is the eigensolver + lumped mass in `sig
 - **Undamped (Q2).** No damping model, no damping input. Light polymer damping (ζ≈1–5 %) barely
   moves the natural frequencies and changes no mode shape. Damped frequency-response is a separate
   feature if ever wanted.
-- **Eigensolver — LOBPCG + multigrid preconditioner (Q3).** The solver is matrix-free
+- **Eigensolver — subspace inverse iteration + Rayleigh–Ritz (Q3).** The solver is matrix-free
   geometric-multigrid CG (`mg.rs`) — no assembled `K`, so a sparse eigensolver (ARPACK/LAPACK) is
-  out. LOBPCG needs only `K·v` (have it), `M·v`, and a preconditioner — and the **existing multigrid
-  V-cycle is exactly that preconditioner**. It targets "the lowest N eigenpairs," which is what the
-  user picks. (Shift-invert Lanczos considered, rejected: more plumbing, a full MGCG solve per
-  Lanczos step, only worth it for clustered modes.)
+  out; the method must be matrix-free too. **Implemented as subspace (block) inverse iteration with
+  Rayleigh–Ritz** — the robust cousin of LOBPCG: each outer step solves `K X = M V` (one matrix-free
+  MGCG solve per column, **reusing the public `MgSolver::solve_warm` as the multigrid inverse**),
+  M-orthonormalizes `X`, and extracts Ritz pairs from the small `p×p` projected stiffness `Yᵀ K Y`
+  (cyclic Jacobi). Inverse iteration maps the smallest eigenvalues to the dominant directions of
+  `K⁻¹ M`, so the lowest frequencies converge first; `guard = clamp(N/2, 4, 8)` extra block columns
+  absorb the slow tail. This reuses the multigrid even more directly than a hand-rolled LOBPCG
+  preconditioner hook (no new V-cycle entry point needed) and is markedly easier to prove correct.
+  Implemented in `crates/sig-core/src/modal.rs`. (LOBPCG and shift-invert Lanczos both considered;
+  the inverse-subspace form won on reuse-of-the-public-API + robustness for the small `N` here.)
 - **Mass matrix — lumped, density-scaled (Q3).** `m_node = ρ·(voxel volume)/8` summed per node,
   with `ρ` from the material `density` (g/cm³, already on every `Material` — `web/src/types.ts`)
   scaled by the **same per-cell `eps`/density field the stiffness uses**. Lumped → `M·v` is an
@@ -156,6 +164,94 @@ system so changing the mode count or the first-LC supports marks modal results s
 - **`web/src/viewer/SceneManager.ts`** — symmetric ± swing variant in `tick()`; auto-animate on
   modal-mode select.
 - **`web/src/types.ts`** — restrict modal field set; "relative" legend for modal stress/strain.
+
+## 11. Free-free modal (unconstrained part) — added post-Q1
+
+Q1 picked constrained modal and deferred free-free. Added on request: a **"Unconstrained (free-free)"**
+checkbox (Verify panel, modal only). An unsupported part has a **singular `K`** (6 rigid-body modes
+at λ = 0), which inverse iteration cannot invert.
+
+- **Method — soft anchor springs (`sig_core::modal::rigid_body_anchor_springs`).** Weak isotropic
+  ground springs (`k ≈ 1e-4·E·h`) at the ± extreme active node of each axis lift the 6 rigid-body
+  modes to low-but-nonzero frequencies so `K` becomes SPD. **Reuses the existing spring machinery**,
+  which already coarsens correctly through the multigrid hierarchy — *zero* `mg.rs` surgery. (An exact
+  mass-shift `K+σM` or deflation would be more accurate but needs invasive solver changes; deferred.)
+- **Filtering.** Request `num_modes + 6`, drop the 6 lowest (the lifted rigid-body modes) in the wasm
+  layer, return the flexible ones. The under-constraint gate is skipped in this mode.
+- **Status: indicative.** The soft anchors slightly perturb the flexible frequencies (weak `k` keeps
+  it small); labeled in the UI as indicative, validate against FEA. Golden test
+  `free_free_beam_filters_rigid_body` asserts the first flexible mode separates cleanly from the 6
+  rigid-body modes and matches the free-free Euler–Bernoulli bending frequency (βL = 4.730) in band.
+
+## 12a. Performance — LOBPCG (the 30-minute → seconds rewrite)
+
+The first cut (subspace **inverse iteration**) ran a `K X = M V` solve per column. Even made
+inexact, on a clustered/slender part (a pipe's degenerate bending pair) the subspace step is weak,
+so it took ~50 outer iterations × `p` columns × several V-cycles = **~3800 V-cycles → ~10 min** on a
+258k-cell pipe (and the first, fully-converged, version was ~30 min).
+
+Rewrote the eigensolver as **LOBPCG** (`crates/sig-core/src/modal.rs`) — block, preconditioned by a
+**single multigrid V-cycle** per mode per iteration (`MgSolver::precondition`, a public one-V-cycle
+entry added to `mg.rs`; `apply_k` exposes the matrix-free `K`). Its conjugate search-direction block
+`P` converges clustered modes fast, and there is no inner solve at all. Two further keys:
+
+- **Rayleigh–Ritz over `[X | W | P]`** each iteration (`W` = preconditioned residual), with the
+  basis M-orthonormalized and **rank-deficient columns dropped** (`m_orthonormalize_drop`).
+- **Eigenvalue-stabilization convergence.** The eigenVALUES (the frequencies the user wants)
+  converge well before the eigenVECTOR residual — especially when the multigrid preconditioner is
+  weak (slender/thin parts, where the residual can plateau above tol). So the loop stops when the
+  requested frequencies stop moving (`EIG_TOL = 1e-5`), not only on a tiny residual. Without this,
+  the fine cantilever ran the full 100-iteration cap; with it, **5 iterations**.
+
+Measured (golden tests): every case — 640 / 5120 cells, constrained and free-free —
+**converges in ~5 iterations / ~25 V-cycles**; the suite went 75 s → **4.6 s**. Expected on the
+258k-cell pipe: ~10-20 iterations → **~100-200 V-cycles (tens of seconds, ~20-40× faster).**
+`ModalResult.total_inner_iters` (the V-cycle count) is surfaced to the nerd log.
+
+*Caveat:* free-free's soft-anchored `K` is near-singular, so each V-cycle's coarse solve is
+expensive; the low iteration count keeps it usable, but a large free-free part is still the slowest
+path. Stiffer anchors (less accurate) or a mass-shift (more solver work) are the levers if needed.
+
+## 12b. Profiling (pipe.stl, lower face fixed, 6 modes) — the memory-bound wall
+
+Even after LOBPCG, a 258k-cell / 50k-solid pipe took minutes. A native profiling harness
+(`pipe_modal_profile`, `#[ignore]`) broke it down and found the cost was **NOT the multigrid**:
+
+- **Ops are memory-bandwidth-bound, not compute-bound.** A K-apply is ~1.9ms whether run 1-thread
+  or 8 (`--features parallel` barely moved it). So threading and micro-optimizing don't help; only
+  cutting *memory traffic* and *iteration count* do.
+- **The scalar Rayleigh–Ritz projection dominated** — building `SᵀKS`, the new `X/KX/P` blocks, and
+  Gram–Schmidt over the **full 813k-length** vectors was ~160s of a ~185s run (the ~680 V-cycles
+  were only ~20s).
+- **The vectors are ~75% zeros** (constrained/void DOFs), streamed for nothing.
+
+Three fixes, in order of impact:
+
+1. **Compact to free DOFs.** The LOBPCG block vectors now live on the `nf` free DOFs (`free_idx`,
+   `scatter`/`gather`); the full node grid is materialized only for `K·x` and the preconditioner
+   (which need the multigrid's layout). ~3-4× less traffic on the dominant scalar work.
+2. **Minimize *total* V-cycles, not iterations.** In the browser a V-cycle is ~5× a native one
+   (~170ms), so total V-cycles = `iters × p × precond_cycles` is the metric that matters. A *stronger*
+   preconditioner (more V-cycles/iter) cut iterations but raised the V-cycle count — worse in the
+   browser. So the preconditioner is a **single V-cycle** (`PRECOND_CYCLES = 1`), which uses the
+   fewest total V-cycles; compaction makes the resulting extra iterations cheap. (`solve_warm(_, 1)`
+   as the preconditioner *stalled* — use the raw `precondition` V-cycle.)
+3. **Eigenvalue-stabilization stop** (§12a) — the pipe's frequencies are stable long before the
+   residual, so it exits at ~68 iterations instead of the 100-cap.
+
+Result on the pipe: **~185s → ~57s native, 612 V-cycles (6× fewer than the old inverse iteration's
+3765), correct frequencies.** Remaining headroom (not done): carry `KX`/`KP` instead of recomputing
+`K·basis`; parallelize the compact projection; soft-lock converged modes to shrink the block.
+
+## 12. Progress + convergence readout — added post-ship
+
+Modal is many MGCG solves (`p × outer`), so it is slow. Two indicators, both reusing existing infra:
+
+- **Live MGCG convergence trace** — `runModal` starts the same residual poll the static solve uses,
+  so the "nerd" convergence plot animates during the inner solves.
+- **Per-outer-iteration progress** — `modal::analyze` takes an `on_progress(outer, max_outer,
+  freqs_hz)` callback (plumbed wasm → worker → `EngineClient` like the build-sim layer callback); the
+  busy line shows `Modal — iteration k/N · f1 ≈ … Hz` with the live Ritz estimates.
 
 ---
 

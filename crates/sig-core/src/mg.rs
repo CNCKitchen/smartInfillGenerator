@@ -934,6 +934,26 @@ impl MgSolver {
         }
     }
 
+    /// Apply ONE multigrid V-cycle as a preconditioner: `z ≈ K⁻¹ r`. Used by
+    /// the modal eigensolver (LOBPCG) as its preconditioner — a single V-cycle
+    /// is far cheaper than a full converged solve and is exactly what LOBPCG
+    /// wants. `r`/`z` are f64 (the bulk of the cycle runs in f32 internally);
+    /// `z` is fully overwritten and is zero at constrained DOFs.
+    pub fn precondition(&mut self, r: &[f64], z: &mut [f64]) {
+        debug_assert_eq!(r.len(), self.levels[0].ndof());
+        debug_assert_eq!(z.len(), self.levels[0].ndof());
+        par::demote(&mut self.ws.r[0], r);
+        v_cycle(&self.levels, &mut self.ws, 0);
+        par::promote(z, &self.ws.z[0]);
+    }
+
+    /// Matrix-free `y = K x` on the finest level (exact eps), f64. The operator
+    /// the modal eigensolver projects with — includes penalty springs and masks
+    /// constrained DOFs.
+    pub fn apply_k(&self, x: &[f64], y: &mut [f64]) {
+        self.levels[0].apply64_eps(&self.eps_exact, x, y);
+    }
+
     /// Mixed-precision MGCG: outer CG loop and operator in f64 (so attainable
     /// accuracy is not capped by f32 cancellation in K·u), V-cycle
     /// preconditioner in f32 (the bulk of the flops). `b` must be zero at

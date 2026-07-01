@@ -395,6 +395,46 @@ impl Default for PrintedOpts {
     }
 }
 
+/// Options for `Model::modal_analysis` — constrained undamped modal analysis.
+/// `num_modes` natural frequencies + mode shapes, force-free, on the supports
+/// already in `bcs` (the store binds these to the first load case). `solid`
+/// picks the stiffness/mass model: solid reference (E₀, full density) vs the
+/// as-printed skin+infill model (same printed params as `PrintedOpts`).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct ModalOpts {
+    num_modes: u32,
+    /// true = solid reference (E₀ + full density); false = as-printed.
+    solid: bool,
+    /// Free-free: run WITHOUT supports (soft-anchored), discarding the 6
+    /// rigid-body modes — for an unconstrained part. false = constrained.
+    free: bool,
+    infill_pct: f64,
+    exponent: f64,
+    coeff: f64,
+    perimeters: u32,
+    line_width: f64,
+    top_bottom_layers: u32,
+    layer_height: f64,
+}
+
+impl Default for ModalOpts {
+    fn default() -> Self {
+        Self {
+            num_modes: 6,
+            solid: false,
+            free: false,
+            infill_pct: 25.0,
+            exponent: 1.5,
+            coeff: 1.0,
+            perimeters: 2,
+            line_width: 0.45,
+            top_bottom_layers: 5,
+            layer_height: 0.2,
+        }
+    }
+}
+
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct BuildSimOpts {
@@ -1158,6 +1198,42 @@ impl Model {
         self.opt = None;
     }
 
+    /// Bearing load (N): radial force on a cylindrical bore, cosine-distributed
+    /// over the loaded half (Ansys-style). Axial component is rejected.
+    pub fn add_bearing(&mut self, tris: &[u32], fx: f64, fy: f64, fz: f64) {
+        self.bcs.push(BcSpec { kind: BcKind::Bearing([fx, fy, fz]), tris: tris.to_vec() });
+        self.solution = None;
+        self.opt = None;
+    }
+
+    /// Moment (N·mm): deformable distributed couple over the selection.
+    pub fn add_moment(&mut self, tris: &[u32], mx: f64, my: f64, mz: f64) {
+        self.bcs.push(BcSpec { kind: BcKind::Moment([mx, my, mz]), tris: tris.to_vec() });
+        self.solution = None;
+        self.opt = None;
+    }
+
+    /// Fit a triangle selection to a cylinder and return the result as JSON:
+    /// `{ok, axis:[3], point:[3], radius, residual}`. `ok` is true only when the
+    /// cylindricity residual is within tolerance — the front end uses it to
+    /// accept/reject a bearing-load selection and to draw the axis glyph.
+    pub fn fit_cylinder(&self, tris: &[u32]) -> String {
+        match sig_core::attach::fit_selection_cylinder(&self.mesh, tris) {
+            Some(c) => {
+                let ok = c.residual.is_finite() && c.residual <= sig_core::cylinder::DEFAULT_TOL;
+                format!(
+                    "{{\"ok\":{},\"axis\":[{},{},{}],\"point\":[{},{},{}],\"radius\":{},\"residual\":{}}}",
+                    ok,
+                    c.axis[0], c.axis[1], c.axis[2],
+                    c.point[0], c.point[1], c.point[2],
+                    c.radius, c.residual
+                )
+            }
+            None => "{\"ok\":false,\"axis\":[0,0,1],\"point\":[0,0,0],\"radius\":0,\"residual\":null}"
+                .to_string(),
+        }
+    }
+
     fn ensure_grid(&mut self) -> Result<(), JsValue> {
         if self.grid.is_some() {
             return Ok(());
@@ -1660,6 +1736,167 @@ impl Model {
         self.solution = Some(sol);
         self.solution_eps = Some(eps);
         Ok(out)
+    }
+
+    /// Constrained undamped modal analysis (`sig_core::modal`): the lowest
+    /// `num_modes` natural frequencies + mode shapes of the part as supported by
+    /// the CURRENT `bcs` (the store sets these to the first load case before the
+    /// call). Force-free — loads are ignored; only supports constrain the
+    /// eigenproblem. Each mode shape is stashed as a result keyed `modal::mode-i`
+    /// (mass-normalized, then rescaled to unit peak for display), and mode 0 is
+    /// left live. JSON: `{ converged, outerIters, modes: [{id, freqHz}] }`. The
+    /// store builds one `ResultEntry` per mode from this and switches modes via
+    /// `activate_result`, reusing the deformed-view + animation path.
+    pub fn modal_analysis(
+        &mut self,
+        opts_json: &str,
+        on_progress: &js_sys::Function,
+    ) -> Result<String, JsValue> {
+        let opts: ModalOpts = serde_json::from_str(opts_json).map_err(err)?;
+        let free = opts.free;
+        let num_modes = (opts.num_modes.clamp(1, 20)) as usize;
+        // Free-free: also compute the 6 rigid-body modes so they can be dropped.
+        let n_compute = if free { num_modes + 6 } else { num_modes };
+        self.ensure_grid()?;
+        // Build the modal stiffness (eps) + lumped-mass material fraction (vfrac)
+        // and the transient solver hierarchy inside the grid borrow; everything
+        // else needed to assemble the mode Solutions is captured owned so the
+        // borrow ends before we mutate the result roster.
+        let (mut cache, eps, vfrac, mx, my, mz, h, origin, active) = {
+            let (grid, levels) = self.grid.as_ref().unwrap();
+            let mut asm = assemble(&self.mesh, grid, &self.bcs, None, &self.settings).map_err(err)?;
+            let report = check_problem(grid, &asm);
+            // Constrained modal needs supports; free-free deliberately runs
+            // WITHOUT them (the rigid-body modes are lifted + dropped below).
+            if !free && !report.ok {
+                return Err(err(
+                    "model is under-constrained for modal analysis — add supports, or enable free-free (run check() for details)",
+                ));
+            }
+            let (eps, vfrac) = if opts.solid {
+                (sig_core::solve::grid_eps(grid), grid.scale.clone())
+            } else {
+                let eval_exp = opts.exponent.clamp(1.0, 3.5);
+                let eval_coeff = opts.coeff.clamp(0.05, 2.0);
+                let (_, wall_mm) = resolve_wall(opts.perimeters, opts.line_width);
+                let tb_mm = (opts.top_bottom_layers.min(20) as f64
+                    * opts.layer_height.clamp(0.04, 0.6))
+                .min(5.0);
+                let infill = (opts.infill_pct / 100.0).clamp(0.01, 1.0);
+                let split =
+                    sig_core::simp::classify_cells(grid, wall_mm, tb_mm, tb_mm, self.composite_skin);
+                let (skin, design, skin_frac) = (split.skin, split.design, split.skin_frac);
+                let x = vec![infill; design.len()];
+                let eps = sig_core::simp::build_eps(
+                    grid, &skin, &design, &skin_frac, &x, eval_exp, eval_coeff,
+                );
+                // Material volume fraction per cell for the lumped mass: solid
+                // skin (occupancy), design cells = occ·(wall band solid + infill
+                // ratio over the rest). Distinct from the E(ρ) stiffness eps.
+                let mut vfrac = grid.scale.clone();
+                for (k, &c) in design.iter().enumerate() {
+                    let occ = grid.scale[c as usize] as f64;
+                    let f = skin_frac[k] as f64;
+                    vfrac[c as usize] = (occ * (f + infill * (1.0 - f))) as f32;
+                }
+                (eps, vfrac)
+            };
+            let active = active_nodes(grid);
+            if free {
+                // Soft anchor springs lift the 6 rigid-body modes so K becomes
+                // invertible (the unsupported part has a singular stiffness).
+                // Weak (≈1e-4·E·h) so the flexible frequencies are ~unperturbed.
+                let k = 1e-4 * self.settings.e0 * grid.h;
+                let anchors = sig_core::modal::rigid_body_anchor_springs(
+                    grid.nx + 1,
+                    grid.ny + 1,
+                    grid.nz + 1,
+                    &active,
+                    k,
+                );
+                asm.problem.springs.extend(anchors);
+            }
+            let cache = SolverCache::build(grid, *levels, &asm.problem, &self.settings, eps.clone());
+            (
+                cache,
+                eps,
+                vfrac,
+                grid.nx + 1,
+                grid.ny + 1,
+                grid.nz + 1,
+                grid.h,
+                grid.origin,
+                active,
+            )
+        };
+
+        let cfg = sig_core::modal::ModalConfig::new(n_compute);
+        // Stream the current Ritz frequency estimates to JS once per outer step
+        // (live progress / convergence readout).
+        let progress = |outer: usize, max_outer: usize, freqs: &[f64]| {
+            let arr = js_sys::Float64Array::from(freqs);
+            let _ = on_progress.call3(
+                &JsValue::NULL,
+                &JsValue::from(outer as u32),
+                &JsValue::from(max_outer as u32),
+                &arr,
+            );
+        };
+        let res = sig_core::modal::analyze(&mut cache.solver, &vfrac, self.density, &cfg, progress)
+            .map_err(err)?;
+
+        // Free-free: drop the lowest modes (the lifted rigid-body modes), keeping
+        // the flexible ones the user asked for.
+        let drop = if free { res.shapes.len().saturating_sub(num_modes) } else { 0 };
+
+        // Replace any prior modal modes; keep other (static/optimized) results.
+        self.results.retain(|k, _| !k.starts_with("modal::"));
+        let nnode = mx * my * mz;
+        let mut modes_json = Vec::with_capacity(res.freqs_hz.len().saturating_sub(drop));
+        for (i, shape) in res.shapes.iter().enumerate().skip(drop) {
+            let mi = i - drop; // 0-based index among the KEPT modes
+            // Rescale the (arbitrary-magnitude) mode shape to unit peak over
+            // active nodes — the viewer re-normalizes anyway, but this keeps the
+            // stashed field tidy and gives each mode the same nominal amplitude.
+            let mut maxmag = 0f64;
+            for n in 0..nnode {
+                if active[n] {
+                    let (ux, uy, uz) =
+                        (shape[3 * n] as f64, shape[3 * n + 1] as f64, shape[3 * n + 2] as f64);
+                    maxmag = maxmag.max((ux * ux + uy * uy + uz * uz).sqrt());
+                }
+            }
+            let inv = if maxmag > 0.0 { 1.0 / maxmag } else { 0.0 };
+            let u: Vec<f32> = shape.iter().map(|&v| (v as f64 * inv) as f32).collect();
+            let sol = Solution {
+                u,
+                mx,
+                my,
+                mz,
+                h,
+                origin,
+                active: active.clone(),
+                iterations: res.outer_iters,
+                rel_residual: 0.0,
+                converged: res.converged,
+                residuals: Vec::new(),
+            };
+            let id = format!("modal::mode-{mi}");
+            if mi == 0 {
+                self.solution = Some(sol.clone());
+                self.solution_eps = Some(eps.clone());
+            }
+            self.results
+                .insert(id.clone(), StashedResult { sol, eps: Some(eps.clone()) });
+            modes_json.push(serde_json::json!({ "id": id, "freqHz": res.freqs_hz[i] }));
+        }
+        Ok(serde_json::json!({
+            "converged": res.converged,
+            "outerIters": res.outer_iters,
+            "totalInnerIters": res.total_inner_iters,
+            "modes": modes_json,
+        })
+        .to_string())
     }
 
     /// Re-solve the CURRENT optimized design under the CURRENT BCs — the per-step

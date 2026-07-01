@@ -5,6 +5,7 @@
 // manager modal so their rows always match each other and the 3D glyphs.
 
 import type { Bc, BcKind } from "../types";
+import type { QuantityKind } from "../units";
 
 export const KIND_LABEL: Record<BcKind, string> = {
   fixed: "Fixed support",
@@ -13,6 +14,8 @@ export const KIND_LABEL: Record<BcKind, string> = {
   elastic: "Elastic support",
   force: "Force",
   pressure: "Pressure",
+  bearing: "Bearing load",
+  moment: "Moment",
 };
 
 // Mirrors BC_COLORS in SceneManager — the dots must match the 3D glyphs.
@@ -23,6 +26,8 @@ export const KIND_DOT: Record<BcKind, string> = {
   elastic: "#1f9d6b",
   force: "#d93025",
   pressure: "#c97b10",
+  bearing: "#b5179e",
+  moment: "#e8590c",
 };
 
 export const SUPPORT_KINDS: BcKind[] = ["fixed", "elastic", "frictionless", "displacement"];
@@ -35,12 +40,26 @@ export const KIND_SHORT: Record<BcKind, string> = {
   elastic: "Elastic",
   force: "Force",
   pressure: "Pressure",
+  bearing: "Bearing",
+  moment: "Moment",
 };
 
-/** A force / pressure's per-step unit. */
+/** A load's per-step unit. Canonical labels — for live display use
+ *  `unitLabel(BC_QUANTITY[kind])` so it follows the unit selection. */
 export const KIND_UNIT: Partial<Record<BcKind, string>> = {
   force: "N",
   pressure: "MPa",
+  bearing: "N",
+  moment: "N·mm",
+};
+
+/** The display-unit quantity kind of a load's value (force/pressure/moment).
+ *  Drives unit-aware inputs + headers in the loads UI. */
+export const BC_QUANTITY: Partial<Record<BcKind, QuantityKind>> = {
+  force: "force",
+  bearing: "force",
+  pressure: "pressure",
+  moment: "moment",
 };
 
 /** Display name: the user's custom name, or the auto kind label. */

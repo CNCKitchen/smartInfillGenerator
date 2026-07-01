@@ -9,9 +9,12 @@ import { Inspector } from "./ui/Inspector";
 import { StatusStrip } from "./ui/StatusStrip";
 import { ViewportChips } from "./ui/ViewportChips";
 import { SettingsModal } from "./ui/Settings";
+import { UnitsModal } from "./ui/UnitsModal";
+import { ImportUnitsModal } from "./ui/ImportUnitsModal";
 import { LoadStepsModal } from "./ui/LoadSteps";
 import { ImprintModal } from "./ui/Imprint";
 import { Disclaimer } from "./ui/Disclaimer";
+import { SupportBanner } from "./ui/SupportBanner";
 import { NerdLog } from "./ui/NerdLog";
 import { Viewer } from "./viewer/Viewer";
 import { useStore } from "./store";
@@ -32,6 +35,7 @@ export function App() {
         <StepPanel />
         <div className="stage">
           <Viewer />
+          <SupportBanner />
           <ViewportChips />
           {!model && <DropZone />}
           <NerdLog />
@@ -62,6 +66,8 @@ export function App() {
       </div>
       <StatusStrip />
       <SettingsModal />
+      <UnitsModal />
+      <ImportUnitsModal />
       <LoadStepsModal />
       <ImprintModal />
       <Disclaimer />
@@ -81,7 +87,7 @@ function DropZone() {
     <div className="dropzone">
       <div className="dz-card">
         <b>Drop an STL or 3MF here</b>
-        <div className="small">Units mm — the file never leaves your browser.</div>
+        <div className="small">STL units are set on import — the file never leaves your browser.</div>
         <input
           ref={fileRef}
           type="file"

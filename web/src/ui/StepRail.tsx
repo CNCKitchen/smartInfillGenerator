@@ -7,6 +7,7 @@
 
 import { useShallow } from "zustand/shallow";
 import { useStore } from "../store";
+import { SUPPORT_KINDS } from "./bcmeta";
 
 const OPTIMIZE_STEPS: { n: number; label: string; title: string }[] = [
   { n: 1, label: "Model", title: "1 · Model" },
@@ -50,7 +51,7 @@ export function StepRail() {
       b.tris.length > 0
   );
   const hasLoad = s.bcs.some(
-    (b) => (b.kind === "force" || b.kind === "pressure") && b.tris.length > 0
+    (b) => !SUPPORT_KINDS.includes(b.kind) && b.tris.length > 0
   );
   const done: Record<number, boolean> = buildsim
     ? {

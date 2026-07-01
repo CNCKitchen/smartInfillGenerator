@@ -26,7 +26,19 @@ import type {
   VoxelInfo,
 } from "./types";
 import { DEFAULT_CURVES, DEFAULT_MATERIALS, RESOLUTIONS, RESULT_FIELDS } from "./types";
+import { fitCylinderFromSelection } from "./cylinderFit";
 import { CONTOUR_BANDS, CONTOUR_BANDS_MIN, CONTOUR_BANDS_MAX, jet, bandHexColors } from "./viewer/colormaps";
+import {
+  type QuantityKind,
+  type UnitPrefs,
+  PRESETS,
+  DEFAULT_PRESET,
+  QUANTITY_KINDS,
+  QUANTITIES,
+  setActiveUnits,
+  convertUnitToCanonical,
+  format as formatQ,
+} from "./units";
 
 /** Color 3MF export bands map 1:1 to slicer filament slots — Bambu/Orca cap. */
 export const COLOR_STEPS_MIN = 2;
@@ -164,7 +176,7 @@ export function budgetBounds(s: {
 
 /** The TYPE of a retained result. A result's full identity is (kind, load
  *  step) — see `ResultEntry.id` / `resultStashId`. */
-export type ResultKind = "optimized" | "uniform" | "solid" | "asprinted";
+export type ResultKind = "optimized" | "uniform" | "solid" | "asprinted" | "modal";
 
 /** Monotonic input epochs. A result is stale when an epoch it depends on has
  *  advanced past the value it was built at. Grid/geometry changes are NOT
@@ -181,6 +193,13 @@ export interface ResultEpochs {
 }
 
 const ZERO_EPOCHS: ResultEpochs = { loads: 0, material: 0, print: 0, opt: 0 };
+
+/** A provenance-card cell: a plain string, or a CANONICAL value tagged with its
+ *  quantity kind so the card formats it in the live display unit (the rows are
+ *  built once at solve time, so unit-bearing ones must stay reformattable). */
+export type ProvVal =
+  | string
+  | { v: number; kind: QuantityKind; prefix?: string; suffix?: string };
 
 /** One retained result: metadata for the dropdown + the provenance card.
  *  The displacement/stress data itself lives in the engine stash (keyed by id)
@@ -205,13 +224,13 @@ export interface ResultEntry {
   converged: boolean;
   /** Provenance card title + rows (the settings the result was built with). */
   provTitle: string;
-  provRows: [string, string][];
+  provRows: [string, ProvVal][];
   /** Epoch stamps at build time — diffed against the live epochs for staleness. */
   epochs: ResultEpochs;
 }
 
 /** Fixed display order in the dropdown. */
-const RESULT_ORDER: ResultKind[] = ["optimized", "uniform", "asprinted", "solid"];
+const RESULT_ORDER: ResultKind[] = ["optimized", "uniform", "asprinted", "solid", "modal"];
 
 /** Engine stash key for a (kind, load step). With a single load step we keep
  *  the BARE kind so the stash key, the result roster, and saved `.infeall`
@@ -238,6 +257,9 @@ function withEnvelope(results: ResultEntry[], steps: LoadStep[]): ResultEntry[] 
   const kinds: ResultKind[] = [];
   for (const r of out) if (!kinds.includes(r.kind)) kinds.push(r.kind);
   for (const kind of kinds) {
+    // Modal "steps" are independent mode shapes — a worst-case envelope across
+    // different modes is meaningless, so modal never gets one.
+    if (kind === "modal") continue;
     const group = out.filter((r) => r.kind === kind);
     if (group.length < 2) continue;
     const maxDisplacement = Math.max(...group.map((r) => r.maxDisplacement));
@@ -258,7 +280,7 @@ function withEnvelope(results: ResultEntry[], steps: LoadStep[]): ResultEntry[] 
       provRows: [
         ["Load steps", `${group.length} combined`],
         ["Worst max |u|", fmtMm(maxDisplacement)],
-        ...(minSf != null ? ([["Min safety factor", `${minSf.toFixed(2)}×`]] as [string, string][]) : []),
+        ...(minSf != null ? ([["Min safety factor", `${minSf.toFixed(2)}×`]] as [string, ProvVal][]) : []),
         ["Reduction", "max field · min SF, per point"],
       ],
       epochs: { ...group[0].epochs },
@@ -289,6 +311,9 @@ export function resultStale(e: ResultEntry, ep: ResultEpochs): boolean {
   if (ep.loads !== e.epochs.loads || ep.material !== e.epochs.material) return true;
   if (e.kind === "asprinted") return ep.print !== e.epochs.print;
   if (e.kind === "solid") return false; // depends on grid+loads+material only
+  // Modal modes depend on grid+loads+material (checked above) and, for the
+  // as-printed model, the print settings — never on the optimized design.
+  if (e.kind === "modal") return ep.print !== e.epochs.print;
   return ep.opt !== e.epochs.opt; // optimized + uniform
 }
 
@@ -317,6 +342,94 @@ function saveSettings(
 }
 
 const initialSettings = loadSettings();
+
+// ---- display-unit preference (per-user UI pref, NOT in the project file) ----
+// See docs/units-design.md §5: lives in localStorage, identical across projects;
+// later moves to the user account when accounts land.
+
+const UNIT_KEY = "sig.units.v1";
+
+/** Load the saved unit selection, dropping any stale unit ids (renamed/removed
+ *  in a later registry) back to the default preset's choice. */
+function loadUnitPrefs(): UnitPrefs {
+  const base: UnitPrefs = { ...PRESETS[DEFAULT_PRESET].units };
+  try {
+    const raw = localStorage.getItem(UNIT_KEY);
+    if (!raw) return base;
+    const p = JSON.parse(raw) as Partial<UnitPrefs>;
+    for (const k of QUANTITY_KINDS) {
+      const id = p[k];
+      if (id && QUANTITIES[k].units.some((u) => u.id === id)) base[k] = id;
+    }
+  } catch {
+    // corrupted storage: keep the default preset
+  }
+  return base;
+}
+
+function saveUnitPrefs(prefs: UnitPrefs) {
+  try {
+    localStorage.setItem(UNIT_KEY, JSON.stringify(prefs));
+  } catch {
+    // storage full/blocked: selection just won't persist
+  }
+}
+
+const initialUnitPrefs = loadUnitPrefs();
+// Prime the format chokepoint's module mirror before the first render.
+setActiveUnits(initialUnitPrefs);
+
+// ---- STL import unit (one-time bake to canonical mm; see units-design §8) ----
+// STL is unitless — a 1×1×1 file is either 1 mm or 1 inch and the file can't
+// say which. The IMPORT unit (a one-time, irreversible bake) is decoupled from
+// the DISPLAY unit (reversible). Persisted separately from the display prefs.
+
+const IMPORT_KEY = "sig.import.v1";
+
+interface ImportPrefs {
+  /** Last chosen import unit id (a length-unit id). */
+  unit: string;
+  /** Show the picker on each STL import (false = "don't ask again"). */
+  ask: boolean;
+}
+
+function loadImportPrefs(): ImportPrefs {
+  const base: ImportPrefs = { unit: "mm", ask: true };
+  try {
+    const raw = localStorage.getItem(IMPORT_KEY);
+    if (!raw) return base;
+    const p = JSON.parse(raw) as Partial<ImportPrefs>;
+    if (p.unit && QUANTITIES.length.units.some((u) => u.id === p.unit)) base.unit = p.unit;
+    if (typeof p.ask === "boolean") base.ask = p.ask;
+  } catch {
+    // corrupted: keep defaults
+  }
+  return base;
+}
+
+function saveImportPrefs(unit: string, ask: boolean) {
+  try {
+    localStorage.setItem(IMPORT_KEY, JSON.stringify({ unit, ask }));
+  } catch {
+    // storage blocked: just won't persist
+  }
+}
+
+const initialImportPrefs = loadImportPrefs();
+
+/** Commit a new unit selection: update the format chokepoint's module mirror,
+ *  persist it, and bump `unitRev` so pure-format components re-render even though
+ *  no canonical data changed. */
+function applyUnitPrefs(set: SetState, get: () => AppState, prefs: UnitPrefs) {
+  setActiveUnits(prefs);
+  saveUnitPrefs(prefs);
+  set({ unitPrefs: prefs, unitRev: get().unitRev + 1 });
+  // The 3D overlays are imperative (not React) — refresh them so they re-render
+  // in the new unit immediately, not only on the next camera move: the min/max
+  // marker labels and the pinned value callouts.
+  if (get().showExtremes) sceneEvents.onShowExtremes?.(true, fieldUnit(get().resultField));
+  sceneEvents.onUnitsChanged?.();
+}
 
 interface AppState {
   // workflow navigation (step rail): 1 Model … 6 View & export
@@ -370,6 +483,15 @@ interface AppState {
   /** What "Solve once" analyzes: the print, the CAD-ideal solid, or the FDM
    *  build simulation (inherent-strain warp + bed peel). */
   analyzeMode: "printed" | "solid" | "buildsim";
+  /** Verify-tab analysis type: a static linear solve, or a modal (natural-
+   *  frequency) analysis. Orthogonal to `analyzeMode` (printed vs solid stiffness
+   *  applies to both). */
+  analysisType: "static" | "modal";
+  /** Number of modes to compute in a modal run (1–20). */
+  modalModeCount: number;
+  /** Free-free modal: run an UNCONSTRAINED part (soft-anchored), discarding the
+   *  6 rigid-body modes. For parts with no supports. */
+  freeFree: boolean;
   /** Active top-level workspace: structural Simulate & Optimize, or Build Sim. */
   appMode: "optimize" | "buildsim";
   /** Build-sim: which state to deform by (off-bed sprung shape or on the bed). */
@@ -481,6 +603,23 @@ interface AppState {
   disclaimerOpen: boolean;
   /** Dev/testing escape hatch (persisted in this browser). */
   disclaimerSkipped: boolean;
+  // ---- display units (presentation only; see docs/units-design.md) ----
+  /** Per-quantity display-unit selection. The engine/store stay canonical;
+   *  this only drives rendering + input conversion. */
+  unitPrefs: UnitPrefs;
+  /** Unit settings popover (clicked from the status-strip units chip). */
+  unitsOpen: boolean;
+  /** Bumped on every unit change so pure-format components re-render even when
+   *  their underlying (canonical) data is unchanged. */
+  unitRev: number;
+  // ---- STL import unit (decoupled from display units; see units-design §8) ----
+  /** Last chosen STL import unit (length-unit id); also the default for silent
+   *  ("don't ask again") imports. */
+  importUnit: string;
+  /** Whether to show the import-unit picker on each STL open. */
+  askImportUnit: boolean;
+  /** STL awaiting a unit choice (picker open); null otherwise. */
+  pendingImport: { name: string; bytes: ArrayBuffer } | null;
   /** Densities of the extracted modifier regions (for the region list). */
   regionInfos: { density: number }[];
   regionVisible: boolean[];
@@ -516,7 +655,19 @@ interface AppState {
   solveTol: number;
 
   setActiveStep(n: number): void;
-  loadFile(name: string, bytes: ArrayBuffer): Promise<void>;
+  /** Open a model. For an ambiguous STL it shows the import-unit picker (unless
+   *  "don't ask again"); `unitId` set = use it directly (the picker's confirm). */
+  loadFile(name: string, bytes: ArrayBuffer, unitId?: string): Promise<void>;
+  /** Picker confirmed: bake the pending STL at `unitId`; `remember` = stop
+   *  asking on future imports. */
+  confirmImport(unitId: string, remember: boolean): void;
+  /** Dismiss the import-unit picker without loading. */
+  cancelImport(): void;
+  /** Re-enable the import-unit picker ("don't ask again" undo). */
+  setAskImportUnit(on: boolean): void;
+  /** Rescale the loaded geometry in place (the "wrong import unit" escape
+   *  hatch, e.g. ×25.4 / ÷25.4) and re-seat it on the plate. */
+  rescaleModel(factor: number): Promise<void>;
   setSegAngle(angle: number): Promise<void>;
   /** Switch the surface-patch source (crease angle vs CAD faces). */
   setSegSource(src: "angle" | "cad"): Promise<void>;
@@ -553,6 +704,12 @@ interface AppState {
         | "forceDir"
         | "forceMag"
         | "forceDirAuto"
+        | "moment"
+        | "momentMode"
+        | "momentDir"
+        | "momentMag"
+        | "cyl"
+        | "cylError"
       >
     >
   ): void;
@@ -568,6 +725,12 @@ interface AppState {
   flipForceDir(id: string): void;
   /** Snap a force's direction back to the selection's average normal. */
   resetForceDirToNormal(id: string): void;
+  /** Set the (un-normalized) axis of a moment; keeps |M|, switches to direction. */
+  setMomentDir(id: string, dir: [number, number, number]): void;
+  /** Reverse a moment's axis (right-hand-rule sense). */
+  flipMomentDir(id: string): void;
+  /** Snap a moment's axis to the selection's average surface normal. */
+  resetMomentDirToNormal(id: string): void;
   /** Scene → store: the pick-direction tool clicked a triangle (its normal). */
   applyPickedDir(normal: [number, number, number]): void;
   // load steps (FEA load cases) — see DESIGN §13. The data layer; the table UI
@@ -588,6 +751,10 @@ interface AppState {
   aimStepForceAlongNormal(stepId: string, bcId: string): void;
   /** Set a step's per-BC pressure (pressure BCs). */
   setStepPressure(stepId: string, bcId: string, pressure: number): void;
+  /** Set a step's per-BC moment vector (moment BCs). */
+  setStepMoment(stepId: string, bcId: string, moment: [number, number, number]): void;
+  /** Aim a step's moment axis along the selection's average normal (|M| kept). */
+  aimStepMomentAlongNormal(stepId: string, bcId: string): void;
   /** Include/exclude a step from the multi-load optimizer. */
   setStepIncludeOptimize(stepId: string, include: boolean): void;
   /** Set a step's weight in the weighted-sum optimizer objective. */
@@ -614,6 +781,9 @@ interface AppState {
   setSnapVoxel(on: boolean): void;
   setCompositeSkin(on: boolean): void;
   setAnalyzeMode(m: "printed" | "solid" | "buildsim"): void;
+  setAnalysisType(t: "static" | "modal"): void;
+  setModalModeCount(n: number): void;
+  setFreeFree(on: boolean): void;
   setAppMode(m: "optimize" | "buildsim"): void;
   setBuildState(s: "released" | "bonded"): void | Promise<void>;
   setMeshDensity(on: boolean): void;
@@ -646,6 +816,12 @@ interface AppState {
   setResultSurface(surface: "stl" | "voxel"): Promise<void>;
   consentDisclaimer(): void;
   setDisclaimerSkipped(on: boolean): void;
+  /** Open/close the unit-settings popover. */
+  openUnits(open: boolean): void;
+  /** Apply a whole preset (Metric / SI-mm / US-in / …). */
+  setUnitPreset(presetId: string): void;
+  /** Override a single quantity's display unit (per-quantity selection). */
+  setUnit(kind: QuantityKind, unitId: string): void;
   setResultField(kind: string): Promise<void>;
   setLegendRange(min: number | null, max: number | null): void;
   setShowExtremes(on: boolean): void;
@@ -663,6 +839,10 @@ interface AppState {
   fitLegend(): void;
   runCheck(): Promise<void>;
   runSolve(): Promise<void>;
+  /** Constrained modal analysis (Verify tab): compute `modalModeCount` natural
+   *  frequencies + mode shapes on the FIRST load case's supports, surfacing each
+   *  mode as a switchable result-case. */
+  runModal(): Promise<void>;
   runOptimize(): Promise<void>;
   downloadThreeMf(): Promise<void>;
   downloadStls(): Promise<void>;
@@ -739,6 +919,8 @@ const BC_KIND_NAME: Record<BcKind, string> = {
   elastic: "Elastic",
   force: "Force",
   pressure: "Pressure",
+  bearing: "Bearing",
+  moment: "Moment",
 };
 
 /** Fresh load step with no overrides (every BC active at its base value). */
@@ -750,7 +932,11 @@ function makeLoadStep(name: string): LoadStep {
 function cloneOverrides(ov: Record<string, LoadStepOverride>): Record<string, LoadStepOverride> {
   const out: Record<string, LoadStepOverride> = {};
   for (const [k, v] of Object.entries(ov)) {
-    out[k] = { ...v, force: v.force ? ([...v.force] as [number, number, number]) : undefined };
+    out[k] = {
+      ...v,
+      force: v.force ? ([...v.force] as [number, number, number]) : undefined,
+      moment: v.moment ? ([...v.moment] as [number, number, number]) : undefined,
+    };
   }
   return out;
 }
@@ -996,7 +1182,7 @@ export function symLabel(normal: [number, number, number], c: number): string {
     ["Z", normal[2]],
   ];
   const major = axes.find(([, v]) => Math.abs(v) > 0.9999);
-  if (major) return `⊥${major[0]} @ ${(c * Math.sign(major[1])).toFixed(1)} mm`;
+  if (major) return `⊥${major[0]} @ ${formatQ(c * Math.sign(major[1]), "length")}`;
   return `tilted (n = ${normal.map((v) => v.toFixed(2)).join(", ")})`;
 }
 
@@ -1090,6 +1276,9 @@ export interface SceneEvents {
    *  group (the cut already lives in the geometry) and hides its cap. */
   onVoxelCutActive?: (on: boolean) => void;
   onAnimateDeformed?: (on: boolean) => void;
+  /** Modal result active: animate the mode shape as a symmetric ± swing
+   *  (vibration) rather than the one-sided 0 → max deflection loop. */
+  onModalAnim?: (on: boolean) => void;
   /** Live optimization skeleton or density-threshold cutaway mesh,
    *  optionally colored by a per-vertex density scalar. */
   onOptShape?: (
@@ -1119,6 +1308,8 @@ export interface SceneEvents {
   onLegendRange?: (min: number | null, max: number | null) => void;
   /** Min/max location markers; unit drives the label formatting. */
   onShowExtremes?: (on: boolean, unit: string) => void;
+  /** Display unit changed — re-format imperative overlays (pinned callouts). */
+  onUnitsChanged?: () => void;
   /** Smooth vs discrete (banded) result contours, and the band count. */
   onBandedContour?: (on: boolean, count: number) => void;
   // Section plane controls.
@@ -1143,11 +1334,16 @@ export function effectiveBcs(bcs: Bc[], step: LoadStep | undefined): Bc[] {
       continue;
     }
     if (ov.active === false) continue; // deactivated in this step
-    if (ov.force === undefined && ov.pressure === undefined) {
+    if (ov.force === undefined && ov.pressure === undefined && ov.moment === undefined) {
       out.push(b);
       continue;
     }
-    out.push({ ...b, force: ov.force ?? b.force, pressure: ov.pressure ?? b.pressure });
+    out.push({
+      ...b,
+      force: ov.force ?? b.force,
+      pressure: ov.pressure ?? b.pressure,
+      moment: ov.moment ?? b.moment,
+    });
   }
   return out;
 }
@@ -1167,7 +1363,12 @@ function sceneBcs(bcs: Bc[], step: LoadStep | undefined): Bc[] {
   return bcs.map((b) => {
     const ov = step.overrides[b.id];
     if (!ov) return b;
-    return { ...b, force: ov.force ?? b.force, pressure: ov.pressure ?? b.pressure };
+    return {
+      ...b,
+      force: ov.force ?? b.force,
+      pressure: ov.pressure ?? b.pressure,
+      moment: ov.moment ?? b.moment,
+    };
   });
 }
 
@@ -1192,6 +1393,7 @@ function pushBcGlyphs(get: () => AppState, activeBcId?: string | null) {
 async function pushBcs(get: () => AppState) {
   await engine.setBcs(effectiveBcs(get().bcs, activeStep(get())));
 }
+
 
 /** After a per-step override edit: if it touched the ACTIVE step, re-sync the
  *  engine (live RBM check + next solve) and stale any standing result. Edits to
@@ -1467,10 +1669,14 @@ function upsertResult(set: (p: Partial<AppState>) => void, get: () => AppState, 
   set({ results: sortResults(next, get().loadSteps) });
 }
 
-/** Sign-aware mm/µm formatter for the provenance card. */
-function fmtMm(v: number): string {
-  const a = Math.abs(v);
-  return a >= 0.01 ? `${v.toFixed(2)} mm` : `${(v * 1000).toFixed(1)} µm`;
+/** Length provenance cell (canonical mm) — formatted live in the display unit. */
+function fmtMm(v: number): ProvVal {
+  return { v, kind: "length" };
+}
+
+/** Mass provenance cell (canonical g) — formatted live in the display unit. */
+function fmtMass(g: number): ProvVal {
+  return { v: g, kind: "mass" };
 }
 
 /** Signed percentage with an explicit + (negatives carry their own −). Both
@@ -1481,9 +1687,18 @@ function signedPct(x: number): string {
 }
 
 /** Analysis-grid summary line for the provenance card. */
-function meshLabel(s: AppState): string {
+function meshLabel(s: AppState): ProvVal {
   const vi = s.voxelInfo;
-  return vi ? `h ${vi.h.toFixed(2)} mm · ${Math.round(vi.cells / 1000)}k cells` : "—";
+  return vi
+    ? {
+        v: vi.h,
+        kind: "length",
+        prefix: "h ",
+        // "solid / total" cells — total is the bounding-box grid, solid is the
+        // part (the rest is empty space the analysis skips).
+        suffix: ` · ${Math.round(vi.solid / 1000)}k/${Math.round(vi.cells / 1000)}k cells`,
+      }
+    : "—";
 }
 
 /** Shared deformation reference = the LOWEST-deflection retained result (min
@@ -1690,14 +1905,14 @@ async function solveAllSteps(set: SetState, get: () => AppState) {
     const rid = resultStashId(kind, step.id, false);
     await engine.stashResult(rid);
     const cur = get();
-    const rows: [string, string][] = printedSummary
+    const rows: [string, ProvVal][] = printedSummary
       ? [
           ["Load step", step.name],
           ["Infill", `${printedSummary.infillPct}% ${printedSummary.pattern}`],
-          ["Skin", `${printedSummary.perimeters} × ${printedSummary.lineWidth} mm`],
+          ["Skin", { v: printedSummary.lineWidth, kind: "length", prefix: `${printedSummary.perimeters} × ` }],
           ["Material", m.name],
           ["Mesh", meshLabel(cur)],
-          ["Mass", `${printedSummary.massGrams.toFixed(1)} g`],
+          ["Mass", fmtMass(printedSummary.massGrams)],
           ["Max |u|", fmtMm(stats.maxDisplacement)],
         ]
       : [
@@ -1833,7 +2048,7 @@ async function stashOptimizedSteps(
     const rid = resultStashId("optimized", step.id, false);
     await engine.stashResult(rid);
     const cur = get();
-    const rows: [string, string][] = [
+    const rows: [string, ProvVal][] = [
       ["Load step", step.name],
       ["Mode", modeLabel + goalNote],
       [sm.solid ? "Retained vol" : "Mean infill", `${meanPct}%`],
@@ -1842,7 +2057,7 @@ async function stashOptimizedSteps(
     rows.push(
       ["Material", cur.material.name],
       ["Mesh", meshLabel(cur)],
-      ["Mass", `${sm.massGrams.toFixed(1)} g`],
+      ["Mass", fmtMass(sm.massGrams)],
       ["Max |u|", fmtMm(stats.maxDisplacement)]
     );
     entries.push({
@@ -1882,7 +2097,7 @@ async function stashOptimizedSingle(set: SetState, get: () => AppState, out: Opt
   const ep = { ...cur.resultEpochs };
   const optStepId = cur.activeLoadStepId;
   const optStepName = activeStep(cur)?.name ?? "Load step";
-  const optRows: [string, string][] = [
+  const optRows: [string, ProvVal][] = [
     ["Mode", modeLabel + goalNote],
     [sm.solid ? "Retained vol" : "Mean infill", `${meanPct}%`],
   ];
@@ -1890,7 +2105,7 @@ async function stashOptimizedSingle(set: SetState, get: () => AppState, out: Opt
   optRows.push(
     ["Material", cur.material.name],
     ["Mesh", meshLabel(cur)],
-    ["Mass", `${sm.massGrams.toFixed(1)} g`],
+    ["Mass", fmtMass(sm.massGrams)],
     ["Max |u|", fmtMm(sm.maxDisplacement)],
     // Same compliance-ratio calc for both; vs solid comes out negative
     // (the optimized design is softer than fully dense material).
@@ -1929,7 +2144,7 @@ async function stashOptimizedSingle(set: SetState, get: () => AppState, out: Opt
         ["Pattern", cur.pattern],
         ["Material", cur.material.name],
         ["Mesh", meshLabel(cur)],
-        ["Mass", `${sm.massGrams.toFixed(1)} g`],
+        ["Mass", fmtMass(sm.massGrams)],
         ["Max |u|", fmtMm(sm.uniformMaxDisp ?? sm.maxDisplacement)],
       ],
       epochs: ep,
@@ -1949,7 +2164,7 @@ async function stashOptimizedSingle(set: SetState, get: () => AppState, out: Opt
         ["Model", "fully dense E₀"],
         ["Material", cur.material.name],
         ["Mesh", meshLabel(cur)],
-        ["Mass", `${sm.massSolidGrams.toFixed(1)} g`],
+        ["Mass", fmtMass(sm.massSolidGrams)],
         ["Max |u|", fmtMm(sm.solidMaxDisp ?? 0)],
       ],
       epochs: ep,
@@ -1992,7 +2207,7 @@ async function stashOptimizedMultiStep(set: SetState, get: () => AppState, out: 
         ["Pattern", cur.pattern],
         ["Material", cur.material.name],
         ["Mesh", meshLabel(cur)],
-        ["Mass", `${sm.massGrams.toFixed(1)} g`],
+        ["Mass", fmtMass(sm.massGrams)],
         ["Max |u|", fmtMm(sm.uniformMaxDisp ?? sm.maxDisplacement)],
         ["Load case", primary.name],
       ],
@@ -2013,7 +2228,7 @@ async function stashOptimizedMultiStep(set: SetState, get: () => AppState, out: 
         ["Model", "fully dense E₀"],
         ["Material", cur.material.name],
         ["Mesh", meshLabel(cur)],
-        ["Mass", `${sm.massSolidGrams.toFixed(1)} g`],
+        ["Mass", fmtMass(sm.massSolidGrams)],
         ["Max |u|", fmtMm(sm.solidMaxDisp ?? 0)],
         ["Load case", primary.name],
       ],
@@ -2220,6 +2435,9 @@ export const useStore = create<AppState>((set, get) => ({
   snapVoxel: true,
   compositeSkin: true,
   analyzeMode: "printed",
+  analysisType: "static",
+  modalModeCount: 6,
+  freeFree: false,
   appMode: "optimize",
   buildState: "released",
   buildProgress: null,
@@ -2271,6 +2489,12 @@ export const useStore = create<AppState>((set, get) => ({
   imprintOpen: false,
   disclaimerOpen: !disclaimerSkippedInit(),
   disclaimerSkipped: disclaimerSkippedInit(),
+  unitPrefs: initialUnitPrefs,
+  unitsOpen: false,
+  unitRev: 0,
+  importUnit: initialImportPrefs.unit,
+  askImportUnit: initialImportPrefs.ask,
+  pendingImport: null,
   regionInfos: [],
   regionVisible: [],
   densityThreshold: 0,
@@ -2295,10 +2519,26 @@ export const useStore = create<AppState>((set, get) => ({
     pushSymmetry(get);
   },
 
-  async loadFile(name, bytes) {
+  async loadFile(name, bytes, unitId) {
+    const isStl = /\.stl$/i.test(name);
+    // STL is unitless → prompt for the import unit (unless "don't ask again").
+    // 3MF/STEP carry their own units, so never prompt and never rescale here.
+    if (isStl && unitId === undefined && get().askImportUnit) {
+      set({ pendingImport: { name, bytes } });
+      return;
+    }
+    const useUnit = unitId ?? (isStl ? get().importUnit : "mm");
     set({ busy: "Parsing & segmenting…", error: null, notice: null });
     try {
       let model = await engine.load(bytes, name.replace(/\.(stl|3mf|step|stp)$/i, ""));
+      // One-time bake to canonical mm: scale the geometry by mm-per-import-unit
+      // (e.g. inch → ×25.4). After this the model is canonical; the display unit
+      // never reinterprets it (units-design §8).
+      const f = convertUnitToCanonical(1, "length", useUnit);
+      if (Math.abs(f - 1) > 1e-9) {
+        const out = await engine.transform([f, 0, 0, 0, f, 0, 0, 0, f, 0, 0, 0]);
+        model = { ...model, positions: out.positions, bbox: out.bbox as LoadedModel["bbox"] };
+      }
       // Land every fresh import centered on the build grid: center the XY
       // footprint over the plate origin and seat the part on the plate
       // (z-min → 0). Mirrors the auto-seat that rotate / place-on-face do.
@@ -2390,6 +2630,29 @@ export const useStore = create<AppState>((set, get) => ({
     } catch (e) {
       set({ busy: null, error: e instanceof Error ? e.message : String(e) });
     }
+  },
+
+  confirmImport(unitId, remember) {
+    const p = get().pendingImport;
+    const ask = remember ? false : get().askImportUnit;
+    set({ pendingImport: null, importUnit: unitId, askImportUnit: ask });
+    saveImportPrefs(unitId, ask);
+    if (p) void get().loadFile(p.name, p.bytes, unitId);
+  },
+
+  cancelImport() {
+    set({ pendingImport: null });
+  },
+
+  setAskImportUnit(on) {
+    set({ askImportUnit: on });
+    saveImportPrefs(get().importUnit, on);
+  },
+
+  async rescaleModel(factor) {
+    if (!get().model || get().busy || !(factor > 0) || Math.abs(factor - 1) < 1e-9) return;
+    // Pure uniform scale about the bbox center, then re-seat on the plate.
+    await transformModel(set, get, [factor, 0, 0, 0, factor, 0, 0, 0, factor]);
   },
 
   async setSegAngle(angle) {
@@ -2517,7 +2780,9 @@ export const useStore = create<AppState>((set, get) => ({
       kind,
       name: `${BC_KIND_NAME[kind]} ${nOfKind + 1}`,
       tris: new Uint32Array(0),
-      force: kind === "force" ? [0, 0, -10] : undefined,
+      // Bearing reuses the force fields (its push vector); a force load and a
+      // bearing load both default to a 10 N downward load.
+      force: kind === "force" || kind === "bearing" ? [0, 0, -10] : undefined,
       pressure: kind === "pressure" ? 0.1 : undefined,
       // ~printed-plastic mount; bolted-to-steel would be >= 5000 (≈ fixed).
       stiffness: kind === "elastic" ? 100 : undefined,
@@ -2529,10 +2794,18 @@ export const useStore = create<AppState>((set, get) => ({
       // selection's average normal (forceDirAuto) and the magnitude is 10 N,
       // which is what most users want (push/pull on a face). Switch to
       // components to edit Fx/Fy/Fz directly.
-      forceMode: kind === "force" ? "direction" : undefined,
-      forceDir: kind === "force" ? [0, 0, -1] : undefined,
-      forceMag: kind === "force" ? 10 : undefined,
-      forceDirAuto: kind === "force" ? true : undefined,
+      forceMode: kind === "force" ? "direction" : kind === "bearing" ? "direction" : undefined,
+      forceDir: kind === "force" || kind === "bearing" ? [0, 0, -1] : undefined,
+      forceMag: kind === "force" || kind === "bearing" ? 10 : undefined,
+      // Force auto-tracks the surface normal; a bearing push direction is set by
+      // the user (which way the pin presses), so it does NOT auto-track.
+      forceDirAuto: kind === "force" ? true : kind === "bearing" ? false : undefined,
+      cyl: kind === "bearing" ? null : undefined,
+      // Moment: default to a 100 N·mm couple about +Z, components mode.
+      moment: kind === "moment" ? [0, 0, 100] : undefined,
+      momentMode: kind === "moment" ? "components" : undefined,
+      momentDir: kind === "moment" ? [0, 0, 1] : undefined,
+      momentMag: kind === "moment" ? 100 : undefined,
     };
     set({ bcs: [...get().bcs, bc], activeBcId: bc.id, tool: "select" });
     markResultsStale(set, get, "loads");
@@ -2568,9 +2841,34 @@ export const useStore = create<AppState>((set, get) => ({
 
   updateBcTris(id, tris) {
     const positions = get().model?.positions;
+    const target = get().bcs.find((b) => b.id === id);
+    const prevTris = target?.tris ?? new Uint32Array(0);
+    // Bearing loads must sit on a cylindrical surface. Validate synchronously
+    // (instant feedback, no worker round-trip) and HARD-BLOCK a non-cylindrical
+    // pick by reverting to the previous selection.
+    let bearingPatch: Partial<Bc> | null = null;
+    if (target?.kind === "bearing") {
+      if (tris.length === 0) {
+        bearingPatch = { tris, cyl: null, cylError: undefined };
+      } else {
+        const fit = positions ? fitCylinderFromSelection(positions, tris) : null;
+        if (fit?.ok) {
+          bearingPatch = { tris, cyl: fit, cylError: undefined };
+        } else {
+          const pct =
+            fit && isFinite(fit.residual) ? ` (${(fit.residual * 100).toFixed(0)}% off-round)` : "";
+          bearingPatch = {
+            tris: prevTris,
+            cyl: null,
+            cylError: `Selection isn’t a cylinder${pct} — bearing load needs a cylindrical surface.`,
+          };
+        }
+      }
+    }
     set({
       bcs: get().bcs.map((b) => {
         if (b.id !== id) return b;
+        if (bearingPatch) return { ...b, ...bearingPatch };
         const next: Bc = { ...b, tris };
         // A direction-mode force that still auto-tracks re-aims along the new
         // selection's average normal (magnitude preserved).
@@ -2679,11 +2977,58 @@ export const useStore = create<AppState>((set, get) => ({
     get().updateBcParams(id, { forceDir: n, forceDirAuto: true, force: resolveForce(next) });
   },
 
+  setMomentDir(id, dir) {
+    const bc = get().bcs.find((b) => b.id === id);
+    if (!bc) return;
+    const l = Math.hypot(dir[0], dir[1], dir[2]);
+    if (l < 1e-12) return;
+    const unit: [number, number, number] = [dir[0] / l, dir[1] / l, dir[2] / l];
+    const mag = bc.momentMag ?? Math.hypot(...(bc.moment ?? [0, 0, 0])) ?? 0;
+    get().updateBcParams(id, {
+      momentMode: "direction",
+      momentDir: unit,
+      momentMag: mag,
+      moment: [unit[0] * mag, unit[1] * mag, unit[2] * mag],
+    });
+  },
+
+  flipMomentDir(id) {
+    const bc = get().bcs.find((b) => b.id === id);
+    if (!bc) return;
+    const m = bc.moment ?? [0, 0, 0];
+    const d = bc.momentDir ?? [0, 0, 1];
+    get().updateBcParams(id, {
+      moment: [-m[0], -m[1], -m[2]],
+      momentDir: [-d[0], -d[1], -d[2]],
+    });
+  },
+
+  resetMomentDirToNormal(id) {
+    const bc = get().bcs.find((b) => b.id === id);
+    if (!bc) return;
+    const n = selectionNormal(get().model?.positions, bc.tris);
+    if (!n) return;
+    get().setMomentDir(id, n);
+  },
+
   applyPickedDir(normal) {
     const id = get().activeBcId;
     if (!id) return;
     const bc = get().bcs.find((b) => b.id === id);
-    if (!bc || bc.kind !== "force") return;
+    if (!bc) return;
+    if (bc.kind === "moment") {
+      // Multi-step: aim THIS step's moment axis; single-step edits the base BC.
+      const step = get().loadSteps.length > 1 ? activeStep(get()) : undefined;
+      if (step) {
+        const cur = step.overrides[id]?.moment ?? bc.moment ?? [0, 0, 0];
+        const mag = Math.hypot(cur[0], cur[1], cur[2]) || bc.momentMag || 100;
+        get().setStepMoment(step.id, id, [normal[0] * mag, normal[1] * mag, normal[2] * mag]);
+      } else {
+        get().setMomentDir(id, normal);
+      }
+      return;
+    }
+    if (bc.kind !== "force" && bc.kind !== "bearing") return;
     // Multi-step: aim THIS step's force vector along the clicked face (keep its
     // magnitude); single-step edits the base BC's direction.
     const step = get().loadSteps.length > 1 ? activeStep(get()) : undefined;
@@ -2768,6 +3113,22 @@ export const useStore = create<AppState>((set, get) => ({
   setStepPressure(stepId, bcId, pressure) {
     set({ loadSteps: patchStepOverride(get().loadSteps, stepId, bcId, { pressure }) });
     syncIfActiveStep(set, get, stepId);
+  },
+
+  setStepMoment(stepId, bcId, moment) {
+    set({ loadSteps: patchStepOverride(get().loadSteps, stepId, bcId, { moment }) });
+    syncIfActiveStep(set, get, stepId);
+  },
+
+  aimStepMomentAlongNormal(stepId, bcId) {
+    const bc = get().bcs.find((b) => b.id === bcId);
+    if (!bc) return;
+    const n = selectionNormal(get().model?.positions, bc.tris);
+    if (!n) return;
+    const cur =
+      get().loadSteps.find((s) => s.id === stepId)?.overrides[bcId]?.moment ?? bc.moment ?? [0, 0, 0];
+    const mag = Math.hypot(cur[0], cur[1], cur[2]) || bc.momentMag || 100;
+    get().setStepMoment(stepId, bcId, [n[0] * mag, n[1] * mag, n[2] * mag]);
   },
 
   setStepIncludeOptimize(stepId, include) {
@@ -3016,6 +3377,15 @@ export const useStore = create<AppState>((set, get) => ({
   setAnalyzeMode(m) {
     set({ analyzeMode: m });
   },
+  setAnalysisType(t) {
+    set({ analysisType: t });
+  },
+  setModalModeCount(n) {
+    set({ modalModeCount: Math.max(1, Math.min(20, Math.round(n))) });
+  },
+  setFreeFree(on) {
+    set({ freeFree: on });
+  },
 
   setMeshDensity(on) {
     set({ meshDensity: on });
@@ -3261,10 +3631,20 @@ export const useStore = create<AppState>((set, get) => ({
       // other result renders on the part hull.
       sceneEvents.onResultSolid?.(e.kind === "optimized" && !!get().optSummary?.solid);
       sceneEvents.onScalarField?.(null);
+      // Modal mode shapes are mass-normalized (unit peak) and animate as a
+      // symmetric ± swing; auto-start the animation when a mode is viewed (Q7).
+      const modal = e.kind === "modal";
+      sceneEvents.onModalAnim?.(modal);
+      if (modal && !get().animateDeformed) {
+        set({ animateDeformed: true });
+        sceneEvents.onAnimateDeformed?.(true);
+      }
       // Anchor the exaggeration on the lowest-deflection result so the scale
       // stays equal across switches (this result still uses its own buffer).
+      // Modal modes are all unit-peak, so anchor them to 1 (independent of any
+      // static results in the roster, which have real mm magnitudes).
       sceneEvents.onDisplacements?.(displacements, {
-        maxDisplacement: referenceMaxDisp(get().results),
+        maxDisplacement: modal ? 1 : referenceMaxDisp(get().results),
       });
       if (get().resultSurface === "voxel") {
         try {
@@ -3594,13 +3974,13 @@ export const useStore = create<AppState>((set, get) => ({
         try {
           await engine.stashResult(rid);
           const cur = get();
-          const rows: [string, string][] = printedSummary
+          const rows: [string, ProvVal][] = printedSummary
             ? [
                 ["Infill", `${printedSummary.infillPct}% ${printedSummary.pattern}`],
-                ["Skin", `${printedSummary.perimeters} × ${printedSummary.lineWidth} mm`],
+                ["Skin", { v: printedSummary.lineWidth, kind: "length", prefix: `${printedSummary.perimeters} × ` }],
                 ["Material", cur.material.name],
                 ["Mesh", meshLabel(cur)],
-                ["Mass", `${printedSummary.massGrams.toFixed(1)} g`],
+                ["Mass", fmtMass(printedSummary.massGrams)],
                 ["Max |u|", fmtMm(stats.maxDisplacement)],
               ]
             : [
@@ -3647,6 +4027,161 @@ export const useStore = create<AppState>((set, get) => ({
         sceneEvents.onBuildActive?.(null);
         set({ buildProgress: null });
       }
+      session.endRun();
+    }
+  },
+
+  async runModal() {
+    if (!get().model || !session.beginRun()) return;
+    set({ busy: "Modal analysis…", error: null });
+    sceneEvents.onAnimateMode?.(null);
+    let stopResidualPoll = () => {};
+    try {
+      const st0 = get();
+      const m = st0.material;
+      const printed = st0.analyzeMode === "printed";
+      const free = st0.freeFree;
+      const curve = st0.curves[st0.pattern];
+      // Constrained modal binds to the FIRST load case's supports (one support
+      // set; forces are ignored — the eigenproblem is force-free). Existing
+      // per-load-case results stay untouched (modal lives in its own kind).
+      const steps = st0.loadSteps;
+      const firstStep = steps[0];
+      await engine.setBcs(effectiveBcs(st0.bcs, firstStep));
+      await logGridInfo(set);
+      // Constrained modal needs a constrained part — reuse the under-constraint
+      // gate (an under-constrained part has rigid-body ~0 Hz modes). Free-free
+      // deliberately runs WITHOUT supports, so it skips this gate.
+      if (!free) {
+        const report = await engine.check();
+        set({ check: report });
+        if (!report.ok) {
+          const bad = report.components.find((c) => !c.constrained && c.mode);
+          sceneEvents.onAnimateMode?.(bad?.mode ?? null);
+          appendLog(set, "Modal aborted: model is under-constrained");
+          set({
+            busy: null,
+            error:
+              "Model is under-constrained — add supports, or tick “Unconstrained (free-free)” to analyze the free part.",
+          });
+          return;
+        }
+      }
+      await prebuildMeshView(set, get);
+      appendLog(
+        set,
+        `Modal analysis — ${st0.modalModeCount} mode${st0.modalModeCount === 1 ? "" : "s"}, ` +
+          `${printed ? "as printed" : "solid"}, ${m.name}` +
+          (free
+            ? " — free-free (unconstrained, rigid-body modes dropped), undamped"
+            : (steps.length > 1 ? ` (supports from "${firstStep.name}")` : "") +
+              " — constrained, undamped") +
+          " …"
+      );
+      // Live MGCG convergence trace (the nerd convergence plot) while the many
+      // inner solves run.
+      set({ solveResiduals: [] });
+      stopResidualPoll = session.startResidualPoll((r) => set({ solveResiduals: r }));
+      const out = await engine.modalAnalysis(
+        {
+          numModes: st0.modalModeCount,
+          solid: !printed,
+          free,
+          infillPct: st0.printInfill,
+          exponent: curve.exponent,
+          coeff: curve.coeff,
+          perimeters: st0.perimeters,
+          lineWidth: st0.lineWidth,
+          topBottomLayers: st0.topBottomLayers,
+          layerHeight: st0.layerHeight,
+        },
+        (p) => {
+          // Per-outer-iteration progress: show how far along + the current f1.
+          const f1 = p.freqs[0] != null ? ` · f1 ≈ ${p.freqs[0].toFixed(0)} Hz` : "";
+          set({ busy: `Modal — iteration ${p.outer}/${p.maxOuter}${f1}` });
+        }
+      );
+      stopResidualPoll();
+      const { result, displacements } = out;
+      session.invalidateSolution();
+      appendLog(
+        set,
+        `Modal ${result.converged ? "converged" : "stopped at the iteration cap"} ` +
+          `in ${result.seconds.toFixed(1)} s ` +
+          `(${result.outerIters} outer iters, ${result.totalInnerIters} MGCG V-cycles): ` +
+          result.modes.map((md, i) => `f${i + 1} ${md.freqHz.toFixed(1)} Hz`).join(", ")
+      );
+      // One ResultEntry per mode — each a synthetic "step" under kind "modal".
+      // The mode shapes are already stashed in the engine (`modal::mode-i`); the
+      // viewer's per-step selector switches them, reusing the deformed view.
+      const cur = get();
+      const kept = cur.results.filter((r) => r.kind !== "modal");
+      const modalEntries: ResultEntry[] = result.modes.map((md, i) => ({
+        id: md.id,
+        kind: "modal",
+        loadStepId: md.id,
+        loadStepName: `Mode ${i + 1} · ${md.freqHz.toFixed(1)} Hz`,
+        label: "Modal",
+        maxDisplacement: 1, // mode shapes are mass-normalized to unit peak
+        massGrams: null,
+        minSf: null,
+        converged: result.converged,
+        provTitle: `Mode ${i + 1}`,
+        provRows: [
+          ["Frequency", `${md.freqHz.toFixed(1)} Hz`],
+          ["Analysis", printed ? "modal · as printed" : "modal · solid"],
+          ["Supports", free ? "free-free (unconstrained)" : steps.length > 1 ? firstStep.name : "load case"],
+          ["Material", cur.material.name],
+          ["Mesh", meshLabel(cur)],
+          ["Shape", "mass-normalized (relative)"],
+        ],
+        epochs: { ...cur.resultEpochs },
+      }));
+      const roster = sortResults(
+        withEnvelope([...kept, ...modalEntries], cur.loadSteps),
+        cur.loadSteps
+      );
+      set({
+        results: roster,
+        activeResultId: modalEntries[0]?.id ?? null,
+        hasResult: true,
+        viewMode: "deformed",
+        busy: null,
+        resultField: "u",
+        fieldRange: null,
+        legendMin: null,
+        legendMax: null,
+        // Auto-start the animation when modal results come up (Q7).
+        animateDeformed: true,
+        notice: result.converged
+          ? null
+          : "Modal solve did not fully converge — the highest modes may be inaccurate. Lower the mode count or raise the resolution.",
+      });
+      // Mode 0 is live in the engine — show it deformed, animating as a ± swing.
+      sceneEvents.onScalarField?.(null);
+      sceneEvents.onModalAnim?.(true);
+      sceneEvents.onAnimateDeformed?.(true);
+      sceneEvents.onDisplacements?.(displacements, { maxDisplacement: 1 });
+      sceneEvents.onViewState?.("deformed", get().deformScale);
+      if (get().resultSurface === "voxel") {
+        try {
+          await session.loadVoxelResult();
+        } catch {
+          set({ resultSurface: "stl" });
+          sceneEvents.onResultSurface?.("stl");
+        }
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      if (/cancelled/i.test(msg)) {
+        set({ busy: null, notice: "Modal analysis stopped." });
+        appendLog(set, "Modal cancelled by user");
+      } else {
+        set({ busy: null, error: msg });
+        appendLog(set, `Modal failed: ${msg}`);
+      }
+    } finally {
+      stopResidualPoll();
       session.endRun();
     }
   },
@@ -3929,6 +4464,21 @@ export const useStore = create<AppState>((set, get) => ({
     } catch {
       // private mode: the checkbox still works for this session
     }
+  },
+
+  openUnits(open) {
+    set({ unitsOpen: open });
+  },
+
+  setUnitPreset(presetId) {
+    const preset = PRESETS[presetId];
+    if (!preset) return;
+    applyUnitPrefs(set, get, { ...preset.units });
+  },
+
+  setUnit(kind, unitId) {
+    if (!QUANTITIES[kind].units.some((u) => u.id === unitId)) return;
+    applyUnitPrefs(set, get, { ...get().unitPrefs, [kind]: unitId });
   },
 
   async downloadThreeMf() {

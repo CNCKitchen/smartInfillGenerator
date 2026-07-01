@@ -8,6 +8,7 @@
 import { useShallow } from "zustand/shallow";
 import { useStore } from "../store";
 import { fmtDispParts } from "./fmt";
+import { format, formatParts } from "../units";
 
 export function Inspector() {
   const s = useStore(
@@ -30,11 +31,13 @@ function PrintedResults() {
       printedStats: s.printedStats,
       stats: s.stats,
       material: s.material,
+      unitRev: s.unitRev,
     }))
   );
   const p = s.printedStats!;
   const stats = s.stats!;
   const [defl, deflUnit] = fmtDispParts(stats.maxDisplacement);
+  const [mass, massUnit] = formatParts(p.massGrams, "mass");
   return (
     <aside className="inspector" aria-label="Results">
       <div className="i-head">
@@ -57,13 +60,13 @@ function PrintedResults() {
         <div className="dro-label">
           <span>Mass</span>
           <span>
-            of {p.massSolidGrams.toFixed(1)} g solid ·{" "}
+            of {format(p.massSolidGrams, "mass")} solid ·{" "}
             {Math.round((100 * p.massGrams) / Math.max(p.massSolidGrams, 1e-9))} %
           </span>
         </div>
         <div className="dro-window">
-          <b>{p.massGrams.toFixed(1)}</b>
-          <span>g</span>
+          <b>{mass}</b>
+          <span>{massUnit}</span>
         </div>
       </div>
 
@@ -82,10 +85,10 @@ function PrintedResults() {
           <span>Min safety factor</span>
           <span>
             {p.sfGoverns === "layer"
-              ? `layer adhesion governs · σₜᶻ ${s.material.strengthZ} MPa`
+              ? `layer adhesion governs · σₜᶻ ${format(s.material.strengthZ, "stress")}`
               : p.sfGoverns === "material"
-                ? `material governs · σₜ ${s.material.strength} MPa`
-                : `σₜ ${s.material.strength} / σₜᶻ ${s.material.strengthZ} MPa`}
+                ? `material governs · σₜ ${format(s.material.strength, "stress")}`
+                : `σₜ ${format(s.material.strength, "stress")} / σₜᶻ ${format(s.material.strengthZ, "stress")}`}
           </span>
         </div>
         <div className="dro-window">
@@ -98,7 +101,7 @@ function PrintedResults() {
       <div className="kv">
         <span>Print settings</span>
         <b>
-          {p.perimeters} × {p.lineWidth} mm · {p.infillPct}% {p.pattern}
+          {p.perimeters} × {format(p.lineWidth, "length")} · {p.infillPct}% {p.pattern}
         </b>
       </div>
       <div className="kv">
@@ -131,7 +134,7 @@ function PrintedResults() {
 
 function OptResults() {
   const s = useStore(
-    useShallow((s) => ({ optSummary: s.optSummary, budget: s.budget }))
+    useShallow((s) => ({ optSummary: s.optSummary, budget: s.budget, unitRev: s.unitRev }))
   );
   const o = s.optSummary!;
   const solid = o.solid;
@@ -174,7 +177,8 @@ function OptResults() {
           <div className="dro-label">
             <span>vs {Math.round(o.refUniformPct!)} % uniform, same stiffness</span>
             <span>
-              {o.massUniformRefGrams!.toFixed(1)} → {o.massGrams.toFixed(1)} g
+              {format(o.massUniformRefGrams!, "mass", { unit: false })} →{" "}
+              {format(o.massGrams, "mass")}
             </span>
           </div>
           <div className="dro-window">
@@ -198,12 +202,12 @@ function OptResults() {
         <div className="dro-label">
           <span>Mass</span>
           <span>
-            of {o.massSolidGrams.toFixed(1)} g solid · {Math.round(o.massFrac * 100)} %
+            of {format(o.massSolidGrams, "mass")} solid · {Math.round(o.massFrac * 100)} %
           </span>
         </div>
         <div className="dro-window">
-          <b>{o.massGrams.toFixed(1)}</b>
-          <span>g</span>
+          <b>{formatParts(o.massGrams, "mass")[0]}</b>
+          <span>{formatParts(o.massGrams, "mass")[1]}</span>
         </div>
       </div>
 

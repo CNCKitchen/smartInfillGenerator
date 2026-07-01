@@ -1,7 +1,26 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
 
-export type BcKind = "fixed" | "frictionless" | "displacement" | "elastic" | "force" | "pressure";
+export type BcKind =
+  | "fixed"
+  | "frictionless"
+  | "displacement"
+  | "elastic"
+  | "force"
+  | "pressure"
+  | "bearing"
+  | "moment";
+
+/** Fitted cylinder for a bearing load: axis + radius recovered from the
+ *  selected surface, plus the cylindricity check. `ok=false` means the
+ *  selection isn't cylindrical and the bearing load can't be applied. */
+export interface CylFit {
+  ok: boolean;
+  axis: [number, number, number];
+  point: [number, number, number];
+  radius: number;
+  residual: number;
+}
 
 /** How a force load is defined in the UI. "components" edits Fx/Fy/Fz
  *  directly; "direction" edits a unit direction + a scalar magnitude. Either
@@ -36,6 +55,25 @@ export interface Bc {
   /** True while the direction auto-tracks the selection's area-weighted
    *  average normal; cleared once the user picks/edits a direction. */
   forceDirAuto?: boolean;
+  // --- Bearing load (kind "bearing"): reuses force / forceMode / forceDir /
+  //     forceMag as the bearing force vector (total N). The loaded half of the
+  //     bore is the half this vector points into. `cyl` caches the fit of the
+  //     selected cylindrical surface. ---
+  /** Fitted cylinder for the bearing selection (bearing only); null until a
+   *  valid cylindrical surface is selected. */
+  cyl?: CylFit | null;
+  /** Transient validation message when a bearing selection isn't cylindrical. */
+  cylError?: string;
+  // --- Moment (kind "moment"): a deformable distributed couple (N·mm). Dual
+  //     mode like force, but its own fields so the two never collide. ---
+  /** Resolved moment vector in N·mm (moment only) — what the solver uses. */
+  moment?: [number, number, number];
+  /** Moment definition mode (moment only); defaults to "components". */
+  momentMode?: ForceMode;
+  /** Unit axis for "direction" mode (moment only). */
+  momentDir?: [number, number, number];
+  /** Magnitude in N·mm for "direction" mode (moment only). */
+  momentMag?: number;
 }
 
 /** Per-load-step override of a single BC (see DESIGN §13). Absent fields
@@ -45,10 +83,13 @@ export interface Bc {
 export interface LoadStepOverride {
   /** Whether this BC participates in the step. Absent = true. */
   active?: boolean;
-  /** Full per-step force vector in N (force BCs); absent = inherit base. */
+  /** Full per-step force vector in N (force AND bearing BCs — bearing stores its
+   *  push force in `force`); absent = inherit base. */
   force?: [number, number, number];
   /** Per-step pressure in MPa (pressure BCs); absent = inherit base. */
   pressure?: number;
+  /** Full per-step moment vector in N·mm (moment BCs); absent = inherit base. */
+  moment?: [number, number, number];
 }
 
 /** One FEA load case. The shared `bcs` array defines geometry/selection ONCE;

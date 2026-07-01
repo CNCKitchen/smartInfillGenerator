@@ -6,7 +6,8 @@
 
 import { useShallow } from "zustand/shallow";
 import { useStore } from "../store";
-import { fmtLen } from "./fmt";
+import { fmtLen, lenUnit } from "./fmt";
+import { format, unitLabel } from "../units";
 
 export function StatusStrip() {
   const s = useStore(
@@ -23,6 +24,9 @@ export function StatusStrip() {
       openImprint: s.openImprint,
       logOpen: s.logOpen,
       setLogOpen: s.setLogOpen,
+      openUnits: s.openUnits,
+      // re-render the chip + dimension readouts whenever the unit selection changes
+      unitRev: s.unitRev,
     }))
   );
   const lamp = s.error ? "lamp err" : s.busy ? "lamp busy" : "lamp";
@@ -39,7 +43,7 @@ export function StatusStrip() {
       {m && (
         <div className="partinfo" title={s.fileName ?? undefined}>
           <b>{s.fileName}</b> · {fmtLen(m.bbox[3] - m.bbox[0])} × {fmtLen(m.bbox[4] - m.bbox[1])} ×{" "}
-          {fmtLen(m.bbox[5] - m.bbox[2])} mm · {m.triCount.toLocaleString()} tris
+          {fmtLen(m.bbox[5] - m.bbox[2])} {lenUnit()} · {m.triCount.toLocaleString()} tris
         </div>
       )}
       {v && (
@@ -48,7 +52,8 @@ export function StatusStrip() {
           <b>
             {v.nx}×{v.ny}×{v.nz}
           </b>{" "}
-          · <b>{Math.round(v.solid / 1000)}k</b> cells · h <b>{v.h.toFixed(2)} mm</b>
+          · <b>{Math.round(v.solid / 1000)}k</b> solid of{" "}
+          <b>{Math.round(v.cells / 1000)}k</b> cells · h <b>{format(v.h, "length")}</b>
         </div>
       )}
       {bp && (
@@ -107,7 +112,12 @@ export function StatusStrip() {
         </>
       )}
       <div className="grow" />
-      <div>mm · MPa</div>
+      <button
+        onClick={() => s.openUnits(true)}
+        title="Display units (length · stress · mass) — click to change"
+      >
+        {unitLabel("length")} · {unitLabel("stress")} · {unitLabel("mass")}
+      </button>
       <button onClick={() => s.openImprint(true)} title="Impressum & Datenschutzerklärung">
         § IMPRINT
       </button>

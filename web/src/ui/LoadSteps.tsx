@@ -10,7 +10,9 @@
 import { useShallow } from "zustand/shallow";
 import { useStore } from "../store";
 import { NumInput } from "./NumInput";
-import { bcLabel, KIND_DOT, KIND_UNIT } from "./bcmeta";
+import { UnitInput } from "./UnitInput";
+import { bcLabel, KIND_DOT, BC_QUANTITY } from "./bcmeta";
+import { unitLabel } from "../units";
 
 export function LoadStepsModal() {
   const s = useStore(
@@ -27,8 +29,10 @@ export function LoadStepsModal() {
       setStepBcActive: s.setStepBcActive,
       setStepForce: s.setStepForce,
       setStepPressure: s.setStepPressure,
+      setStepMoment: s.setStepMoment,
       setStepIncludeOptimize: s.setStepIncludeOptimize,
       setStepWeight: s.setStepWeight,
+      unitRev: s.unitRev,
     }))
   );
   if (!s.loadStepsOpen) return null;
@@ -63,19 +67,26 @@ export function LoadStepsModal() {
                     Load step
                   </th>
                   {s.bcs.map((bc) => {
-                    const span = bc.kind === "force" ? 4 : bc.kind === "pressure" ? 2 : 1;
+                    const span =
+                      bc.kind === "force" || bc.kind === "bearing" || bc.kind === "moment"
+                        ? 4
+                        : bc.kind === "pressure"
+                          ? 2
+                          : 1;
                     return (
                       <th key={bc.id} className="lsgrouphead" colSpan={span}>
                         <span className="dot" style={{ background: KIND_DOT[bc.kind] }} />
                         {bcLabel(bc)}
-                        {KIND_UNIT[bc.kind] && <span className="lscolunit">{KIND_UNIT[bc.kind]}</span>}
+                        {BC_QUANTITY[bc.kind] && (
+                          <span className="lscolunit">{unitLabel(BC_QUANTITY[bc.kind]!)}</span>
+                        )}
                       </th>
                     );
                   })}
                 </tr>
                 <tr>
                   {s.bcs.flatMap((bc) => {
-                    if (bc.kind === "force")
+                    if (bc.kind === "force" || bc.kind === "bearing" || bc.kind === "moment")
                       return [
                         <th key={`${bc.id}-on`} className="lssub">
                           on
@@ -134,15 +145,16 @@ export function LoadStepsModal() {
                           />
                         </td>
                       );
-                      if (bc.kind === "force") {
+                      if (bc.kind === "force" || bc.kind === "bearing") {
                         const f = ls.overrides[bc.id]?.force ?? bc.force ?? [0, 0, 0];
                         return [
                           onCell,
                           ...[0, 1, 2].map((c) => (
                             <td key={`${bc.id}-${c}`}>
-                              <NumInput
+                              <UnitInput
                                 className="gridnum"
                                 value={f[c]}
+                                kind="force"
                                 step={1}
                                 disabled={!on}
                                 onCommit={(v) => {
@@ -155,14 +167,37 @@ export function LoadStepsModal() {
                           )),
                         ];
                       }
+                      if (bc.kind === "moment") {
+                        const mm = ls.overrides[bc.id]?.moment ?? bc.moment ?? [0, 0, 0];
+                        return [
+                          onCell,
+                          ...[0, 1, 2].map((c) => (
+                            <td key={`${bc.id}-${c}`}>
+                              <UnitInput
+                                className="gridnum"
+                                value={mm[c]}
+                                kind="moment"
+                                step={10}
+                                disabled={!on}
+                                onCommit={(v) => {
+                                  const nv = [...mm] as [number, number, number];
+                                  nv[c] = v;
+                                  s.setStepMoment(ls.id, bc.id, nv);
+                                }}
+                              />
+                            </td>
+                          )),
+                        ];
+                      }
                       if (bc.kind === "pressure") {
                         const p = ls.overrides[bc.id]?.pressure ?? bc.pressure ?? 0;
                         return [
                           onCell,
                           <td key={`${bc.id}-p`}>
-                            <NumInput
+                            <UnitInput
                               className="gridnum"
                               value={p}
+                              kind="pressure"
                               step={0.01}
                               disabled={!on}
                               onCommit={(v) => s.setStepPressure(ls.id, bc.id, v)}

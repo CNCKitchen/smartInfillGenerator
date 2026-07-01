@@ -88,8 +88,10 @@ type Req =
         stiffness?: number;
         axes?: boolean[];
         disp?: number[];
+        moment?: number[];
       }[];
     }
+  | { id: number; op: "fitCylinder"; tris: Uint32Array }
   | { id: number; op: "voxelInfo" }
   | { id: number; op: "voxelMesh" }
   | {
@@ -122,6 +124,12 @@ type Req =
       id: number;
       op: "buildSim";
       /** BuildSimOpts object — serialized to JSON for the wasm API. */
+      opts: Record<string, unknown>;
+    }
+  | {
+      id: number;
+      op: "modalAnalysis";
+      /** ModalOpts object — serialized to JSON for the wasm API. */
       opts: Record<string, unknown>;
     }
   | {
@@ -298,8 +306,20 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
             const f = bc.force ?? [0, 0, 0];
             m.add_force(bc.tris, f[0], f[1], f[2]);
           } else if (bc.kind === "pressure") m.add_pressure(bc.tris, bc.pressure ?? 0);
+          else if (bc.kind === "bearing") {
+            const f = bc.force ?? [0, 0, 0];
+            m.add_bearing(bc.tris, f[0], f[1], f[2]);
+          } else if (bc.kind === "moment") {
+            const mm = bc.moment ?? [0, 0, 0];
+            m.add_moment(bc.tris, mm[0], mm[1], mm[2]);
+          }
         }
         break;
+      }
+      case "fitCylinder": {
+        const json = requireModel().fit_cylinder(msg.tris);
+        (self as unknown as Worker).postMessage({ id: msg.id, ok: true, data: JSON.parse(json) });
+        return;
       }
       case "voxelInfo": {
         const info = JSON.parse(requireModel().voxel_info());
@@ -408,6 +428,32 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
         stats.seconds = (performance.now() - t0) / 1000;
         (self as unknown as Worker).postMessage(
           { id: msg.id, ok: true, data: { stats, displacements } },
+          [displacements.buffer]
+        );
+        return;
+      }
+      case "modalAnalysis": {
+        if (cancelArr) Atomics.store(cancelArr, 0, 0); // arm fresh
+        const t0 = performance.now();
+        // Computes the modes, stashes each as `modal::mode-i`, and leaves
+        // mode 0 live — so `vertex_displacements` returns its mesh deformation.
+        // The callback streams per-outer-iteration progress + current frequencies.
+        const result = JSON.parse(
+          requireModel().modal_analysis(
+            JSON.stringify(msg.opts),
+            (outer: number, maxOuter: number, freqs: Float64Array) => {
+              (self as unknown as Worker).postMessage({
+                id: msg.id,
+                progress: true,
+                data: { outer, maxOuter, freqs: Array.from(freqs) },
+              });
+            }
+          )
+        );
+        const displacements = requireModel().vertex_displacements();
+        result.seconds = (performance.now() - t0) / 1000;
+        (self as unknown as Worker).postMessage(
+          { id: msg.id, ok: true, data: { result, displacements } },
           [displacements.buffer]
         );
         return;

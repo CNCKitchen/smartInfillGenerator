@@ -5,6 +5,8 @@ import { useEffect, useState } from "react";
 import { useShallow } from "zustand/shallow";
 import { useStore } from "../store";
 import { NumInput } from "./NumInput";
+import { UnitInput } from "./UnitInput";
+import { unitLabel } from "../units";
 import type { PatternKey } from "../types";
 
 const PATTERN_LABEL: Record<PatternKey, string> = {
@@ -28,6 +30,9 @@ export function SettingsModal() {
       resetCurves: s.resetCurves,
       levelSettings: s.levelSettings,
       updateLevelSettings: s.updateLevelSettings,
+      unitRev: s.unitRev,
+      askImportUnit: s.askImportUnit,
+      setAskImportUnit: s.setAskImportUnit,
     }))
   );
   if (!s.settingsOpen) return null;
@@ -52,12 +57,12 @@ export function SettingsModal() {
           <thead>
             <tr>
               <th>Name</th>
-              <th>E (MPa)</th>
+              <th>E ({unitLabel("modulus")})</th>
               <th>ν</th>
-              <th>ρ (g/cm³)</th>
-              <th>σₜ (MPa)</th>
-              <th>σₜᶻ (MPa)</th>
-              <th title="Build-sim yield stress — enables the elastic–perfectly-plastic step so the released warp responds to infill density (0 = pure-elastic, density-blind)">σy (MPa)</th>
+              <th>ρ ({unitLabel("density")})</th>
+              <th>σₜ ({unitLabel("stress")})</th>
+              <th>σₜᶻ ({unitLabel("stress")})</th>
+              <th title="Build-sim yield stress — enables the elastic–perfectly-plastic step so the released warp responds to infill density (0 = pure-elastic, density-blind)">σy ({unitLabel("stress")})</th>
               <th title="Build-sim IN-PLANE (XY) process shrink — the dominant warp driver (inherent strain)">Shrink % (XY)</th>
               <th title="Build-sim THROUGH-LAYER (Z) process shrink — transverse isotropy; usually less than in-plane">Shrink % (Z)</th>
               <th />
@@ -74,8 +79,9 @@ export function SettingsModal() {
                   />
                 </td>
                 <td>
-                  <NumInput
+                  <UnitInput
                     value={m.e0}
+                    kind="modulus"
                     min={10}
                     step={50}
                     onCommit={(v) =>
@@ -98,8 +104,9 @@ export function SettingsModal() {
                   />
                 </td>
                 <td>
-                  <NumInput
+                  <UnitInput
                     value={m.density}
+                    kind="density"
                     min={0.1}
                     step={0.01}
                     onCommit={(v) =>
@@ -108,8 +115,9 @@ export function SettingsModal() {
                   />
                 </td>
                 <td>
-                  <NumInput
+                  <UnitInput
                     value={m.strength}
+                    kind="stress"
                     min={1}
                     step={1}
                     onCommit={(v) =>
@@ -118,8 +126,9 @@ export function SettingsModal() {
                   />
                 </td>
                 <td>
-                  <NumInput
+                  <UnitInput
                     value={m.strengthZ}
+                    kind="stress"
                     min={1}
                     step={1}
                     onCommit={(v) =>
@@ -128,8 +137,9 @@ export function SettingsModal() {
                   />
                 </td>
                 <td>
-                  <NumInput
+                  <UnitInput
                     value={m.yieldStrength ?? 0}
+                    kind="stress"
                     min={0}
                     step={1}
                     onCommit={(v) =>
@@ -303,6 +313,20 @@ export function SettingsModal() {
           Auto pins the bottom level at the floor and places the load-bearing levels high (dense
           infill is stiffer per gram). Manual levels still get the mass-true assignment, so the
           budget is met either way.
+        </div>
+
+        <h3>Import</h3>
+        <label className="rowcheck">
+          <input
+            type="checkbox"
+            checked={s.askImportUnit}
+            onChange={(e) => s.setAskImportUnit(e.target.checked)}
+          />
+          <span>Ask for the unit on every STL import</span>
+        </label>
+        <div className="dim small">
+          STL files carry no unit. When off, imports silently use your last choice — the status-bar
+          bounding box still catches a wrong guess, and the Model step can rescale.
         </div>
       </div>
     </div>

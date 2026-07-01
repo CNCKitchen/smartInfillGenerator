@@ -489,6 +489,48 @@ a.iconbtn:hover {
   flex: 1;
 }
 
+/* Modal analysis: mode-count input row + natural-frequency chip list. */
+.numrow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.numrow input[type="number"] {
+  width: 64px;
+  padding: 5px 6px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+}
+
+.checkrow {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 8px;
+  cursor: pointer;
+}
+
+.checkrow input {
+  flex: none;
+}
+
+/* Render frame-rate counter — bottom-right, directly below the axis gizmo. */
+.fpscounter {
+  position: absolute;
+  right: 28px;
+  bottom: 6px;
+  padding: 2px 7px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: #555;
+  background: rgba(245, 244, 238, 0.7);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  pointer-events: none;
+  user-select: none;
+}
+
 .rowcheck {
   display: flex;
   align-items: center;
@@ -824,10 +866,12 @@ input[type="number"] {
   outline: none;
 }
 
-/* unit behind a force field (now that the fields are wide) */
+/* unit behind a force field — sizes to its label so wide units (lbf·in, N·mm,
+   kgf…) don't overflow; the number field (flex:1, min-width:0) yields the room */
 .forcerow .funit {
   flex: none;
-  width: 24px;
+  min-width: 24px;
+  white-space: nowrap;
   font-size: 11px;
   color: var(--dim);
   font-family: var(--mono);
@@ -1169,6 +1213,67 @@ input[type="number"] {
   font-weight: 600;
   font-size: 12px;
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.1);
+}
+
+/* When the support banner is visible it owns the bottom-center; stack the
+   deflection-playback button just above it so the two never collide. */
+.supportbanner ~ .playchip {
+  bottom: 54px;
+}
+
+/* Support banner — bottom-center pill, clear of the corner chips and the axis
+   gizmo. Same call-to-action as bumpmesh.com. */
+.supportbanner {
+  position: absolute;
+  bottom: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 5;
+  max-width: min(560px, calc(100% - 260px));
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px 8px 16px;
+  background: linear-gradient(180deg, #7c4dff, #6a3df0);
+  color: #fff;
+  font-size: 12.5px;
+  font-weight: 600;
+  line-height: 1.35;
+  text-align: center;
+  border-radius: 999px;
+  box-shadow: 0 2px 10px rgba(74, 40, 160, 0.35);
+}
+
+.supportbanner a {
+  color: #fff;
+  font-weight: 700;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.supportbanner a:hover {
+  text-decoration: none;
+}
+
+.supportbanner .sb-x {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 15px;
+  line-height: 1;
+  color: #fff;
+  background: rgba(255, 255, 255, 0.18);
+  border: none;
+  border-radius: 50%;
+  cursor: pointer;
+}
+
+.supportbanner .sb-x:hover {
+  background: rgba(255, 255, 255, 0.32);
 }
 
 .sectionchip,

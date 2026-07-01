@@ -40,6 +40,20 @@ pub enum BcKind {
     Force([f64; 3]),
     /// Pressure (MPa), applied as total force -p * (sum of selected area vectors).
     Pressure(f64),
+    /// Bearing load (N): a pin pushing the wall of a CYLINDRICAL bore. The
+    /// selection is fitted to a cylinder; the radial part of the force vector is
+    /// spread over the loaded half with a projected-area cosine law (peak where
+    /// the surface normal opposes the push, zero at ±90°). The axial component
+    /// is rejected upstream (Ansys-Mechanical behaviour), so only the radial
+    /// projection is applied. Resultant equals the (radial) input force.
+    Bearing([f64; 3]),
+    /// Moment (N·mm) on a surface. The voxel hex elements have no rotational
+    /// DOFs and there are no remote points/MPC, so the moment is realised as a
+    /// DEFORMABLE distributed force couple over the attached nodes, equivalent
+    /// to the moment vector about the selection's area-weighted centroid:
+    /// `fᵢ = wᵢ (G⁻¹ M) × dᵢ` with `G = Σ wᵢ(|dᵢ|²I − dᵢdᵢᵀ)`. This makes
+    /// `Σ dᵢ×fᵢ = M` exactly with zero net force, mesh-independently.
+    Moment([f64; 3]),
 }
 
 #[derive(Clone, Debug)]
@@ -236,6 +250,24 @@ pub fn assemble(
                     load_nodes.push(n);
                 }
             }
+            BcKind::Bearing(f) => {
+                let fv = bearing_forces(mesh, &sel, &nodes, grid, *f, |n| node_pos(n));
+                for (i, &n) in nodes.iter().enumerate() {
+                    if fv[i] != [0.0; 3] {
+                        problem.forces.push((n, fv[i]));
+                    }
+                    load_nodes.push(n);
+                }
+            }
+            BcKind::Moment(m) => {
+                let fv = moment_forces(mesh, &sel, &nodes, grid, *m, |n| node_pos(n));
+                for (i, &n) in nodes.iter().enumerate() {
+                    if fv[i] != [0.0; 3] {
+                        problem.forces.push((n, fv[i]));
+                    }
+                    load_nodes.push(n);
+                }
+            }
         }
         bc_nodes.push(nodes);
     }
@@ -422,6 +454,173 @@ fn pressure_forces(
         }
     });
     fv
+}
+
+fn dot3(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+fn cross3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+/// Fit a triangle selection to a cylinder (axis + radius + cylindricity
+/// residual). Public so the front end can validate a bearing-load selection and
+/// read back the axis/radius; assembly uses the same fit so the two agree.
+pub fn fit_selection_cylinder(mesh: &TriMesh, sel: &[u32]) -> Option<crate::cylinder::Cylinder> {
+    let (pts, nrm, ws) = selection_samples(mesh, sel);
+    crate::cylinder::fit(&pts, &nrm, &ws)
+}
+
+/// One sample per selected triangle: (centroid, unit normal, area). Feeds the
+/// cylinder fit for bearing loads.
+fn selection_samples(mesh: &TriMesh, sel: &[u32]) -> (Vec<[f64; 3]>, Vec<[f64; 3]>, Vec<f64>) {
+    let mut pts = Vec::with_capacity(sel.len());
+    let mut nrm = Vec::with_capacity(sel.len());
+    let mut ws = Vec::with_capacity(sel.len());
+    for &ti in sel {
+        let t = &mesh.tris[ti as usize];
+        let av = crate::mesh::triangle_area_vector(t);
+        let area = ((av[0] as f64).powi(2) + (av[1] as f64).powi(2) + (av[2] as f64).powi(2)).sqrt();
+        if area <= 0.0 {
+            continue;
+        }
+        let c = [
+            (t[0] + t[3] + t[6]) as f64 / 3.0,
+            (t[1] + t[4] + t[7]) as f64 / 3.0,
+            (t[2] + t[5] + t[8]) as f64 / 3.0,
+        ];
+        pts.push(c);
+        nrm.push([av[0] as f64 / area, av[1] as f64 / area, av[2] as f64 / area]);
+        ws.push(area);
+    }
+    (pts, nrm, ws)
+}
+
+/// Bearing load: fit the selection to a cylinder, then spread the radial part of
+/// `f` over the loaded half with a projected-area cosine law so the resultant
+/// equals the radial force. `node_pos` maps a node id to world position.
+fn bearing_forces<F: Fn(u32) -> [f64; 3]>(
+    mesh: &TriMesh,
+    sel: &[u32],
+    nodes: &[u32],
+    grid: &VoxelGrid,
+    f: [f64; 3],
+    node_pos: F,
+) -> Vec<[f64; 3]> {
+    let mut out = vec![[0f64; 3]; nodes.len()];
+    let (pts, nrm, ws) = selection_samples(mesh, sel);
+    let cyl = match crate::cylinder::fit(&pts, &nrm, &ws) {
+        Some(c) => c,
+        None => return out, // not cylindrical — UI blocks this; no-op as a guard
+    };
+    let axis = cyl.axis;
+    // Radial part of the load (the axial component is rejected in the UI).
+    let f_ax = dot3(f, axis);
+    let f_rad = [f[0] - f_ax * axis[0], f[1] - f_ax * axis[1], f[2] - f_ax * axis[2]];
+    let fr_len = dot3(f_rad, f_rad).sqrt();
+    if fr_len <= 1e-12 {
+        return out;
+    }
+    let load_dir = [f_rad[0] / fr_len, f_rad[1] / fr_len, f_rad[2] / fr_len];
+
+    let w = area_weights(mesh, sel, nodes, grid);
+    let mut rhat = vec![[0f64; 3]; nodes.len()];
+    let mut gain = vec![0f64; nodes.len()];
+    let mut denom = 0f64;
+    for (i, &n) in nodes.iter().enumerate() {
+        let p = node_pos(n);
+        let d = [p[0] - cyl.point[0], p[1] - cyl.point[1], p[2] - cyl.point[2]];
+        let axial = dot3(d, axis);
+        let radial = [d[0] - axial * axis[0], d[1] - axial * axis[1], d[2] - axial * axis[2]];
+        let rl = dot3(radial, radial).sqrt();
+        if rl < 1e-9 {
+            continue;
+        }
+        let rh = [radial[0] / rl, radial[1] / rl, radial[2] / rl];
+        let cos = dot3(rh, load_dir);
+        if cos <= 0.0 {
+            continue; // unloaded half
+        }
+        rhat[i] = rh;
+        gain[i] = w[i] * cos;
+        denom += w[i] * cos * cos;
+    }
+    if denom <= 1e-20 {
+        return out;
+    }
+    let k = fr_len / denom;
+    for i in 0..nodes.len() {
+        if gain[i] > 0.0 {
+            let s = k * gain[i];
+            out[i] = [s * rhat[i][0], s * rhat[i][1], s * rhat[i][2]];
+        }
+    }
+    out
+}
+
+/// Moment as a deformable distributed couple about the area-weighted centroid:
+/// `fᵢ = wᵢ (G⁻¹ M) × dᵢ`, `G = Σ wᵢ(|dᵢ|²I − dᵢdᵢᵀ)`. Exact resultant moment,
+/// zero net force, mesh-independent.
+fn moment_forces<F: Fn(u32) -> [f64; 3]>(
+    mesh: &TriMesh,
+    sel: &[u32],
+    nodes: &[u32],
+    grid: &VoxelGrid,
+    m: [f64; 3],
+    node_pos: F,
+) -> Vec<[f64; 3]> {
+    let mut out = vec![[0f64; 3]; nodes.len()];
+    if m == [0.0; 3] {
+        return out;
+    }
+    let w = area_weights(mesh, sel, nodes, grid);
+    let wsum: f64 = w.iter().sum();
+    if wsum <= 0.0 {
+        return out;
+    }
+    let mut c = [0f64; 3];
+    for (i, &n) in nodes.iter().enumerate() {
+        let p = node_pos(n);
+        for d in 0..3 {
+            c[d] += w[i] * p[d];
+        }
+    }
+    for d in 0..3 {
+        c[d] /= wsum;
+    }
+    let mut g = [[0f64; 3]; 3];
+    let mut dd = vec![[0f64; 3]; nodes.len()];
+    for (i, &n) in nodes.iter().enumerate() {
+        let p = node_pos(n);
+        let d = [p[0] - c[0], p[1] - c[1], p[2] - c[2]];
+        dd[i] = d;
+        let r2 = dot3(d, d);
+        for r in 0..3 {
+            for cc in 0..3 {
+                g[r][cc] += w[i] * ((if r == cc { r2 } else { 0.0 }) - d[r] * d[cc]);
+            }
+        }
+    }
+    // Light Tikhonov term so a degenerate (collinear/point) selection still has
+    // an invertible inertia tensor instead of blowing up.
+    let tr = g[0][0] + g[1][1] + g[2][2];
+    let eps = 1e-9 * tr.max(1e-12);
+    for k in 0..3 {
+        g[k][k] += eps;
+    }
+    let x = match crate::cylinder::solve3(g, m) {
+        Some(x) => x,
+        None => return out,
+    };
+    for i in 0..nodes.len() {
+        let cr = cross3(x, dd[i]);
+        out[i] = [w[i] * cr[0], w[i] * cr[1], w[i] * cr[2]];
+    }
+    out
 }
 
 #[derive(Clone, Debug)]

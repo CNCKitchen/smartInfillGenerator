@@ -4,9 +4,16 @@
 import { useEffect, useRef, useState } from "react";
 import { useShallow } from "zustand/shallow";
 import { SceneManager } from "./SceneManager";
-import { sceneEvents, useStore, resultStale, type ResultEntry } from "../store";
+import { sceneEvents, useStore, resultStale, type ResultEntry, type ProvVal } from "../store";
 import { RESULT_FIELDS } from "../types";
 import { cssBands, cssGradient, jet, ramp } from "./colormaps";
+import {
+  format,
+  unitLabel,
+  convertFromCanonical,
+  convertToCanonical,
+  type QuantityKind,
+} from "../units";
 
 function union(a: Uint32Array, b: Uint32Array): Uint32Array {
   const s = new Set<number>(a as unknown as number[]);
@@ -30,6 +37,7 @@ export function Viewer() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const sceneRef = useRef<SceneManager | null>(null);
+  const [fps, setFps] = useState(0);
 
   const tool = useStore((s) => s.tool);
   const brushRadius = useStore((s) => s.brushRadius);
@@ -38,6 +46,7 @@ export function Viewer() {
   useEffect(() => {
     const scene = new SceneManager();
     sceneRef.current = scene;
+    scene.onFps = (f) => setFps(f);
     scene.init(canvasRef.current!, {
       onPickPatch: (tris, additive) => {
         const st = useStore.getState();
@@ -102,6 +111,7 @@ export function Viewer() {
     sceneEvents.onWireframe = (on) => scene.setWireframe(on);
     sceneEvents.onVoxelCutActive = (on) => scene.setVoxelCutActive(on);
     sceneEvents.onAnimateDeformed = (on) => scene.setDeformAnimate(on);
+    sceneEvents.onModalAnim = (on) => scene.setModalAnim(on);
     sceneEvents.onOptShape = (p, i, d) => scene.setOptShape(p, i, d);
     sceneEvents.onResultSolid = (solid) => scene.setResultSolid(solid);
     sceneEvents.captureThumbnail = () => scene.captureThumbnail();
@@ -113,6 +123,7 @@ export function Viewer() {
     sceneEvents.onResultSurface = (s) => scene.setResultSurface(s);
     sceneEvents.onLegendRange = (min, max) => scene.setLegendRange(min, max);
     sceneEvents.onShowExtremes = (on, unit) => scene.setShowExtremes(on, unit);
+    sceneEvents.onUnitsChanged = () => scene.relabelCallouts();
     sceneEvents.onBandedContour = (on, count) => scene.setBanded(on, count);
     sceneEvents.onSectionState = (on) => scene.setSection(on);
     sceneEvents.onSectionFlip = () => scene.flipSection();
@@ -194,6 +205,9 @@ export function Viewer() {
       <canvas ref={canvasRef} />
       <Provenance />
       <Legend />
+      <div className="fpscounter" title="Render frame rate">
+        {Math.round(fps)} fps
+      </div>
     </div>
   );
 }
@@ -203,6 +217,13 @@ export function Viewer() {
 // Mirrors the legend's instrument styling, on the opposite corner: the settings
 // the SELECTED result was computed with, plus a staleness caution. In the
 // Density/Regions views it pins to the optimized run (those tabs are its).
+/** Render a provenance cell: plain string, or a canonical value formatted in the
+ *  live display unit (with optional prefix/suffix around it). */
+function fmtProv(v: ProvVal): string {
+  if (typeof v === "string") return v;
+  return `${v.prefix ?? ""}${format(v.v, v.kind)}${v.suffix ?? ""}`;
+}
+
 function Provenance() {
   const s = useStore(
     useShallow((st) => ({
@@ -212,6 +233,7 @@ function Provenance() {
       viewMode: st.viewMode,
     }))
   );
+  useStore((st) => st.unitRev); // reformat unit-bearing rows on a unit change
   let entry: ResultEntry | undefined;
   if (s.viewMode === "deformed") entry = s.results.find((r) => r.id === s.activeResultId);
   else if (s.viewMode === "density" || s.viewMode === "infill")
@@ -225,7 +247,7 @@ function Provenance() {
         {entry.provRows.map(([k, v]) => (
           <div className="provrow" key={k}>
             <span>{k}</span>
-            <b>{v}</b>
+            <b>{fmtProv(v)}</b>
           </div>
         ))}
       </div>
@@ -247,33 +269,38 @@ const JET_GRADIENT_FLIP = cssGradient(jet, true);
 const RAMP_GRADIENT = cssGradient(ramp);
 
 function fmtDisp(mm: number): string {
-  // Sign-aware: displacement components can be negative; pick mm vs µm by
-  // magnitude so −0.34 mm never renders as "−340 µm".
-  const a = Math.abs(mm);
-  if (a >= 0.01) return `${mm.toFixed(2)} mm`;
-  return `${(mm * 1000).toFixed(1)} µm`;
+  // Length/displacement in the active unit (mm↔µm / in↔mil auto-scale lives in
+  // the registry). Sign-aware so −0.34 mm never renders as "−340 µm".
+  return format(mm, "length");
+}
+
+/** Map a RESULT_FIELDS unit tag ("mm" | "MPa" | "") to its quantity kind.
+ *  Displacement is length; stress fields (and bed-peel traction) are stress;
+ *  the dimensionless rest are strain. */
+function fieldKind(unit: string): QuantityKind {
+  return unit === "MPa" ? "stress" : unit === "mm" ? "length" : "strain";
 }
 
 function fmtField(v: number, unit: string): string {
-  if (unit === "MPa") {
-    const a = Math.abs(v);
-    if (a >= 0.01 || a === 0) return `${v.toPrecision(3)} MPa`;
-    return `${v.toExponential(1)} MPa`;
-  }
-  // strain: dimensionless, engineering notation
-  return v === 0 ? "0" : v.toExponential(2);
+  return format(v, fieldKind(unit));
 }
 
-/** Click-to-edit legend bound: shows the formatted value, becomes an input. */
+/** Click-to-edit legend bound: shows the formatted value, becomes an input.
+ *  `value` is CANONICAL; the user edits in the active DISPLAY unit and the typed
+ *  value is converted back to canonical on commit (round-trip invariant — the
+ *  canonical store value is never overwritten by a re-rounded display number).
+ *  `kind` null = dimensionless (safety factor): no conversion. */
 function EditableBound({
   value,
   display,
   hint,
+  kind,
   onCommit,
 }: {
   value: number;
   display: string;
   hint: string;
+  kind: QuantityKind | null;
   onCommit: (v: number) => void;
 }) {
   const [editing, setEditing] = useState(false);
@@ -281,7 +308,7 @@ function EditableBound({
   const commit = () => {
     setEditing(false);
     const v = parseFloat(text);
-    if (Number.isFinite(v)) onCommit(v);
+    if (Number.isFinite(v)) onCommit(kind ? convertToCanonical(v, kind) : v);
   };
   if (!editing) {
     return (
@@ -289,7 +316,8 @@ function EditableBound({
         className="legendedit"
         title={`Click to set (${hint})`}
         onClick={() => {
-          setText(String(Number(value.toPrecision(4))));
+          const disp = kind ? convertFromCanonical(value, kind) : value;
+          setText(String(Number(disp.toPrecision(4))));
           setEditing(true);
         }}
       >
@@ -352,6 +380,8 @@ function Legend() {
   const setMaterialStress = useStore((s) => s.setMaterialStress);
   const results = useStore((s) => s.results);
   const activeResultId = useStore((s) => s.activeResultId);
+  // Re-render the legend (labels + bounds) whenever the unit selection changes.
+  useStore((s) => s.unitRev);
 
   // Show whenever a result is on screen — a live solve (stats) OR a result
   // restored from a project (no stats, but an active entry carries the data).
@@ -385,7 +415,10 @@ function Legend() {
     const effMax = legendMax ?? autoMax;
     const overridden = legendMin !== null || legendMax !== null;
     const fmt = (v: number) => (isSf ? v.toFixed(2) : isField ? fmtField(v, unit) : fmtDisp(v));
-    const hint = unit === "MPa" ? "MPa" : unit === "mm" ? "mm" : isSf ? "factor" : "strain";
+    // Field kind for the editable bounds' display↔canonical round-trip (null =
+    // dimensionless safety factor).
+    const kind: QuantityKind | null = isSf ? null : isField ? fieldKind(unit) : "length";
+    const hint = isSf ? "factor" : unitLabel(kind!);
     return (
       <div className="legend">
         <div className="legendtitle">
@@ -418,6 +451,7 @@ function Legend() {
               value={effMax}
               display={fmt(effMax)}
               hint={hint}
+              kind={kind}
               onCommit={(v) => setLegendRange(effMin, v)}
             />
             <span>{fmt((effMin + effMax) / 2)}</span>
@@ -425,6 +459,7 @@ function Legend() {
               value={effMin}
               display={fmt(effMin)}
               hint={hint}
+              kind={kind}
               onCommit={(v) => setLegendRange(v, effMax)}
             />
           </div>
@@ -499,6 +534,7 @@ function Legend() {
             value={total}
             display={totalLabel}
             hint="total ×, 0 = undeformed"
+            kind={null}
             onCommit={(v) =>
               setDeformScale(Math.min(10, Math.max(0, v / Math.max(autoScale, 1e-9))))
             }
@@ -542,13 +578,14 @@ function MeshLegend() {
   const perimeters = useStore((s) => s.perimeters);
   const lineWidth = useStore((s) => s.lineWidth);
   const optSummary = useStore((s) => s.optSummary);
+  useStore((s) => s.unitRev); // re-render on unit change
   return (
     <div className="legend">
       <div className="legendtitle">Analysis mesh</div>
       <div className="legendnote">
         {voxelInfo.solid.toLocaleString()} hex cells
         <br />
-        h = {voxelInfo.h.toFixed(2)} mm
+        h = {format(voxelInfo.h, "length")}
         <br />
         {voxelInfo.nx}×{voxelInfo.ny}×{voxelInfo.nz} grid
       </div>
@@ -573,12 +610,12 @@ function MeshLegend() {
       <div className="legendnote">
         {meshDensity ? (
           <>
-            skin ({(perimeters * lineWidth).toFixed(2)} mm wall) = 100%
+            skin ({format(perimeters * lineWidth, "length")} wall) = 100%
             <br />
             interior = {optSummary ? "optimized density" : "infill setting"}
           </>
         ) : (
-          <>skin = {(perimeters * lineWidth).toFixed(2)} mm wall</>
+          <>skin = {format(perimeters * lineWidth, "length")} wall</>
         )}
       </div>
       {meshDensity && <CalloutHelp />}

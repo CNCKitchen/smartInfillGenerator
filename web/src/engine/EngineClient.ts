@@ -3,7 +3,7 @@
 
 // Promise wrapper around the engine worker.
 
-import type { Bc, CheckReport, LoadedModel, SolveStats, VoxelInfo } from "../types";
+import type { Bc, CheckReport, CylFit, LoadedModel, SolveStats, VoxelInfo } from "../types";
 
 interface Pending {
   resolve: (v: unknown) => void;
@@ -191,11 +191,19 @@ export class EngineClient {
       stiffness: bc.stiffness,
       axes: bc.axes,
       disp: bc.disp,
+      moment: bc.moment,
     }));
     return this.call(
       { op: "setBcs", bcs: payload },
       payload.map((b) => b.tris.buffer)
     );
+  }
+
+  /** Fit a triangle selection to a cylinder (for bearing-load validation).
+   *  Returns the axis/radius and a cylindricity `ok` flag. */
+  fitCylinder(tris: Uint32Array): Promise<CylFit> {
+    const copy = new Uint32Array(tris);
+    return this.call({ op: "fitCylinder", tris: copy }, [copy.buffer]);
   }
 
   voxelInfo(): Promise<VoxelInfo> {
@@ -248,6 +256,24 @@ export class EngineClient {
       { op: "buildSim", opts: opts as unknown as Record<string, unknown> },
       [],
       onProgress as unknown as ((data: unknown, density: Float32Array) => void) | undefined
+    );
+  }
+
+  /** Constrained undamped modal analysis: the lowest `numModes` natural
+   *  frequencies + mode shapes on the CURRENT supports (the store sets these to
+   *  the first load case). Stashes each mode as `modal::mode-i` and leaves mode
+   *  0 live, returning its mesh displacements for the deformed view. */
+  modalAnalysis(
+    opts: ModalOptions,
+    onProgress?: (p: ModalProgress) => void
+  ): Promise<{ result: ModalAnalysisResult; displacements: Float32Array }> {
+    this.resetProgress();
+    return this.call(
+      { op: "modalAnalysis", opts: opts as unknown as Record<string, unknown> },
+      [],
+      onProgress
+        ? ((data: unknown) => onProgress(data as ModalProgress)) as Pending["onProgress"]
+        : undefined
     );
   }
 
@@ -484,6 +510,45 @@ export interface PrintedStats extends SolveStats {
   skinLayers: number;
   /** True when the solve used the composite (blended) skin model. */
   compositeSkin: boolean;
+}
+
+/** Live per-outer-iteration progress of a modal run. */
+export interface ModalProgress {
+  outer: number;
+  maxOuter: number;
+  /** Current Ritz frequency estimates (Hz) for the requested modes. */
+  freqs: number[];
+}
+
+/** Mirrors the wasm ModalOpts (serialized to JSON in the worker). */
+export interface ModalOptions {
+  /** Number of natural frequencies / mode shapes to compute (1–20). */
+  numModes: number;
+  /** true = solid reference (E₀ + full density); false = as-printed. */
+  solid: boolean;
+  /** Free-free: run unconstrained (soft-anchored), discarding the 6 rigid-body
+   *  modes — for a part with no supports. false = constrained. */
+  free: boolean;
+  /** As-printed model params (ignored when `solid`) — mirror PrintedOptions. */
+  infillPct: number;
+  exponent: number;
+  coeff: number;
+  perimeters: number;
+  lineWidth: number;
+  topBottomLayers: number;
+  layerHeight: number;
+}
+
+/** Result of a modal run: one entry per computed mode + convergence info. */
+export interface ModalAnalysisResult {
+  converged: boolean;
+  outerIters: number;
+  /** Total inner MGCG iterations (≈ multigrid V-cycles) — the dominant cost. */
+  totalInnerIters: number;
+  seconds: number;
+  /** Per mode: the stash id (`modal::mode-i`) and natural frequency in Hz,
+   *  ascending. The store builds one ResultEntry per mode from this. */
+  modes: { id: string; freqHz: number }[];
 }
 
 /** Mirrors the wasm BuildSimOpts (serialized to JSON in the worker). */

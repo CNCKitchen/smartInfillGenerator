@@ -15,9 +15,18 @@ import {
   COLOR_STEPS_MAX,
 } from "../store";
 import { NumInput } from "./NumInput";
+import { UnitInput } from "./UnitInput";
 import { RESULT_FIELDS, type Bc, type ForceMode, type LoadStep, type PatternKey } from "../types";
-import { fmtDisp, fmtLen, rampCss } from "./fmt";
+import { fmtDisp, fmtLen, lenUnit, rampCss } from "./fmt";
 import { bcLabel, KIND_DOT, KIND_LABEL, SUPPORT_KINDS } from "./bcmeta";
+import {
+  format,
+  unitLabel,
+  convertFromCanonical,
+  convertToCanonical,
+  unitDef,
+  type QuantityKind,
+} from "../units";
 
 const SLICER_NAMES = {
   orca: "OrcaSlicer",
@@ -110,7 +119,14 @@ function SurfacePatchControl() {
 
 export function StepPanel() {
   const s = useStore(
-    useShallow((s) => ({ model: s.model, activeStep: s.activeStep, appMode: s.appMode }))
+    useShallow((s) => ({
+      model: s.model,
+      activeStep: s.activeStep,
+      appMode: s.appMode,
+      // re-render the whole panel subtree (all unit-bearing inputs/readouts) on
+      // a unit change — saves wiring unitRev into every sub-editor.
+      unitRev: s.unitRev,
+    }))
   );
   const buildsim = s.appMode === "buildsim";
   const step = s.model ? s.activeStep : 1;
@@ -182,6 +198,7 @@ function StepModel() {
       tool: s.tool,
       setTool: s.setTool,
       rotateModel: s.rotateModel,
+      rescaleModel: s.rescaleModel,
     }))
   );
   const fileRef = useRef<HTMLInputElement>(null);
@@ -210,11 +227,11 @@ function StepModel() {
           <div className="dim">
             {fmtLen(s.model!.bbox[3] - s.model!.bbox[0])} ×{" "}
             {fmtLen(s.model!.bbox[4] - s.model!.bbox[1])} ×{" "}
-            {fmtLen(s.model!.bbox[5] - s.model!.bbox[2])} mm
+            {fmtLen(s.model!.bbox[5] - s.model!.bbox[2])} {lenUnit()}
           </div>
         </div>
       ) : (
-        <div className="dim drophint">…or drop a file into the viewport. Units: mm.</div>
+        <div className="dim drophint">…or drop a file into the viewport. STL units set on import.</div>
       )}
       {s.model && (
         <>
@@ -245,6 +262,30 @@ function StepModel() {
               {s.tool === "place"
                 ? "Click the face the part prints ON — it turns to the build plate (Z−)."
                 : "Layer-adhesion safety treats Z as the layer direction. Loads keep their world directions; results reset on reorientation."}
+            </div>
+          </div>
+          <div className="group">
+            <div className="g-label">
+              <span>Rescale</span>
+              <b className="dim">wrong import unit?</b>
+            </div>
+            <div className="toolrow">
+              <button onClick={() => void s.rescaleModel(1 / 25.4)} title="Scale ÷25.4 (mm → inch-sized)">
+                ÷25.4
+              </button>
+              <button onClick={() => void s.rescaleModel(25.4)} title="Scale ×25.4 (inch → mm-sized)">
+                ×25.4
+              </button>
+              <button onClick={() => void s.rescaleModel(0.1)} title="Scale ÷10">
+                ÷10
+              </button>
+              <button onClick={() => void s.rescaleModel(10)} title="Scale ×10">
+                ×10
+              </button>
+            </div>
+            <div className="dim small">
+              An STL imported in the wrong unit comes in 25.4× off. Rescale here without re-importing —
+              the bounding box in the status bar confirms the size.
             </div>
           </div>
           <div className="group">
@@ -305,6 +346,8 @@ function StepBcs() {
         <div className="addrow">
           <button onClick={() => s.addBc("force")}>+ Force</button>
           <button onClick={() => s.addBc("pressure")}>+ Pressure</button>
+          <button onClick={() => s.addBc("bearing")}>+ Bearing</button>
+          <button onClick={() => s.addBc("moment")}>+ Moment</button>
         </div>
       </div>
 
@@ -337,7 +380,7 @@ function StepBcs() {
           <div className="group">
             <div className="g-label">
               <span>Brush diameter</span>
-              <b>{(s.brushRadius * 2).toFixed(1)} mm</b>
+              <b>{format(s.brushRadius * 2, "length")}</b>
             </div>
             <input
               type="range"
@@ -487,20 +530,23 @@ function BcRow({ bc }: { bc: Bc }) {
         </button>
       </div>
       {bc.kind === "force" && <ForceEditor bc={bc} step={step} />}
+      {bc.kind === "bearing" && <BearingEditor bc={bc} step={step} />}
+      {bc.kind === "moment" && <MomentEditor bc={bc} step={step} />}
       {bc.kind === "displacement" && <DisplacementEditor bc={bc} />}
       {bc.kind === "pressure" && (
         <div className="bcparams" onClick={(e) => e.stopPropagation()}>
           <label>
             p
-            <NumInput
+            <UnitInput
               value={step ? step.overrides[bc.id]?.pressure ?? bc.pressure ?? 0 : bc.pressure ?? 0}
+              kind="pressure"
               step={0.01}
               onCommit={(v) =>
                 step ? s.setStepPressure(step.id, bc.id, v) : s.updateBcParams(bc.id, { pressure: v })
               }
             />
           </label>
-          <span className="dim">MPa</span>
+          <span className="dim">{unitLabel("pressure")}</span>
         </div>
       )}
       {bc.kind === "elastic" && (
@@ -535,14 +581,24 @@ function VectorInput({
   onChange,
   label = "F",
   unit = "",
+  kind,
   step = 1,
 }: {
+  /** CANONICAL component values. */
   values: [number, number, number];
+  /** Receives CANONICAL components. */
   onChange: (v: [number, number, number]) => void;
   label?: string;
+  /** Static unit label (dimensionless vectors, e.g. a direction). */
   unit?: string;
+  /** Quantity kind — when set, each component is shown in the active display
+   *  unit and converted back to canonical on commit (force / moment). */
+  kind?: QuantityKind;
   step?: number;
 }) {
+  const lbl = kind ? unitLabel(kind) : unit;
+  const show = (v: number) =>
+    kind ? Number(convertFromCanonical(v, kind).toFixed(unitDef(kind).decimals)) : v;
   return (
     <div className="forcegrid">
       {(["X", "Y", "Z"] as const).map((axis, i) => (
@@ -553,15 +609,15 @@ function VectorInput({
           </span>
           <NumInput
             className="fnum"
-            value={values[i]}
+            value={show(values[i])}
             step={step}
             onCommit={(v) => {
               const nv = [...values] as [number, number, number];
-              nv[i] = v;
+              nv[i] = kind ? convertToCanonical(v, kind) : v;
               onChange(nv);
             }}
           />
-          {unit && <span className="funit">{unit}</span>}
+          {lbl && <span className="funit">{lbl}</span>}
         </label>
       ))}
     </div>
@@ -624,7 +680,7 @@ function BaseForceEditor({ bc }: { bc: Bc }) {
         <VectorInput
           values={force}
           label="F"
-          unit="N"
+          kind="force"
           step={1}
           onChange={(nf) => s.updateBcParams(bc.id, { force: nf })}
         />
@@ -632,13 +688,14 @@ function BaseForceEditor({ bc }: { bc: Bc }) {
         <>
           <div className="forcerow">
             <span className="flabel">|F|</span>
-            <NumInput
+            <UnitInput
               className="fnum"
               value={bc.forceMag ?? 0}
+              kind="force"
               step={1}
               onCommit={(v) => s.setForceMag(bc.id, v)}
             />
-            <span className="funit">N</span>
+            <span className="funit">{unitLabel("force")}</span>
           </div>
           <VectorInput
             values={[r4(dir[0]), r4(dir[1]), r4(dir[2])]}
@@ -694,18 +751,19 @@ function StepForceEditor({ bc, step }: { bc: Bc; step: LoadStep }) {
     <div className="forceedit" onClick={(e) => e.stopPropagation()}>
       <ForceModeToggle mode={mode} onMode={setMode} />
       {mode === "components" ? (
-        <VectorInput values={f} label="F" unit="N" step={1} onChange={setVec} />
+        <VectorInput values={f} label="F" kind="force" step={1} onChange={setVec} />
       ) : (
         <>
           <div className="forcerow">
             <span className="flabel">|F|</span>
-            <NumInput
+            <UnitInput
               className="fnum"
-              value={round(mag)}
+              value={mag}
+              kind="force"
               step={1}
               onCommit={(v) => setVec([dir[0] * v, dir[1] * v, dir[2] * v])}
             />
-            <span className="funit">N</span>
+            <span className="funit">{unitLabel("force")}</span>
           </div>
           <VectorInput
             values={[round(dir[0]), round(dir[1]), round(dir[2])]}
@@ -772,6 +830,227 @@ function ForceDirTools({
   );
 }
 
+/** Unit vector, or `fallback` when the input is ~zero. */
+function unitOr(
+  d: [number, number, number],
+  fallback: [number, number, number]
+): [number, number, number] {
+  const l = Math.hypot(d[0], d[1], d[2]);
+  return l > 1e-9 ? [d[0] / l, d[1] / l, d[2] / l] : fallback;
+}
+
+/** Bearing-load editor: the push force (reusing the Force editor — components OR
+ *  direction + magnitude, pick/flip/surface-normal, AND per-load-step values)
+ *  plus a live cylinder readout. The force vector says which way the pin
+ *  presses; the loaded half + cosine distribution + axial reject all happen in
+ *  the solver once the selection fits a cylinder. */
+function BearingEditor({ bc, step }: { bc: Bc; step?: LoadStep }) {
+  return (
+    <>
+      <ForceEditor bc={bc} step={step} />
+      <div className="forceedit" onClick={(e) => e.stopPropagation()} style={{ paddingTop: 0 }}>
+        <BearingCylStatus bc={bc} />
+      </div>
+    </>
+  );
+}
+
+/** Cylinder-fit feedback for a bearing load: the fitted ⌀/axis once valid, the
+ *  hard-block message when a non-cylindrical face was picked, or a prompt. */
+function BearingCylStatus({ bc }: { bc: Bc }) {
+  if (bc.cylError) {
+    return (
+      <div className="dim small" style={{ color: "#c0392b" }}>
+        {bc.cylError}
+      </div>
+    );
+  }
+  if (bc.tris.length === 0) {
+    return (
+      <div className="dim small">
+        Pick a <b>cylindrical</b> surface (a bore or boss). The load presses the wall in the F
+        direction, cosine-distributed over the contacted half; any component along the axis is
+        ignored.
+      </div>
+    );
+  }
+  if (bc.cyl?.ok) {
+    const a = bc.cyl.axis;
+    return (
+      <div className="dim small">
+        ⌀ {format(bc.cyl.radius * 2, "length")} · axis ({r4(a[0])}, {r4(a[1])}, {r4(a[2])})
+      </div>
+    );
+  }
+  return <div className="dim small">Checking cylindricity…</div>;
+}
+
+/** Moment editor: edits the active load step's vector when multi-step, else the
+ *  base BC (mirrors ForceEditor). */
+function MomentEditor({ bc, step }: { bc: Bc; step?: LoadStep }) {
+  return step ? <StepMomentEditor bc={bc} step={step} /> : <BaseMomentEditor bc={bc} />;
+}
+
+/** Per-step moment editor — edits the active load step's vector. Components, or
+ *  axis + magnitude derived from it. Mode is a local view choice. */
+function StepMomentEditor({ bc, step }: { bc: Bc; step: LoadStep }) {
+  const s = useStore(
+    useShallow((s) => ({
+      activeBcId: s.activeBcId,
+      tool: s.tool,
+      setActiveBc: s.setActiveBc,
+      setTool: s.setTool,
+      setStepMoment: s.setStepMoment,
+      aimStepMomentAlongNormal: s.aimStepMomentAlongNormal,
+    }))
+  );
+  const [mode, setMode] = useState<ForceMode>(bc.momentMode ?? "components");
+  const m = step.overrides[bc.id]?.moment ?? bc.moment ?? [0, 0, 0];
+  const setVec = (v: [number, number, number]) => s.setStepMoment(step.id, bc.id, v);
+  const mag = Math.hypot(m[0], m[1], m[2]);
+  const dir: [number, number, number] =
+    mag > 1e-9 ? [m[0] / mag, m[1] / mag, m[2] / mag] : bc.momentDir ?? [0, 0, 1];
+  const picking = s.activeBcId === bc.id && s.tool === "pickdir";
+  const round = (x: number) => Math.round(x * 1000) / 1000;
+  return (
+    <div className="forceedit" onClick={(e) => e.stopPropagation()}>
+      <ForceModeToggle mode={mode} onMode={setMode} />
+      {mode === "components" ? (
+        <VectorInput values={m} label="M" kind="moment" step={10} onChange={setVec} />
+      ) : (
+        <>
+          <div className="forcerow">
+            <span className="flabel">|M|</span>
+            <UnitInput
+              className="fnum"
+              value={mag}
+              kind="moment"
+              step={10}
+              onCommit={(v) => setVec([dir[0] * v, dir[1] * v, dir[2] * v])}
+            />
+            <span className="funit">{unitLabel("moment")}</span>
+          </div>
+          <VectorInput
+            values={[round(dir[0]), round(dir[1]), round(dir[2])]}
+            label="a"
+            step={0.1}
+            onChange={(d) => {
+              const len = Math.hypot(d[0], d[1], d[2]) || 1;
+              setVec([(d[0] / len) * mag, (d[1] / len) * mag, (d[2] / len) * mag]);
+            }}
+          />
+          <ForceDirTools
+            picking={picking}
+            disabledNormal={bc.tris.length === 0}
+            onPick={() => {
+              s.setActiveBc(bc.id);
+              s.setTool(picking ? "orbit" : "pickdir");
+            }}
+            onFlip={() => setVec([-m[0], -m[1], -m[2]])}
+            onNormal={() => s.aimStepMomentAlongNormal(step.id, bc.id)}
+          />
+          <div className="dim small">This step's moment vector (right-hand rule about the axis).</div>
+        </>
+      )}
+    </div>
+  );
+}
+
+/** Single-step (base) moment editor: a moment vector (components OR axis +
+ *  magnitude), N·mm. Applied as a deformable distributed couple about the
+ *  selection centroid. */
+function BaseMomentEditor({ bc }: { bc: Bc }) {
+  const s = useStore(
+    useShallow((s) => ({
+      activeBcId: s.activeBcId,
+      tool: s.tool,
+      setActiveBc: s.setActiveBc,
+      setTool: s.setTool,
+      updateBcParams: s.updateBcParams,
+      setMomentDir: s.setMomentDir,
+      flipMomentDir: s.flipMomentDir,
+      resetMomentDirToNormal: s.resetMomentDirToNormal,
+    }))
+  );
+  const active = s.activeBcId === bc.id;
+  const mode = bc.momentMode ?? "components";
+  const m = bc.moment ?? [0, 0, 0];
+  const dir = bc.momentDir ?? [0, 0, 1];
+  const mag = bc.momentMag ?? 0;
+  const picking = active && s.tool === "pickdir";
+  const setMode = (mm: ForceMode) => {
+    if (mm === mode) return;
+    if (mm === "components") {
+      // The resolved vector is already current; just switch the editor view.
+      s.updateBcParams(bc.id, { momentMode: "components" });
+    } else {
+      const len = Math.hypot(m[0], m[1], m[2]);
+      const nd = unitOr(m, dir);
+      const nm = len > 1e-9 ? len : mag || 100;
+      s.updateBcParams(bc.id, { momentMode: "direction", momentDir: nd, momentMag: nm });
+    }
+  };
+  return (
+    <div className="forceedit" onClick={(e) => e.stopPropagation()}>
+      <ForceModeToggle mode={mode} onMode={setMode} />
+      {mode === "components" ? (
+        <VectorInput
+          values={m}
+          label="M"
+          kind="moment"
+          step={10}
+          onChange={(nm) => s.updateBcParams(bc.id, { moment: nm })}
+        />
+      ) : (
+        <>
+          <div className="forcerow">
+            <span className="flabel">|M|</span>
+            <UnitInput
+              className="fnum"
+              value={mag}
+              kind="moment"
+              step={10}
+              onCommit={(v) => {
+                const nd = unitOr(dir, [0, 0, 1]);
+                s.updateBcParams(bc.id, {
+                  momentMag: v,
+                  moment: [nd[0] * v, nd[1] * v, nd[2] * v],
+                });
+              }}
+            />
+            <span className="funit">{unitLabel("moment")}</span>
+          </div>
+          <VectorInput
+            values={[r4(dir[0]), r4(dir[1]), r4(dir[2])]}
+            label="a"
+            step={0.1}
+            onChange={(d) => s.setMomentDir(bc.id, d)}
+          />
+          <ForceDirTools
+            picking={picking}
+            disabledNormal={bc.tris.length === 0}
+            onPick={() => {
+              s.setActiveBc(bc.id);
+              s.setTool(picking ? "orbit" : "pickdir");
+            }}
+            onFlip={() => s.flipMomentDir(bc.id)}
+            onNormal={() => s.resetMomentDirToNormal(bc.id)}
+          />
+          <div className="dim small">
+            {picking
+              ? "Click a triangle — its normal becomes the moment axis (right-hand rule)."
+              : "Axis of rotation (right-hand rule). ‘Surface normal’ aims it along the selection."}
+          </div>
+        </>
+      )}
+      <div className="dim small">
+        Applied as a distributed force couple about the selection's centroid (the voxel mesh has no
+        rotational DOFs).
+      </div>
+    </div>
+  );
+}
+
 /** Displacement support editor: per global axis, an enforce checkbox + the
  *  prescribed displacement value (mm). Enforced + 0 = pin to zero; enforced + v
  *  = an imposed motion; unchecked = free (roller). */
@@ -793,9 +1072,10 @@ function DisplacementEditor({ bc }: { bc: Bc }) {
               title={`Enforce the global ${axis} displacement`}
             />
             <span className="flabel">{axis}</span>
-            <NumInput
+            <UnitInput
               className="fnum"
               value={disp[i]}
+              kind="length"
               step={0.1}
               disabled={!axes[i]}
               onCommit={(v) => {
@@ -804,7 +1084,7 @@ function DisplacementEditor({ bc }: { bc: Bc }) {
                 s.updateBcParams(bc.id, { disp: d });
               }}
             />
-            <span className="funit">mm</span>
+            <span className="funit">{unitLabel("length")}</span>
           </label>
         ))}
       </div>
@@ -869,8 +1149,8 @@ function StepProperties() {
           ))}
         </select>
         <div className="dim small">
-          E = {s.material.e0} MPa · ν = {s.material.nu} · ρ = {s.material.density} g/cm³ · σₜ ={" "}
-          {s.material.strength} MPa —{" "}
+          E = {format(s.material.e0, "modulus")} · ν = {s.material.nu} · ρ ={" "}
+          {format(s.material.density, "density")} · σₜ = {format(s.material.strength, "stress")} —{" "}
           <a className="link" onClick={() => s.openSettings(true)}>
             edit
           </a>
@@ -887,10 +1167,11 @@ function StepProperties() {
         <div className="group">
           <div className="g-label">
             <span>Line width</span>
-            <b>mm</b>
+            <b>{unitLabel("length")}</b>
           </div>
-          <NumInput
+          <UnitInput
             value={s.lineWidth}
+            kind="length"
             step={0.05}
             min={0.1}
             max={1.5}
@@ -899,7 +1180,7 @@ function StepProperties() {
         </div>
       </div>
       <div className="dim small">
-        ≈ {wall.toFixed(2)} mm solid wall — what the analysis assumes and what the 3MF's
+        ≈ {format(wall, "length")} solid wall — what the analysis assumes and what the 3MF's
         wall_loops will print. Match the line width to your profile.
       </div>
 
@@ -919,10 +1200,11 @@ function StepProperties() {
         <div className="group">
           <div className="g-label">
             <span>Layer height</span>
-            <b>mm</b>
+            <b>{unitLabel("length")}</b>
           </div>
-          <NumInput
+          <UnitInput
             value={s.layerHeight}
+            kind="length"
             step={0.05}
             min={0.04}
             max={0.6}
@@ -932,7 +1214,7 @@ function StepProperties() {
       </div>
       <div className="dim small">
         {s.topBottomLayers > 0
-          ? `≈ ${(s.topBottomLayers * s.layerHeight).toFixed(2)} mm solid shells on up/down-facing surfaces — exported as top/bottom shell layers.`
+          ? `≈ ${format(s.topBottomLayers * s.layerHeight, "length")} solid shells on up/down-facing surfaces — exported as top/bottom shell layers.`
           : "0 layers: no top/bottom shells — the infill shows through the surface (showpieces). Exported as 0 shell layers."}
       </div>
 
@@ -992,9 +1274,10 @@ function StepProperties() {
             return (
               <>
                 <label className="row">
-                  <span className="dim small">Cell size h (mm)</span>
-                  <NumInput
+                  <span className="dim small">Cell size h ({unitLabel("length")})</span>
+                  <UnitInput
                     value={s.customH}
+                    kind="length"
                     step={0.1}
                     min={0.05}
                     max={20}
@@ -1011,7 +1294,7 @@ function StepProperties() {
                   {!tooFine && !tooCoarse && cells > 0 && s.customH > wall + 1e-9 && (
                     <>
                       {" "}
-                      Coarser than the {wall.toFixed(2)} mm wall — composite skin keeps the
+                      Coarser than the {format(wall, "length")} wall — composite skin keeps the
                       stiffness honest, but the geometry stays blocky.
                     </>
                   )}
@@ -1039,8 +1322,8 @@ function StepProperties() {
         <div className="dim small">
           {s.voxelInfo
             ? s.compositeSkin
-              ? `Grid h = ${s.voxelInfo.h.toFixed(2)} mm — the ${wall.toFixed(2)} mm skin spans ${(wall / s.voxelInfo.h).toFixed(2)} cell layers; partially covered cells get a blended wall + infill stiffness.`
-              : `Grid h = ${s.voxelInfo.h.toFixed(2)} mm — the ${wall.toFixed(2)} mm skin is ${k} cell layer${k === 1 ? "" : "s"} thick.`
+              ? `Grid h = ${format(s.voxelInfo.h, "length")} — the ${format(wall, "length")} skin spans ${(wall / s.voxelInfo.h).toFixed(2)} cell layers; partially covered cells get a blended wall + infill stiffness.`
+              : `Grid h = ${format(s.voxelInfo.h, "length")} — the ${format(wall, "length")} skin is ${k} cell layer${k === 1 ? "" : "s"} thick.`
             : "Grid size is computed at the next check/solve/optimize."}
           {!s.compositeSkin && s.snapVoxel && k === 1 && (
             <> Single-layer skin is coarse — raise the resolution for printed-mode accuracy.</>
@@ -1058,6 +1341,13 @@ function StepVerify() {
     useShallow((s) => ({
       analyzeMode: s.analyzeMode,
       setAnalyzeMode: s.setAnalyzeMode,
+      analysisType: s.analysisType,
+      setAnalysisType: s.setAnalysisType,
+      modalModeCount: s.modalModeCount,
+      setModalModeCount: s.setModalModeCount,
+      freeFree: s.freeFree,
+      setFreeFree: s.setFreeFree,
+      runModal: s.runModal,
       perimeters: s.perimeters,
       lineWidth: s.lineWidth,
       printInfill: s.printInfill,
@@ -1072,11 +1362,38 @@ function StepVerify() {
       printedStats: s.printedStats,
     }))
   );
+  const modal = s.analysisType === "modal";
   return (
     <>
       <div className="group">
         <div className="g-label">
-          <span>Analyze</span>
+          <span>Analysis</span>
+        </div>
+        <div className="seg">
+          <button
+            className={!modal ? "on" : ""}
+            onClick={() => s.setAnalysisType("static")}
+            title="Linear static solve under the loads & supports — deflection, stress, safety factor"
+          >
+            Static
+          </button>
+          <button
+            className={modal ? "on" : ""}
+            onClick={() => s.setAnalysisType("modal")}
+            title="Natural frequencies & mode shapes (constrained, undamped) — how the part resonates as supported"
+          >
+            Modal
+          </button>
+        </div>
+        <div className="dim small">
+          {modal
+            ? "Constrained, undamped modal — the lowest natural frequencies + mode shapes of the part as supported by the first load case. Force-free; the selected stiffness (below) sets both stiffness and mass."
+            : "Linear static solve under the current loads & supports."}
+        </div>
+      </div>
+      <div className="group">
+        <div className="g-label">
+          <span>Stiffness</span>
         </div>
         <div className="seg">
           <button
@@ -1096,17 +1413,51 @@ function StepVerify() {
         </div>
         <div className="dim small">
           {s.analyzeMode === "printed"
-            ? `Skin ${s.perimeters} × ${s.lineWidth} mm at 100%, interior ${s.printInfill}% ${s.pattern} — accuracy is the accuracy of the calibrated E(ρ) curve.`
+            ? `Skin ${s.perimeters} × ${format(s.lineWidth, "length")} at 100%, interior ${s.printInfill}% ${s.pattern} — accuracy is the accuracy of the calibrated E(ρ) curve.`
             : "Fully dense E₀ everywhere — answers \"how much stiffness does printing cost me?\" next to an as-printed run."}
         </div>
       </div>
+      {modal && (
+        <div className="group">
+          <div className="g-label">
+            <span>Modes</span>
+          </div>
+          <div className="numrow">
+            <input
+              type="number"
+              min={1}
+              max={20}
+              step={1}
+              value={s.modalModeCount}
+              disabled={!!s.busy}
+              onChange={(e) => s.setModalModeCount(Number(e.target.value))}
+            />
+            <span className="dim small">natural frequencies to compute (1–20; higher = slower).</span>
+          </div>
+          <label className="checkrow" title="Analyze a part with NO supports: the 6 rigid-body modes are soft-anchored and discarded, leaving the flexible modes. Indicative — validate against FEA.">
+            <input
+              type="checkbox"
+              checked={s.freeFree}
+              disabled={!!s.busy}
+              onChange={(e) => s.setFreeFree(e.target.checked)}
+            />
+            <span>Unconstrained (free-free) — discard rigid-body modes</span>
+          </label>
+        </div>
+      )}
       <div className="toolrow">
         <button onClick={() => void s.runCheck()} disabled={!!s.busy}>
           Check setup
         </button>
-        <button onClick={() => void s.runSolve()} disabled={!!s.busy}>
-          Solve once
-        </button>
+        {modal ? (
+          <button onClick={() => void s.runModal()} disabled={!!s.busy}>
+            Run modal
+          </button>
+        ) : (
+          <button onClick={() => void s.runSolve()} disabled={!!s.busy}>
+            Solve once
+          </button>
+        )}
       </div>
       {s.check && (
         <div className={s.check.ok ? "status ok" : "status bad"}>
@@ -1117,7 +1468,7 @@ function StepVerify() {
               : "Under-constrained — the part can still move (animated). Add supports."}
         </div>
       )}
-      {s.stats && s.hasResult && !s.optSummary && (
+      {!modal && s.stats && s.hasResult && !s.optSummary && (
         <div className="status ok">
           Max deflection <b>{fmtDisp(s.stats.maxDisplacement)}</b> ·{" "}
           {s.printedStats ? `as printed (${s.printedStats.infillPct}% ${s.printedStats.pattern})` : "solid"} ·{" "}
@@ -1211,8 +1562,8 @@ function StepBuildSim() {
           <b>{br.densityAware ? "as-printed infill density" : "solid hull"}</b>
           {br.densityAware ? "" : " (optimize the part first to use the printed infill)"}.
           <br />
-          Bed peel — peak traction <b>{br.peakLift.toFixed(3)} MPa</b> · shear{" "}
-          <b>{br.peakShear.toFixed(3)} MPa</b>. Pick <b>Peel traction</b> on the Results bar's field
+          Bed peel — peak traction <b>{format(br.peakLift, "stress")}</b> · shear{" "}
+          <b>{format(br.peakShear, "stress")}</b>. Pick <b>Peel traction</b> on the Results bar's field
           menu to see where the part wants to lift (mesh-independent, uncalibrated indicator).
         </div>
       )}
@@ -1433,7 +1784,7 @@ function StepOptimize() {
       ) : (
         <div className="row">
           <div className="dim small" style={{ flex: 1 }}>
-            Skin {s.perimeters} × {s.lineWidth} mm · {s.pattern} —{" "}
+            Skin {s.perimeters} × {format(s.lineWidth, "length")} · {s.pattern} —{" "}
             <a className="link" onClick={() => s.setActiveStep(3)}>
               edit in Properties
             </a>
@@ -1502,11 +1853,16 @@ function StepOptimize() {
       <div className="group">
         <div className="g-label">
           <span>Minimum member size</span>
-          <b>{s.minMemberMm == null ? `auto · ${(2 * s.lineWidth).toFixed(2)} mm` : "mm"}</b>
+          <b>
+            {s.minMemberMm == null
+              ? `auto · ${format(2 * s.lineWidth, "length")}`
+              : unitLabel("length")}
+          </b>
         </div>
         <div className="toolrow">
-          <NumInput
+          <UnitInput
             value={s.minMemberMm ?? 2 * s.lineWidth}
+            kind="length"
             step={0.1}
             min={0}
             max={10}
@@ -1530,8 +1886,8 @@ function StepOptimize() {
               optimization (≈ the filter diameter). Defaults to 2× your line width.
               {eff <= 1e-9 && " Off — only the numerical anti-checkerboard floor applies."}
               {capped &&
-                ` At this resolution (h=${h.toFixed(2)} mm) the filter is capped — the` +
-                  ` enforced size tops out near ${(16 * h).toFixed(2)} mm; use a coarser mesh` +
+                ` At this resolution (h=${format(h, "length")}) the filter is capped — the` +
+                  ` enforced size tops out near ${format(16 * h, "length")}; use a coarser mesh` +
                   ` for larger members.`}
             </div>
           );

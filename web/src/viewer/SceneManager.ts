@@ -12,6 +12,7 @@ import type { Bc, LoadedModel } from "../types";
 import type { Tool, ViewMode } from "../store";
 import { CONTOUR_BANDS, jet, ramp, type RGB } from "./colormaps";
 import type { OptRegion } from "../engine/EngineClient";
+import { format } from "../units";
 
 /** Named orthographic camera presets (keyboard Ctrl + 0–6). Axes follow the
  *  Z-up / Blender convention: "front" is the −Y face, matching the default
@@ -69,6 +70,8 @@ const BC_COLORS: Record<string, THREE.Color> = {
   elastic: new THREE.Color(0x1f9d6b),
   force: new THREE.Color(0xd93025),
   pressure: new THREE.Color(0xc97b10),
+  bearing: new THREE.Color(0xb5179e),
+  moment: new THREE.Color(0xe8590c),
 };
 
 export interface SceneCallbacks {
@@ -228,6 +231,13 @@ export class SceneManager {
   private deformScale = 1;
   private autoScale = 1;
   private deformAnimate = false;
+  /** Modal mode-shape animation: symmetric ± swing instead of 0 → max. */
+  private modalAnim = false;
+
+  /** FPS readout (sampled ~2×/s) — set by the Viewer to display a counter. */
+  onFps?: (fps: number) => void;
+  private fpsFrames = 0;
+  private fpsLast = 0;
 
   // Live optimization skeleton / density-threshold cutaway.
   private optShapeMesh: THREE.Mesh | null = null;
@@ -442,6 +452,16 @@ export class SceneManager {
       if (this.disposed) return;
       requestAnimationFrame(loop);
       this.tick();
+      // Sample the frame rate ~twice a second for the on-screen counter.
+      this.fpsFrames++;
+      const now = performance.now();
+      if (this.fpsLast === 0) this.fpsLast = now;
+      const dt = now - this.fpsLast;
+      if (dt >= 500) {
+        this.onFps?.((this.fpsFrames * 1000) / dt);
+        this.fpsFrames = 0;
+        this.fpsLast = now;
+      }
     };
     loop();
   }
@@ -791,6 +811,14 @@ export class SceneManager {
     for (const bc of this.bcs) {
       if (bc.tris.length === 0) continue;
       const inactive = this.inactiveBcs.has(bc.id);
+      if (bc.kind === "bearing") {
+        this.buildBearingGlyphs(bc, inactive);
+        continue;
+      }
+      if (bc.kind === "moment" && bc.moment) {
+        this.buildMomentGlyph(bc, inactive);
+        continue;
+      }
       if (bc.kind === "force" && bc.force) {
         const f = new THREE.Vector3(...bc.force);
         if (f.lengthSq() === 0) continue;
@@ -801,6 +829,7 @@ export class SceneManager {
         // when the arrow is viewed end-on — e.g. a -Z force from a top-down
         // camera — leaving a context-free floating dot. A shaded cylinder
         // stays readable from every angle. Deactivated in this step → ghosted.
+        const labelHex = 0xc2330e;
         const mat = new THREE.MeshStandardMaterial({
           color: 0xff5252,
           roughness: 0.45,
@@ -824,7 +853,7 @@ export class SceneManager {
         const mag = f.length();
         const label = this.makeLabelSprite(
           `${mag >= 9.95 ? mag.toFixed(0) : mag.toFixed(1)} N`,
-          0xc2330e
+          labelHex
         );
         if (inactive) (label.material as THREE.SpriteMaterial).opacity = 0.3;
         label.position.set(0, -len * 0.02, 0);
@@ -950,6 +979,157 @@ export class SceneManager {
     }
   }
 
+  /** Bearing load: a fan of arrows over the loaded half of the fitted cylinder,
+   *  each pointing in the push direction with length ∝ cos θ (the projected-area
+   *  contact law). Nothing is drawn until the selection fits a cylinder. */
+  private buildBearingGlyphs(bc: Bc, inactive: boolean) {
+    const cyl = bc.cyl;
+    const fa = bc.force ?? [0, 0, 0];
+    const f = new THREE.Vector3(fa[0], fa[1], fa[2]);
+    if (!cyl || !cyl.ok || f.lengthSq() === 0 || !this.basePositions) return;
+    const axis = new THREE.Vector3(cyl.axis[0], cyl.axis[1], cyl.axis[2]).normalize();
+    const frad = f.clone().sub(axis.clone().multiplyScalar(f.dot(axis)));
+    if (frad.lengthSq() < 1e-12) return;
+    const loadDir = frad.clone().normalize();
+    const center = new THREE.Vector3(cyl.point[0], cyl.point[1], cyl.point[2]);
+    const radius = cyl.radius;
+    // Axial extent of the selection (its vertices projected on the axis).
+    const p = this.basePositions;
+    let amin = Infinity;
+    let amax = -Infinity;
+    for (const t of bc.tris) {
+      for (let v = 0; v < 3; v++) {
+        const o = 9 * t + 3 * v;
+        const a =
+          (p[o] - center.x) * axis.x +
+          (p[o + 1] - center.y) * axis.y +
+          (p[o + 2] - center.z) * axis.z;
+        if (a < amin) amin = a;
+        if (a > amax) amax = a;
+      }
+    }
+    if (!isFinite(amin)) {
+      amin = 0;
+      amax = 0;
+    }
+    const w = new THREE.Vector3().crossVectors(axis, loadDir).normalize();
+    const baseLen = Math.min(radius * 0.9, this.bboxDiag * 0.12);
+    const mat = new THREE.MeshStandardMaterial({
+      color: 0xb5179e,
+      roughness: 0.45,
+      metalness: 0.05,
+      transparent: inactive,
+      opacity: inactive ? 0.25 : 1,
+    });
+    const shaftGeo = new THREE.CylinderGeometry(baseLen * 0.03, baseLen * 0.03, 1, 8);
+    const headGeo = new THREE.ConeGeometry(baseLen * 0.09, baseLen * 0.3, 12);
+    this.markerDisposables.push(mat, shaftGeo, headGeo);
+    const up = new THREE.Vector3(0, 1, 0);
+    const nAx = amax - amin > radius * 0.5 ? 3 : 1;
+    const nAng = 9;
+    for (let i = 0; i < nAx; i++) {
+      const aOff = nAx === 1 ? (amin + amax) / 2 : amin + ((amax - amin) * (i + 0.5)) / nAx;
+      for (let j = 0; j < nAng; j++) {
+        const phi = (-1 + (2 * j) / (nAng - 1)) * ((80 * Math.PI) / 180); // −80°…80°
+        const cosT = Math.cos(phi);
+        if (cosT <= 0.02) continue;
+        const rhat = loadDir
+          .clone()
+          .multiplyScalar(Math.cos(phi))
+          .add(w.clone().multiplyScalar(Math.sin(phi)));
+        const surf = center.clone().addScaledVector(axis, aOff).addScaledVector(rhat, radius);
+        const arrowLen = baseLen * cosT;
+        const g = new THREE.Group();
+        const shaft = new THREE.Mesh(shaftGeo, mat);
+        shaft.scale.y = arrowLen * 0.7;
+        shaft.position.y = arrowLen * 0.35;
+        const head = new THREE.Mesh(headGeo, mat);
+        head.position.y = arrowLen * 0.7 + baseLen * 0.15;
+        g.add(shaft, head);
+        g.quaternion.setFromUnitVectors(up, loadDir);
+        // Head tip lands on the surface; shaft trails outward (pin pushing in).
+        g.position.copy(surf).addScaledVector(loadDir, -(arrowLen * 0.7 + baseLen * 0.3));
+        this.bcMarkers.add(g);
+      }
+    }
+    const mag = frad.length();
+    const label = this.makeLabelSprite(
+      `${mag >= 9.95 ? mag.toFixed(0) : mag.toFixed(1)} N`,
+      0x8e1278
+    );
+    if (inactive) (label.material as THREE.SpriteMaterial).opacity = 0.3;
+    label.position.copy(
+      center
+        .clone()
+        .addScaledVector(axis, (amin + amax) / 2)
+        .addScaledVector(loadDir, radius + baseLen * 1.2)
+    );
+    this.bcMarkers.add(label);
+  }
+
+  /** Moment: a curved arrow encircling the moment axis at the selection
+   *  centroid; circulation sense follows the right-hand rule about the axis. */
+  private buildMomentGlyph(bc: Bc, inactive: boolean) {
+    const ma = bc.moment ?? [0, 0, 0];
+    const mvec = new THREE.Vector3(ma[0], ma[1], ma[2]);
+    if (mvec.lengthSq() === 0) return;
+    const axis = mvec.clone().normalize();
+    const center = this.selectionCentroid(bc.tris);
+    const R = this.bboxDiag * 0.13;
+    const ax = Math.abs(axis.x);
+    const ay = Math.abs(axis.y);
+    const az = Math.abs(axis.z);
+    const seed =
+      ax <= ay && ax <= az
+        ? new THREE.Vector3(1, 0, 0)
+        : ay <= az
+          ? new THREE.Vector3(0, 1, 0)
+          : new THREE.Vector3(0, 0, 1);
+    const u = new THREE.Vector3().crossVectors(axis, seed).normalize();
+    const wv = new THREE.Vector3().crossVectors(axis, u); // right-handed about axis
+    const mat = new THREE.MeshStandardMaterial({
+      color: 0xe8590c,
+      roughness: 0.45,
+      metalness: 0.05,
+      transparent: inactive,
+      opacity: inactive ? 0.25 : 1,
+    });
+    const sweep = Math.PI * 1.6; // ~288° open ring
+    const pts: THREE.Vector3[] = [];
+    const N = 48;
+    for (let i = 0; i <= N; i++) {
+      const ang = sweep * (i / N);
+      pts.push(
+        center
+          .clone()
+          .addScaledVector(u, R * Math.cos(ang))
+          .addScaledVector(wv, R * Math.sin(ang))
+      );
+    }
+    const tubeGeo = new THREE.TubeGeometry(new THREE.CatmullRomCurve3(pts), 64, R * 0.05, 8, false);
+    const headGeo = new THREE.ConeGeometry(R * 0.16, R * 0.42, 14);
+    this.markerDisposables.push(mat, tubeGeo, headGeo);
+    this.bcMarkers.add(new THREE.Mesh(tubeGeo, mat));
+    // Arrowhead at the open end, along the tangent (−sin, cos) at `sweep`.
+    const tangent = u
+      .clone()
+      .multiplyScalar(-Math.sin(sweep))
+      .add(wv.clone().multiplyScalar(Math.cos(sweep)))
+      .normalize();
+    const head = new THREE.Mesh(headGeo, mat);
+    head.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), tangent);
+    head.position.copy(pts[pts.length - 1]).addScaledVector(tangent, R * 0.18);
+    this.bcMarkers.add(head);
+    const mag = mvec.length();
+    const label = this.makeLabelSprite(
+      `${mag >= 9.95 ? mag.toFixed(0) : mag.toFixed(1)} N·mm`,
+      0xb14708
+    );
+    if (inactive) (label.material as THREE.SpriteMaterial).opacity = 0.3;
+    label.position.copy(center.clone().addScaledVector(axis, R * 0.9));
+    this.bcMarkers.add(label);
+  }
+
   private updateMarkerVisibility() {
     this.bcMarkers.visible = this.viewMode === "setup";
   }
@@ -993,7 +1173,7 @@ export class SceneManager {
     if (!this.colors || !this.geometry) return;
     const triColor: (THREE.Color | null)[] = new Array(this.triCount).fill(null);
     for (const bc of this.bcs) {
-      const col = BC_COLORS[bc.kind];
+      const col = BC_COLORS[bc.kind] ?? new THREE.Color(0x888888);
       const isActive = bc.id === this.activeBcId;
       const c = isActive ? col.clone().lerp(new THREE.Color(0xffffff), 0.25) : col;
       for (const t of bc.tris) triColor[t] = c;
@@ -1802,6 +1982,12 @@ export class SceneManager {
     if (!on) this.applyPositions(); // restore full deflection
   }
 
+  /** Modal result active: animate as a symmetric ± swing (a vibrating mode
+   *  passes through the undeformed shape) rather than the 0 → max loop. */
+  setModalAnim(on: boolean) {
+    this.modalAnim = on;
+  }
+
   /** Flat-shaded soup mesh for the live build preview. */
   private buildHullMesh(positions: Float32Array, ghost: boolean): THREE.Mesh {
     const geo = new THREE.BufferGeometry();
@@ -2410,6 +2596,13 @@ export class SceneManager {
     this.extremesOn = on;
     this.extremesUnit = unit;
     this.refreshView();
+  }
+
+  /** Re-format the pinned value callouts after a display-unit change (their chip
+   *  text is captured once at creation; `probeFormat` reads the live unit). */
+  relabelCallouts() {
+    if (!this.probeFormat) return;
+    for (const c of this.callouts) c.chip.textContent = this.probeFormat(c.value);
   }
 
   // ---------- section plane ----------
@@ -3021,17 +3214,13 @@ export class SceneManager {
   }
 
   private fmtExtreme(v: number): string {
-    if (this.extremesUnit === "mm") {
-      const a = Math.abs(v);
-      return a >= 0.01 || a === 0 ? `${v.toFixed(3)} mm` : `${(v * 1000).toFixed(1)} µm`;
-    }
-    if (this.extremesUnit === "MPa") {
-      return `${Math.abs(v) >= 0.01 || v === 0 ? v.toPrecision(3) : v.toExponential(1)} MPa`;
-    }
-    if (this.extremesUnit === "×") {
-      return `${v.toFixed(2)}×`; // safety factor
-    }
-    return v === 0 ? "0" : v.toExponential(2);
+    // `extremesUnit` is the field's canonical unit tag ("mm" | "MPa" | "×" | "")
+    // from the store; route through the display-unit registry so markers match
+    // the legend. Values are canonical.
+    if (this.extremesUnit === "×") return `${v.toFixed(2)}×`; // safety factor
+    if (this.extremesUnit === "mm") return format(v, "length");
+    if (this.extremesUnit === "MPa") return format(v, "stress");
+    return v === 0 ? "0" : format(v, "strain"); // dimensionless strain
   }
 
   /** Small screen-aligned value chip (canvas-rendered text on a light pill),
@@ -3175,8 +3364,13 @@ export class SceneManager {
       this.applyPositions(Math.sin(t * 2.0 * Math.PI * 0.66));
     } else if (this.deformAnimate && this.viewMode === "deformed" && this.displacements) {
       const t = this.clock.getElapsedTime();
-      // Smooth 0 → max → 0 loop, 2.4 s period.
-      this.applyPositions(undefined, 0.5 - 0.5 * Math.cos((2 * Math.PI * t) / 2.4));
+      // Modal: symmetric ± swing (+A → 0 → −A → 0), a vibrating mode shape.
+      // Static deflection: one-sided 0 → max → 0 loop. Both at a 2.4 s period
+      // (fixed VISUAL rate — the real frequency is shown as a number, not speed).
+      const frac = this.modalAnim
+        ? Math.sin((2 * Math.PI * t) / 2.4)
+        : 0.5 - 0.5 * Math.cos((2 * Math.PI * t) / 2.4);
+      this.applyPositions(undefined, frac);
     }
     this.controls.update();
     const r = this.renderer;

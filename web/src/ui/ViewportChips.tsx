@@ -8,6 +8,7 @@
 import { useShallow } from "zustand/shallow";
 import { useStore, resultStale, type ViewMode, type ResultKind } from "../store";
 import { RESULT_FIELDS } from "../types";
+import { format } from "../units";
 
 function ViewBtn({ mode, label }: { mode: ViewMode; label: string }) {
   const s = useStore(
@@ -53,10 +54,15 @@ export function ViewportChips() {
       toggleSection: s.toggleSection,
       flipSection: s.flipSection,
       setSectionAxis: s.setSectionAxis,
+      unitRev: s.unitRev,
     }))
   );
   if (!s.model) return null;
   const resultsView = s.viewMode === "deformed" && s.hasResult;
+  // Modal result active: stress/strain are RELATIVE (a mass-normalized mode has
+  // arbitrary magnitude), and safety factor is meaningless — so the field picker
+  // keeps displacement/stress/strain but drops SF and labels them "relative".
+  const activeModal = s.results.find((r) => r.id === s.activeResultId)?.kind === "modal";
   return (
     <>
       <div className="viewmodes">
@@ -105,7 +111,7 @@ export function ViewportChips() {
           />
           <span className="chipdiv" />
           <span title="Peak per-element inherent-strain source (uncalibrated)">
-            peak <b>{s.strainPeakMPa.toFixed(2)} MPa</b>
+            peak <b>{format(s.strainPeakMPa, "stress")}</b>
           </span>
         </div>
       )}
@@ -232,6 +238,35 @@ export function ViewportChips() {
               <optgroup label="Bed peel (MPa · relative)">
                 <option value="peel">Peel traction (+Z)</option>
                 <option value="peelshear">Bed shear traction</option>
+              </optgroup>
+            </select>
+          ) : activeModal ? (
+            <select
+              value={s.resultField}
+              onChange={(e) => void s.setResultField(e.target.value)}
+              title="Field on the mode shape. Stress/strain show the relative PATTERN (where it concentrates) — a mode is mass-normalized, so the magnitudes are arbitrary, not calibrated."
+            >
+              <option value="u">Displacement |u| (mode shape)</option>
+              <optgroup label="Displacement (mode shape)">
+                {RESULT_FIELDS.filter((f) => ["ux", "uy", "uz"].includes(f.value)).map((f) => (
+                  <option key={f.value} value={f.value}>
+                    {f.label}
+                  </option>
+                ))}
+              </optgroup>
+              <optgroup label="Stress (relative — pattern only)">
+                {RESULT_FIELDS.filter((f) => f.unit === "MPa").map((f) => (
+                  <option key={f.value} value={f.value}>
+                    {f.label}
+                  </option>
+                ))}
+              </optgroup>
+              <optgroup label="Strain (relative — pattern only)">
+                {RESULT_FIELDS.filter((f) => f.unit === "" && !f.value.startsWith("sf")).map((f) => (
+                  <option key={f.value} value={f.value}>
+                    {f.label}
+                  </option>
+                ))}
               </optgroup>
             </select>
           ) : (
