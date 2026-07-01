@@ -12,15 +12,15 @@
 //!     (machine noise / thread-count differences would make that flaky).
 //!
 //! Usage (run from the repo root; release build for realistic timing):
-//!   cargo run --release -p sig-core --bin regbench -- --save baseline.tsv
-//!   cargo run --release -p sig-core --bin regbench -- --check baseline.tsv
+//!   cargo run --release -p filasim-core --bin regbench -- --save baseline.tsv
+//!   cargo run --release -p filasim-core --bin regbench -- --check baseline.tsv
 //!   ... add --big for the ~1M-cell solve (the perf worst case), --tol 0.01 to loosen.
 
-use sig_core::attach::{assemble, BcKind, BcSpec};
-use sig_core::bins::{assign_bins_mass, cleanup_small_regions, cluster_levels};
-use sig_core::mesh::primitives;
-use sig_core::simp::{evaluate, optimize, OptimizeParams};
-use sig_core::{pad_for_levels, solve_static, BoxRegion, SolveSettings, StaticProblem, VoxelGrid};
+use filasim_core::attach::{assemble, BcKind, BcSpec};
+use filasim_core::bins::{assign_bins_mass, cleanup_small_regions, cluster_levels};
+use filasim_core::mesh::primitives;
+use filasim_core::simp::{evaluate, optimize, OptimizeParams};
+use filasim_core::{pad_for_levels, solve_static, BoxRegion, SolveSettings, StaticProblem, VoxelGrid};
 use std::time::Instant;
 
 #[derive(Clone, Copy, PartialEq)]

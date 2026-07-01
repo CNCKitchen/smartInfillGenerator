@@ -6,10 +6,10 @@
 //! stats next to the reference CAD-exported .stl.
 //!
 //! Usage (from workspace root):
-//!   cargo run -p sig-core --bin stepbench -- "hook5 v3.step" "hook5 v3.stl"
+//!   cargo run -p filasim-core --bin stepbench -- "hook5 v3.step" "hook5 v3.stl"
 
-use sig_core::mesh::TriMesh;
-use sig_core::step::{import_step, StepTessellation};
+use filasim_core::mesh::TriMesh;
+use filasim_core::step::{import_step, StepTessellation};
 
 struct Stats {
     tris: usize,

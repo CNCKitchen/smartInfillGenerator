@@ -165,7 +165,7 @@ pub fn export_orca_3mf(
     root.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     root.push_str("<model unit=\"millimeter\" xml:lang=\"en-US\" xmlns=\"http://schemas.microsoft.com/3dmanufacturing/core/2015/02\" xmlns:BambuStudio=\"http://schemas.bambulab.com/package/2021\" xmlns:p=\"http://schemas.microsoft.com/3dmanufacturing/production/2015/06\" requiredextensions=\"p\">\n");
     // Vendor string the loader recognizes as one of its own projects. (Real
-    // OrcaSlicer exports also write "BambuStudio-…"; ours is InFEAll under the
+    // OrcaSlicer exports also write "BambuStudio-…"; ours is filaSim under the
     // hood — the Title metadata carries the part name.)
     root.push_str(" <metadata name=\"Application\">BambuStudio-02.07.00.00</metadata>\n");
     root.push_str(" <metadata name=\"BambuStudio:3mfVersion\">1</metadata>\n");
@@ -992,7 +992,7 @@ pub fn export_prusa_3mf(
     model.push_str("<model unit=\"millimeter\" xml:lang=\"en-US\" xmlns=\"http://schemas.microsoft.com/3dmanufacturing/core/2015/02\" xmlns:slic3rpe=\"http://schemas.slic3r.org/3mf/2017/06\">\n");
     model.push_str(" <metadata name=\"slic3rpe:Version3mf\">1</metadata>\n");
     model.push_str(&format!(" <metadata name=\"Title\">{}</metadata>\n", xml_escape(part_name)));
-    model.push_str(" <metadata name=\"Application\">InFEAll-0.1.0</metadata>\n");
+    model.push_str(" <metadata name=\"Application\">filaSim-0.1.0</metadata>\n");
     model.push_str(" <resources>\n  <object id=\"1\" type=\"model\">\n");
     model.push_str(&mesh_xml(&mesh));
     model.push_str("  </object>\n </resources>\n <build>\n");

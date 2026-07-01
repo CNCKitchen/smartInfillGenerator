@@ -6,7 +6,7 @@ product-fit are explicitly deferred (see §6).*
 
 ## 0. One-paragraph summary
 
-Add an FDM build simulation that reuses InFEAll's existing matrix-free geometric-multigrid
+Add an FDM build simulation that reuses filaSim's existing matrix-free geometric-multigrid
 voxel FEA to apply an **inherent (eigen)strain** field and predict (a) **warping** — for
 part predeformation / gcode morphing — and (b) **bed peel / plate release**. A third target,
 **interlayer delamination**, was scoped out of the MVP: it depends on thermal history the
@@ -189,7 +189,7 @@ Single material + process. **No real generalization** — and the demo must say 
 
 ## 7. Open / strategic
 
-- **Product fit:** does build-sim belong in InFEAll, or is it a separate product sharing only the
+- **Product fit:** does build-sim belong in filaSim, or is it a separate product sharing only the
   voxel grid (different user, different physics, different validation culture)? **To be answered
   via literature + a few tests, not from the armchair.**
 - The gcode pipeline (§5) and its three payoffs.
@@ -202,7 +202,7 @@ Single material + process. **No real generalization** — and the demo must say 
 
 ## 8. Placement — separate top-level mode (decided 2026-06-26)
 
-Two top-level modes sharing the front-end plumbing, viewer, and sig-core solver:
+Two top-level modes sharing the front-end plumbing, viewer, and filasim-core solver:
 - **"Simulate & Optimize"** — the existing tool (structural FEA + infill/topology optimization).
 - **"Build Sim"** — the new inherent-strain build simulation.
 
@@ -210,7 +210,7 @@ Chosen = **option C** (separate mode), over a shared rail step (B) or an experim
 (A). Rationale: different physics, different user intent, different validation culture — and clean
 separation means Build Sim can be **deleted as a unit** if §7's strategic question resolves against
 it, rather than untangled from the structural flow. Marginal cost is low: both modes share Model
-import, voxelization, the viewer/colormap/legend, and the sig-core solver; they diverge only at the
+import, voxelization, the viewer/colormap/legend, and the filasim-core solver; they diverge only at the
 rail, the analysis, and export.
 
 ### Mode switch
@@ -234,8 +234,8 @@ rail, the analysis, and export.
 ### Code reuse
 - **Solver:** eigenstrain enters as an **RHS force** on the existing `StaticProblem`/`NodeProblem`
   (same path as prescribed displacement — never invalidates the cached matrix). Reuse `solve.rs`,
-  `fem.rs`, `mg.rs`, `stress.rs` wholesale. New **`crates/sig-core/src/buildsim.rs`**, a *sibling*
-  to `pipeline.rs` (not part of the SIMP loop); new `sig-wasm` entry point.
+  `fem.rs`, `mg.rs`, `stress.rs` wholesale. New **`crates/filasim-core/src/buildsim.rs`**, a *sibling*
+  to `pipeline.rs` (not part of the SIMP loop); new `filasim-wasm` entry point.
 - **Shared touch point:** State 2's free-body solve needs inertia relief / 3-2-1 pinning, which
   intersects `check.rs` — the under-constraint guard must not fire on the deliberately free part.
 - **Viewer:** warp rides the existing `ViewMode "deformed"` path; peel is a new bottom-surface

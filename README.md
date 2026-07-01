@@ -1,4 +1,4 @@
-# InFEAll
+# filaSim
 
 *FEA-driven infill for FDM prints (formerly "Smart Infill Generator").*
 
@@ -122,11 +122,11 @@ solver residual curve.
 ## Repo layout
 
 ```
-crates/sig-core   Rust engine: STL/3MF I/O, winding-number voxelization,
+crates/filasim-core   Rust engine: STL/3MF I/O, winding-number voxelization,
                   segmentation, matrix-free multigrid FEA (mixed precision),
                   BC attachment, RBM checks, SIMP optimizer, bins, marching
                   tetrahedra, zip + Orca/Bambu 3MF writer
-crates/sig-wasm   wasm-bindgen API consumed by the web worker
+crates/filasim-wasm   wasm-bindgen API consumed by the web worker
 web/              Vite + React + three.js app
 ```
 
@@ -135,9 +135,9 @@ web/              Vite + React + three.js app
 Prereqs: Rust (GNU host works on Windows), Node 18+, wasm-pack.
 
 ```sh
-cargo test -p sig-core                                            # 24 tests
+cargo test -p filasim-core                                            # 24 tests
 cargo run --release --bin bench                                   # native numbers
-wasm-pack build crates/sig-wasm --target web --out-dir ../../web/src/wasm
+wasm-pack build crates/filasim-wasm --target web --out-dir ../../web/src/wasm
 node smoke-wasm.mjs                                               # full-pipeline smoke
 cd web && npm run build                                           # production build
 ```

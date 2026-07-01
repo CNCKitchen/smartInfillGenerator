@@ -4,12 +4,12 @@
 //! "As printed" verify path: voxel-size snapping to the wall thickness,
 //! exact skin layer counts, and the composite-sandwich stiffness check.
 
-use sig_core::attach::{assemble, BcKind, BcSpec};
-use sig_core::mesh::primitives;
-use sig_core::simp::{build_eps, classify_cells, evaluate, solve_with_eps};
-use sig_core::solve::SolveSettings;
-use sig_core::voxel::pick_voxel_size;
-use sig_core::{pad_for_levels, VoxelGrid};
+use filasim_core::attach::{assemble, BcKind, BcSpec};
+use filasim_core::mesh::primitives;
+use filasim_core::simp::{build_eps, classify_cells, evaluate, solve_with_eps};
+use filasim_core::solve::SolveSettings;
+use filasim_core::voxel::pick_voxel_size;
+use filasim_core::{pad_for_levels, VoxelGrid};
 
 fn face_tris(face: usize) -> Vec<u32> {
     vec![2 * face as u32, 2 * face as u32 + 1]

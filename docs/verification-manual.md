@@ -1,9 +1,9 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 <!-- Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com> -->
 
-# InFEAll — Verification & Validation Manual
+# filaSim — Verification & Validation Manual
 
-*Engine version: `sig-core` (master). Document revised 2026-06-14.*
+*Engine version: `filasim-core` (master). Document revised 2026-06-14.*
 
 This is the companion to the [Theory Manual](theory-manual.md). It documents how
 the engine is checked against **known answers** — closed-form solutions, textbook
@@ -61,19 +61,19 @@ formulas or exact structure, so a regression fails the build.
 
 ```bash
 # Tier 1, 3, 4 — the CI suite (fast, assertion-backed). Run on every change.
-cargo test -p sig-core
+cargo test -p filasim-core
 
 # Tier 2 — the meshing-convention benchmark harness (prints tables, mostly
 # #[ignore]d so it does not run in normal CI). One command re-validates the
 # cut-cell convention against analytic/textbook truth.
-cargo test -p sig-core --test meshbench -- --ignored --nocapture
+cargo test -p filasim-core --test meshbench -- --ignored --nocapture
 
 # Phase-1 exit-criterion benchmark (throughput + analytic cantilever check).
-cargo run -p sig-core --release --bin bench            # add --small to skip the 1M-cell run
+cargo run -p filasim-core --release --bin bench            # add --small to skip the 1M-cell run
 # Optional: drop a 3dbenchy.stl in the working dir for the thin-shell case.
 
 # STEP tessellation regularity harness (needs the `step` feature).
-cargo run -p sig-core --features step --bin stepbench -- "model.step" "model.stl"
+cargo run -p filasim-core --features step --bin stepbench -- "model.step" "model.stl"
 ```
 
 Tests that need an external fixture (`Cube.3mf`, `3dbenchy.stl`) **self-skip**
@@ -83,7 +83,7 @@ when the file is absent, so the core suite is hermetic.
 
 ## 3. Tier 1 — Analytic verification (CI)
 
-These run on every commit (`crates/sig-core/tests/validation.rs`,
+These run on every commit (`crates/filasim-core/tests/validation.rs`,
 `phase2.rs`, `phase3.rs`). Each compares the FE result to a **closed-form**
 solution. Tolerances are the actual acceptance criteria in the code.
 
@@ -148,7 +148,7 @@ solution. Tolerances are the actual acceptance criteria in the code.
 
 ## 4. Tier 2 — Meshing / discretization benchmarks
 
-`crates/sig-core/tests/meshbench.rs` is the harness that **chose the cut-cell
+`crates/filasim-core/tests/meshbench.rs` is the harness that **chose the cut-cell
 convention** (Finite-Cell occupancy + 0.15 floor) by comparing five boundary
 conventions against analytic/textbook truth across eight cases. Most functions
 print comparison tables and are `#[ignore]`d (run them when touching meshing);
@@ -175,8 +175,8 @@ on curved features (fillet Kt within ~1–3% where binary conventions over-read
 
 ## 5. Tier 3 — Printed-material (composite) verification
 
-`crates/sig-core/tests/printed.rs` validates the **skin + homogenized infill**
-model (the thing that makes InFEAll an FDM tool, not a generic solid solver)
+`crates/filasim-core/tests/printed.rs` validates the **skin + homogenized infill**
+model (the thing that makes filaSim an FDM tool, not a generic solid solver)
 against the **composite/sandwich-beam closed form**. CI.
 
 | # | Case | Reference (closed form) | Tolerance |
@@ -194,7 +194,7 @@ the limitation on surface stress in the Theory Manual §12.
 
 ## 6. Tier 4 — Interoperability / format golden files
 
-`crates/sig-core/tests/phase3.rs` checks that exports/imports are **byte-correct**
+`crates/filasim-core/tests/phase3.rs` checks that exports/imports are **byte-correct**
 against the real slicer dialects (pinned from the `Cube.3mf` sample). CI.
 
 | # | Case | What it asserts |
@@ -226,7 +226,7 @@ behaviors the engine claims:
 | 5.4 | **Hook / cantilever fixture** (the in-repo smoke beam) | the primary optimization fixture; checks as-printed vs solid | CalculiX with manual skin/infill ersatz | deflection within ~10% |
 | 5.5 | **Lattice/infill coupon** | validates the homogenized E(ρ) against a *resolved* infill model | CalculiX on a meshed gyroid unit cell, or measured data | effective stiffness within calibration error |
 
-**How to run it (when set up):** export each fixture as STL, solve in InFEAll
+**How to run it (when set up):** export each fixture as STL, solve in filaSim
 (Fine preset) and in the reference code with matched material/BC/load, and record
 max displacement, compliance, and peak nominal stress. Track the ratios over time
 as a golden file. Discrepancies at singular features are expected and should be
@@ -252,7 +252,7 @@ changes, and as a periodic confidence check). It is deliberately small,
 fast-running, physically meaningful, and spans every subsystem — so a green
 battery is a strong statement that "the tool works", suitable to show users.
 
-**Automated core (`cargo test -p sig-core`, < ~1 min):**
+**Automated core (`cargo test -p filasim-core`, < ~1 min):**
 
 | Battery item | Backing test(s) | Proves | Pass criterion |
 |---|---|---|---|
@@ -272,8 +272,8 @@ battery is a strong statement that "the tool works", suitable to show users.
 
 | Battery item | Command | Proves |
 |---|---|---|
-| **B12 Mesh-convention benchmark** | `cargo test -p sig-core --test meshbench -- --ignored --nocapture` | cut-cell convention still wins on volume/phase/Kirsch/fillet |
-| **B13 Performance budget** | `cargo run -p sig-core --release --bin bench` | 1 M cells solved in seconds; cantilever ratio in band |
+| **B12 Mesh-convention benchmark** | `cargo test -p filasim-core --test meshbench -- --ignored --nocapture` | cut-cell convention still wins on volume/phase/Kirsch/fillet |
+| **B13 Performance budget** | `cargo run -p filasim-core --release --bin bench` | 1 M cells solved in seconds; cantilever ratio in band |
 | **B14 Cross-code goldens (Tier 5)** | manual, per §7 | whole-part agreement with CalculiX/Fusion |
 
 **Recommended cadence:** B1–B11 on every commit (CI); B12–B13 before each release

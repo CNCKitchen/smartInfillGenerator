@@ -227,6 +227,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 
 [[package]]
+name = "filasim-core"
+version = "0.1.0"
+dependencies = [
+ "miniz_oxide",
+ "quick-xml",
+ "rayon",
+ "truck-meshalgo",
+ "truck-modeling",
+ "truck-polymesh",
+ "truck-stepio",
+]
+
+[[package]]
+name = "filasim-wasm"
+version = "0.1.0"
+dependencies = [
+ "filasim-core",
+ "js-sys",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+ "wasm-bindgen-rayon",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -780,31 +805,6 @@ name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
-
-[[package]]
-name = "sig-core"
-version = "0.1.0"
-dependencies = [
- "miniz_oxide",
- "quick-xml",
- "rayon",
- "truck-meshalgo",
- "truck-modeling",
- "truck-polymesh",
- "truck-stepio",
-]
-
-[[package]]
-name = "sig-wasm"
-version = "0.1.0"
-dependencies = [
- "js-sys",
- "serde",
- "serde_json",
- "sig-core",
- "wasm-bindgen",
- "wasm-bindgen-rayon",
-]
 
 [[package]]
 name = "slab"

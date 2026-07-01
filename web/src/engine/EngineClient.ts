@@ -413,7 +413,7 @@ export class EngineClient {
     return this.call({ op: "transformMatrix" });
   }
 
-  /** Assemble a `.infeall` project zip (model + manifest + design + results). */
+  /** Assemble a `.filasim` project zip (model + manifest + design + results). */
   exportProject(manifest: string, modelEntry: string, includeResults: boolean): Promise<Uint8Array> {
     return this.call({ op: "exportProject", manifest, modelEntry, includeResults });
   }

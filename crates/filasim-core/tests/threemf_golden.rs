@@ -10,20 +10,20 @@
 //! committed fixture, so any change to the wire format shows up as a diff.
 //!
 //! Intentional format changes: regenerate with
-//!   SIG_UPDATE_GOLDEN=1 cargo test -p sig-core --test threemf_golden
+//!   SIG_UPDATE_GOLDEN=1 cargo test -p filasim-core --test threemf_golden
 //! then review and commit the updated fixtures under tests/golden/.
 
-use sig_core::bins::RegionMesh;
-use sig_core::mesh::primitives;
-use sig_core::threemf::{export_orca_3mf, export_prusa_3mf, weld};
-use sig_core::zip::read_zip;
+use filasim_core::bins::RegionMesh;
+use filasim_core::mesh::primitives;
+use filasim_core::threemf::{export_orca_3mf, export_prusa_3mf, weld};
+use filasim_core::zip::read_zip;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// A small but non-trivial part + two nested modifier regions. Fixed geometry
 /// → fully deterministic output (UUIDs and the bed-placement transform are
 /// derived from this, nothing random).
-fn fixture_inputs() -> (sig_core::threemf::IndexedMesh, Vec<RegionMesh>) {
+fn fixture_inputs() -> (filasim_core::threemf::IndexedMesh, Vec<RegionMesh>) {
     let part = weld(&primitives::boxx([0.0; 3], [30.0, 20.0, 10.0]));
     let region = |lo: [f32; 3], hi: [f32; 3], density: f64| -> RegionMesh {
         let m = weld(&primitives::boxx(lo, hi));

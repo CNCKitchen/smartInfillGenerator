@@ -12,9 +12,9 @@ import init, {
   set_progress_buffer,
   project_manifest,
   project_model,
-} from "./web/src/wasm/sig_wasm.js";
+} from "./web/src/wasm/filasim_wasm.js";
 
-// --- build a binary STL box (matches sig-core primitives::boxx layout) ---
+// --- build a binary STL box (matches filasim-core primitives::boxx layout) ---
 function boxStl(lo, hi) {
   const v = (x, y, z) => [x ? hi[0] : lo[0], y ? hi[1] : lo[1], z ? hi[2] : lo[2]];
   const faces = [
@@ -45,7 +45,7 @@ function boxStl(lo, hi) {
   return new Uint8Array(buf);
 }
 
-const wasmBytes = readFileSync(new URL("./web/src/wasm/sig_wasm_bg.wasm", import.meta.url));
+const wasmBytes = readFileSync(new URL("./web/src/wasm/filasim_wasm_bg.wasm", import.meta.url));
 await init({ module_or_path: wasmBytes });
 
 const assert = (cond, msg) => {
@@ -635,7 +635,7 @@ assert(matchSummary.massGrams < matchSummary.massUniformRefGrams,
   "matched design is lighter than the uniform reference");
 console.log("ok: stiffness-match goal (lighter at equal stiffness)");
 
-// ---- project (.infeall) save / load round-trip ----
+// ---- project (.filasim) save / load round-trip ----
 // Orient → optimize → export project → re-import the original file + replay the
 // transform + restore: the design (regions, density, stress eps) and the result
 // displacements must come back identical, with no re-optimization.
@@ -677,7 +677,7 @@ console.log("ok: stiffness-match goal (lighter at equal stiffness)");
   const vmBefore = pModel.result_field("vm");
   const accum = Array.from(pModel.transform_matrix());
 
-  const manifest = JSON.stringify({ app: "InFEAll", fileName: "projbeam.stl", transform: accum });
+  const manifest = JSON.stringify({ app: "filaSim", fileName: "projbeam.stl", transform: accum });
 
   // Save WITH results, then read the pieces back out.
   const proj = pModel.export_project(pStl, "model.stl", manifest, true);

@@ -1,5 +1,5 @@
 [package]
-name = "sig-core"
+name = "filasim-core"
 version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-only"
@@ -13,7 +13,7 @@ parallel = ["dep:rayon"]
 # stock rustup *windows-gnu* toolchain can't build (no MinGW assembler) — so a
 # hard dep would break native `cargo test`/`build` on a default Windows setup.
 # Gating it keeps native dev clean; the wasm target (the real product) builds it
-# fine, and sig-wasm turns this feature on.
+# fine, and filasim-wasm turns this feature on.
 step = ["dep:truck-stepio", "dep:truck-meshalgo", "dep:truck-modeling", "dep:truck-polymesh"]
 
 [dependencies]

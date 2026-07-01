@@ -4,12 +4,12 @@
 //     and compare the REFINED working meshes — STEP should now be refined by the
 //     exact same path as STL (diag/60 subdivision in Model::new).
 // Build the Node wasm pkg first (from repo root):
-//   wasm-pack build crates/sig-wasm --target nodejs --release --out-dir pkg-stepnode -- --features step
+//   wasm-pack build crates/filasim-wasm --target nodejs --release --out-dir pkg-stepnode -- --features step
 // Then run:  node stepnode_test.mjs
 import { readFileSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
-const wasm = require('./crates/sig-wasm/pkg-stepnode/sig_wasm.js');
+const wasm = require('./crates/filasim-wasm/pkg-stepnode/filasim_wasm.js');
 
 const stepPath = process.argv[2] ?? 'hook5 v3.step';
 const stlPath = process.argv[3] ?? 'hook5 v3.stl';

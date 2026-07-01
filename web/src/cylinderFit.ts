@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
 
 // Synchronous cylinder fit for bearing-load validation + glyphs, mirroring the
-// Rust `sig_core::cylinder` fit (axis from the surface-normal covariance, then
+// Rust `filasim_core::cylinder` fit (axis from the surface-normal covariance, then
 // an algebraic circle fit in the plane ⟂ axis). Kept in TypeScript so the
 // editor can validate a selection and draw the load distribution INSTANTLY —
 // no worker round-trip that could stall — while the solver re-fits in Rust for
@@ -11,7 +11,7 @@
 import type { CylFit } from "./types";
 
 /** Acceptance threshold on the cylindricity residual (RMS radial deviation /
- *  radius) — must match sig_core::cylinder::DEFAULT_TOL. */
+ *  radius) — must match filasim_core::cylinder::DEFAULT_TOL. */
 export const CYL_TOL = 0.07;
 
 type V3 = [number, number, number];

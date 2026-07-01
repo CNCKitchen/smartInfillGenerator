@@ -6,12 +6,12 @@
 //! bed), and writes exaggerated deformed hulls so the "hull line" warp signature
 //! can be inspected.
 //!
-//! Run: `cargo run -p sig-core --bin buildsim_benchy -- <benchy.stl> [out_dir] [h_mm]`
+//! Run: `cargo run -p filasim-core --bin buildsim_benchy -- <benchy.stl> [out_dir] [h_mm]`
 
-use sig_core::buildsim::{deformed_hull_stl, solve_bonded, solve_build};
-use sig_core::mesh::TriMesh;
-use sig_core::solve::SolveSettings;
-use sig_core::voxel::VoxelGrid;
+use filasim_core::buildsim::{deformed_hull_stl, solve_bonded, solve_build};
+use filasim_core::mesh::TriMesh;
+use filasim_core::solve::SolveSettings;
+use filasim_core::voxel::VoxelGrid;
 use std::path::PathBuf;
 use std::time::Instant;
 

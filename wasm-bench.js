@@ -9,7 +9,7 @@ const wasmPath = path.join(
   "target",
   "wasm32-unknown-unknown",
   "release",
-  "sig_wasm.wasm"
+  "filasim_wasm.wasm"
 );
 const bytes = fs.readFileSync(wasmPath);
 const mod = new WebAssembly.Module(bytes);

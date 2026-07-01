@@ -41,7 +41,7 @@ export function TopBar() {
   // Load Project also accepts a plain STL/3MF and falls back to a normal import.
   const onLoad = async (f: File | undefined) => {
     if (f) {
-      if (/\.infeall$/i.test(f.name)) await s.openProject(f);
+      if (/\.filasim$/i.test(f.name)) await s.openProject(f);
       else await s.loadFile(f.name, await f.arrayBuffer());
     }
     if (openRef.current) openRef.current.value = ""; // allow re-picking the same file
@@ -49,9 +49,9 @@ export function TopBar() {
 
   return (
     <header className="top">
-      <div className="brandmark">IF</div>
+      <div className="brandmark">FS</div>
       <div className="brand">
-        <b>InFEAll</b>
+        <b>filaSim</b>
         <span>CNC Kitchen · browser FEA</span>
       </div>
       <label className="workspace" title="Switch workspace">
@@ -68,7 +68,7 @@ export function TopBar() {
       <input
         ref={openRef}
         type="file"
-        accept=".infeall,.stl,.3mf"
+        accept=".filasim,.stl,.3mf"
         hidden
         onChange={(e) => void onLoad(e.target.files?.[0] ?? undefined)}
       />
@@ -77,7 +77,7 @@ export function TopBar() {
           className="ghost"
           onClick={() => setSaveOpen((o) => !o)}
           disabled={!!s.busy || !m}
-          title="Save the project as a .infeall file"
+          title="Save the project as a .filasim file"
         >
           Save Project ▾
         </button>
@@ -115,7 +115,7 @@ export function TopBar() {
         className="ghost"
         onClick={() => openRef.current?.click()}
         disabled={!!s.busy}
-        title="Open a .infeall project — or a plain STL / 3MF to start fresh"
+        title="Open a .filasim project — or a plain STL / 3MF to start fresh"
       >
         Load Project
       </button>

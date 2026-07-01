@@ -160,7 +160,7 @@ function OptResults() {
       {/* o.converged is the optimizer's DESIGN-stationarity signal (mean |Δρ|
           settled before the iteration cap). It does NOT yet reflect the
           binned VERIFICATION solve's MGCG convergence — that is hardcoded
-          converged:true in the wasm layer (see crates/sig-wasm/src/lib.rs,
+          converged:true in the wasm layer (see crates/filasim-wasm/src/lib.rs,
           the Solution built after the optimize loop). Surfacing the real
           verification-solve residual here is the deferred follow-up. */}
       {!o.converged && (

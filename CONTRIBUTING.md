@@ -53,9 +53,9 @@ for Rust; `npx license-checker --summary` for npm. CI runs these on PRs.
 
 ## Practicalities
 
-- Engine work: `cargo test -p sig-core` must stay green (validation tests
+- Engine work: `cargo test -p filasim-core` must stay green (validation tests
   compare against analytic solutions — treat tolerance changes as red flags).
-- Full pipeline: `wasm-pack build crates/sig-wasm --target web --out-dir
+- Full pipeline: `wasm-pack build crates/filasim-wasm --target web --out-dir
   ../../web/src/wasm && node smoke-wasm.mjs`.
 - Web: `cd web && npm run build` (tsc strict + vite).
 - New source files carry the SPDX header:

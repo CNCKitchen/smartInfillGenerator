@@ -4,7 +4,7 @@
 /// <reference lib="webworker" />
 // The wasm Model lives here; the main thread talks via EngineClient.
 
-import type { Model } from "../wasm/sig_wasm.js";
+import type { Model } from "../wasm/filasim_wasm.js";
 
 let model: Model | null = null;
 let ModelCtor: typeof Model;
@@ -14,7 +14,7 @@ let setCancelFlagFn: ((flag: Int32Array) => void) | null = null;
 let cancelArr: Int32Array | null = null;
 /** wasm hook installing the live residual-progress buffer (thread-local). */
 let setProgressBufferFn: ((count: Int32Array, data: Float32Array) => void) | null = null;
-/** Project (.infeall) unzip helpers from the wasm module. */
+/** Project (.filasim) unzip helpers from the wasm module. */
 let projectManifestFn: ((bytes: Uint8Array) => string) | null = null;
 let projectModelFn: ((bytes: Uint8Array) => Uint8Array) | null = null;
 /** Original imported model bytes (for project save) + name. */
@@ -30,8 +30,8 @@ const ready = (async () => {
     // Static asset (web/public/wasm-mt), deliberately NOT bundled — the
     // rayon pool workers re-import the glue by plain relative URL.
     const mt = (await import(
-      /* @vite-ignore */ new URL(import.meta.env.BASE_URL + "wasm-mt/sig_wasm.js", self.location.origin).href
-    )) as typeof import("../wasm/sig_wasm.js") & {
+      /* @vite-ignore */ new URL(import.meta.env.BASE_URL + "wasm-mt/filasim_wasm.js", self.location.origin).href
+    )) as typeof import("../wasm/filasim_wasm.js") & {
       initThreadPool(threads: number): Promise<unknown>;
     };
     await mt.default();
@@ -44,7 +44,7 @@ const ready = (async () => {
     projectModelFn = mt.project_model;
     console.info(`engine: threaded wasm (${threads} threads)`);
   } else {
-    const st = await import("../wasm/sig_wasm.js");
+    const st = await import("../wasm/filasim_wasm.js");
     await st.default();
     ModelCtor = st.Model;
     setCancelFlagFn = st.set_cancel_flag;
@@ -640,7 +640,7 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
         let name = "project";
         try {
           const mf = JSON.parse(manifest);
-          if (mf.fileName) name = String(mf.fileName).replace(/\.(stl|3mf|infeall)$/i, "");
+          if (mf.fileName) name = String(mf.fileName).replace(/\.(stl|3mf|filasim)$/i, "");
         } catch {
           // manifest name is cosmetic — fall back to "project"
         }

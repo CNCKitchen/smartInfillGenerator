@@ -5,12 +5,12 @@
 //! rigid-body-mode checks, triangle-selection BC attachment, frictionless
 //! penalty springs, gravity.
 
-use sig_core::attach::{assemble, check_problem, BcKind, BcSpec};
-use sig_core::bvh::WindingBvh;
-use sig_core::check::{islands, rbm_check, ConstraintDir};
-use sig_core::mesh::{primitives, TriMesh};
-use sig_core::segment::segment;
-use sig_core::{pad_for_levels, solve_nodes, BoxRegion, SolveSettings, VoxelGrid};
+use filasim_core::attach::{assemble, check_problem, BcKind, BcSpec};
+use filasim_core::bvh::WindingBvh;
+use filasim_core::check::{islands, rbm_check, ConstraintDir};
+use filasim_core::mesh::{primitives, TriMesh};
+use filasim_core::segment::segment;
+use filasim_core::{pad_for_levels, solve_nodes, BoxRegion, SolveSettings, VoxelGrid};
 
 #[test]
 fn segmentation_box_has_six_patches() {

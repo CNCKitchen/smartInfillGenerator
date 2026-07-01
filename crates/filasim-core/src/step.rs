@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
 
 //! STEP (ISO 10303) import via the `truck` CAD kernel (Apache-2.0, vetted
-//! 2026-06-13 — see crates/sig-core/Cargo.toml).
+//! 2026-06-13 — see crates/filasim-core/Cargo.toml).
 //!
 //! STEP carries BREP geometry (trimmed NURBS faces). The downstream pipeline is
 //! triangle-soup based (winding-number voxelization), so we tessellate the BREP

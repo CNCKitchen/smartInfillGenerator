@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/sig-core", "crates/sig-wasm"]
+members = ["crates/filasim-core", "crates/filasim-wasm"]
 
 [profile.release]
 opt-level = 3

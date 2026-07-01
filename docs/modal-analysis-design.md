@@ -14,7 +14,7 @@ geometric-multigrid solve as the `K⁻¹` operator**, against a **lumped, densit
 new `kind: "modal"`, riding the existing `ResultEntry` / result-stash / viewer-switcher infra — so
 mode switching, the deformed view, and animation come for free. Looking at a mode **auto-starts the
 animation** (fixed visual rate, symmetric ± swing). The work reuses the static-FEA pipeline
-end-to-end; the only genuinely new code is the eigensolver + lumped mass in `sig-core`.
+end-to-end; the only genuinely new code is the eigensolver + lumped mass in `filasim-core`.
 
 ## 1. Scope
 
@@ -47,7 +47,7 @@ end-to-end; the only genuinely new code is the eigensolver + lumped mass in `sig
   `K⁻¹ M`, so the lowest frequencies converge first; `guard = clamp(N/2, 4, 8)` extra block columns
   absorb the slow tail. This reuses the multigrid even more directly than a hand-rolled LOBPCG
   preconditioner hook (no new V-cycle entry point needed) and is markedly easier to prove correct.
-  Implemented in `crates/sig-core/src/modal.rs`. (LOBPCG and shift-invert Lanczos both considered;
+  Implemented in `crates/filasim-core/src/modal.rs`. (LOBPCG and shift-invert Lanczos both considered;
   the inverse-subspace form won on reuse-of-the-public-API + robustness for the small `N` here.)
 - **Mass matrix — lumped, density-scaled (Q3).** `m_node = ρ·(voxel volume)/8` summed per node,
   with `ρ` from the material `density` (g/cm³, already on every `Material` — `web/src/types.ts`)
@@ -141,19 +141,19 @@ Reuse the existing `deformAnimate` loop (`SceneManager.ts` `tick()`):
 ## 9. Persistence (decided — Q12)
 
 **Option B — frequencies saved, shapes recomputed lazily.** Saving N full mode-shape fields
-(`numModes × 3 × nNodes`) into every `.infeall` is bloat. Save the **frequencies** (tiny) + the
+(`numModes × 3 × nNodes`) into every `.filasim` is bloat. Save the **frequencies** (tiny) + the
 **mode-count config**; recompute mode shapes on demand when a modal result is reopened. Mode shapes
 are fully determined by mesh+BCs — nothing is lost by recomputing. Wire the existing staleness-epoch
 system so changing the mode count or the first-LC supports marks modal results stale (same as static).
 
 ## 10. Code touch points (reuse-first)
 
-- **`crates/sig-core/`** — NEW `modal.rs`: assemble lumped density-scaled mass; LOBPCG with the
+- **`crates/filasim-core/`** — NEW `modal.rs`: assemble lumped density-scaled mass; LOBPCG with the
   `mg.rs` V-cycle as preconditioner; return frequencies (rad/s → Hz at the UI) + mode-shape vectors.
   Add a lumped element-mass helper in `fem.rs`. Reuse `mg.rs`, `solve.rs`, `attach.rs` (BCs),
   `stress.rs` (relative stress/strain recovery on a mode shape) wholesale. Add `pub mod modal;` to
   `lib.rs`.
-- **`crates/sig-wasm/src/lib.rs`** — new `modal_analysis(opts_json)` entry (mode count, printed flag,
+- **`crates/filasim-wasm/src/lib.rs`** — new `modal_analysis(opts_json)` entry (mode count, printed flag,
   perimeters/line-width like the others); returns frequencies + transferred mode-shape buffers.
 - **`web/src/worker/engine.worker.ts`** — `"modalAnalysis"` request variant + handler; stash each
   mode shape keyed `modal::mode-{i}`.
@@ -171,7 +171,7 @@ Q1 picked constrained modal and deferred free-free. Added on request: a **"Uncon
 checkbox (Verify panel, modal only). An unsupported part has a **singular `K`** (6 rigid-body modes
 at λ = 0), which inverse iteration cannot invert.
 
-- **Method — soft anchor springs (`sig_core::modal::rigid_body_anchor_springs`).** Weak isotropic
+- **Method — soft anchor springs (`filasim_core::modal::rigid_body_anchor_springs`).** Weak isotropic
   ground springs (`k ≈ 1e-4·E·h`) at the ± extreme active node of each axis lift the 6 rigid-body
   modes to low-but-nonzero frequencies so `K` becomes SPD. **Reuses the existing spring machinery**,
   which already coarsens correctly through the multigrid hierarchy — *zero* `mg.rs` surgery. (An exact
@@ -190,7 +190,7 @@ inexact, on a clustered/slender part (a pipe's degenerate bending pair) the subs
 so it took ~50 outer iterations × `p` columns × several V-cycles = **~3800 V-cycles → ~10 min** on a
 258k-cell pipe (and the first, fully-converged, version was ~30 min).
 
-Rewrote the eigensolver as **LOBPCG** (`crates/sig-core/src/modal.rs`) — block, preconditioned by a
+Rewrote the eigensolver as **LOBPCG** (`crates/filasim-core/src/modal.rs`) — block, preconditioned by a
 **single multigrid V-cycle** per mode per iteration (`MgSolver::precondition`, a public one-V-cycle
 entry added to `mg.rs`; `apply_k` exposes the matrix-free `K`). Its conjugate search-direction block
 `P` converges clustered modes fast, and there is no inner solve at all. Two further keys:

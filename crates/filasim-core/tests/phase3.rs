@@ -5,19 +5,19 @@
 //! region extraction, 3MF export/import roundtrips (incl. the reference
 //! Cube.3mf sample from OrcaSlicer/Bambu Studio).
 
-use sig_core::attach::{assemble, check_problem, BcKind, BcSpec};
-use sig_core::bins::{
+use filasim_core::attach::{assemble, check_problem, BcKind, BcSpec};
+use filasim_core::bins::{
     assign_bins, assign_bins_mass, cleanup_small_regions, cluster_densities, cluster_levels,
     extract_region, taubin_smooth, RegionMesh,
 };
-use sig_core::mesh::primitives;
-use sig_core::simp::{build_mirror_pairs, classify_cells, evaluate, optimize, OptimizeParams};
-use sig_core::solve::SolveSettings;
-use sig_core::threemf::{
+use filasim_core::mesh::primitives;
+use filasim_core::simp::{build_mirror_pairs, classify_cells, evaluate, optimize, OptimizeParams};
+use filasim_core::solve::SolveSettings;
+use filasim_core::threemf::{
     export_orca_3mf, export_prusa_3mf, export_stl_zip, import_3mf, weld, IndexedMesh,
 };
-use sig_core::zip::{read_zip, ZipWriter};
-use sig_core::{pad_for_levels, solve_static, BoxRegion, StaticProblem, VoxelGrid};
+use filasim_core::zip::{read_zip, ZipWriter};
+use filasim_core::{pad_for_levels, solve_static, BoxRegion, StaticProblem, VoxelGrid};
 use std::collections::HashMap;
 
 fn face_tris(face: usize) -> Vec<u32> {
@@ -28,7 +28,7 @@ fn face_tris(face: usize) -> Vec<u32> {
 struct OptFixture {
     grid: VoxelGrid,
     levels: usize,
-    problem: sig_core::NodeProblem,
+    problem: filasim_core::NodeProblem,
     settings: SolveSettings,
     skin: Vec<u32>,
     design: Vec<u32>,
@@ -193,7 +193,7 @@ fn signed_volume(positions: &[f32], indices: &[u32]) -> f64 {
 /// Diagnostic: A/B the old binning (mass-error k-means on density, nearest
 /// assignment) against the new one (floor-pinned energy-weighted levels,
 /// mass-constrained assignment) on the cantilever fixture. Run with:
-/// cargo test -p sig-core --test phase3 bin_placement_ab -- --ignored --nocapture
+/// cargo test -p filasim-core --test phase3 bin_placement_ab -- --ignored --nocapture
 #[test]
 #[ignore]
 fn bin_placement_ab() {
@@ -474,7 +474,7 @@ fn orca_3mf_roundtrips_through_own_zip_and_import() {
     assert_eq!(stl_entries.len(), 2);
     assert!(stl_entries.iter().any(|(n, _)| n == "modifier_25pct.stl"));
     let (_, stl_bytes) = &stl_entries[0];
-    let parsed = sig_core::TriMesh::from_stl(stl_bytes).unwrap();
+    let parsed = filasim_core::TriMesh::from_stl(stl_bytes).unwrap();
     assert_eq!(parsed.len(), 12);
 }
 
@@ -499,7 +499,7 @@ fn imports_reference_orca_sample() {
 }
 
 /// Diagnostic: print the convergence signals per iteration on the smoke-test
-/// fixture. Run with: cargo test -p sig-core --test phase3 conv_trace -- --ignored --nocapture
+/// fixture. Run with: cargo test -p filasim-core --test phase3 conv_trace -- --ignored --nocapture
 #[test]
 #[ignore]
 fn conv_trace() {
@@ -535,13 +535,13 @@ fn conv_trace() {
 }
 
 /// Diagnostic: MGCG convergence on the 3DBenchy at the app's resolution
-/// presets. Run: cargo test -p sig-core --test phase3 benchy -- --ignored --nocapture
+/// presets. Run: cargo test -p filasim-core --test phase3 benchy -- --ignored --nocapture
 #[test]
 #[ignore]
 fn benchy_convergence() {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../3dbenchy.stl");
     let bytes = std::fs::read(path).expect("3dbenchy.stl in repo root");
-    let mesh = sig_core::TriMesh::from_stl(&bytes).expect("parse benchy");
+    let mesh = filasim_core::TriMesh::from_stl(&bytes).expect("parse benchy");
     let (lo, hi) = mesh.bounds().unwrap();
     let vol = (hi[0] - lo[0]) * (hi[1] - lo[1]) * (hi[2] - lo[2]);
     println!(
@@ -586,7 +586,7 @@ fn benchy_convergence() {
 #[test]
 fn subdivision_preserves_area_and_respects_cap() {
     let m = primitives::boxx([0.0; 3], [40.0, 6.0, 6.0]);
-    let area = |mm: &sig_core::TriMesh| -> f64 {
+    let area = |mm: &filasim_core::TriMesh| -> f64 {
         mm.tris
             .iter()
             .map(|t| {
@@ -623,7 +623,7 @@ fn subdivision_preserves_area_and_respects_cap() {
 
 #[test]
 fn capped_edges_tames_slivers_without_needles() {
-    use sig_core::TriMesh;
+    use filasim_core::TriMesh;
     // A developable-surface sliver like truck emits along a cylinder axis:
     // 100 mm long, 1 mm wide. Barycentric n×n would shatter the 1 mm direction
     // into needles; longest-edge bisection must split ONLY the long edges.
@@ -693,8 +693,8 @@ fn capped_edges_tames_slivers_without_needles() {
 
 #[test]
 fn column_compression_stress_matches_nominal() {
-    use sig_core::solve::{solve_nodes, NodeProblem};
-    use sig_core::stress::{cell_field, FieldKind};
+    use filasim_core::solve::{solve_nodes, NodeProblem};
+    use filasim_core::stress::{cell_field, FieldKind};
     // 8x8x16 mm column, E=2000, clamped bottom, 64 N total down on top:
     // nominal sigma_zz = -64/(8*8) = -1 MPa away from the ends.
     let grid0 = VoxelGrid::solid_box(8, 8, 16, 1.0);
@@ -735,7 +735,7 @@ fn column_compression_stress_matches_nominal() {
 
 #[test]
 fn displacement_sampling_ignores_inactive_nodes() {
-    use sig_core::solve::{active_nodes, Solution};
+    use filasim_core::solve::{active_nodes, Solution};
     // One solid cell at (1,1,1) in an otherwise empty 4^3 grid.
     let mut grid = VoxelGrid::solid_box(4, 4, 4, 1.0);
     grid.scale.iter_mut().for_each(|s| *s = 0.0);
@@ -774,7 +774,7 @@ fn displacement_sampling_ignores_inactive_nodes() {
 
 #[test]
 fn elastic_foundation_settles_by_sigma_over_k() {
-    use sig_core::solve::solve_nodes;
+    use filasim_core::solve::solve_nodes;
     // 10x10x20 mm column standing on an elastic (Winkler) foundation, uniform
     // pressure on top: the base must settle by u = sigma/k and the top adds
     // the column's own elastic shortening sigma*L/E. Validates the area-
@@ -921,7 +921,7 @@ fn symmetry_constraint_yields_mirror_density() {
 
 #[test]
 fn nodal_recovery_averages_adjacent_cells() {
-    use sig_core::stress::recover_nodal;
+    use filasim_core::stress::recover_nodal;
     // 2x1x1 solid cells with values 1 and 3: shared face nodes average to 2,
     // outer nodes keep their cell's value, and a padded void region (the
     // grid is 4 wide) yields NaN on nodes touching no solid cell.

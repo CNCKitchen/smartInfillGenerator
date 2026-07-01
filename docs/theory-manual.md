@@ -1,11 +1,11 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 <!-- Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com> -->
 
-# InFEAll — Theory & Engineering Reference
+# filaSim — Theory & Engineering Reference
 
-*Engine version: `sig-core` (master). Document revised 2026-06-14.*
+*Engine version: `filasim-core` (master). Document revised 2026-06-14.*
 
-This document describes the structural-analysis engine inside InFEAll the way a
+This document describes the structural-analysis engine inside filaSim the way a
 commercial code's theory reference does: the governing equations, material
 models, element formulation, meshing, solver, boundary conditions, the analysis
 types, and — most importantly for an engineer deciding whether to trust a
@@ -18,7 +18,7 @@ It is a companion to:
 - [`DESIGN.md`](../DESIGN.md) — the product design record (the *why* behind the
   decisions summarized here).
 
-> **Status disclaimer.** InFEAll is a fast, voxel-based linear-elastic FEA aimed
+> **Status disclaimer.** filaSim is a fast, voxel-based linear-elastic FEA aimed
 > at *FDM design decisions* (where to put dense infill, how stiff a part is, will
 > it delaminate). It is **not** a certified analysis tool. Safety factors are
 > **advisory**. Read [§12 Assumptions & Limitations](#12-assumptions--limitations)
@@ -46,7 +46,7 @@ It is a companion to:
 
 ## 1. Scope and intended use
 
-InFEAll solves **3-D linear elastostatics** on a regular voxel discretization of
+filaSim solves **3-D linear elastostatics** on a regular voxel discretization of
 a printable part, with a material model that homogenizes FDM sparse infill and
 the solid perimeter/shell structure into per-cell effective stiffnesses. Its two
 jobs are:
@@ -148,8 +148,8 @@ parameterized by Young's modulus `E` and Poisson's ratio `ν`:
 
 The 6×6 Voigt elasticity matrix `C` (engineering shear) has `C[i][i] = λ+2μ` and
 off-diagonal `λ` on the normal block, and `μ` on the three shear diagonals. This
-is implemented exactly once in `ke_hex` (`crates/sig-core/src/fem.rs`) and reused
-for stress recovery (`crates/sig-core/src/stress.rs`).
+is implemented exactly once in `ke_hex` (`crates/filasim-core/src/fem.rs`) and reused
+for stress recovery (`crates/filasim-core/src/stress.rs`).
 
 ### 4.2 Material library
 
@@ -194,7 +194,7 @@ advanced panel. Defaults:
 
 The law is convex for `n > 1` (stiffness-per-gram rises with density). This is
 the physical basis for graded infill and for how the optimizer places density
-bins (§10.3, [`bins.rs`](../crates/sig-core/src/bins.rs)).
+bins (§10.3, [`bins.rs`](../crates/filasim-core/src/bins.rs)).
 
 > **Calibration validity window.** `c, n` are only valid near the layer height /
 > line width at which they were measured. Using them far outside that window
@@ -204,7 +204,7 @@ bins (§10.3, [`bins.rs`](../crates/sig-core/src/bins.rs)).
 ### 4.4 Skin / wall model and composite blend
 
 A printed part is a solid shell around sparse infill. `classify_cells`
-(`crates/sig-core/src/simp.rs`) reproduces the way a slicer builds that shell,
+(`crates/filasim-core/src/simp.rs`) reproduces the way a slicer builds that shell,
 directionally:
 
 - **Walls** (perimeters × line width = `wall_mm`): an **in-plane** band measured
@@ -271,7 +271,7 @@ Stress is screened against two **anisotropic** allowables, reflecting the two
 ways an FDM part fails. Allowables of graded infill scale by the **same**
 Gibson–Ashby relative factor as the stiffness (strength tracks stiffness to first
 order; the skin carries full strength). Implemented in
-`crates/sig-wasm/src/lib.rs`.
+`crates/filasim-wasm/src/lib.rs`.
 
 | SF field | Definition | Failure mode |
 |---|---|---|
@@ -308,7 +308,7 @@ node** (u_x, u_y, u_z) → **24 DOF per element**. Because the mesh is a regular
 voxel grid, every element is a cube of edge `h`; there is no element distortion.
 
 Node ordering (local ξη ζ signs) and the strain-displacement `B` matrix
-(engineering order) are defined in `crates/sig-core/src/fem.rs`. The trilinear
+(engineering order) are defined in `crates/filasim-core/src/fem.rs`. The trilinear
 shape functions are `N_l = ⅛(1+ξξ_l)(1+ηη_l)(1+ζζ_l)`.
 
 ### 5.2 Integration scheme
@@ -363,7 +363,7 @@ matrix-free multigrid solver fast and robust to dirty input.
 ### 6.2 Winding-number voxelization
 
 Cell centers are classified inside/outside by the **generalized winding number**
-(Barill-style dipole BVH, `crates/sig-core/src/bvh.rs`): `|w| ≥ 0.5` ⇒ inside.
+(Barill-style dipole BVH, `crates/filasim-core/src/bvh.rs`): `|w| ≥ 0.5` ⇒ inside.
 This is robust to "triangle soup" — holes, self-intersections, non-manifold
 edges, and even fully inverted (inside-out) normals all voxelize correctly. No
 mesh repair is required from the user.
@@ -384,7 +384,7 @@ exterior cells skip the supersample. The result is stored in `grid.scale`.
 | **Fine** | ~1 M | final verification |
 | **Custom** | user sets `h` (mm) | UI shows implied cell count and warnings |
 
-`pick_voxel_size` (`crates/sig-core/src/voxel.rs`) derives `h` from the bbox
+`pick_voxel_size` (`crates/filasim-core/src/voxel.rs`) derives `h` from the bbox
 volume and target count: `h₀ = (V / target)^{1/3}`. It can **snap** `h` to an
 integer fraction of the wall thickness (`h = wall/k`) so the solid skin is an
 exact number of cell layers (an accuracy nicety once composite skin is on). A
@@ -448,8 +448,8 @@ warning path.
 ### 8.1 The linear system
 
 `K u = f` is solved with a **matrix-free, geometric-multigrid-preconditioned
-conjugate gradient (MGCG)** method (`crates/sig-core/src/mg.rs`,
-`crates/sig-core/src/solve.rs`). `K` is never assembled: the operator `y = Ku` is
+conjugate gradient (MGCG)** method (`crates/filasim-core/src/mg.rs`,
+`crates/filasim-core/src/solve.rs`). `K` is never assembled: the operator `y = Ku` is
 evaluated cell-by-cell from the single reference `KE` scaled by per-cell `eps`,
 with an 8-color parity partition so the scatter-adds parallelize without races.
 
@@ -539,7 +539,7 @@ WebGPU) are noted in the engine notes.
 ## 9. Pre-solve diagnostics
 
 Before solving, the engine runs the checks from `DESIGN.md §6`
-(`crates/sig-core/src/check.rs`):
+(`crates/filasim-core/src/check.rs`):
 
 1. **Disconnected islands.** A 6-connected flood fill over solid cells finds
    separate bodies; **each** island must be independently supported and is
@@ -573,7 +573,7 @@ strain, and SF fields. Entry point `Model::solve` / `solve_static` /
 `Model::solve_printed` solves the part **as it will actually be printed**: skin
 (perimeters × line width, plus top/bottom shells) at 100%, interior at a single
 uniform infill ratio through the calibrated pattern law (§4.3–4.4). It is the
-same machinery as the optimizer's verification solve. This turns InFEAll into a
+same machinery as the optimizer's verification solve. This turns filaSim into a
 general FDM-FEA: stiffness, deflection, mass, and per-cell SF of the printed
 part — its accuracy *is* the accuracy of the E(ρ) calibration. Reports min-SF and
 which limit governs, mass at the print settings, and skin resolution.
@@ -581,7 +581,7 @@ which limit governs, mass at the print settings, and skin resolution.
 ### 10.3 Infill optimization
 
 Continuous, SIMP-style **compliance minimization under a mass budget** using the
-*physical* E(ρ) (`crates/sig-core/src/simp.rs`):
+*physical* E(ρ) (`crates/filasim-core/src/simp.rs`):
 
 - **Objective/update:** minimize compliance `fᵀu` at a target mean interior infill
   (the slider %), via classic **optimality-criteria (OC)** updates with move
@@ -605,7 +605,7 @@ Continuous, SIMP-style **compliance minimization under a mass budget** using the
 - **Region export:** per-bin indicator → marching-tetrahedra isosurface → Taubin
   smoothing → small-region cleanup → slight dilation, emitted as nested
   overlapping modifier meshes (low→high density) so the slicer resolves them with
-  no gaps (`crates/sig-core/src/bins.rs`, `threemf.rs`).
+  no gaps (`crates/filasim-core/src/bins.rs`, `threemf.rs`).
 
 ### 10.4 Minimum member size (printability length scale)
 
@@ -630,7 +630,7 @@ but are **not present today** — do not assume them.
 ### 11.1 Field recovery
 
 Strains are evaluated at **cell centers**, the superconvergent point of the
-trilinear hex, where `dN_l/dx_i = s_li/(4h)` (`crates/sig-core/src/stress.rs`).
+trilinear hex, where `dN_l/dx_i = s_li/(4h)` (`crates/filasim-core/src/stress.rs`).
 Strain is pure kinematics — it carries no `eps` factor and is therefore correct
 even on partially-filled boundary cells. Stresses use the isotropic law (§4.1)
 with a per-cell **effective modulus**.
@@ -651,7 +651,7 @@ density`, where `occupancy` is the finite-cell cut fraction (`grid.scale`, §4.5
 - **Legacy (occupancy-scaled).** Stress uses `E = E₀·eps`, i.e. the exact
   modulus the solve used. Boundary cells then under-read by their occupancy.
 
-`material_factor` (`crates/sig-core/src/stress.rs`) builds the decoupled factor;
+`material_factor` (`crates/filasim-core/src/stress.rs`) builds the decoupled factor;
 the toggle is display-side only (`set_material_stress`). The **safety factor is
 identical in both modes** — the allowable scales by the *same* factor as the
 stress, so it cancels (§4.7). For a binned-infill cell either mode reports the

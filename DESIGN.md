@@ -1,7 +1,8 @@
-# InFEAll — Design Document
+# filaSim — Design Document
 
-*Resolved via design interview, 2026-06-10. Named **InFEAll** on 2026-06-12 (working name
-was "Smart Infill Generator"); the GitHub repo / deploy path still carry the old slug.*
+*Resolved via design interview, 2026-06-10. Renamed to **filaSim** on 2026-07-01
+(previously "InFEAll", named 2026-06-12; original working name "Smart Infill
+Generator"). The GitHub repo / Cloudflare deploy path still carry the old slugs.*
 
 ## 1. Product definition
 
@@ -277,7 +278,7 @@ Reference points:
     (Kt within ~1–3% on the fillet where binary conventions over-read 12–28%, because occupancy
     derating tempers the staircase stress spikes). The floor removes the lone pure-inflate
     coarse-mesh sliver false-alarm (min-SF dip) while costing ~1% volume. The harness stays in
-    the tree (`cargo test -p sig-core --test meshbench -- --ignored --nocapture`) so any future
+    the tree (`cargo test -p filasim-core --test meshbench -- --ignored --nocapture`) so any future
     change is one command from re-validation.
 - **Custom analysis resolution (2026-06):** the Preview/Normal/Fine presets (~100k/300k/1M
   cells) gained a "Custom…" option where the user sets the CELL SIZE h in mm (seeded from
@@ -297,7 +298,7 @@ Reference points:
   is blocked inside wasm, so a postMessage can never arrive mid-call — instead the UI
   thread sets a SharedArrayBuffer flag (available because the site already ships COOP/COEP
   for threaded wasm; without isolation the Stop button hides). The wasm side installs a
-  thread-local checker (`sig_core::cancel`); the MGCG loop polls it every CG iteration and
+  thread-local checker (`filasim_core::cancel`); the MGCG loop polls it every CG iteration and
   the SIMP loop every outer iteration, surfacing a `Cancelled` error ("■ Stop" button in
   the busy chip → "Solve/Optimization stopped." notice, no error toast). The partial CG
   iterate is kept as a warm start for the next run; the flag re-arms at the start of every
@@ -475,7 +476,7 @@ panel. Fallback pattern law: conservative generic n = 2.
   Real fix before re-enabling = re-tessellate analytic
   faces (cylinder/cone/plane) ourselves in their natural 2D parameter space from
   truck's correct BREP + boundary polylines (the surface vertices truck emits are
-  exactly on the true surface). Dev scaffolding kept: `sig-wasm` debug exports
+  exactly on the true surface). Dev scaffolding kept: `filasim-wasm` debug exports
   `step_face_report` / `step_face_stl`, harness `stepnode_test.mjs`.
 - Self-weight: engine supports it, UI hides it (negligible for desktop plastic prints; revisit for large/heavy parts).
 
@@ -530,7 +531,7 @@ a resolution/geometry change clears the stash (every result is stale anyway). Ve
 solve/optimize touches with regbench + the wasm smoke test (the pipeline change only
 stops discarding two vectors — the numerics are byte-identical).
 
-## 12. Project save / load — `.infeall` files (interview 2026-06-16)
+## 12. Project save / load — `.filasim` files (interview 2026-06-16)
 
 **Problem.** Work was ephemeral — reload the page and the model, loads, settings,
 and results were gone. Users need to save and reopen a project.
@@ -542,8 +543,8 @@ and results were gone. Users need to save and reopen a project.
 | 3 | Results-excluded reopen | **Keep the optimized design.** The compact density field is always saved, so a small file still restores the optimized design (Density/Regions + 3MF re-export); deflection recomputes when you re-run Optimize. |
 | 4 | Heavy data | Just the **displacement vector per result** (+ its `eps`). Stress/strain/SF derive from displacement on the fly, so they're never stored. |
 
-**File format** — one **stored-zip** (`sig_core::zip`, the same writer behind the 3MF
-export), extension `.infeall`:
+**File format** — one **stored-zip** (`filasim_core::zip`, the same writer behind the 3MF
+export), extension `.filasim`:
 - `project.json` — schema + app version, all session settings (material/curve *values*
   used — self-contained), the loads/supports (triangle indices), the cumulative
   orientation matrix, the `optSummary`/region densities, and the result roster (metadata
@@ -601,7 +602,7 @@ thing.)
 | 8 | Results & step-through | One `ResultEntry` per **(kind, step)**, tagged with an optional `loadStepId` (existing entries → null/global). A **load-step selector** in the Results view, orthogonal to the kind picker; reuses `activate_result`. Per-step buffers preloaded when steps ≤ 5, lazy beyond. |
 | 9 | Envelope result | A client-side reduction over the per-step buffers → per-vertex **max von Mises / min safety factor** ("does the part survive ANY load?"), shown as a pseudo-step in the selector. The view the user usually acts on. |
 | 10 | Legend | **Shared fixed color range across all steps** so magnitudes compare honestly (today the legend auto-ranges per result, Viewer.tsx:362-365) + a small **"fit" button** by the legend that rescales to the current step on demand. Deform exaggeration stays global (`referenceMaxDisp`, store.ts:1039) so deflections are comparable. |
-| 11 | Persistence | **STAY at `PROJECT_SCHEMA = 1`** (the loader hard-rejects schemaVersion > 1, store.ts:2610); add an **optional** `loadSteps` field to the manifest. The loader synthesizes a single step from `mf.bcs` when it's absent → existing `.infeall` files AND single-step new files interoperate across versions; only multi-step files need new code. BCs are re-id'd on load (store.ts:2623), so serialize override keys by BC order and remap after re-id; re-id step ids too. |
+| 11 | Persistence | **STAY at `PROJECT_SCHEMA = 1`** (the loader hard-rejects schemaVersion > 1, store.ts:2610); add an **optional** `loadSteps` field to the manifest. The loader synthesizes a single step from `mf.bcs` when it's absent → existing `.filasim` files AND single-step new files interoperate across versions; only multi-step files need new code. BCs are re-id'd on load (store.ts:2623), so serialize override keys by BC order and remap after re-id; re-id step ids too. |
 | 12 | Naming | Internally rename the wizard "Step" concept to **"Station"** (`activeStation`, etc.) to kill the clash with the FEA "Load step"; user-facing FEA term stays **"Load step"**. (Falls back to "Load case" for the FEA term if a code-wide rename is too invasive in the moment.) |
 
 **Build order** (each milestone shippable, each gated by regbench + the wasm smoke test per

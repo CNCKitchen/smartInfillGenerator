@@ -6,8 +6,8 @@
 //!   2. Cantilever MGCG solves at 131k and ~1.05M cells, with the
 //!      Timoshenko-ratio printed as a built-in correctness check.
 
-use sig_core::mesh::primitives;
-use sig_core::{solve_static, BoxRegion, SolveSettings, StaticProblem, VoxelGrid};
+use filasim_core::mesh::primitives;
+use filasim_core::{solve_static, BoxRegion, SolveSettings, StaticProblem, VoxelGrid};
 use std::time::Instant;
 
 fn bench_voxelize() {
@@ -97,10 +97,10 @@ fn bench_benchy() {
             return;
         }
     };
-    let mesh = sig_core::mesh::TriMesh::from_stl(&bytes).expect("benchy parse");
+    let mesh = filasim_core::mesh::TriMesh::from_stl(&bytes).expect("benchy parse");
     let (lo, hi) = mesh.bounds().unwrap();
     let vol = (hi[0] - lo[0]) * (hi[1] - lo[1]) * (hi[2] - lo[2]);
-    let h = sig_core::voxel::pick_voxel_size(vol, vol, 300_000.0, 0.0);
+    let h = filasim_core::voxel::pick_voxel_size(vol, vol, 300_000.0, 0.0);
     let t0 = Instant::now();
     let grid = VoxelGrid::voxelize(&mesh, h);
     let t_vox = t0.elapsed();
@@ -133,7 +133,7 @@ fn bench_benchy() {
     // None-check — what every normal solve pays.
     if std::env::var("SIG_PROGRESS").is_ok() {
         let buf = std::cell::RefCell::new(Vec::<f32>::with_capacity(1024));
-        sig_core::progress::set_sink(Some(Box::new(move |trace: &[f32]| {
+        filasim_core::progress::set_sink(Some(Box::new(move |trace: &[f32]| {
             let mut b = buf.borrow_mut();
             b.clear();
             b.extend_from_slice(trace);

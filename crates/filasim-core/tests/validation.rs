@@ -10,10 +10,10 @@
 //! 6. Winding-number robustness: holes, flipped normals, degenerate triangles.
 //! 7. Voxelizer volume accuracy on a sphere; STL parser roundtrips.
 
-use sig_core::fem::{ke_hex, NODE_OFFSETS};
-use sig_core::mesh::{primitives, TriMesh};
-use sig_core::mg::{Level, MgSolver};
-use sig_core::{solve_static, BoxRegion, SolveSettings, StaticProblem, VoxelGrid};
+use filasim_core::fem::{ke_hex, NODE_OFFSETS};
+use filasim_core::mesh::{primitives, TriMesh};
+use filasim_core::mg::{Level, MgSolver};
+use filasim_core::{solve_static, BoxRegion, SolveSettings, StaticProblem, VoxelGrid};
 
 // ---------- helpers ----------
 
@@ -373,7 +373,7 @@ fn cantilever_matches_timoshenko_and_converges() {
 
 #[test]
 fn winding_number_closed_open_flipped() {
-    use sig_core::bvh::WindingBvh;
+    use filasim_core::bvh::WindingBvh;
     let cube = primitives::boxx([0.0; 3], [10.0; 3]);
     let bvh = WindingBvh::build(&cube);
     assert!((bvh.winding_number([5.0, 5.0, 5.0]) - 1.0).abs() < 1e-3);

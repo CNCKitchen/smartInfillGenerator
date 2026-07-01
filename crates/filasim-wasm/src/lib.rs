@@ -1,24 +1,24 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
 
-//! WASM API for the InFEAll web app.
+//! WASM API for the filaSim web app.
 //!
 //! One `Model` instance lives in a web worker and owns mesh, segmentation,
 //! voxel grid, boundary conditions, and the last solution. Bulk data crosses
 //! the boundary as typed arrays; small results as JSON strings.
 
-use sig_core::attach::{assemble, check_problem, BcKind, BcSpec};
-use sig_core::bins::{extract_iso, extract_region, taubin_smooth, RegionMesh};
-use sig_core::mesh::TriMesh;
-use sig_core::pipeline::{smooth_regions, solid_keep_bins};
-use sig_core::segment::{segment, Segmentation};
-use sig_core::simp::OptimizeParams;
-use sig_core::solve::{
+use filasim_core::attach::{assemble, check_problem, BcKind, BcSpec};
+use filasim_core::bins::{extract_iso, extract_region, taubin_smooth, RegionMesh};
+use filasim_core::mesh::TriMesh;
+use filasim_core::pipeline::{smooth_regions, solid_keep_bins};
+use filasim_core::segment::{segment, Segmentation};
+use filasim_core::simp::OptimizeParams;
+use filasim_core::solve::{
     active_nodes, pad_for_levels, solve_nodes_cached, SolveSettings, Solution, SolverCache,
 };
-use sig_core::stress::{cell_field_eigen, material_factor, recover_nodal, FieldKind};
-use sig_core::threemf::{export_orca_3mf, export_stl_zip, import_3mf, weld};
-use sig_core::voxel::VoxelGrid;
+use filasim_core::stress::{cell_field_eigen, material_factor, recover_nodal, FieldKind};
+use filasim_core::threemf::{export_orca_3mf, export_stl_zip, import_3mf, weld};
+use filasim_core::voxel::VoxelGrid;
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
@@ -62,7 +62,7 @@ fn resolve_wall(perimeters: u32, line_width: f64) -> (u32, f64) {
 /// loop) — the checker is thread-local.
 #[wasm_bindgen]
 pub fn set_cancel_flag(flag: js_sys::Int32Array) {
-    sig_core::cancel::set_checker(Some(Box::new(move || flag.get_index(0) != 0)));
+    filasim_core::cancel::set_checker(Some(Box::new(move || flag.get_index(0) != 0)));
 }
 
 /// Install the live residual-progress buffer: views over a SharedArrayBuffer
@@ -77,7 +77,7 @@ pub fn set_cancel_flag(flag: js_sys::Int32Array) {
 #[wasm_bindgen]
 pub fn set_progress_buffer(count: js_sys::Int32Array, data: js_sys::Float32Array) {
     let cap = data.length();
-    sig_core::progress::set_sink(Some(Box::new(move |trace: &[f32]| {
+    filasim_core::progress::set_sink(Some(Box::new(move |trace: &[f32]| {
         let n = (trace.len() as u32).min(cap);
         // Copy into a length-matched view: `Float32Array::copy_from` asserts
         // dest.len() == src.len(), so we slice the buffer to exactly `n` (the
@@ -184,15 +184,15 @@ pub fn step_face_stl(bytes: &[u8], surface_deviation: f64, face_id: u32) -> Resu
         .filter(|(_, &f)| f == face_id)
         .map(|(t, _)| *t)
         .collect();
-    Ok(sig_core::mesh::TriMesh::from_triangles(tris).to_stl_binary())
+    Ok(filasim_core::mesh::TriMesh::from_triangles(tris).to_stl_binary())
 }
 
 #[cfg(feature = "step")]
 fn step_import_inner(
     bytes: &[u8],
     surface_deviation: f64,
-) -> Result<sig_core::step::StepImport, JsError> {
-    use sig_core::step::{import_step, StepTessellation};
+) -> Result<filasim_core::step::StepImport, JsError> {
+    use filasim_core::step::{import_step, StepTessellation};
     let settings = StepTessellation {
         surface_deviation: (surface_deviation > 0.0).then_some(surface_deviation),
         ..Default::default()
@@ -215,7 +215,7 @@ fn import_any(bytes: &[u8]) -> Result<(TriMesh, usize, Option<Vec<u32>>), JsValu
     {
         let head = &bytes[..bytes.len().min(256)];
         if head.windows(12).any(|w| w == b"ISO-10303-21") {
-            use sig_core::step::{import_step, StepTessellation};
+            use filasim_core::step::{import_step, StepTessellation};
             let imp = import_step(bytes, &StepTessellation::default()).map_err(err)?;
             return Ok((imp.mesh, imp.shell_count.max(1), Some(imp.face_of_tri)));
         }
@@ -264,7 +264,7 @@ struct OptOutput {
     /// after the run (a higher value keeps less material). Default 0.5.
     iso_threshold: f64,
     // ---- project-save snapshot: the inputs needed to re-derive this design's
-    // regions + stress eps on reload (and re-verify it), so a `.infeall` file
+    // regions + stress eps on reload (and re-verify it), so a `.filasim` file
     // stores only a compact density field, not the heavy region meshes. ----
     /// Bin index per design cell (parallel to `design_cells`).
     bins: Vec<u8>,
@@ -491,7 +491,7 @@ fn cell_activated(grid: &VoxelGrid, ci: usize, active: &[bool]) -> bool {
 /// (`grid_eps`) rather than collapsing to zero. Void coarse cells stay 0. Used
 /// to carry the optimized infill density into the coarser build-sim grid.
 fn resample_eps(fine: &VoxelGrid, fine_eps: &[f32], coarse: &VoxelGrid) -> Vec<f32> {
-    let occ = sig_core::solve::grid_eps(coarse);
+    let occ = filasim_core::solve::grid_eps(coarse);
     let mut out = vec![0f32; coarse.cell_count()];
     for cz in 0..coarse.nz {
         for cy in 0..coarse.ny {
@@ -708,7 +708,7 @@ fn remap_segmentation(orig: &Segmentation, parents: &[u32]) -> Segmentation {
     }
 }
 
-// ---- project (.infeall) binary serialization ----
+// ---- project (.filasim) binary serialization ----
 
 const DESIGN_MAGIC: &[u8; 4] = b"SIGD";
 
@@ -798,7 +798,7 @@ impl<'a> Reader<'a> {
     fn tag(&mut self, expect: &[u8; 4]) -> Result<(), JsValue> {
         self.need(4)?;
         if &self.b[self.p..self.p + 4] != expect {
-            return Err(err("not a valid InFEAll project (bad design magic)"));
+            return Err(err("not a valid filaSim project (bad design magic)"));
         }
         self.p += 4;
         Ok(())
@@ -831,22 +831,22 @@ fn design_blob(opt: &OptOutput) -> Vec<u8> {
     v
 }
 
-/// Read the manifest (project.json) out of a `.infeall` project file.
+/// Read the manifest (project.json) out of a `.filasim` project file.
 #[wasm_bindgen]
 pub fn project_manifest(bytes: &[u8]) -> Result<String, JsValue> {
-    let entries = sig_core::zip::read_zip(bytes).map_err(|e| err(format!("{e:?}")))?;
+    let entries = filasim_core::zip::read_zip(bytes).map_err(|e| err(format!("{e:?}")))?;
     for (name, data) in entries {
         if name == "project.json" {
             return String::from_utf8(data).map_err(err);
         }
     }
-    Err(err("not an InFEAll project (no project.json)"))
+    Err(err("not a filaSim project (no project.json)"))
 }
 
 /// Extract the embedded original model bytes from a project file.
 #[wasm_bindgen]
 pub fn project_model(bytes: &[u8]) -> Result<Vec<u8>, JsValue> {
-    let entries = sig_core::zip::read_zip(bytes).map_err(|e| err(format!("{e:?}")))?;
+    let entries = filasim_core::zip::read_zip(bytes).map_err(|e| err(format!("{e:?}")))?;
     for (name, data) in entries {
         if name.starts_with("model.") {
             return Ok(data);
@@ -1218,9 +1218,9 @@ impl Model {
     /// cylindricity residual is within tolerance — the front end uses it to
     /// accept/reject a bearing-load selection and to draw the axis glyph.
     pub fn fit_cylinder(&self, tris: &[u32]) -> String {
-        match sig_core::attach::fit_selection_cylinder(&self.mesh, tris) {
+        match filasim_core::attach::fit_selection_cylinder(&self.mesh, tris) {
             Some(c) => {
-                let ok = c.residual.is_finite() && c.residual <= sig_core::cylinder::DEFAULT_TOL;
+                let ok = c.residual.is_finite() && c.residual <= filasim_core::cylinder::DEFAULT_TOL;
                 format!(
                     "{{\"ok\":{},\"axis\":[{},{},{}],\"point\":[{},{},{}],\"radius\":{},\"residual\":{}}}",
                     ok,
@@ -1283,7 +1283,7 @@ impl Model {
             } else {
                 bbox_vol
             };
-            sig_core::voxel::pick_voxel_size(
+            filasim_core::voxel::pick_voxel_size(
                 fill_vol,
                 bbox_vol,
                 self.target_cells as f64,
@@ -1371,7 +1371,7 @@ impl Model {
         Ok(out)
     }
 
-    /// FDM build simulation (inherent strain, see `sig_core::buildsim`): predict
+    /// FDM build simulation (inherent strain, see `filasim_core::buildsim`): predict
     /// warping + bed peel from the current voxelization. Ignores structural BCs —
     /// the only "loads" are the per-layer eigenstrain and the build plate. Leaves
     /// the chosen state (released = off-bed sprung shape, or bonded) as the live
@@ -1416,7 +1416,7 @@ impl Model {
         // responds to geometry/infill density (otherwise a uniform eigenstrain
         // releases to the same density-blind compatible shrink).
         let yield_strength = (opts.yield_strength > 0.0).then_some(opts.yield_strength);
-        let r = sig_core::buildsim::solve_build_progress(
+        let r = filasim_core::buildsim::solve_build_progress(
             &grid,
             eigen,
             &self.settings,
@@ -1508,7 +1508,7 @@ impl Model {
         let (gnx, gny, gnz, gh) = (grid.nx, grid.ny, grid.nz, grid.h);
         // Keep the coarse grid + the eps/eigen it was solved with so residual
         // print-stress fields can be evaluated on the SAME grid + state later.
-        self.build_eps = Some(eps_override.unwrap_or_else(|| sig_core::solve::grid_eps(&grid)));
+        self.build_eps = Some(eps_override.unwrap_or_else(|| filasim_core::solve::grid_eps(&grid)));
         self.build_eigen = eigen;
         self.build_grid = Some(grid);
         // Keep BOTH states so the UI can flip on bed ⇄ released with no re-solve.
@@ -1681,12 +1681,12 @@ impl Model {
         // A part thinner than the wall everywhere simply prints solid —
         // design is empty and the solve degenerates to the solid case.
         let split =
-            sig_core::simp::classify_cells(grid, wall_mm, tb_mm, tb_mm, self.composite_skin);
+            filasim_core::simp::classify_cells(grid, wall_mm, tb_mm, tb_mm, self.composite_skin);
         let (skin, design, skin_frac) = (split.skin, split.design, split.skin_frac);
         let x = vec![infill; design.len()];
         let eps =
-            sig_core::simp::build_eps(grid, &skin, &design, &skin_frac, &x, eval_exp, eval_coeff);
-        let (sol, _compliance) = sig_core::simp::solve_with_eps_cached(
+            filasim_core::simp::build_eps(grid, &skin, &design, &skin_frac, &x, eval_exp, eval_coeff);
+        let (sol, _compliance) = filasim_core::simp::solve_with_eps_cached(
             &mut self.solver_cache,
             grid,
             *levels,
@@ -1738,7 +1738,7 @@ impl Model {
         Ok(out)
     }
 
-    /// Constrained undamped modal analysis (`sig_core::modal`): the lowest
+    /// Constrained undamped modal analysis (`filasim_core::modal`): the lowest
     /// `num_modes` natural frequencies + mode shapes of the part as supported by
     /// the CURRENT `bcs` (the store sets these to the first load case before the
     /// call). Force-free — loads are ignored; only supports constrain the
@@ -1774,7 +1774,7 @@ impl Model {
                 ));
             }
             let (eps, vfrac) = if opts.solid {
-                (sig_core::solve::grid_eps(grid), grid.scale.clone())
+                (filasim_core::solve::grid_eps(grid), grid.scale.clone())
             } else {
                 let eval_exp = opts.exponent.clamp(1.0, 3.5);
                 let eval_coeff = opts.coeff.clamp(0.05, 2.0);
@@ -1784,10 +1784,10 @@ impl Model {
                 .min(5.0);
                 let infill = (opts.infill_pct / 100.0).clamp(0.01, 1.0);
                 let split =
-                    sig_core::simp::classify_cells(grid, wall_mm, tb_mm, tb_mm, self.composite_skin);
+                    filasim_core::simp::classify_cells(grid, wall_mm, tb_mm, tb_mm, self.composite_skin);
                 let (skin, design, skin_frac) = (split.skin, split.design, split.skin_frac);
                 let x = vec![infill; design.len()];
-                let eps = sig_core::simp::build_eps(
+                let eps = filasim_core::simp::build_eps(
                     grid, &skin, &design, &skin_frac, &x, eval_exp, eval_coeff,
                 );
                 // Material volume fraction per cell for the lumped mass: solid
@@ -1807,7 +1807,7 @@ impl Model {
                 // invertible (the unsupported part has a singular stiffness).
                 // Weak (≈1e-4·E·h) so the flexible frequencies are ~unperturbed.
                 let k = 1e-4 * self.settings.e0 * grid.h;
-                let anchors = sig_core::modal::rigid_body_anchor_springs(
+                let anchors = filasim_core::modal::rigid_body_anchor_springs(
                     grid.nx + 1,
                     grid.ny + 1,
                     grid.nz + 1,
@@ -1830,7 +1830,7 @@ impl Model {
             )
         };
 
-        let cfg = sig_core::modal::ModalConfig::new(n_compute);
+        let cfg = filasim_core::modal::ModalConfig::new(n_compute);
         // Stream the current Ritz frequency estimates to JS once per outer step
         // (live progress / convergence readout).
         let progress = |outer: usize, max_outer: usize, freqs: &[f64]| {
@@ -1842,7 +1842,7 @@ impl Model {
                 &arr,
             );
         };
-        let res = sig_core::modal::analyze(&mut cache.solver, &vfrac, self.density, &cfg, progress)
+        let res = filasim_core::modal::analyze(&mut cache.solver, &vfrac, self.density, &cfg, progress)
             .map_err(err)?;
 
         // Free-free: drop the lowest modes (the lifted rigid-body modes), keeping
@@ -1927,7 +1927,7 @@ impl Model {
         if !report.ok {
             return Err(err("model is under-constrained — run check() for details"));
         }
-        let (sol, _compliance) = sig_core::simp::solve_with_eps_cached(
+        let (sol, _compliance) = filasim_core::simp::solve_with_eps_cached(
             &mut self.solver_cache,
             grid,
             *levels,
@@ -1997,7 +1997,7 @@ impl Model {
         self.build_eps = None;
     }
 
-    /// Assemble a `.infeall` project zip: the original model bytes, the JS-built
+    /// Assemble a `.filasim` project zip: the original model bytes, the JS-built
     /// manifest (settings + BCs + result roster), the compact optimized design,
     /// and — when `include_results` — every stashed result's displacement + eps.
     pub fn export_project(
@@ -2007,7 +2007,7 @@ impl Model {
         manifest: &str,
         include_results: bool,
     ) -> Vec<u8> {
-        let mut zip = sig_core::zip::ZipWriter::new();
+        let mut zip = filasim_core::zip::ZipWriter::new();
         zip.add(model_entry, model_bytes);
         zip.add("project.json", manifest.as_bytes());
         if let Some(opt) = &self.opt {
@@ -2052,7 +2052,7 @@ impl Model {
 
         let split = {
             let (grid, _) = self.grid.as_ref().unwrap();
-            sig_core::simp::classify_cells(grid, wall_mm, tb_mm, tb_mm, self.composite_skin)
+            filasim_core::simp::classify_cells(grid, wall_mm, tb_mm, tb_mm, self.composite_skin)
         };
         let (skin, design, skin_frac) = (split.skin, split.design, split.skin_frac);
         if design.len() != x_binned.len()
@@ -2083,19 +2083,19 @@ impl Model {
                 let inside = |ci: usize| -> bool {
                     bin_of_cell.get(&(ci as u32)).is_some_and(|&b| b as usize >= level)
                 };
-                let mut r = sig_core::bins::extract_region(grid, &inside, 0.4);
+                let mut r = filasim_core::bins::extract_region(grid, &inside, 0.4);
                 if r.indices.is_empty() {
                     continue;
                 }
                 r.density = centers[level];
                 regions_raw.push(r);
             }
-            let eps = sig_core::simp::build_eps(
+            let eps = filasim_core::simp::build_eps(
                 grid, &skin, &design, &skin_frac, &x_binned_f64, eval_exp, eval_coeff,
             );
             (regions_raw, eps)
         };
-        let regions = sig_core::pipeline::smooth_regions(&regions_raw, smooth_iters as usize);
+        let regions = filasim_core::pipeline::smooth_regions(&regions_raw, smooth_iters as usize);
         self.solution = None;
         self.solution_eps = Some(eps);
         // A restored design is evaluable under every load step too (DESIGN §13).
@@ -2164,7 +2164,7 @@ impl Model {
     /// { restoredResults: [...ids], hasDesign }.
     pub fn restore_project(&mut self, project_bytes: &[u8]) -> Result<String, JsValue> {
         self.ensure_grid()?;
-        let entries = sig_core::zip::read_zip(project_bytes).map_err(|e| err(format!("{e:?}")))?;
+        let entries = filasim_core::zip::read_zip(project_bytes).map_err(|e| err(format!("{e:?}")))?;
         for (name, data) in &entries {
             if name == "design.bin" {
                 self.restore_optimization(data)?;
@@ -2297,7 +2297,7 @@ impl Model {
         if !report.ok {
             return Err(err("model is under-constrained — fix the setup first (run Check)"));
         }
-        let mut load_set = sig_core::simp::LoadSet::default();
+        let mut load_set = filasim_core::simp::LoadSet::default();
         if !self.load_cases.is_empty() {
             load_set.primary_weight = self.load_cases[0].1;
             for (case_bcs, w) in &self.load_cases[1..] {
@@ -2354,7 +2354,7 @@ impl Model {
         // ---- pipeline (core) ----
         // The orchestration — goal-match budget secant, binning, the binned
         // verification + uniform/solid reference solves, and region extraction —
-        // lives in sig_core::pipeline::run_optimization. This adapter resolves
+        // lives in filasim_core::pipeline::run_optimization. This adapter resolves
         // params (above), marshals the per-iteration callback to JS, and
         // serializes the outcome. The grid/mesh borrows are disjoint fields from
         // the &mut solver_cache the pipeline takes.
@@ -2372,8 +2372,8 @@ impl Model {
                 Some(l)
             }
         });
-        let cfg = sig_core::pipeline::PipelineCfg {
-            eval: sig_core::pipeline::EvalLaw { exp: eval_exp, coeff: eval_coeff },
+        let cfg = filasim_core::pipeline::PipelineCfg {
+            eval: filasim_core::pipeline::EvalLaw { exp: eval_exp, coeff: eval_coeff },
             goal_match,
             ref_frac,
             n_bins,
@@ -2384,7 +2384,7 @@ impl Model {
         let max_iter = params.max_iter;
         // Isosurface threshold for the live "shape emerging" preview.
         const SKEL_DENSITY: f64 = 0.4;
-        let oc = sig_core::pipeline::run_optimization(
+        let oc = filasim_core::pipeline::run_optimization(
             &mut self.solver_cache,
             grid,
             *levels,
@@ -2870,7 +2870,7 @@ impl Model {
         let pattern = opt.solid_pattern.as_deref();
         let thumb = if thumbnail.is_empty() { None } else { Some(thumbnail) };
         Ok(match slicer {
-            "prusa" => sig_core::threemf::export_prusa_3mf(
+            "prusa" => filasim_core::threemf::export_prusa_3mf(
                 name,
                 &part,
                 &opt.regions,
@@ -2948,7 +2948,7 @@ impl Model {
         let fine2 = fine_edge * fine_edge;
         const MAX_TRIS: usize = 700_000;
         let (mut mesh, met) =
-            sig_core::threemf::subdivide_to_edge_checked(&welded, coarse, MAX_TRIS);
+            filasim_core::threemf::subdivide_to_edge_checked(&welded, coarse, MAX_TRIS);
         if !met {
             console_warn("color-3MF: surface too large to refine fully; band edges may coarsen");
         }
@@ -2965,9 +2965,9 @@ impl Model {
             let vfield = self.field_at_points(kind, &pts)?;
             let band: Vec<u32> = vfield
                 .iter()
-                .map(|&s| sig_core::threemf::band_index(lo, hi, steps, s))
+                .map(|&s| filasim_core::threemf::band_index(lo, hi, steps, s))
                 .collect();
-            let (next, split) = sig_core::threemf::subdivide_pass(&mesh, |v, a, b| {
+            let (next, split) = filasim_core::threemf::subdivide_pass(&mesh, |v, a, b| {
                 if band[a as usize] == band[b as usize] {
                     return false; // not on a band seam
                 }
@@ -2987,7 +2987,7 @@ impl Model {
             pts.extend_from_slice(v);
         }
         let vscalars = self.field_at_points(kind, &pts)?;
-        let (cut_pos, cut_band) = sig_core::threemf::isoband_cut_indexed(
+        let (cut_pos, cut_band) = filasim_core::threemf::isoband_cut_indexed(
             &mesh.vertices,
             &mesh.triangles,
             &vscalars,
@@ -2997,7 +2997,7 @@ impl Model {
         );
         let name = if self.name.is_empty() { "part" } else { &self.name };
         let thumb = if thumbnail.is_empty() { None } else { Some(thumbnail) };
-        Ok(sig_core::threemf::export_color_3mf(name, &cut_pos, &cut_band, &colors, thumb))
+        Ok(filasim_core::threemf::export_color_3mf(name, &cut_pos, &cut_band, &colors, thumb))
     }
 
     /// Per-corner scalar field (3 values/triangle) sampled at an arbitrary
@@ -3092,7 +3092,7 @@ impl Model {
         self.ensure_grid()?;
         let (grid, _) = self.grid.as_ref().unwrap();
         let tb = top_bottom_mm.clamp(0.0, 5.0);
-        let split = sig_core::simp::classify_cells(
+        let split = filasim_core::simp::classify_cells(
             grid,
             wall_mm.clamp(WALL_MM.0, WALL_MM.1),
             tb,
@@ -3471,8 +3471,8 @@ fn sample_field_static(
 
 // ---- Phase-1 raw benchmark exports (used by wasm-bench.js via raw cargo build) ----
 
-use sig_core::mesh::primitives;
-use sig_core::{solve_static, BoxRegion, StaticProblem};
+use filasim_core::mesh::primitives;
+use filasim_core::{solve_static, BoxRegion, StaticProblem};
 
 #[no_mangle]
 pub extern "C" fn bench_voxelize(h: f64) -> u32 {

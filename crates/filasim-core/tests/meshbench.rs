@@ -15,13 +15,13 @@
 //! production voxel.rs is untouched. Occupancy is supersampled finely here so
 //! the convention's BIAS is what's measured, not occupancy quantization.
 //!
-//! Run:  cargo test -p sig-core --test meshbench -- --ignored --nocapture
+//! Run:  cargo test -p filasim-core --test meshbench -- --ignored --nocapture
 
-use sig_core::bvh::WindingBvh;
-use sig_core::mesh::{primitives, TriMesh};
-use sig_core::solve::{active_nodes, grid_eps};
-use sig_core::stress::{cell_field, FieldKind};
-use sig_core::{
+use filasim_core::bvh::WindingBvh;
+use filasim_core::mesh::{primitives, TriMesh};
+use filasim_core::solve::{active_nodes, grid_eps};
+use filasim_core::stress::{cell_field, FieldKind};
+use filasim_core::{
     pad_for_levels, solve_nodes, solve_static, BoxRegion, NodeProblem, SolveSettings,
     StaticProblem, VoxelGrid,
 };

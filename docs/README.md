@@ -1,9 +1,9 @@
 <!-- SPDX-License-Identifier: AGPL-3.0-only -->
 <!-- Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com> -->
 
-# InFEAll — Technical Documentation
+# filaSim — Technical Documentation
 
-Engineering documentation for the InFEAll structural-analysis engine, written for
+Engineering documentation for the filaSim structural-analysis engine, written for
 **structural/mechanical engineers** who need to know what the tool computes, how,
 and where its limits are — the same ground a commercial code covers in its theory
 and verification manuals.
@@ -29,7 +29,7 @@ and verification manuals.
 
 ## Scope in one paragraph
 
-InFEAll is a browser-based, voxel-discretized **linear-elastic static** FEA for
+filaSim is a browser-based, voxel-discretized **linear-elastic static** FEA for
 FDM parts. It homogenizes sparse infill and the printed shell into per-cell
 effective stiffnesses, solves with a matrix-free multigrid CG, and reports
 displacement, stress/strain, and FDM-specific (bulk + inter-layer) safety

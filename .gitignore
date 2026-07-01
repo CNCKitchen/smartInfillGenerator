@@ -10,7 +10,7 @@ node_modules/
 /web/public/wasm-mt/
 
 # STEP-import dev harness build (stepnode_test.mjs builds this pkg)
-/crates/sig-wasm/pkg-stepnode/
+/crates/filasim-wasm/pkg-stepnode/
 
 # TypeScript incremental build cache (tsc -b)
 *.tsbuildinfo

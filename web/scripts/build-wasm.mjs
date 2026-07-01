@@ -18,7 +18,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const crate = path.resolve(here, "../../crates/sig-wasm");
+const crate = path.resolve(here, "../../crates/filasim-wasm");
 
 function run(cmd, env = {}) {
   console.log(`\n> ${cmd}`);

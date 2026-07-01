@@ -233,7 +233,7 @@ export interface ResultEntry {
 const RESULT_ORDER: ResultKind[] = ["optimized", "uniform", "asprinted", "solid", "modal"];
 
 /** Engine stash key for a (kind, load step). With a single load step we keep
- *  the BARE kind so the stash key, the result roster, and saved `.infeall`
+ *  the BARE kind so the stash key, the result roster, and saved `.filasim`
  *  files are byte-identical to the pre-load-step model. Only once a project has
  *  more than one step do results become per-step (`kind::stepId`). */
 function resultStashId(kind: ResultKind, stepId: string, singleStep: boolean): string {
@@ -856,11 +856,11 @@ interface AppState {
    *  discrete Bambu/Orca filament bands across the active contour min/max, on
    *  the original undeformed mesh. Only meaningful in the results view. */
   downloadColorThreeMf(): Promise<void>;
-  /** Save the whole project as a `.infeall` file. `includeResults` embeds the
+  /** Save the whole project as a `.filasim` file. `includeResults` embeds the
    *  FEA displacement buffers (instant reopen) — off keeps the file small and
    *  restores the optimized design only. */
   saveProject(includeResults: boolean): Promise<void>;
-  /** Open a `.infeall` project: restore model, settings, design, and results. */
+  /** Open a `.filasim` project: restore model, settings, design, and results. */
   openProject(file: File): Promise<void>;
   setViewMode(mode: ViewMode): Promise<void>;
   setWireframe(on: boolean): void;
@@ -2084,7 +2084,7 @@ async function stashOptimizedSteps(
 }
 
 /** Single-step (or single-load) optimize result roster — byte-identical to the
- *  pre-load-step model and old `.infeall` files: one bare `optimized` stash plus
+ *  pre-load-step model and old `.filasim` files: one bare `optimized` stash plus
  *  the equal-mass uniform + solid baselines (infill modes), tagged with the sole
  *  (active) load step. */
 async function stashOptimizedSingle(set: SetState, get: () => AppState, out: OptimizeOutput) {
@@ -2260,7 +2260,7 @@ async function stashOptimizedMultiStep(set: SetState, get: () => AppState, out: 
   sceneEvents.onDisplacements?.(disp, { maxDisplacement: referenceMaxDisp(roster) });
 }
 
-// ---- project (.infeall) save / load ----
+// ---- project (.filasim) save / load ----
 
 const PROJECT_SCHEMA = 1;
 const APP_VERSION = "0.1.0";
@@ -4375,7 +4375,7 @@ export const useStore = create<AppState>((set, get) => ({
         viewMode: "infill",
         // converged:true here is the OPTIMIZER's design-stationarity, not the
         // binned verification solve's MGCG convergence (the engine hardcodes
-        // that — see crates/sig-wasm/src/lib.rs Solution after the opt loop).
+        // that — see crates/filasim-wasm/src/lib.rs Solution after the opt loop).
         // The dock keys its non-convergence banner off optSummary.converged;
         // surfacing the verification residual needs the deferred wasm change.
         stats: {
@@ -4554,7 +4554,7 @@ export const useStore = create<AppState>((set, get) => ({
       const transform = await engine.transformMatrix();
       const ext = /\.3mf$/i.test(s.fileName) ? "3mf" : "stl";
       const manifest: ProjectManifest = {
-        app: "InFEAll",
+        app: "filaSim",
         schemaVersion: PROJECT_SCHEMA,
         appVersion: APP_VERSION,
         fileName: s.fileName,
@@ -4570,7 +4570,7 @@ export const useStore = create<AppState>((set, get) => ({
       };
       const bytes = await engine.exportProject(JSON.stringify(manifest), `model.${ext}`, includeResults);
       const base = s.fileName.replace(/\.(stl|3mf)$/i, "");
-      download(bytes, `${base}.infeall`, "application/octet-stream");
+      download(bytes, `${base}.filasim`, "application/octet-stream");
       set({
         busy: null,
         notice: includeResults
@@ -4588,11 +4588,11 @@ export const useStore = create<AppState>((set, get) => ({
       const bytes = await file.arrayBuffer();
       const { manifest, model: mi } = await engine.openProjectModel(bytes);
       const mf = JSON.parse(manifest) as ProjectManifest;
-      if (mf.app !== "InFEAll" || typeof mf.schemaVersion !== "number") {
-        throw new Error("Not an InFEAll project file.");
+      if (mf.app !== "filaSim" || typeof mf.schemaVersion !== "number") {
+        throw new Error("Not a filaSim project file.");
       }
       if (mf.schemaVersion > PROJECT_SCHEMA) {
-        throw new Error("This project was saved by a newer version of InFEAll — please update to open it.");
+        throw new Error("This project was saved by a newer version of filaSim — please update to open it.");
       }
       const st = mf.settings;
       const model: LoadedModel = {

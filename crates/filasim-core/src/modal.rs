@@ -668,7 +668,7 @@ mod tests {
     }
 
     // Profiling harness for the real user scenario: pipe.stl, lower face fixed,
-    // 6 modes. Run with:  cargo test -p sig-core --lib --release pipe_modal_profile -- --ignored --nocapture
+    // 6 modes. Run with:  cargo test -p filasim-core --lib --release pipe_modal_profile -- --ignored --nocapture
     #[test]
     #[ignore]
     fn pipe_modal_profile() {

@@ -73,14 +73,14 @@ self.onmessage = async (e) => {
   try {
     const stl = await (await fetch("/3dbenchy.stl")).arrayBuffer();
 
-    const st = await import("../src/wasm/sig_wasm.js");
+    const st = await import("../src/wasm/filasim_wasm.js");
     const stWasm = await st.default();
     runCases(stWasm, "single-thread", post);
     await runBenchy(st, "single-thread", post, stl);
 
     if (self.crossOriginIsolated) {
       post({ label: "status", name: "loading mt module" });
-      const mt = await import("/wasm-mt/sig_wasm.js");
+      const mt = await import("/wasm-mt/filasim_wasm.js");
       const mtWasm = await mt.default();
       const threads = Math.max(1, e.data.threads || 4);
       post({ label: "status", name: `mt loaded, initThreadPool(${threads})` });

@@ -7,12 +7,12 @@
 //! NOTE: single-shot scales the H ~uniformly (bonded adds a bed-pinned tilt);
 //! the *distinct cross-bar shrink line* is a sequential-activation effect and
 //! will appear once the layer loop lands. These files are the baseline to
-//! contrast against. Run: `cargo run -p sig-core --bin buildsim_h [out_dir]`.
+//! contrast against. Run: `cargo run -p filasim-core --bin buildsim_h [out_dir]`.
 
-use sig_core::buildsim::{
+use filasim_core::buildsim::{
     deformed_hull_stl, h_grid, solve_bonded, solve_sequential_bonded, solve_warp,
 };
-use sig_core::solve::SolveSettings;
+use filasim_core::solve::SolveSettings;
 use std::path::PathBuf;
 
 fn main() {

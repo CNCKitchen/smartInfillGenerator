@@ -67,7 +67,7 @@ This is permanently guarded by the convergence assertion in
 ## Architecture as built
 
 ```
-crates/sig-core        engine library (no_std-free, zero GPL deps; rayon optional)
+crates/filasim-core        engine library (no_std-free, zero GPL deps; rayon optional)
   mesh.rs              TriMesh + robust STL reader (binary/ASCII/dirty)
   bvh.rs               triangle BVH + fast winding numbers (Barill-style dipoles)
   voxel.rs             |w|≥0.5 voxelization
@@ -76,7 +76,7 @@ crates/sig-core        engine library (no_std-free, zero GPL deps; rayon optiona
                        rediscretized geometric multigrid, mixed-precision MGCG
   solve.rs             padding, BC regions, force assembly, Solution queries
   bin/bench.rs         the numbers above
-crates/sig-wasm        C-ABI cdylib benchmark surface (92 KiB)
+crates/filasim-wasm        C-ABI cdylib benchmark surface (92 KiB)
 wasm-bench.js          Node harness
 ```
 
