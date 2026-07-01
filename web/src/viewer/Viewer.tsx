@@ -583,7 +583,7 @@ function MeshLegend() {
     <div className="legend">
       <div className="legendtitle">Analysis mesh</div>
       <div className="legendnote">
-        {voxelInfo.solid.toLocaleString()} hex cells
+        {voxelInfo.solid.toLocaleString()} voxels
         <br />
         h = {format(voxelInfo.h, "length")}
         <br />

@@ -15,6 +15,7 @@ import { LoadStepsModal } from "./ui/LoadSteps";
 import { ImprintModal } from "./ui/Imprint";
 import { Disclaimer } from "./ui/Disclaimer";
 import { SupportBanner } from "./ui/SupportBanner";
+import { SupportModal } from "./ui/SupportModal";
 import { NerdLog } from "./ui/NerdLog";
 import { Viewer } from "./viewer/Viewer";
 import { useStore } from "./store";
@@ -70,6 +71,7 @@ export function App() {
       <ImportUnitsModal />
       <LoadStepsModal />
       <ImprintModal />
+      <SupportModal />
       <Disclaimer />
     </div>
   );

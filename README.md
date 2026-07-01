@@ -142,6 +142,25 @@ node smoke-wasm.mjs                                               # full-pipelin
 cd web && npm run build                                           # production build
 ```
 
+### Pre-push gate
+
+Run before a major push — one command, one green/red verdict:
+
+```sh
+node scripts/preflight.mjs        # cargo test + regbench --check + wasm smoke (+ fmt/clippy advisory)
+```
+
+Hard gates (fail the run): `cargo test`, `regbench --check`, the wasm smoke test.
+Advisory (reported, never block): `cargo fmt --check`, `cargo clippy`.
+
+`regbench` is the physics-and-speed regression harness ([crates/filasim-core/src/bin/regbench.rs](crates/filasim-core/src/bin/regbench.rs)). It runs the voxelizer, a Timoshenko cantilever, the SIMP optimizer, and the **beam suite** — a 64×8×4 mm cantilever in tension, bending, and 6-mode modal, as **solid** and **uniform 30 % infill**, at two mesh sizes. Its `QUALITY` metrics fail `--check` if the physics drifts past `--tol` (default 0.5 %); `INFO` timings/iteration counts are reported with a delta but never fail. Regenerate the committed baseline after an intentional physics change:
+
+```sh
+cargo run --release -p filasim-core --bin regbench -- --save crates/filasim-core/tests/regbench-baseline.tsv
+```
+
+The strongest check is the mesh-independent solid↔infill ratio: because both share a mesh, discretization cancels and the ratio must equal the exact `E(ρ)=x^1.5` / mass-`x` closed form (deflection ×6.086, frequency ×0.740 at x=0.3).
+
 ## State / known limitations
 
 - Phases 1–4 of DESIGN.md are implemented and tested (engine: 24 tests; full

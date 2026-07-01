@@ -125,21 +125,26 @@ impl VoxelGrid {
             if all_same {
                 return if self_in { 1.0 } else { 0.0 };
             }
-            let mut inside = 0u32;
+            // The 27 subsample points all lie in one cell, so they share almost
+            // the entire BVH descent — evaluate them in one traversal instead of
+            // 27 independent root-to-leaf walks (bit-for-bit the same result).
+            let mut pts = [[0f64; 3]; 27];
+            let mut k = 0;
             for a in 0..3 {
                 for b in 0..3 {
                     for c in 0..3 {
-                        let q = [
+                        pts[k] = [
                             ox + (cx as f64 + (2 * a + 1) as f64 / 6.0) * h,
                             oy + (cy as f64 + (2 * b + 1) as f64 / 6.0) * h,
                             oz + (cz as f64 + (2 * c + 1) as f64 / 6.0) * h,
                         ];
-                        if bvh.winding_number(q).abs() >= 0.5 {
-                            inside += 1;
-                        }
+                        k += 1;
                     }
                 }
             }
+            let mut w = [0f64; 27];
+            bvh.winding_number_batch(&pts, &mut w);
+            let inside = w.iter().filter(|&&x| x.abs() >= 0.5).count() as u32;
             let occ = inside as f32 / 27.0;
             if occ >= BOUNDARY_FLOOR {
                 occ

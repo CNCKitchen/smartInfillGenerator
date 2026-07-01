@@ -52,8 +52,7 @@ export function StatusStrip() {
           <b>
             {v.nx}×{v.ny}×{v.nz}
           </b>{" "}
-          · <b>{Math.round(v.solid / 1000)}k</b> solid of{" "}
-          <b>{Math.round(v.cells / 1000)}k</b> cells · h <b>{format(v.h, "length")}</b>
+          · <b>{Math.round(v.solid / 1000)}k</b> voxels · h <b>{format(v.h, "length")}</b>
         </div>
       )}
       {bp && (

@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+<!-- Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com> -->
+<!--
+  COLOUR + TYPE DRAFTS · brand-blue accent options and typeface options for
+  filaSim. Self-contained — open directly in a browser (fonts pull from Google
+  Fonts). Two independent choices:
+    · ACCENT  — three-variable swap (--accent, --accent-d, --accent-soft).
+    · TYPEFACE — three-role swap (--ui body, --cond labels, --mono data).
+  Pick a font at the top; every card below re-renders in it so you can judge it
+  on the real palette. Swapping the live theme = editing those vars in styles.css
+  (and the @font-face block + /fonts files for a new typeface).
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>filaSim — colour &amp; type drafts</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link
+  href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600;700&family=Barlow+Semi+Condensed:wght@500;600&family=B612+Mono:wght@400;700&family=Roboto:wght@400;500;700&family=Roboto+Condensed:wght@500;600&family=Roboto+Mono:wght@400;700&family=Libre+Franklin:wght@400;500;600;700&family=Archivo:wght@400;500;600;700&family=Archivo+Narrow:wght@600&family=Inter:wght@400;500;600;700&display=swap"
+  rel="stylesheet"
+/>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 24px 28px 60px;
+    font-size: 13px;
+    color: #26282a;
+    background: #d7d6d0;
+  }
+  /* the whole stage inherits the currently-selected typeface roles */
+  #stage {
+    --ui: "Barlow", system-ui, sans-serif;
+    --cond: "Barlow Semi Condensed", var(--ui);
+    --mono: "B612 Mono", ui-monospace, monospace;
+    font-family: var(--ui);
+  }
+  h1 { font-family: var(--ui); font-size: 20px; margin: 0 0 4px; }
+  .sub { font-family: var(--ui); color: #6a6d70; margin: 0 0 18px; font-size: 13px; max-width: 780px; line-height: 1.5; }
+  code { font-family: var(--mono); font-size: 12px; }
+
+  /* ---- typeface picker ---- */
+  .fontbar {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    padding: 12px 14px;
+    margin-bottom: 18px;
+    background: #fcfcfa;
+    border: 1px solid #b5b4ad;
+    border-radius: 8px;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+  }
+  .fontbar .lbl {
+    font-family: var(--ui);
+    font-size: 11px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: 0.12em; color: #75787b;
+    margin-right: 4px;
+  }
+  .fontbar button {
+    font: inherit; font-size: 13px;
+    padding: 7px 13px;
+    border: 1px solid #cfcec7; border-radius: 4px;
+    background: #fff; color: #26282a; cursor: pointer;
+  }
+  .fontbar button small { color: #8a8d90; font-weight: 400; }
+  .fontbar button:hover { border-color: #b5b4ad; }
+  .fontbar button.sel {
+    background: #1877c0; border-color: #1877c0; color: #fff;
+  }
+  .fontbar button.sel small { color: #cfe3f4; }
+
+  /* ---- big type specimen (selected font, brand-blue chassis) ---- */
+  .specimen {
+    --accent: #1877c0; --accent-d: #12629f;
+    display: grid; grid-template-columns: 1.1fr 1fr; gap: 22px;
+    padding: 20px 22px;
+    margin-bottom: 24px;
+    background: #e7e6e1;
+    border: 1px solid #b5b4ad; border-radius: 8px;
+  }
+  .specimen .big {
+    font-family: var(--ui);
+    font-size: 46px; font-weight: 700; line-height: 1; letter-spacing: -0.01em;
+    margin: 0 0 6px;
+  }
+  .specimen .big b { color: var(--accent); }
+  .specimen .glyphs { font-family: var(--ui); font-size: 18px; color: #4a4d4f; letter-spacing: 0.01em; }
+  .specimen .rolebox { display: flex; flex-direction: column; gap: 12px; justify-content: center; }
+  .specimen .role { display: flex; flex-direction: column; gap: 3px; }
+  .specimen .role .tag {
+    font-family: var(--ui);
+    font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.14em; color: #9a9d9f;
+  }
+  .specimen .r-ui { font-family: var(--ui); font-size: 15px; }
+  .specimen .r-cond { font-family: var(--cond); font-size: 15px; text-transform: uppercase; letter-spacing: 0.1em; font-weight: 600; color: #75787b; }
+  .specimen .r-mono { font-family: var(--mono); font-size: 15px; }
+  .specimen .fontname { font-family: var(--ui); font-weight: 600; font-size: 13px; color: #1877c0; }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+    gap: 20px;
+  }
+
+  /* ---- one theme card: the warm-gray "werkbank" chassis ---- */
+  .card {
+    --chassis: #e7e6e1;
+    --panel: #fcfcfa;
+    --well: #efeee9;
+    --line: #cfcec7;
+    --line-strong: #b5b4ad;
+    --ink: #26282a;
+    --dim: #75787b;
+    --lcd-bg: #20241f;
+    --lcd: #c9e89b;
+    background: var(--chassis);
+    border: 1px solid var(--line-strong);
+    border-radius: 8px;
+    overflow: hidden;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.12);
+    font-family: var(--ui);
+  }
+
+  /* ---- accent presets ---- */
+  .orange    { --accent: #e06a13; --accent-d: #c25709; --accent-soft: #f7e3d2; }
+  .brand     { --accent: #1877c0; --accent-d: #12629f; --accent-soft: #d9e8f5; }
+  .cobalt    { --accent: #1f7fdb; --accent-d: #1668ba; --accent-soft: #dcebfa; }
+  .azure     { --accent: #14608f; --accent-d: #0f4d73; --accent-soft: #d5e3ee; }
+  .steel     { --accent: #3a719b; --accent-d: #2d5b7f; --accent-soft: #dde7ee; }
+  /* Cool-chassis variant: neutral (blue-leaning) grays instead of warm ones. */
+  .cool {
+    --chassis: #e4e6e9;
+    --panel: #fbfcfd;
+    --well: #eceef1;
+    --line: #cbced3;
+    --line-strong: #b0b4ba;
+    --accent: #1877c0; --accent-d: #12629f; --accent-soft: #dae8f6;
+  }
+
+  .cardhead {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    padding: 11px 14px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--line);
+  }
+  .cardhead b { font-size: 14px; }
+  .cardhead .hex { font-family: var(--mono); font-size: 11px; color: var(--dim); }
+
+  .swatches { display: flex; gap: 0; height: 30px; }
+  .swatches span { flex: 1; }
+
+  .body { padding: 14px; display: flex; flex-direction: column; gap: 12px; }
+
+  /* toolbar row: brandmark + primary + toggles */
+  .toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .brandmark {
+    width: 30px; height: 30px; border-radius: 3px;
+    background: var(--accent); color: #fff;
+    display: grid; place-items: center;
+    font-family: var(--cond);
+    font-weight: 700; font-size: 12px;
+  }
+  button {
+    font: inherit; font-size: 12px;
+    padding: 6px 12px;
+    border: 1px solid var(--line-strong);
+    border-radius: 3px;
+    background: var(--panel);
+    color: var(--ink);
+    cursor: pointer;
+  }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button.primary:hover { background: var(--accent-d); border-color: var(--accent-d); }
+  button.on { background: var(--ink); border-color: var(--ink); color: #fff; }
+
+  /* viewmodes cluster (floating pill) */
+  .viewmodes {
+    display: inline-flex; gap: 2px; padding: 3px;
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 3px; box-shadow: 0 1px 4px rgba(0,0,0,.1);
+  }
+  .viewmodes button { border: none; padding: 4px 11px; color: var(--dim); background: none; border-radius: 2px; }
+  .viewmodes button.on { background: var(--ink); color: #fff; }
+
+  /* input with accent focus ring */
+  .field { display: flex; flex-direction: column; gap: 5px; }
+  .field label { font-family: var(--cond); font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: .1em; }
+  input.txt {
+    font: inherit; font-family: var(--mono); padding: 7px 9px;
+    border: 1px solid var(--accent);
+    border-radius: 3px;
+    background: var(--panel);
+    box-shadow: 0 0 0 1px var(--accent), 0 1px 3px rgba(0,0,0,.08);
+    outline: none;
+  }
+
+  /* selected-material soft tint */
+  .matrow {
+    display: flex; align-items: center; gap: 10px;
+    padding: 9px 11px;
+    border: 1px solid var(--accent);
+    border-radius: 3px;
+    background: var(--accent-soft);
+  }
+  .matrow .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accent); }
+  .matrow small { color: var(--dim); margin-left: auto; font-family: var(--mono); }
+
+  /* slider */
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+
+  /* link + DRO readout */
+  .footrow { display: flex; align-items: center; justify-content: space-between; }
+  a { color: var(--accent-d); font-weight: 600; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .dro {
+    font-family: var(--mono);
+    background: var(--lcd-bg); color: var(--lcd);
+    padding: 5px 10px; border-radius: 3px; font-size: 12px;
+  }
+</style>
+</head>
+<body>
+<div id="stage">
+  <h1>filaSim — colour &amp; type drafts</h1>
+  <p class="sub">
+    Accent is decided (brand blue). Now the <b>typeface</b>: pick one below and
+    every card re-renders in it. Each font sets three roles — <b>body</b> UI text,
+    a <b>condensed</b> face for small-caps labels, and a <b>mono</b> face for data
+    readouts. You mentioned Roboto and a gothic sans; both are here (I read
+    “gothic sans” as Franklin Gothic — <code>Libre Franklin</code> — with Archivo
+    and Inter as neighbours).
+  </p>
+
+  <div class="fontbar" id="fontbar">
+    <span class="lbl">Typeface</span>
+  </div>
+
+  <div class="specimen" id="specimen"></div>
+
+  <div class="grid" id="grid"></div>
+</div>
+
+  <script>
+    // Each font defines the three type roles the app uses. Where a family has no
+    // condensed or mono cut, we borrow a compatible neighbour (noted per font).
+    const FONTS = {
+      barlow: {
+        name: "Barlow", note: "current — self-hosted",
+        ui: '"Barlow", system-ui, sans-serif',
+        cond: '"Barlow Semi Condensed", "Barlow", sans-serif',
+        mono: '"B612 Mono", ui-monospace, monospace',
+      },
+      roboto: {
+        name: "Roboto", note: "your video font",
+        ui: '"Roboto", system-ui, sans-serif',
+        cond: '"Roboto Condensed", "Roboto", sans-serif',
+        mono: '"Roboto Mono", ui-monospace, monospace',
+      },
+      franklin: {
+        name: "Libre Franklin", note: "gothic sans (Franklin Gothic)",
+        ui: '"Libre Franklin", system-ui, sans-serif',
+        cond: '"Libre Franklin", sans-serif',
+        mono: '"Roboto Mono", ui-monospace, monospace',
+      },
+      archivo: {
+        name: "Archivo", note: "grotesque gothic",
+        ui: '"Archivo", system-ui, sans-serif',
+        cond: '"Archivo Narrow", "Archivo", sans-serif',
+        mono: '"Roboto Mono", ui-monospace, monospace',
+      },
+      inter: {
+        name: "Inter", note: "modern neo-grotesque",
+        ui: '"Inter", system-ui, sans-serif',
+        cond: '"Inter", sans-serif',
+        mono: '"Roboto Mono", ui-monospace, monospace',
+      },
+    };
+
+    const stage = document.getElementById("stage");
+    function applyFont(key) {
+      const f = FONTS[key];
+      stage.style.setProperty("--ui", f.ui);
+      stage.style.setProperty("--cond", f.cond);
+      stage.style.setProperty("--mono", f.mono);
+      document.querySelectorAll(".fontbar button").forEach((b) =>
+        b.classList.toggle("sel", b.dataset.key === key)
+      );
+      renderSpecimen(f);
+    }
+
+    // font picker buttons
+    document.getElementById("fontbar").insertAdjacentHTML(
+      "beforeend",
+      Object.entries(FONTS)
+        .map(([k, f]) => `<button data-key="${k}">${f.name} <small>· ${f.note}</small></button>`)
+        .join("")
+    );
+    document.querySelectorAll(".fontbar button").forEach((b) =>
+      b.addEventListener("click", () => applyFont(b.dataset.key))
+    );
+
+    function renderSpecimen(f) {
+      document.getElementById("specimen").innerHTML = `
+        <div>
+          <div class="big">fila<b>Sim</b></div>
+          <div class="glyphs">ABCDEFGHIJKLM abcdefghijklm 0123456789 · µ Ω σ ± → N·mm</div>
+          <div class="fontname" style="margin-top:10px">${f.name} — ${f.note}</div>
+        </div>
+        <div class="rolebox">
+          <div class="role"><span class="tag">Body / UI</span><span class="r-ui">Run analysis · Optimize infill · Displacement 0.42 mm</span></div>
+          <div class="role"><span class="tag">Condensed label</span><span class="r-cond">Force magnitude · Material · Boundary conditions</span></div>
+          <div class="role"><span class="tag">Mono data (DRO)</span><span class="r-mono">σ 24.6 MPa   SF 1.83   E 3.2 GPa</span></div>
+        </div>`;
+    }
+
+    const THEMES = [
+      { cls: "orange", name: "Current — Anodized Orange", hex: "#e06a13", sw: ["#e06a13","#c25709","#f7e3d2"] },
+      { cls: "brand",  name: "Brand Blue (logo match)",   hex: "#1877c0", sw: ["#1877c0","#12629f","#d9e8f5"] },
+      { cls: "cobalt", name: "Bright Cobalt (punchier)",  hex: "#1f7fdb", sw: ["#1f7fdb","#1668ba","#dcebfa"] },
+      { cls: "azure",  name: "Deep Azure (instrument)",   hex: "#14608f", sw: ["#14608f","#0f4d73","#d5e3ee"] },
+      { cls: "steel",  name: "Steel Blue (muted)",        hex: "#3a719b", sw: ["#3a719b","#2d5b7f","#dde7ee"] },
+      { cls: "cool",   name: "Brand Blue + Cool Chassis",  hex: "#1877c0", sw: ["#1877c0","#12629f","#dae8f6"] },
+    ];
+    const card = (t) => `
+      <div class="card ${t.cls}">
+        <div class="cardhead"><b>${t.name}</b><span class="hex">${t.hex}</span></div>
+        <div class="swatches">${t.sw.map(c => `<span style="background:${c}"></span>`).join("")}</div>
+        <div class="body">
+          <div class="toolbar">
+            <div class="brandmark">FS</div>
+            <button class="primary">Run analysis</button>
+            <div class="viewmodes">
+              <button class="on">Setup</button><button>Mesh</button><button>Results</button>
+            </div>
+          </div>
+          <div class="field">
+            <label>Force magnitude (N)</label>
+            <input class="txt" value="250" />
+          </div>
+          <div class="matrow">
+            <span class="dot"></span> PLA — selected
+            <small>E&nbsp;3.2&nbsp;GPa</small>
+          </div>
+          <input type="range" min="0" max="100" value="62" />
+          <div class="footrow">
+            <a href="#">Visit CNCKitchen.STORE →</a>
+            <span class="dro">σ 24.6 MPa</span>
+          </div>
+        </div>
+      </div>`;
+    document.getElementById("grid").innerHTML = THEMES.map(card).join("");
+
+    applyFont("roboto"); // start on a video font so the change is obvious
+  </script>
+</body>
+</html>

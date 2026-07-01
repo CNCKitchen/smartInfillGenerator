@@ -31,7 +31,7 @@ export function SupportBanner() {
     <div className="supportbanner">
       <span>
         Support this tool? Shop at{" "}
-        <a href="https://cnckitchen.store" target="_blank" rel="noopener noreferrer">
+        <a href="https://geni.us/CNCStoreSim" target="_blank" rel="noopener noreferrer">
           CNCKitchen.STORE
         </a>{" "}
         or send a tip via{" "}

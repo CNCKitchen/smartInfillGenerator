@@ -186,18 +186,17 @@ impl WindingBvh {
             stack.push(0);
             while let Some(idx) = stack.pop() {
                 let node = &self.nodes[idx as usize];
-                let d = dist(&node.centroid, &q);
-                if node.count == 0 && d > BETA * node.radius {
-                    // Far field: dipole approximation  w += A·(c - q) / (4π |c-q|³)
-                    let r3 = d * d * d;
-                    let dx =
-                        [node.centroid[0] - q[0], node.centroid[1] - q[1], node.centroid[2] - q[2]];
-                    acc += (node.area_normal[0] * dx[0]
-                        + node.area_normal[1] * dx[1]
-                        + node.area_normal[2] * dx[2])
-                        / (4.0 * std::f64::consts::PI * r3);
-                } else if node.count > 0 {
-                    if d > BETA * node.radius && node.radius > 0.0 {
+                // Far-field test in SQUARED distance: internal near nodes (the
+                // common case) just recurse and never need the sqrt. When a node
+                // IS far we compute d = sqrt(d2) and r3 = d*d*d exactly as before,
+                // so the dipole sum is bit-identical to the plain-distance form.
+                let bt = BETA * node.radius;
+                let d2 = dist2(&node.centroid, &q);
+                let far = d2 > bt * bt;
+                if node.count == 0 {
+                    if far {
+                        // Far field: dipole  w += A·(c - q) / (4π |c-q|³)
+                        let d = d2.sqrt();
                         let r3 = d * d * d;
                         let dx = [
                             node.centroid[0] - q[0],
@@ -209,17 +208,93 @@ impl WindingBvh {
                             + node.area_normal[2] * dx[2])
                             / (4.0 * std::f64::consts::PI * r3);
                     } else {
-                        for ti in node.start..node.start + node.count {
-                            acc += solid_angle(&self.tris[ti as usize], &q);
-                        }
+                        stack.push(node.left);
+                        stack.push(node.right);
                     }
+                } else if far && node.radius > 0.0 {
+                    let d = d2.sqrt();
+                    let r3 = d * d * d;
+                    let dx = [
+                        node.centroid[0] - q[0],
+                        node.centroid[1] - q[1],
+                        node.centroid[2] - q[2],
+                    ];
+                    acc += (node.area_normal[0] * dx[0]
+                        + node.area_normal[1] * dx[1]
+                        + node.area_normal[2] * dx[2])
+                        / (4.0 * std::f64::consts::PI * r3);
                 } else {
-                    stack.push(node.left);
-                    stack.push(node.right);
+                    for ti in node.start..node.start + node.count {
+                        acc += solid_angle(&self.tris[ti as usize], &q);
+                    }
                 }
             }
             acc
         })
+    }
+
+    /// Winding numbers for a batch of nearby query points sharing ONE BVH
+    /// descent. Used by voxelization's occupancy pass, where the 3×3×3 = 27
+    /// subsample points of a boundary cell all lie within one cell and thus
+    /// visit almost the same nodes. Each point still makes its own far/near
+    /// decision per node (so the result matches `winding_number` up to float
+    /// summation order), but the traversal — node fetches, stack work, and the
+    /// far-subtree pruning — is done once for the whole batch instead of 27×.
+    /// `out` is filled with one winding number per point (len must equal `pts`).
+    pub fn winding_number_batch(&self, pts: &[[f64; 3]], out: &mut [f64]) {
+        debug_assert_eq!(pts.len(), out.len());
+        debug_assert!(pts.len() <= 64, "batch buffer holds 64 points");
+        for o in out.iter_mut() {
+            *o = 0.0;
+        }
+        let mut active = [0u8; 64];
+        for (k, a) in active.iter_mut().enumerate().take(pts.len()) {
+            *a = k as u8;
+        }
+        self.wn_batch(0, pts, out, &active[..pts.len()]);
+    }
+
+    fn wn_batch(&self, idx: u32, pts: &[[f64; 3]], out: &mut [f64], active: &[u8]) {
+        let node = &self.nodes[idx as usize];
+        let is_leaf = node.count > 0;
+        let bt = BETA * node.radius;
+        let bt2 = bt * bt;
+        // Partition the active points: those for which this node is far take the
+        // dipole here and drop out (they are far for the whole subtree too);
+        // the rest stay active for the children / leaf triangles.
+        let mut near = [0u8; 64];
+        let mut nn = 0usize;
+        for &pi in active {
+            let p = &pts[pi as usize];
+            let d2 = dist2(&node.centroid, p);
+            if d2 > bt2 && (!is_leaf || node.radius > 0.0) {
+                let d = d2.sqrt();
+                let r3 = d * d * d;
+                let dx = [node.centroid[0] - p[0], node.centroid[1] - p[1], node.centroid[2] - p[2]];
+                out[pi as usize] += (node.area_normal[0] * dx[0]
+                    + node.area_normal[1] * dx[1]
+                    + node.area_normal[2] * dx[2])
+                    / (4.0 * std::f64::consts::PI * r3);
+            } else {
+                near[nn] = pi;
+                nn += 1;
+            }
+        }
+        if nn == 0 {
+            return;
+        }
+        let near = &near[..nn];
+        if is_leaf {
+            for ti in node.start..node.start + node.count {
+                let t = &self.tris[ti as usize];
+                for &pi in near {
+                    out[pi as usize] += solid_angle(t, &pts[pi as usize]);
+                }
+            }
+        } else {
+            self.wn_batch(node.left, pts, out, near);
+            self.wn_batch(node.right, pts, out, near);
+        }
     }
 }
 
@@ -285,10 +360,15 @@ fn tri_area_vector_f64(t: &[f64; 9]) -> [f64; 3] {
 }
 
 fn dist(a: &[f64; 3], b: &[f64; 3]) -> f64 {
+    dist2(a, b).sqrt()
+}
+
+#[inline]
+fn dist2(a: &[f64; 3], b: &[f64; 3]) -> f64 {
     let dx = a[0] - b[0];
     let dy = a[1] - b[1];
     let dz = a[2] - b[2];
-    (dx * dx + dy * dy + dz * dz).sqrt()
+    dx * dx + dy * dy + dz * dz
 }
 
 fn sub3(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {

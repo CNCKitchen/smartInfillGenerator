@@ -11,17 +11,49 @@
 //!     delta vs the baseline so a slowdown is visible, but never fails the run
 //!     (machine noise / thread-count differences would make that flaky).
 //!
+//! Fixtures: sphere voxelize + Timoshenko cantilever + SIMP optimize, plus the
+//! BEAM SUITE (`bench_beam_suite`) — a 64×8×4 mm cantilever in tension, bending,
+//! and 6-mode modal, run SOLID and at uniform 30 % INFILL at two mesh sizes, and
+//! the 3DBenchy voxelization at two resolutions. The beam suite's headline Q is
+//! the mesh-independent solid↔infill ratio, which must hit the exact E(ρ)/mass
+//! closed form (see DESIGN.md §14).
+//!
 //! Usage (run from the repo root; release build for realistic timing):
 //!   cargo run --release -p filasim-core --bin regbench -- --save baseline.tsv
 //!   cargo run --release -p filasim-core --bin regbench -- --check baseline.tsv
 //!   ... add --big for the ~1M-cell solve (the perf worst case), --tol 0.01 to loosen.
+//!
+//! Usually invoked via `node scripts/preflight.mjs` (the pre-push gate).
 
 use filasim_core::attach::{assemble, BcKind, BcSpec};
 use filasim_core::bins::{assign_bins_mass, cleanup_small_regions, cluster_levels};
 use filasim_core::mesh::primitives;
+use filasim_core::modal::{analyze, ModalConfig};
 use filasim_core::simp::{evaluate, optimize, OptimizeParams};
-use filasim_core::{pad_for_levels, solve_static, BoxRegion, SolveSettings, StaticProblem, VoxelGrid};
+use filasim_core::solve::{active_nodes, solve_cached, SolverCache};
+use filasim_core::{
+    pad_for_levels, solve_static, BoxRegion, NodeProblem, SolveSettings, StaticProblem, TriMesh,
+    VoxelGrid,
+};
 use std::time::Instant;
+
+// ---------- beam suite constants ----------
+
+/// Uniform-infill validation density and the Gibson–Ashby stiffness law
+/// `E/E0 = coeff · x^exponent` (simp.rs defaults). A uniform beam at this
+/// density has EXACT analytic scaling vs the solid beam on the SAME mesh:
+/// deflection × 1/x^exp, frequency × (x^exp / x)^0.5 = x^((exp-1)/2). The
+/// mesh cancels in the ratio, so it isolates the E(ρ)+mass wiring.
+const INFILL_X: f64 = 0.3;
+const INFILL_EXP: f64 = 1.5;
+const INFILL_COEFF: f64 = 1.0;
+/// Beam material (PLA-ish, consistent units: MPa, mm, tonne/mm³).
+const BEAM_E0: f64 = 2400.0;
+const BEAM_NU: f64 = 0.35;
+const BEAM_RHO: f64 = 1.24e-9;
+/// Tip loads (small-strain linear regime).
+const TENSION_N: f64 = 100.0;
+const BENDING_N: f64 = -1.0;
 
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
@@ -152,6 +184,195 @@ fn bench_optimize(m: &mut Metrics) {
     m.i("opt_time_ms", dt * 1000.0);
 }
 
+// ---------- beam suite (solid + uniform infill; tension, bending, modal) ----------
+
+struct BeamOut {
+    ux: f64,      // tension: mean axial tip displacement (mm)
+    uz: f64,      // bending: mean transverse tip displacement (mm)
+    f: Vec<f64>,  // modal natural frequencies (Hz, ascending)
+}
+
+/// Mean of displacement component `comp` (0=x,1=y,2=z) over `nodes`.
+fn mean_disp(u: &[f64], nodes: &[u32], comp: usize) -> f64 {
+    if nodes.is_empty() {
+        return 0.0;
+    }
+    let s: f64 = nodes.iter().map(|&n| u[3 * n as usize + comp]).sum();
+    s / nodes.len() as f64
+}
+
+/// One canonical rectangular cantilever (L×B×H = nx·h × ny·h × nz·h), root
+/// plane x=0 fully fixed, run in three ways: axial tension, transverse bending,
+/// and 6-mode modal. `infill=None` → solid (eps=1, mass frac=1); `infill=Some(x)`
+/// → uniform density x with stiffness eps=coeff·x^exp (Gibson–Ashby) and mass
+/// fraction x — DECOUPLED, so the solid↔infill ratio is the exact closed form.
+fn bench_beam(
+    m: &mut Metrics,
+    prefix: &str,
+    nx: usize,
+    ny: usize,
+    nz: usize,
+    h: f64,
+    infill: Option<f64>,
+) -> BeamOut {
+    let s = SolveSettings { e0: BEAM_E0, nu: BEAM_NU, tol: 1e-6, max_iter: 400, ..Default::default() };
+
+    // Solid box; for infill, drop every cell's material fraction to x (mass law).
+    let mut raw = VoxelGrid::solid_box(nx, ny, nz, h);
+    if let Some(x) = infill {
+        for v in raw.scale.iter_mut() {
+            *v = x as f32;
+        }
+    }
+    let (grid, levels) = pad_for_levels(&raw, s.max_levels);
+    let active = active_nodes(&grid);
+    let (mx, my, mz) = (grid.nx + 1, grid.ny + 1, grid.nz + 1);
+
+    // Root plane (x=0) fixed; tip plane (x=nx, the free end of the solid) loaded.
+    // The chosen sizes need no padding on x, so the solid tip sits at node x=nx.
+    let mut fixed = Vec::new();
+    let mut tip = Vec::new();
+    for z in 0..mz {
+        for y in 0..my {
+            let root = (z * my + y) * mx;
+            if active[root] {
+                fixed.push(root as u32);
+            }
+            let t = (z * my + y) * mx + nx;
+            if active[t] {
+                tip.push(t as u32);
+            }
+        }
+    }
+
+    // Stiffness eps: flat solid (1.0) or Gibson–Ashby infill (coeff·x^exp), on
+    // solid cells only. Uniform ⇒ scales K by a constant vs the solid beam.
+    let eps_val = match infill {
+        Some(x) => (INFILL_COEFF * x.powf(INFILL_EXP)) as f32,
+        None => 1.0,
+    };
+    let eps: Vec<f32> = grid.scale.iter().map(|&sc| if sc > 0.0 { eps_val } else { 0.0 }).collect();
+
+    // Geometry for the analytic anchors.
+    let (l, bdim, hdim) = (nx as f64 * h, ny as f64 * h, nz as f64 * h);
+    let area = bdim * hdim;
+
+    // --- tension: total +Fx spread over the tip face ---
+    let forces: Vec<(u32, [f64; 3])> =
+        tip.iter().map(|&n| (n, [TENSION_N / tip.len() as f64, 0.0, 0.0])).collect();
+    let prob = NodeProblem { fixed: fixed.clone(), springs: Vec::new(), forces };
+    let t0 = Instant::now();
+    let r = solve_cached(&mut None, &grid, levels, &prob, &s, eps.clone(), s.tol, s.max_iter)
+        .expect("tension solve");
+    let dt = t0.elapsed().as_secs_f64();
+    let ux = mean_disp(&r.u, &tip, 0);
+    m.q(&format!("{prefix}_tension_ux"), ux);
+    m.i(&format!("{prefix}_tension_iters"), r.stats.iterations as f64);
+    m.i(&format!("{prefix}_tension_residual"), r.stats.rel_residual);
+    m.i(&format!("{prefix}_tension_time_ms"), dt * 1000.0);
+    if infill.is_none() {
+        // Exact uniaxial: ux = F·L / (A·E).
+        let exact = TENSION_N * l / (area * BEAM_E0);
+        m.q(&format!("{prefix}_tension_axial_ratio"), ux / exact);
+    }
+
+    // --- bending: total -Fz spread over the tip face ---
+    let forces: Vec<(u32, [f64; 3])> =
+        tip.iter().map(|&n| (n, [0.0, 0.0, BENDING_N / tip.len() as f64])).collect();
+    let prob = NodeProblem { fixed: fixed.clone(), springs: Vec::new(), forces };
+    let t0 = Instant::now();
+    let r = solve_cached(&mut None, &grid, levels, &prob, &s, eps.clone(), s.tol, s.max_iter)
+        .expect("bending solve");
+    let dt = t0.elapsed().as_secs_f64();
+    let uz = mean_disp(&r.u, &tip, 2);
+    m.q(&format!("{prefix}_bend_uz"), uz);
+    m.i(&format!("{prefix}_bend_iters"), r.stats.iterations as f64);
+    m.i(&format!("{prefix}_bend_residual"), r.stats.rel_residual);
+    m.i(&format!("{prefix}_bend_time_ms"), dt * 1000.0);
+    if infill.is_none() {
+        // Timoshenko tip deflection (bending in z; weak-axis inertia I = B·H³/12).
+        let inertia = bdim * hdim.powi(3) / 12.0;
+        let g = BEAM_E0 / (2.0 * (1.0 + BEAM_NU));
+        let kappa = 10.0 * (1.0 + BEAM_NU) / (12.0 + 11.0 * BEAM_NU);
+        let exact = BENDING_N * l.powi(3) / (3.0 * BEAM_E0 * inertia)
+            + BENDING_N * l / (kappa * g * area);
+        m.q(&format!("{prefix}_bend_timo_ratio"), uz / exact);
+    }
+
+    // --- modal: root-clamped free vibration, lowest 6 modes ---
+    let mprob = NodeProblem { fixed: fixed.clone(), springs: Vec::new(), forces: Vec::new() };
+    let mut cache = SolverCache::build(&grid, levels, &mprob, &s, eps.clone());
+    let cfg = ModalConfig::new(6);
+    let t0 = Instant::now();
+    let res = analyze(&mut cache.solver, &grid.scale, BEAM_RHO, &cfg, |_, _, _| {})
+        .expect("modal solve");
+    let dt = t0.elapsed().as_secs_f64();
+    for (k, &fk) in res.freqs_hz.iter().take(6).enumerate() {
+        m.q(&format!("{prefix}_modal_f{}", k + 1), fk);
+    }
+    m.i(&format!("{prefix}_modal_outer_iters"), res.outer_iters as f64);
+    m.i(&format!("{prefix}_modal_vcycles"), res.total_inner_iters as f64);
+    m.i(&format!("{prefix}_modal_time_ms"), dt * 1000.0);
+    if infill.is_none() {
+        // Euler–Bernoulli 1st-bending (weak axis): wide band (a thick hex beam
+        // is shear-stiff) — this only catches a gross mass/unit slip.
+        let inertia = bdim * hdim.powi(3) / 12.0;
+        let bl = 1.875104f64;
+        let eb = bl * bl / std::f64::consts::TAU
+            * (BEAM_E0 * inertia / (BEAM_RHO * area * l.powi(4))).sqrt();
+        m.q(&format!("{prefix}_modal_f1_eb_ratio"), res.freqs_hz.first().copied().unwrap_or(0.0) / eb);
+    }
+
+    BeamOut { ux, uz, f: res.freqs_hz }
+}
+
+/// Solid + uniform-infill beam at one mesh, plus the mesh-independent solid↔infill
+/// ratios (must equal the closed-form E(ρ)/mass multiplier).
+fn bench_beam_pair(m: &mut Metrics, sz: &str, nx: usize, ny: usize, nz: usize, h: f64) {
+    let solid = bench_beam(m, &format!("beam_solid_{sz}"), nx, ny, nz, h, None);
+    let infill = bench_beam(m, &format!("beam_infill_{sz}"), nx, ny, nz, h, Some(INFILL_X));
+    // Deflection ratio = 1/x^exp; frequency ratio = x^((exp-1)/2).
+    m.q(&format!("beam_ratio_tension_{sz}"), infill.ux / solid.ux);
+    m.q(&format!("beam_ratio_bend_{sz}"), infill.uz / solid.uz);
+    if !solid.f.is_empty() && !infill.f.is_empty() {
+        m.q(&format!("beam_ratio_modal_{sz}"), infill.f[0] / solid.f[0]);
+    }
+}
+
+/// Voxelize the 3DBenchy at one resolution — regression-anchored (no analytic
+/// volume): cell/element counts and solid volume must not drift; time is Info.
+fn bench_voxelize_benchy(m: &mut Metrics, sz: &str, mesh: &TriMesh, h: f64) {
+    let t0 = Instant::now();
+    let grid = VoxelGrid::voxelize(mesh, h);
+    let dt = t0.elapsed().as_secs_f64();
+    m.q(&format!("benchy_{sz}_cells"), grid.cell_count() as f64);
+    m.q(&format!("benchy_{sz}_solid"), grid.solid_count() as f64);
+    m.q(&format!("benchy_{sz}_volume_mm3"), grid.solid_volume());
+    m.i(&format!("benchy_{sz}_time_ms"), dt * 1000.0);
+    m.i(&format!("benchy_{sz}_mcells_s"), grid.cell_count() as f64 / 1e6 / dt);
+}
+
+/// The full beam suite (both mesh sizes) + the Benchy voxelization checks.
+/// Physical beam is fixed at 64×8×4 mm; the fine mesh keeps it (h = 1/3 mm).
+fn bench_beam_suite(m: &mut Metrics) {
+    bench_beam_pair(m, "small", 64, 8, 4, 1.0);
+    bench_beam_pair(m, "fine", 192, 24, 12, 1.0 / 3.0);
+
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../3dbenchy.stl");
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let mesh = TriMesh::from_stl(&bytes).expect("parse 3dbenchy.stl");
+            let (lo, hi) = mesh.bounds().expect("benchy bounds");
+            m.q("benchy_bbox_x", hi[0] - lo[0]);
+            m.q("benchy_bbox_y", hi[1] - lo[1]);
+            m.q("benchy_bbox_z", hi[2] - lo[2]);
+            bench_voxelize_benchy(m, "coarse", &mesh, 1.0);
+            bench_voxelize_benchy(m, "fine", &mesh, 0.4);
+        }
+        Err(e) => eprintln!("skip benchy voxelization ({path}: {e})"),
+    }
+}
+
 // ---------- baseline I/O ----------
 
 fn save(m: &Metrics, path: &str) {
@@ -241,6 +462,7 @@ fn main() {
     bench_cantilever(&mut m, "solve_small", 80, 8, 8, 1.0);
     bench_cantilever(&mut m, "solve_mid", 160, 16, 16, 0.5);
     bench_optimize(&mut m);
+    bench_beam_suite(&mut m);
     if args.iter().any(|a| a == "--big") {
         bench_cantilever(&mut m, "solve_big", 256, 64, 64, 0.25);
     }

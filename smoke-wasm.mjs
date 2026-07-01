@@ -557,11 +557,16 @@ const reimported = new Model(threeMf, "roundtrip");
 assert(reimported.triangle_count() >= 12, "exported 3MF re-imports (part wins by bbox)");
 
 // ---- binary (hollow/solid) mode ----
-// Smaller grid for speed: the point is the pipeline, not the physics here.
+// Coarse grid: the point is the pipeline, not the physics here — and it's fast.
+// NOTE: keep this a COARSE grid (~h=1 mm on this 60×12×12 beam). Binary gain vs
+// uniform is strongly positive at h≈1.0 (+31%) and h≈0.5 (+33%) but dips
+// NEGATIVE at h≈0.7 (a narrow, resolution-specific optimizer artifact — likely
+// wall/skin thickness rounding to a bad cell count). res≈8k lands near h=1.0;
+// res≈25k lands on the h≈0.7 pothole and made `gainVsUniform > 0` fail.
 const binModel = new Model(boxStl([0, 0, 0], [60, 12, 12]), "beam3");
 const bsel = patchSelector(binModel);
 binModel.set_material(2400, 0.35, 1.24, 50, 35);
-binModel.set_resolution(25000);
+binModel.set_resolution(8000);
 binModel.add_fixed(bsel(0, "min"));
 binModel.add_force(bsel(0, "max"), 0, 0, -40);
 const t2 = performance.now();

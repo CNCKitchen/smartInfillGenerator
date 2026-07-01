@@ -599,6 +599,8 @@ interface AppState {
   loadStepsOpen: boolean;
   /** Imprint & privacy modal (German Impressumspflicht). */
   imprintOpen: boolean;
+  /** Support/donation popup — shown when a run starts (unless suppressed). */
+  supportOpen: boolean;
   /** Startup disclaimer (legal): shown every load unless skipped below. */
   disclaimerOpen: boolean;
   /** Dev/testing escape hatch (persisted in this browser). */
@@ -769,6 +771,10 @@ interface AppState {
   openSettings(open: boolean): void;
   openLoadSteps(open: boolean): void;
   openImprint(open: boolean): void;
+  /** Show the support popup unless the user suppressed it (7-day window). */
+  maybeShowSupport(): void;
+  /** Close the support popup; when `dontShowAgain`, suppress it for 7 days. */
+  closeSupport(dontShowAgain: boolean): void;
   setResolution(r: ResolutionKey | "custom"): void;
   setCustomH(v: number): void;
   setBudget(v: number): void;
@@ -966,6 +972,21 @@ let meshCutTimer: ReturnType<typeof setTimeout> | null = null;
 let lastSectionPlane: { normal: [number, number, number]; constant: number } | null = null;
 /** Dev/testing escape hatch for the startup disclaimer (this browser only). */
 const SKIP_DISCLAIMER_KEY = "sig-skip-disclaimer";
+
+/** Support popup (CTA shown when a run starts) — suppressed for 7 days when the
+ *  user ticks "Don't show this again". We store an EXPIRY timestamp: once it
+ *  passes, the decision is invalidated and the popup returns. */
+const SUPPORT_SUPPRESS_KEY = "filasim-support-suppress-until";
+const SUPPORT_SUPPRESS_MS = 7 * 24 * 60 * 60 * 1000;
+
+function supportSuppressed(): boolean {
+  try {
+    const until = Number(localStorage.getItem(SUPPORT_SUPPRESS_KEY));
+    return Number.isFinite(until) && until > 0 && Date.now() < until;
+  } catch {
+    return false;
+  }
+}
 
 function disclaimerSkippedInit(): boolean {
   try {
@@ -1215,7 +1236,7 @@ async function logGridInfo(set: SetState) {
       appendLog(
         set,
         `Voxel grid ${info.nx}×${info.ny}×${info.nz} @ h=${info.h.toFixed(2)} mm — ` +
-          `${info.solid.toLocaleString()} solid of ${info.cells.toLocaleString()} cells`
+          `${info.solid.toLocaleString()} voxels`
       );
     }
     set({ voxelInfo: info });
@@ -1694,9 +1715,9 @@ function meshLabel(s: AppState): ProvVal {
         v: vi.h,
         kind: "length",
         prefix: "h ",
-        // "solid / total" cells — total is the bounding-box grid, solid is the
-        // part (the rest is empty space the analysis skips).
-        suffix: ` · ${Math.round(vi.solid / 1000)}k/${Math.round(vi.cells / 1000)}k cells`,
+        // Just the solid voxel count — the bounding-box total is redundant with
+        // the grid dims and only counts empty space the analysis skips.
+        suffix: ` · ${Math.round(vi.solid / 1000)}k voxels`,
       }
     : "—";
 }
@@ -2487,6 +2508,7 @@ export const useStore = create<AppState>((set, get) => ({
   settingsOpen: false,
   loadStepsOpen: false,
   imprintOpen: false,
+  supportOpen: false,
   disclaimerOpen: !disclaimerSkippedInit(),
   disclaimerSkipped: disclaimerSkippedInit(),
   unitPrefs: initialUnitPrefs,
@@ -3214,6 +3236,21 @@ export const useStore = create<AppState>((set, get) => ({
     set({ imprintOpen: open });
   },
 
+  maybeShowSupport() {
+    if (!supportSuppressed()) set({ supportOpen: true });
+  },
+
+  closeSupport(dontShowAgain) {
+    set({ supportOpen: false });
+    if (dontShowAgain) {
+      try {
+        localStorage.setItem(SUPPORT_SUPPRESS_KEY, String(Date.now() + SUPPORT_SUPPRESS_MS));
+      } catch {
+        // storage blocked: the decision just won't persist
+      }
+    }
+  },
+
   setResolution(r) {
     set({ resolution: r });
     if (r === "custom" && get().customH <= 0) {
@@ -3688,7 +3725,7 @@ export const useStore = create<AppState>((set, get) => ({
               (report.components[0] ? ` (λ ratio ${report.components[0].lambdaRatio.toExponential(1)})` : "")
           : `Check: UNDER-CONSTRAINED — ${report.islandCount} ${report.islandCount === 1 ? "body" : "bodies"}; ` +
               report.components
-                .map((c, i) => `#${i + 1}: ${c.cells.toLocaleString()} cells, ${c.constrained ? "ok" : "free"}`)
+                .map((c, i) => `#${i + 1}: ${c.cells.toLocaleString()} voxels, ${c.constrained ? "ok" : "free"}`)
                 .join(", ")
       );
     } catch (e) {
@@ -3702,6 +3739,7 @@ export const useStore = create<AppState>((set, get) => ({
 
   async runSolve() {
     if (!get().model || !session.beginRun()) return;
+    get().maybeShowSupport();
     set({ busy: "Solving…", error: null });
     sceneEvents.onAnimateMode?.(null);
     let stopResidualPoll = () => {};
@@ -4033,6 +4071,7 @@ export const useStore = create<AppState>((set, get) => ({
 
   async runModal() {
     if (!get().model || !session.beginRun()) return;
+    get().maybeShowSupport();
     set({ busy: "Modal analysis…", error: null });
     sceneEvents.onAnimateMode?.(null);
     let stopResidualPoll = () => {};
@@ -4189,6 +4228,7 @@ export const useStore = create<AppState>((set, get) => ({
   async runOptimize() {
     const st = get();
     if (!st.model || !session.beginRun()) return;
+    get().maybeShowSupport();
     set({
       busy: st.optMode === "solid" ? "Optimizing shape…" : "Optimizing infill…",
       error: null,

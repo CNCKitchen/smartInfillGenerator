@@ -3308,7 +3308,7 @@ export class SceneManager {
     chip.style.top = `${y + 9}px`;
   }
 
-  private applyPositions(rbmOffset?: number, deformFactor = 1) {
+  private applyPositions(rbmOffset?: number, deformFactor = 1, animating = false) {
     if (!this.geometry || !this.basePositions) return;
     const attr = this.geometry.getAttribute("position") as THREE.BufferAttribute;
     const out = attr.array as Float32Array;
@@ -3331,14 +3331,20 @@ export class SceneManager {
       out.set(base);
     }
     attr.needsUpdate = true;
-    this.geometry.computeVertexNormals();
-    this.morphVoxelResult(deformFactor);
+    // Recomputing vertex normals over the whole surface soup is the dominant
+    // per-frame cost of the mode-shape / deflection animation (a 300k-tri part
+    // is ~900k verts). During playback we keep the rest-pose normals: on a fast
+    // swing the stale shading is imperceptible next to the color field, and the
+    // one-shot applyPositions() on stop refreshes them. This roughly triples
+    // playback FPS on large meshes.
+    if (!animating) this.geometry.computeVertexNormals();
+    this.morphVoxelResult(deformFactor, animating);
     // Markers ride the displayed (deformed/animated) vertices.
     this.updateExtremeMarkers(true);
   }
 
   /** Deform the voxel-result hull (and its cell edges) like the part. */
-  private morphVoxelResult(deformFactor: number) {
+  private morphVoxelResult(deformFactor: number, animating = false) {
     const vr = this.voxRes;
     if (!vr || !vr.group.visible) return;
     const s = this.autoScale * this.deformScale * deformFactor;
@@ -3346,7 +3352,7 @@ export class SceneManager {
     const out = attr.array as Float32Array;
     for (let i = 0; i < vr.base.length; i++) out[i] = vr.base[i] + s * vr.disp[i];
     attr.needsUpdate = true;
-    vr.geo.computeVertexNormals();
+    if (!animating) vr.geo.computeVertexNormals();
     if (vr.lineGeo && vr.lineBase && vr.lineDisp) {
       const la = vr.lineGeo.getAttribute("position") as THREE.BufferAttribute;
       const lo = la.array as Float32Array;
@@ -3361,7 +3367,7 @@ export class SceneManager {
     if (this.contextLost) return; // GPU is mid-reset — don't touch the dead context
     if (this.rbmMode) {
       const t = this.clock.getElapsedTime();
-      this.applyPositions(Math.sin(t * 2.0 * Math.PI * 0.66));
+      this.applyPositions(Math.sin(t * 2.0 * Math.PI * 0.66), 1, true);
     } else if (this.deformAnimate && this.viewMode === "deformed" && this.displacements) {
       const t = this.clock.getElapsedTime();
       // Modal: symmetric ± swing (+A → 0 → −A → 0), a vibrating mode shape.
@@ -3370,7 +3376,7 @@ export class SceneManager {
       const frac = this.modalAnim
         ? Math.sin((2 * Math.PI * t) / 2.4)
         : 0.5 - 0.5 * Math.cos((2 * Math.PI * t) / 2.4);
-      this.applyPositions(undefined, frac);
+      this.applyPositions(undefined, frac, true);
     }
     this.controls.update();
     const r = this.renderer;

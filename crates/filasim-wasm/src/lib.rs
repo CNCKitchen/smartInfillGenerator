@@ -1247,7 +1247,14 @@ impl Model {
         self.build_peel = None;
         self.build_grid = None;
         self.build_eps = None;
-        let grid = VoxelGrid::voxelize(&self.mesh, self.analysis_h()?);
+        // Voxelize the ORIGINAL import, not `self.mesh`. `self.mesh` is the
+        // display-refined tessellation (each face split into coplanar
+        // sub-triangles so deflection curves render smoothly) — that subdivision
+        // leaves the surface geometry, and hence the winding number, unchanged,
+        // so it only inflates the per-cell near-field triangle count the
+        // occupancy pass has to integrate. The coarse original gives the
+        // identical classification far faster.
+        let grid = VoxelGrid::voxelize(&self.mesh_orig, self.analysis_h()?);
         if grid.solid_count() == 0 {
             return Err(err("voxelization produced no solid cells — model too thin for this resolution"));
         }
@@ -1396,7 +1403,9 @@ impl Model {
         // resolution-robust, so this buys a much faster preview cheaply. (Kept
         // local — never touches self.grid / opt_eps, which stay at analysis res.)
         let h_build = self.analysis_h()? * 2f64.cbrt();
-        let braw = VoxelGrid::voxelize(&self.mesh, h_build);
+        // Coarse original, not `self.mesh` — see the note in `ensure_grid`:
+        // display subdivision doesn't change the winding number, only the cost.
+        let braw = VoxelGrid::voxelize(&self.mesh_orig, h_build);
         if braw.solid_count() == 0 {
             return Err(err("voxelization produced no solid cells — model too thin for this resolution"));
         }

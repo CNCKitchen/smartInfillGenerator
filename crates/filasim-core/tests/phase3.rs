@@ -944,43 +944,45 @@ fn nodal_recovery_averages_adjacent_cells() {
 
 #[test]
 fn voxelize_cut_cells_carry_occupancy() {
-    // A 9.5 mm box on a 1 mm grid: the grid centers on the bounds, so every
-    // outer cell is only 75% inside. The 3×3×3 supersample (local 1/6, 1/2,
-    // 5/6) sees 2 of 3 stations inside along each cut axis — exact fractions
-    // 18/27 (face), 12/27 (edge), 8/27 (corner), 1.0 interior.
-    let b = primitives::boxx([0.0; 3], [9.5, 9.5, 9.5]);
+    // A 9.6 mm box on a 1 mm grid → 10³ cells. X and Y CENTER on the bounds, so
+    // the outer cells (index 0 or 9) are cut with 2 of 3 supersample stations
+    // inside (local 1/6, 1/2, 5/6). Z snaps its origin to the part BOTTOM
+    // (build-plate flush, see voxel.rs), so the bottom row (cz=0) is NOT cut —
+    // it sits full on the plate — and only the top row (cz=9) is cut. Occupancy
+    // is therefore (xs·ys·zs)/27 with each factor 2 (cut) or 3 (uncut): 1.0
+    // interior, 18/27 one cut, 12/27 two cuts, 8/27 three cuts.
+    //
+    // The box is 9.6 (not 9.5) so the cut faces fall cleanly BETWEEN supersample
+    // stations. At 9.5 the top face lands exactly on the middle Z station (z=9.5),
+    // a floating-point knife edge that quantizes some top cells to 17/27.
+    let b = primitives::boxx([0.0; 3], [9.6, 9.6, 9.6]);
     let grid = VoxelGrid::voxelize(&b, 1.0);
     assert_eq!((grid.nx, grid.ny, grid.nz), (10, 10, 10));
-    let mut counts = [0usize; 4]; // face, edge, corner, interior
     for cz in 0..10 {
         for cy in 0..10 {
             for cx in 0..10 {
                 let s = grid.scale[(cz * 10 + cy) * 10 + cx];
                 assert!(s > 0.0, "center-inside cells stay solid");
-                let cut = [cx, cy, cz].iter().filter(|&&c| c == 0 || c == 9).count();
-                let expect = [18.0 / 27.0, 12.0 / 27.0, 8.0 / 27.0, 1.0][if cut == 0 {
-                    3
-                } else {
-                    cut - 1
-                }];
+                let xs = if cx == 0 || cx == 9 { 2 } else { 3 };
+                let ys = if cy == 0 || cy == 9 { 2 } else { 3 };
+                let zs = if cz == 9 { 2 } else { 3 }; // bottom row flush on the plate
+                let expect = (xs * ys * zs) as f32 / 27.0;
                 assert!(
-                    (s - expect as f32).abs() < 1e-6,
+                    (s - expect).abs() < 1e-6,
                     "cell ({cx},{cy},{cz}) occupancy {s} vs {expect}"
                 );
-                counts[if cut == 0 { 3 } else { cut - 1 }] += 1;
             }
         }
     }
-    assert_eq!(counts, [6 * 8 * 8, 12 * 8, 8, 8 * 8 * 8]);
-    // Occupancy-weighted volume approaches the true 9.5³. The 3-station
-    // quantization reads 0.75-covered cells as 2/3, so this worst-case
-    // alignment lands ~5% low — far better than the +19% of counting cut
-    // cells as full.
+    // Occupancy-weighted volume. The 3-station quantization reads the ~80%-
+    // covered outer faces as 2/3, landing ~5% low — far better than the +19%
+    // of counting cut cells as full. (The flush bottom row keeps it from being
+    // worse.)
     let vol = grid.solid_volume();
     assert!(
-        (vol / 9.5f64.powi(3) - 1.0).abs() < 0.07,
+        (vol / 9.6f64.powi(3) - 1.0).abs() < 0.07,
         "occupancy volume {vol:.1} vs true {:.1}",
-        9.5f64.powi(3)
+        9.6f64.powi(3)
     );
 }
 

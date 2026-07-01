@@ -144,7 +144,7 @@ export function NerdLog() {
           title="Objective bᵀu [N·mm]"
           xs={its}
           logY
-          series={[{ ys: optSeries.map((p) => p.compliance), color: "#e06a13" }]}
+          series={[{ ys: optSeries.map((p) => p.compliance), color: "#1877c0" }]}
           yFmt={(v) => v.toExponential(2)}
         />
         <MiniChart
@@ -153,21 +153,21 @@ export function NerdLog() {
           logY
           threshold={0.005}
           series={[
-            { ys: optSeries.map((p) => p.meanChange), color: "#e06a13", label: "mean" },
+            { ys: optSeries.map((p) => p.meanChange), color: "#1877c0", label: "mean" },
             { ys: optSeries.map((p) => p.change), color: "#aba8a0", label: "max" },
           ]}
         />
         <MiniChart
           title="Inner CG iterations / step"
           xs={its}
-          series={[{ ys: optSeries.map((p) => p.innerIters), color: "#e06a13" }]}
+          series={[{ ys: optSeries.map((p) => p.innerIters), color: "#1877c0" }]}
           yFmt={(v) => v.toFixed(0)}
         />
         <MiniChart
           title="MGCG residual"
           logY
           threshold={solveTol || undefined}
-          series={[{ ys: solveResiduals, color: "#e06a13" }]}
+          series={[{ ys: solveResiduals, color: "#1877c0" }]}
           yFmt={(v) => v.toExponential(0)}
         />
       </div>

@@ -629,3 +629,39 @@ bar to change the count (2–20). Shared LUT rewrite; session-only, not persiste
 **Deferred.** Per-step support *parameters* (different pinned axes or elastic stiffness per
 step) — only on/off varies in v1; a fuller override is a later decision. Min-max (worst-case)
 optimization objective. A hard cap / eviction policy for very large step counts on fine meshes.
+
+## 14. Pre-push gate & the beam regression suite (2026-07-01)
+
+One command — `node scripts/preflight.mjs` — is the gate before a major push,
+formalizing the "gated by regbench + the wasm smoke test" convention. **Hard**
+gates (fail the run): `cargo test`, `regbench --check`, the wasm smoke test.
+**Advisory** (reported, never block): `cargo fmt --check`, `cargo clippy` — the
+tree ships no `rustfmt.toml`, so default rustfmt disagrees with the house style;
+promote both to hard once a `rustfmt.toml` captures the style and clippy is clean.
+
+**Beam suite** (added to `regbench`): one canonical 64×8×4 mm rectangular
+cantilever, run **solid** and at **uniform 30 % infill**, at two mesh sizes
+(h = 1.0 → ~2k cells; h = 1/3 → ~55k cells), in three load cases:
+- **tension** (axial) — anchor: exact uniaxial `ux = FL/AE` (ratio ≈ 1.0);
+- **bending** (transverse tip) — anchor: Timoshenko tip deflection;
+- **modal** (root-clamped, 6 modes) — anchor: Euler–Bernoulli mode 1 (wide band;
+  a thick hex beam is shear-stiff, so this only guards a gross mass/unit slip).
+
+The rectangular (2:1) section separates all six modes so they are individually
+interpretable. Modal is **regression-anchored** (all 6 freqs drift-guarded at
+0.5 %) with the analytic ratio kept only as a sanity metric.
+
+**The key check** is the mesh-independent solid↔infill ratio. Solid and infill
+share a mesh, so discretization cancels and the ratio must equal the exact
+`E(ρ)=coeff·x^exp` (stiffness) / mass-`x` closed form: deflection × `1/x^exp`
+(=6.086 at x=0.3), frequency × `x^((exp-1)/2)` (=0.740). This isolates the
+E(ρ)-vs-mass wiring independent of mesh error — the classic place a unit/scale
+bug hides. Measured 6.085806 / 0.740083 at BOTH mesh sizes.
+
+**Benchy voxelization**: 3DBenchy at h = 1.0 (coarse ~90k) and h = 0.4 (fine
+~1.4M cells), regression-anchored (no analytic volume): cell/element counts,
+solid volume, and bbox as QUALITY; time / Mcells·s⁻¹ as INFO.
+
+Solve **speed** is guarded by INFO metrics only (iteration counts, modal
+V-cycles — deterministic — plus wall-clock): the human reads the deltas before
+pushing; no hard time budget (machine/thread noise would make it flaky).

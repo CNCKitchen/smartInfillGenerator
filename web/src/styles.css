@@ -2,7 +2,7 @@
 /* Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com> */
 
 /* "Werkbank" theme — software as a measuring instrument. Warm-gray chassis,
-   recessed input wells, CNC-Kitchen-orange accent, DRO-style readouts.
+   recessed input wells, CNC-Kitchen-blue accent, DRO-style readouts.
    Type: Barlow (DIN heritage) for UI, Barlow Semi Condensed for small caps
    labels, B612 Mono (the Airbus cockpit face) for all data. All three are
    SIL OFL 1.1, self-hosted from /fonts (licenses alongside the files). */
@@ -26,9 +26,9 @@
   --ink: #26282a;
   --dim: #75787b;
   --faint: #9a9d9f;
-  --orange: #e06a13; /* anodized accent */
-  --orange-d: #c25709;
-  --orange-soft: #f7e3d2;
+  --accent: #1877c0; /* CNC Kitchen brand blue */
+  --accent-d: #12629f;
+  --accent-soft: #d9e8f5;
   --green: #2e7d46; /* status lamp */
   --red: #b3361c;
   --amber: #c97b10;
@@ -63,7 +63,7 @@ body {
 }
 
 :focus-visible {
-  outline: 2px solid var(--orange);
+  outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
 
@@ -142,7 +142,7 @@ body {
   width: 30px;
   height: 30px;
   border-radius: var(--r);
-  background: var(--orange);
+  background: var(--accent);
   display: grid;
   place-items: center;
   color: #fff;
@@ -220,16 +220,16 @@ button:disabled {
 }
 
 button.primary {
-  background: var(--orange);
-  border-color: var(--orange);
+  background: var(--accent);
+  border-color: var(--accent);
   color: #fff;
   font-weight: 600;
   box-shadow: 0 1px 0 rgba(0, 0, 0, 0.15);
 }
 
 button.primary:hover:not(:disabled) {
-  background: var(--orange-d);
-  border-color: var(--orange-d);
+  background: var(--accent-d);
+  border-color: var(--accent-d);
 }
 
 button.on {
@@ -340,7 +340,7 @@ a.iconbtn:hover {
 }
 
 .station.active {
-  background: var(--orange);
+  background: var(--accent);
   border-radius: var(--r);
   margin: 0 14px 0 8px;
   width: auto;
@@ -356,7 +356,7 @@ a.iconbtn:hover {
   top: 50%;
   margin-top: -7px;
   border: 7px solid transparent;
-  border-left-color: var(--orange);
+  border-left-color: var(--accent);
 }
 
 .station.active .st-no,
@@ -539,7 +539,7 @@ a.iconbtn:hover {
 }
 
 input[type="checkbox"] {
-  accent-color: var(--orange);
+  accent-color: var(--accent);
 }
 
 input[type="range"] {
@@ -566,7 +566,7 @@ input[type="range"]::-webkit-slider-thumb {
   margin-top: -5.5px;
   border-radius: 50%;
   background: #fff;
-  border: 2px solid var(--orange);
+  border: 2px solid var(--accent);
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
 }
 
@@ -582,7 +582,7 @@ input[type="range"]::-moz-range-thumb {
   height: 12px;
   border-radius: 50%;
   background: #fff;
-  border: 2px solid var(--orange);
+  border: 2px solid var(--accent);
 }
 
 select,
@@ -651,7 +651,7 @@ input[type="number"] {
 }
 
 .link {
-  color: var(--orange-d);
+  color: var(--accent-d);
   cursor: pointer;
   text-decoration: underline;
 }
@@ -670,8 +670,8 @@ input[type="number"] {
 }
 
 .bc.active {
-  border-color: var(--orange);
-  box-shadow: 0 0 0 1px var(--orange), 0 1px 3px rgba(0, 0, 0, 0.08);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent), 0 1px 3px rgba(0, 0, 0, 0.08);
 }
 
 .bchead {
@@ -737,7 +737,7 @@ input[type="number"] {
 
 .lsadd button:hover {
   color: var(--ink);
-  border-color: var(--orange);
+  border-color: var(--accent);
 }
 
 /* compact step selector (Loads panel) */
@@ -752,11 +752,11 @@ input[type="number"] {
   text-transform: none;
   padding: 2px 9px;
   color: var(--ink);
-  border-color: var(--orange);
+  border-color: var(--accent);
 }
 
 .lsmanage:hover {
-  background: var(--orange-soft);
+  background: var(--accent-soft);
 }
 
 /* force editor: uniform vertical rhythm between mode toggle / fields / tools */
@@ -785,9 +785,9 @@ input[type="number"] {
 }
 
 .lspill.on {
-  border-color: var(--orange);
+  border-color: var(--accent);
   color: var(--ink);
-  box-shadow: 0 0 0 1px var(--orange);
+  box-shadow: 0 0 0 1px var(--accent);
   font-weight: 600;
 }
 
@@ -861,7 +861,7 @@ input[type="number"] {
 }
 
 .bcnameinput:focus {
-  border-color: var(--orange);
+  border-color: var(--accent);
   background: var(--panel);
   outline: none;
 }
@@ -960,7 +960,7 @@ input[type="number"] {
 }
 
 .lsgrid tbody tr.on {
-  background: var(--orange-soft);
+  background: var(--accent-soft);
 }
 
 .lsgrid td.lssteprow {
@@ -1089,7 +1089,7 @@ input[type="number"] {
 .progress .bar {
   position: absolute;
   inset: 0 auto 0 0;
-  background: var(--orange);
+  background: var(--accent);
   opacity: 0.55;
   transition: width 0.2s;
 }
@@ -1234,14 +1234,14 @@ input[type="number"] {
   align-items: center;
   gap: 6px;
   padding: 8px 10px 8px 16px;
-  background: linear-gradient(180deg, #7c4dff, #6a3df0);
+  background: linear-gradient(180deg, var(--accent), var(--accent-d));
   color: #fff;
   font-size: 12.5px;
   font-weight: 600;
   line-height: 1.35;
   text-align: center;
   border-radius: 999px;
-  box-shadow: 0 2px 10px rgba(74, 40, 160, 0.35);
+  box-shadow: 0 2px 10px rgba(18, 98, 159, 0.35);
 }
 
 .supportbanner a {
@@ -1391,7 +1391,7 @@ input[type="number"] {
 }
 
 .legendbarclick:hover {
-  border-color: var(--orange);
+  border-color: var(--accent);
 }
 
 .legendlabels {
@@ -1444,14 +1444,14 @@ input[type="number"] {
 }
 
 .legendedit:hover {
-  color: var(--orange-d);
+  color: var(--accent-d);
 }
 
 .legendinput {
   width: 80px;
   font-family: var(--mono);
   font-size: 11px;
-  border-color: var(--orange) !important;
+  border-color: var(--accent) !important;
   padding: 1px 4px;
 }
 
@@ -1524,7 +1524,7 @@ input[type="number"] {
 
 .provnote {
   font-size: 11px;
-  color: var(--orange-d);
+  color: var(--accent-d);
 }
 
 .provstale {
@@ -1532,7 +1532,7 @@ input[type="number"] {
   padding-top: 6px;
   border-top: 1px solid var(--rule, rgba(0, 0, 0, 0.08));
   font-size: 11px;
-  color: var(--orange-d);
+  color: var(--accent-d);
   line-height: 1.4;
   font-weight: 600;
 }
@@ -1571,7 +1571,7 @@ input[type="number"] {
 .spinner {
   width: 13px;
   height: 13px;
-  border: 2px solid var(--orange);
+  border: 2px solid var(--accent);
   border-top-color: transparent;
   border-radius: 50%;
   animation: spin 0.8s linear infinite;
@@ -1986,7 +1986,7 @@ input[type="number"] {
 }
 
 .modal.disclaimer a {
-  color: var(--orange);
+  color: var(--accent);
   font-weight: 600;
 }
 
@@ -2067,7 +2067,82 @@ input[type="number"] {
 }
 
 .modal.imprint a {
-  color: var(--orange);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+/* ---------------- support popup (CTA on run start) ---------------- */
+
+.modal.support {
+  width: 460px;
+  gap: 14px;
+}
+
+.modal.support h2 {
+  font-size: 18px;
+}
+
+.support .sm-lead {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--dim);
+}
+
+.support .sm-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.support .sm-btn {
+  display: block;
+  text-align: center;
+  padding: 12px;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 700;
+  color: #fff;
+  text-decoration: none;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.15);
+}
+
+.support .sm-btn:hover {
+  filter: brightness(1.06);
+}
+
+.support .sm-btn.store {
+  background: linear-gradient(180deg, #7c4dff, #6a3df0);
+}
+
+.support .sm-btn.paypal {
+  background: linear-gradient(180deg, #12a4e0, #0c8fce);
+}
+
+.support .sm-btn.kofi {
+  background: linear-gradient(180deg, #ff6b62, #f75950);
+}
+
+.support .sm-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 2px;
+}
+
+.support .sm-dontshow {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 13px;
+  color: var(--dim);
+  user-select: none;
+  cursor: pointer;
+}
+
+.support .sm-foot .primary {
+  padding: 9px 16px;
   font-weight: 600;
 }
 
