@@ -10,6 +10,7 @@ import {
   type SlicerFlavor,
 } from "./engine/EngineClient";
 import { EngineSession } from "./engine/EngineSession";
+import { ENVELOPE_STEP, FieldServer, isEnvelope } from "./engine/FieldServer";
 import type {
   Bc,
   BcKind,
@@ -240,14 +241,8 @@ function resultStashId(kind: ResultKind, stepId: string, singleStep: boolean): s
   return singleStep ? kind : `${kind}::${stepId}`;
 }
 
-/** Sentinel `loadStepId` for the envelope pseudo-step (DESIGN §13): the worst
- *  case across all of a kind's load steps. Not a real load step — it has no
- *  stashed solution; its field is reduced client-side from the steps. */
-const ENVELOPE_STEP = "__envelope__";
-
-function isEnvelope(e: ResultEntry): boolean {
-  return e.loadStepId === ENVELOPE_STEP;
-}
+// The envelope pseudo-step sentinel (`ENVELOPE_STEP`) and `isEnvelope` live in
+// engine/FieldServer.ts with the client-side envelope reduction they gate.
 
 /** Append an "Envelope · worst case" pseudo-step to every kind that has ≥2 real
  *  load-step results (a single step has nothing to envelope). The entry carries
@@ -1003,101 +998,35 @@ const session = new EngineSession((p, d, e, ed) =>
   sceneEvents.onVoxelResult?.(p, d, e, ed)
 );
 
-/** Push the envelope's worst-case `field` as a scalar contour on the undeformed
- *  part (it has no single displacement). Reduces the kind's steps client-side;
- *  every field — including |u| — goes through the scalar-field path. */
-async function pushEnvelopeField(
-  set: SetState,
-  get: () => AppState,
-  kind: ResultKind,
-  field: string
-) {
-  const values = await computeEnvelopeField(get, kind, field);
-  // Bail if the user moved on (switched result or field) during the reduction.
-  const active = get().results.find((r) => r.id === get().activeResultId);
-  if (!active || !isEnvelope(active) || active.kind !== kind || get().resultField !== field) return;
-  if (!values) {
-    sceneEvents.onScalarField?.(null);
-    return;
-  }
-  let min = Infinity;
-  let max = -Infinity;
-  for (let i = 0; i < values.length; i++) {
-    if (values[i] < min) min = values[i];
-    if (values[i] > max) max = values[i];
-  }
-  const signed = field === "svm";
-  if (signed) {
-    const m = Math.max(Math.abs(min), Math.abs(max), 1e-12);
-    min = -m;
-    max = m;
-  } else if (field === "u") {
-    min = 0; // |u| anchors at zero like the per-step view
-  }
-  set({ fieldRange: { min, max } });
-  sceneEvents.onScalarField?.(values, field.startsWith("sf"), signed);
-}
+/** Owns the result-field display pipeline: the four fetch/compute paths
+ *  (envelope reduction, peel maps, displacement components, engine scalar
+ *  fields), their staleness discipline, and the reduced-envelope cache.
+ *  The store adapts it via `pushScalarField` below. */
+const fieldServer = new FieldServer(session);
 
 /** Push the active result field, sized for the active result surface
- *  ("u" = displacement coloring straight from the displacement arrays). */
-async function pushScalarField(set: SetState, get: () => AppState) {
-  const active = get().results.find((r) => r.id === get().activeResultId);
-  if (active && isEnvelope(active)) {
-    await pushEnvelopeField(set, get, active.kind, get().resultField);
-    return;
-  }
-  const kind = get().resultField;
-  // Displacement fields are colored client-side from the displacement buffer:
-  // |u| magnitude (-1) or a signed X/Y/Z component (0/1/2). No engine fetch.
-  // Build-sim bed-peel: shown as a flat heatmap lying ON the plate (visible
-  // from above), NOT painted on the part — so leave the part in its plain
-  // deformed shade and drop any stress coloring. Anchored at 0, N, uncalibrated.
-  if (kind === "peel" || kind === "peelshear") {
-    sceneEvents.onScalarField?.(null);
-    const { positions, values } = await engine.peelMap(kind as "peel" | "peelshear");
-    if (get().resultField !== kind) return;
-    let max = 0;
-    for (let i = 0; i < values.length; i++) if (values[i] > max) max = values[i];
-    set({ fieldRange: { min: 0, max } });
-    sceneEvents.onPeelMap?.(positions, values, max);
-    return;
-  }
-  // Any non-peel field: make sure a previous bed-peel heatmap is gone.
-  sceneEvents.onPeelMap?.(null, null, 0);
-  const dispComp = kind === "u" ? -1 : kind === "ux" ? 0 : kind === "uy" ? 1 : kind === "uz" ? 2 : null;
-  if (dispComp !== null) {
-    sceneEvents.onScalarField?.(null);
-    // Both |u| (anchored [0, max]) and the signed components report their auto
-    // range back from the scene via onResultRange → fieldRange, so the legend
-    // follows the ACTIVE result instead of a stale solve stat. Don't null it
-    // here — the scene repopulates it synchronously as it colors.
-    sceneEvents.onDispComponent?.(dispComp);
-    return;
-  }
-  const vox = get().resultSurface === "voxel";
-  let values = session.fieldOf(kind, vox);
-  if (!values) {
-    values = vox ? await engine.voxelResultField(kind) : await engine.resultField(kind);
-    session.setField(kind, vox, values);
-  }
-  if (get().resultField !== kind) return; // user moved on mid-fetch
-  let min = Infinity;
-  let max = -Infinity;
-  for (let i = 0; i < values.length; i++) {
-    min = Math.min(min, values[i]);
-    max = Math.max(max, values[i]);
-  }
-  // Signed von Mises is a diverging field: center the scale on 0 so red =
-  // tension, blue = compression, green ≈ unloaded (and the legend reads ±M).
-  const signed = kind === "svm";
-  if (signed) {
-    const m = Math.max(Math.abs(min), Math.abs(max), 1e-12);
-    min = -m;
-    max = m;
-  }
-  set({ fieldRange: { min, max } });
-  // Safety factor: invert the colormap so red marks the critical LOW.
-  sceneEvents.onScalarField?.(values, kind.startsWith("sf"), signed);
+ *  ("u" = displacement coloring straight from the displacement arrays).
+ *  Thin adapter over the FieldServer: the store stays the only zustand
+ *  writer (`fieldRange`) and the only scene-event caller; the server picks
+ *  the fetch path and drops results the user has navigated away from. */
+function pushScalarField(set: SetState, get: () => AppState): Promise<void> {
+  return fieldServer.pushActiveField(
+    () => {
+      const s = get();
+      return {
+        activeResultId: s.activeResultId,
+        resultField: s.resultField,
+        resultSurface: s.resultSurface,
+        results: s.results,
+      };
+    },
+    {
+      setFieldRange: (range) => set({ fieldRange: range }),
+      scalarField: (values, flip, signed) => sceneEvents.onScalarField?.(values, flip, signed),
+      peelMap: (positions, values, max) => sceneEvents.onPeelMap?.(positions, values, max),
+      dispComponent: (comp) => sceneEvents.onDispComponent?.(comp),
+    }
+  );
 }
 
 /** Min safety factor of the CURRENT (live) printed solution from BOTH limits
@@ -1750,58 +1679,11 @@ function currentLegendRange(s: AppState): [number, number] | null {
 
 // ---- envelope (worst case across load steps) ----
 
-/** Reduced envelope fields, keyed `${kind}::${field}`. Cleared whenever the
- *  result set is rebuilt (new solve / grid drop) — the stashes it reduces over
- *  would no longer match. */
-const envelopeFields = new Map<string, Float32Array>();
+/** The FieldServer holds the reduced-envelope fields (keyed `${kind}::${field}`).
+ *  Cleared whenever the result set is rebuilt (new solve / grid drop) — the
+ *  stashes it reduces over would no longer match. */
 function clearEnvelopeCache() {
-  envelopeFields.clear();
-}
-
-/** Displacement component index for a field, or null for an engine field. */
-function dispCompOf(field: string): number | null {
-  return field === "u" ? -1 : field === "ux" ? 0 : field === "uy" ? 1 : field === "uz" ? 2 : null;
-}
-
-/** Worst case of `field` across every real load step of `kind`, per surface
- *  vertex: MIN for safety factors ("does it survive any load"), MAX otherwise.
- *  Activates each step's stash in turn and reduces client-side; cached. The
- *  fields are NOT written to the shared field cache (they'd shadow a real
- *  step's). */
-async function computeEnvelopeField(
-  get: () => AppState,
-  kind: ResultKind,
-  field: string
-): Promise<Float32Array | null> {
-  const key = `${kind}::${field}`;
-  const hit = envelopeFields.get(key);
-  if (hit) return hit;
-  const steps = get().results.filter((r) => r.kind === kind && !isEnvelope(r));
-  if (!steps.length) return null;
-  const comp = dispCompOf(field);
-  const isSf = field.startsWith("sf");
-  let acc: Float32Array | null = null;
-  for (const step of steps) {
-    const disp = await engine.activateResult(step.id);
-    let vals: Float32Array;
-    if (comp !== null) {
-      const n = disp.length / 3;
-      vals = new Float32Array(n);
-      for (let i = 0; i < n; i++) {
-        vals[i] = comp < 0 ? Math.hypot(disp[3 * i], disp[3 * i + 1], disp[3 * i + 2]) : disp[3 * i + comp];
-      }
-    } else {
-      vals = (await engine.resultField(field)).slice();
-    }
-    if (!acc) {
-      acc = comp !== null ? vals : vals.slice();
-    } else {
-      const n = Math.min(acc.length, vals.length);
-      for (let i = 0; i < n; i++) acc[i] = isSf ? Math.min(acc[i], vals[i]) : Math.max(acc[i], vals[i]);
-    }
-  }
-  if (acc) envelopeFields.set(key, acc);
-  return acc;
+  fieldServer.clearEnvelopeCache();
 }
 
 /** Display an envelope result: undeformed geometry (it has no single
