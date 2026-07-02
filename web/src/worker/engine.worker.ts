@@ -5,6 +5,17 @@
 // The wasm Model lives here; the main thread talks via EngineClient.
 
 import type { Model } from "../wasm/filasim_wasm.js";
+import type {
+  BuildSimProgressMessage,
+  EngineResponses,
+  EngineWorkerRequest,
+  LoadedModelData,
+  ModalProgressMessage,
+  Op,
+  OptimizeProgressMessage,
+  WorkerErrorMessage,
+  WorkerRequest,
+} from "../engine/EngineProtocol";
 
 let model: Model | null = null;
 let ModelCtor: typeof Model;
@@ -55,133 +66,15 @@ const ready = (async () => {
   }
 })();
 
-type Req =
-  | { id: number; op: "load"; bytes: ArrayBuffer; name: string }
-  | {
-      id: number;
-      op: "transform";
-      /** Rigid transform: [r00..r22 row-major, tx, ty, tz] in mm. */
-      matrix: number[];
-    }
-  | { id: number; op: "resegment"; angle: number }
-  | { id: number; op: "useCadFaces" }
-  | {
-      id: number;
-      op: "setMaterial";
-      e0: number;
-      nu: number;
-      density: number;
-      strength: number;
-      strengthZ: number;
-    }
-  | { id: number; op: "setGravity"; on: boolean }
-  | { id: number; op: "setResolution"; cells: number }
-  | { id: number; op: "setVoxelSize"; h: number }
-  | {
-      id: number;
-      op: "setBcs";
-      bcs: {
-        kind: string;
-        tris: Uint32Array;
-        force?: number[];
-        pressure?: number;
-        stiffness?: number;
-        axes?: boolean[];
-        disp?: number[];
-        moment?: number[];
-      }[];
-    }
-  | { id: number; op: "fitCylinder"; tris: Uint32Array }
-  | { id: number; op: "voxelInfo" }
-  | { id: number; op: "voxelMesh" }
-  | {
-      id: number;
-      op: "voxelMeshCut";
-      plane: { normal: [number, number, number]; constant: number } | null;
-      wall: number;
-      /** Top/bottom shell thickness in mm (layers × layer height). */
-      topBottomMm: number;
-      /** Uniform infill % for interior-cell density (optimized densities
-       *  win when an optimization result exists). */
-      infillPct: number;
-    }
-  | { id: number; op: "check" }
-  | { id: number; op: "solve" }
-  | { id: number; op: "solveOptimized" }
-  | { id: number; op: "setSnapWall"; wall: number }
-  | { id: number; op: "setCompositeSkin"; on: boolean }
-  | { id: number; op: "setSmoothStress"; on: boolean }
-  | { id: number; op: "setMaterialStress"; on: boolean }
-  | { id: number; op: "setCancelBuffer"; buf: SharedArrayBuffer }
-  | { id: number; op: "setProgressBuffer"; buf: SharedArrayBuffer }
-  | {
-      id: number;
-      op: "solvePrinted";
-      /** PrintedOpts object — serialized to JSON for the wasm API. */
-      opts: Record<string, unknown>;
-    }
-  | {
-      id: number;
-      op: "buildSim";
-      /** BuildSimOpts object — serialized to JSON for the wasm API. */
-      opts: Record<string, unknown>;
-    }
-  | {
-      id: number;
-      op: "modalAnalysis";
-      /** ModalOpts object — serialized to JSON for the wasm API. */
-      opts: Record<string, unknown>;
-    }
-  | {
-      id: number;
-      op: "setBuildState";
-      /** "bonded" (on bed) | "released" (off bed). */
-      state: string;
-    }
-  | {
-      id: number;
-      op: "optimize";
-      /** OptimizeOptions object — serialized to JSON for the wasm API. */
-      opts: Record<string, unknown>;
-    }
-  | { id: number; op: "densityShape"; threshold: number }
-  | { id: number; op: "resmooth"; iters: number }
-  | { id: number; op: "setIsoThreshold"; threshold: number; smoothIters: number }
-  | { id: number; op: "resultField"; kind: string }
-  | { id: number; op: "peelField"; kind: string }
-  | { id: number; op: "peelMap"; kind: string }
-  | {
-      id: number;
-      op: "inherentStrainVoxels";
-      layerMax: number;
-      shrinkXy: number;
-      shrinkZ: number;
-    }
-  | { id: number; op: "voxelResults" }
-  | { id: number; op: "voxelResultField"; kind: string }
-  | { id: number; op: "stashResult"; resultId: string }
-  | { id: number; op: "activateResult"; resultId: string }
-  | { id: number; op: "clearResults" }
-  | { id: number; op: "clearLoadCases" }
-  | { id: number; op: "addLoadCase"; weight: number }
-  | { id: number; op: "transformMatrix" }
-  | { id: number; op: "exportProject"; manifest: string; modelEntry: string; includeResults: boolean }
-  | { id: number; op: "openProjectModel"; bytes: ArrayBuffer }
-  | { id: number; op: "openProjectRestore" }
-  | { id: number; op: "vertexDensity" }
-  | { id: number; op: "exportThreeMf"; slicer: string; thumbnail: Uint8Array | null }
-  | {
-      id: number;
-      op: "exportColorThreeMf";
-      kind: string;
-      lo: number;
-      hi: number;
-      steps: number;
-      colors: string[];
-      thumbnail: Uint8Array | null;
-    }
-  | { id: number; op: "exportStls" }
-  | { id: number; op: "exportSolidStl" };
+/** Typed success reply: `data` is checked against the op's entry in
+ *  `EngineResponses`, so a switch case can't post the wrong shape. */
+function reply<O extends Op>(
+  msg: WorkerRequest<O>,
+  data: EngineResponses[O],
+  transfer: Transferable[] = []
+): void {
+  (self as unknown as Worker).postMessage({ id: msg.id, ok: true, data }, transfer);
+}
 
 /** Collect region meshes + transfer list (shared by optimize + resmooth). */
 function collectRegions(m: Model): {
@@ -199,7 +92,7 @@ function collectRegions(m: Model): {
   return { regions, transfer };
 }
 
-self.onmessage = async (ev: MessageEvent<Req>) => {
+self.onmessage = async (ev: MessageEvent<EngineWorkerRequest>) => {
   const msg = ev.data;
   try {
     await ready;
@@ -216,42 +109,30 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
           patchIds,
           patchCount: model.patch_count(),
           triCount: model.triangle_count(),
-          bbox: Array.from(model.bbox()),
+          bbox: Array.from(model.bbox()) as LoadedModelData["bbox"],
           meshObjects: model.mesh_object_count(),
           hasCadFaces: model.has_cad_faces(),
         };
-        (self as unknown as Worker).postMessage({ id: msg.id, ok: true, data }, [
-          positions.buffer,
-          patchIds.buffer,
-        ]);
+        reply(msg, data, [positions.buffer, patchIds.buffer]);
         return;
       }
       case "transform": {
         const m = requireModel();
         m.transform(new Float64Array(msg.matrix));
         const positions = m.positions();
-        (self as unknown as Worker).postMessage(
-          { id: msg.id, ok: true, data: { positions, bbox: Array.from(m.bbox()) } },
-          [positions.buffer]
-        );
+        reply(msg, { positions, bbox: Array.from(m.bbox()) }, [positions.buffer]);
         return;
       }
       case "resegment": {
         requireModel().resegment(msg.angle);
         const patchIds = requireModel().patch_ids();
-        (self as unknown as Worker).postMessage(
-          { id: msg.id, ok: true, data: { patchIds, patchCount: requireModel().patch_count() } },
-          [patchIds.buffer]
-        );
+        reply(msg, { patchIds, patchCount: requireModel().patch_count() }, [patchIds.buffer]);
         return;
       }
       case "useCadFaces": {
         requireModel().use_cad_faces();
         const patchIds = requireModel().patch_ids();
-        (self as unknown as Worker).postMessage(
-          { id: msg.id, ok: true, data: { patchIds, patchCount: requireModel().patch_count() } },
-          [patchIds.buffer]
-        );
+        reply(msg, { patchIds, patchCount: requireModel().patch_count() }, [patchIds.buffer]);
         return;
       }
       case "setMaterial":
@@ -318,12 +199,12 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
       }
       case "fitCylinder": {
         const json = requireModel().fit_cylinder(msg.tris);
-        (self as unknown as Worker).postMessage({ id: msg.id, ok: true, data: JSON.parse(json) });
+        reply(msg, JSON.parse(json));
         return;
       }
       case "voxelInfo": {
         const info = JSON.parse(requireModel().voxel_info());
-        (self as unknown as Worker).postMessage({ id: msg.id, ok: true, data: info });
+        reply(msg, info);
         return;
       }
       case "voxelMesh": {
@@ -331,10 +212,7 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
         const hull = m.voxel_hull();
         const edges = m.voxel_edges();
         const info = JSON.parse(m.voxel_info());
-        (self as unknown as Worker).postMessage(
-          { id: msg.id, ok: true, data: { hull, edges, info } },
-          [hull.buffer, edges.buffer]
-        );
+        reply(msg, { hull, edges, info }, [hull.buffer, edges.buffer]);
         return;
       }
       case "voxelMeshCut": {
@@ -354,15 +232,12 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
         const density = arr[1] as Float32Array;
         const edges = arr[2] as Float32Array;
         const info = JSON.parse(m.voxel_info());
-        (self as unknown as Worker).postMessage(
-          { id: msg.id, ok: true, data: { hull, density, edges, info } },
-          [hull.buffer, density.buffer, edges.buffer]
-        );
+        reply(msg, { hull, density, edges, info }, [hull.buffer, density.buffer, edges.buffer]);
         return;
       }
       case "check": {
         const report = JSON.parse(requireModel().check());
-        (self as unknown as Worker).postMessage({ id: msg.id, ok: true, data: report });
+        reply(msg, report);
         return;
       }
       case "solve": {
@@ -371,10 +246,7 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
         const stats = JSON.parse(requireModel().solve());
         const displacements = requireModel().vertex_displacements();
         stats.seconds = (performance.now() - t0) / 1000;
-        (self as unknown as Worker).postMessage(
-          { id: msg.id, ok: true, data: { stats, displacements } },
-          [displacements.buffer]
-        );
+        reply(msg, { stats, displacements }, [displacements.buffer]);
         return;
       }
       case "solveOptimized": {
@@ -383,10 +255,7 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
         const stats = JSON.parse(requireModel().solve_optimized());
         const displacements = requireModel().vertex_displacements();
         stats.seconds = (performance.now() - t0) / 1000;
-        (self as unknown as Worker).postMessage(
-          { id: msg.id, ok: true, data: { stats, displacements } },
-          [displacements.buffer]
-        );
+        reply(msg, { stats, displacements }, [displacements.buffer]);
         return;
       }
       case "solvePrinted": {
@@ -395,10 +264,7 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
         const stats = JSON.parse(requireModel().solve_printed(JSON.stringify(msg.opts)));
         const displacements = requireModel().vertex_displacements();
         stats.seconds = (performance.now() - t0) / 1000;
-        (self as unknown as Worker).postMessage(
-          { id: msg.id, ok: true, data: { stats, displacements } },
-          [displacements.buffer]
-        );
+        reply(msg, { stats, displacements }, [displacements.buffer]);
         return;
       }
       case "buildSim": {
@@ -418,7 +284,7 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
                   data: { done, total, maxU },
                   density: pos,
                   skelPositions: mags,
-                },
+                } satisfies BuildSimProgressMessage,
                 pos.length > 0 ? [pos.buffer, mags.buffer] : []
               );
             }
@@ -426,10 +292,7 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
         );
         const displacements = requireModel().vertex_displacements();
         stats.seconds = (performance.now() - t0) / 1000;
-        (self as unknown as Worker).postMessage(
-          { id: msg.id, ok: true, data: { stats, displacements } },
-          [displacements.buffer]
-        );
+        reply(msg, { stats, displacements }, [displacements.buffer]);
         return;
       }
       case "modalAnalysis": {
@@ -446,16 +309,13 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
                 id: msg.id,
                 progress: true,
                 data: { outer, maxOuter, freqs: Array.from(freqs) },
-              });
+              } satisfies ModalProgressMessage);
             }
           )
         );
         const displacements = requireModel().vertex_displacements();
         result.seconds = (performance.now() - t0) / 1000;
-        (self as unknown as Worker).postMessage(
-          { id: msg.id, ok: true, data: { result, displacements } },
-          [displacements.buffer]
-        );
+        reply(msg, { result, displacements }, [displacements.buffer]);
         return;
       }
       case "setBuildState": {
@@ -463,10 +323,7 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
         // onto the mesh for the deformed view.
         const stats = JSON.parse(requireModel().set_build_state(msg.state));
         const displacements = requireModel().vertex_displacements();
-        (self as unknown as Worker).postMessage(
-          { id: msg.id, ok: true, data: { stats, displacements } },
-          [displacements.buffer]
-        );
+        reply(msg, { stats, displacements }, [displacements.buffer]);
         return;
       }
       case "optimize": {
@@ -492,7 +349,7 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
                   skelPositions,
                   skelIndices,
                   skelDensity,
-                },
+                } satisfies OptimizeProgressMessage,
                 [density.buffer, skelPositions.buffer, skelIndices.buffer, skelDensity.buffer]
               );
             }
@@ -504,10 +361,7 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
         const vertexDensity = m.vertex_density();
         const displacements = m.vertex_displacements();
         transfer.push(vertexDensity.buffer, displacements.buffer);
-        (self as unknown as Worker).postMessage(
-          { id: msg.id, ok: true, data: { summary, regions, vertexDensity, displacements } },
-          transfer
-        );
+        reply(msg, { summary, regions, vertexDensity, displacements }, transfer);
         return;
       }
       case "densityShape": {
@@ -515,54 +369,42 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
         const positions = arr[0] as Float32Array;
         const indices = arr[1] as Uint32Array;
         const density = arr[2] as Float32Array;
-        (self as unknown as Worker).postMessage(
-          { id: msg.id, ok: true, data: { positions, indices, density } },
-          [positions.buffer, indices.buffer, density.buffer]
-        );
+        reply(msg, { positions, indices, density }, [
+          positions.buffer,
+          indices.buffer,
+          density.buffer,
+        ]);
         return;
       }
       case "resmooth": {
         const m = requireModel();
         m.resmooth_regions(msg.iters);
         const { regions, transfer } = collectRegions(m);
-        (self as unknown as Worker).postMessage(
-          { id: msg.id, ok: true, data: { regions } },
-          transfer
-        );
+        reply(msg, { regions }, transfer);
         return;
       }
       case "setIsoThreshold": {
         const m = requireModel();
         m.set_iso_threshold(msg.threshold, msg.smoothIters);
         const { regions, transfer } = collectRegions(m);
-        (self as unknown as Worker).postMessage(
-          { id: msg.id, ok: true, data: { regions } },
-          transfer
-        );
+        reply(msg, { regions }, transfer);
         return;
       }
       case "resultField": {
         const values = requireModel().result_field(msg.kind);
-        (self as unknown as Worker).postMessage({ id: msg.id, ok: true, data: values }, [
-          values.buffer,
-        ]);
+        reply(msg, values, [values.buffer]);
         return;
       }
       case "peelField": {
         const values = requireModel().peel_field(msg.kind);
-        (self as unknown as Worker).postMessage({ id: msg.id, ok: true, data: values }, [
-          values.buffer,
-        ]);
+        reply(msg, values, [values.buffer]);
         return;
       }
       case "peelMap": {
         const arr = requireModel().peel_map(msg.kind);
         const positions = arr[0] as Float32Array;
         const values = arr[1] as Float32Array;
-        (self as unknown as Worker).postMessage(
-          { id: msg.id, ok: true, data: { positions, values } },
-          [positions.buffer, values.buffer]
-        );
+        reply(msg, { positions, values }, [positions.buffer, values.buffer]);
         return;
       }
       case "inherentStrainVoxels": {
@@ -572,10 +414,7 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
         const edges = arr[2] as Float32Array;
         const max = arr[3] as number;
         const nz = arr[4] as number;
-        (self as unknown as Worker).postMessage(
-          { id: msg.id, ok: true, data: { hull, values, edges, max, nz } },
-          [hull.buffer, values.buffer, edges.buffer]
-        );
+        reply(msg, { hull, values, edges, max, nz }, [hull.buffer, values.buffer, edges.buffer]);
         return;
       }
       case "voxelResults": {
@@ -584,17 +423,17 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
         const displacements = arr[1] as Float32Array;
         const edges = arr[2] as Float32Array;
         const edgeDisplacements = arr[3] as Float32Array;
-        (self as unknown as Worker).postMessage(
-          { id: msg.id, ok: true, data: { positions, displacements, edges, edgeDisplacements } },
-          [positions.buffer, displacements.buffer, edges.buffer, edgeDisplacements.buffer]
-        );
+        reply(msg, { positions, displacements, edges, edgeDisplacements }, [
+          positions.buffer,
+          displacements.buffer,
+          edges.buffer,
+          edgeDisplacements.buffer,
+        ]);
         return;
       }
       case "voxelResultField": {
         const values = requireModel().voxel_result_field(msg.kind);
-        (self as unknown as Worker).postMessage({ id: msg.id, ok: true, data: values }, [
-          values.buffer,
-        ]);
+        reply(msg, values, [values.buffer]);
         return;
       }
       case "stashResult":
@@ -602,9 +441,7 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
         break;
       case "activateResult": {
         const displacements = requireModel().activate_result(msg.resultId);
-        (self as unknown as Worker).postMessage({ id: msg.id, ok: true, data: displacements }, [
-          displacements.buffer,
-        ]);
+        reply(msg, displacements, [displacements.buffer]);
         return;
       }
       case "clearResults":
@@ -618,7 +455,7 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
         break;
       case "transformMatrix": {
         const mtx = Array.from(requireModel().transform_matrix());
-        (self as unknown as Worker).postMessage({ id: msg.id, ok: true, data: mtx });
+        reply(msg, mtx);
         return;
       }
       case "exportProject": {
@@ -629,7 +466,7 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
           msg.manifest,
           msg.includeResults
         );
-        (self as unknown as Worker).postMessage({ id: msg.id, ok: true, data: bytes }, [bytes.buffer]);
+        reply(msg, bytes, [bytes.buffer]);
         return;
       }
       case "openProjectModel": {
@@ -657,35 +494,30 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
             patchIds,
             patchCount: model.patch_count(),
             triCount: model.triangle_count(),
-            bbox: Array.from(model.bbox()),
+            bbox: Array.from(model.bbox()) as LoadedModelData["bbox"],
             meshObjects: model.mesh_object_count(),
             hasCadFaces: model.has_cad_faces(),
           },
         };
-        (self as unknown as Worker).postMessage({ id: msg.id, ok: true, data }, [
-          positions.buffer,
-          patchIds.buffer,
-        ]);
+        reply(msg, data, [positions.buffer, patchIds.buffer]);
         return;
       }
       case "openProjectRestore": {
         if (!pendingProject) throw new Error("no project staged to restore");
         const summary = JSON.parse(requireModel().restore_project(pendingProject));
         pendingProject = null;
-        (self as unknown as Worker).postMessage({ id: msg.id, ok: true, data: summary });
+        reply(msg, summary);
         return;
       }
       case "vertexDensity": {
         const vd = requireModel().vertex_density();
-        (self as unknown as Worker).postMessage({ id: msg.id, ok: true, data: vd }, [vd.buffer]);
+        reply(msg, vd, [vd.buffer]);
         return;
       }
       case "exportThreeMf": {
         const thumb = msg.thumbnail ?? new Uint8Array(0);
         const bytes = requireModel().export_3mf(msg.slicer, thumb);
-        (self as unknown as Worker).postMessage({ id: msg.id, ok: true, data: bytes }, [
-          bytes.buffer,
-        ]);
+        reply(msg, bytes, [bytes.buffer]);
         return;
       }
       case "exportColorThreeMf": {
@@ -698,24 +530,24 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
           JSON.stringify(msg.colors),
           thumb
         );
-        (self as unknown as Worker).postMessage({ id: msg.id, ok: true, data: bytes }, [
-          bytes.buffer,
-        ]);
+        reply(msg, bytes, [bytes.buffer]);
         return;
       }
       case "exportStls": {
         const bytes = requireModel().export_stls();
-        (self as unknown as Worker).postMessage({ id: msg.id, ok: true, data: bytes }, [
-          bytes.buffer,
-        ]);
+        reply(msg, bytes, [bytes.buffer]);
         return;
       }
       case "exportSolidStl": {
         const bytes = requireModel().export_solid_stl();
-        (self as unknown as Worker).postMessage({ id: msg.id, ok: true, data: bytes }, [
-          bytes.buffer,
-        ]);
+        reply(msg, bytes, [bytes.buffer]);
         return;
+      }
+      default: {
+        // Compile-time exhaustiveness: an op added to EngineRequests without
+        // a case here fails this assignment. Unreachable at runtime.
+        const unhandled: never = msg;
+        return unhandled;
       }
     }
     (self as unknown as Worker).postMessage({ id: msg.id, ok: true });
@@ -724,7 +556,7 @@ self.onmessage = async (ev: MessageEvent<Req>) => {
       id: msg.id,
       ok: false,
       error: e instanceof Error ? e.message : String(e),
-    });
+    } satisfies WorkerErrorMessage);
   }
 };
 

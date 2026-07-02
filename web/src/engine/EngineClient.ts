@@ -4,17 +4,27 @@
 // Promise wrapper around the engine worker.
 
 import type { Bc, CheckReport, CylFit, LoadedModel, SolveStats, VoxelInfo } from "../types";
+import { EngineError } from "./EngineProtocol";
+import type {
+  BcPayload,
+  EngineRequests,
+  EngineResponses,
+  EngineWorkerMessage,
+  Op,
+} from "./EngineProtocol";
 
 interface Pending {
-  resolve: (v: unknown) => void;
-  reject: (e: Error) => void;
-  onProgress?: (
+  // Method syntax on purpose: the map stores one entry per in-flight op, so a
+  // specific op's resolve is held as the all-ops union (bivariance applies).
+  resolve(v: EngineResponses[Op]): void;
+  reject(e: EngineError): void;
+  onProgress?(
     data: unknown,
-    density: Float32Array,
+    density?: Float32Array,
     skelPositions?: Float32Array,
     skelIndices?: Uint32Array,
     skelDensity?: Float32Array
-  ) => void;
+  ): void;
 }
 
 /** Capacity of the live residual buffer (f32 slots). Caps the streamed
@@ -53,29 +63,30 @@ export class EngineClient {
       this.progressData = new Float32Array(pbuf, 4, PROGRESS_CAP);
       void this.call({ op: "setProgressBuffer", buf: pbuf });
     }
-    this.worker.onmessage = (ev) => {
-      const { id, ok, data, error, progress, density, skelPositions, skelIndices, skelDensity } =
-        ev.data;
-      const p = this.pending.get(id);
+    this.worker.onmessage = (ev: MessageEvent<EngineWorkerMessage>) => {
+      const msg = ev.data;
+      const p = this.pending.get(msg.id);
       if (!p) return;
-      if (progress) {
-        p.onProgress?.(data, density, skelPositions, skelIndices, skelDensity);
+      if ("progress" in msg) {
+        p.onProgress?.(msg.data, msg.density, msg.skelPositions, msg.skelIndices, msg.skelDensity);
         return;
       }
-      this.pending.delete(id);
-      if (ok) p.resolve(data);
-      else p.reject(new Error(error));
+      this.pending.delete(msg.id);
+      if (msg.ok) p.resolve(msg.data);
+      else p.reject(new EngineError(msg.error));
     };
   }
 
-  private call<T>(
-    msg: Record<string, unknown>,
+  private call<O extends Op>(
+    msg: { op: O } & EngineRequests[O],
     transfer: Transferable[] = [],
-    onProgress?: (data: unknown, density: Float32Array) => void
-  ): Promise<T> {
+    onProgress?: Pending["onProgress"]
+  ): Promise<EngineResponses[O]> {
     const id = this.nextId++;
-    return new Promise<T>((resolve, reject) => {
-      this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject, onProgress });
+    return new Promise<EngineResponses[O]>((resolve, reject) => {
+      // One type-erasure point: the map holds every op's entry, so the
+      // op-specific resolve widens to the union here (call sites stay typed).
+      this.pending.set(id, { resolve, reject, onProgress } as Pending);
       this.worker.postMessage({ id, ...msg }, transfer);
     });
   }
@@ -109,7 +120,7 @@ export class EngineClient {
   }
 
   load(bytes: ArrayBuffer, name: string): Promise<LoadedModel> {
-    return this.call<LoadedModel>({ op: "load", bytes, name }, [bytes]);
+    return this.call({ op: "load", bytes, name }, [bytes]);
   }
 
   resegment(angle: number): Promise<{ patchIds: Uint32Array; patchCount: number }> {
@@ -183,7 +194,7 @@ export class EngineClient {
 
   setBcs(bcs: Bc[]): Promise<void> {
     // Copy tri arrays: the originals stay with the UI.
-    const payload = bcs.map((bc) => ({
+    const payload: BcPayload[] = bcs.map((bc) => ({
       kind: bc.kind,
       tris: new Uint32Array(bc.tris),
       force: bc.force,
@@ -234,7 +245,7 @@ export class EngineClient {
     opts: PrintedOptions
   ): Promise<{ stats: PrintedStats; displacements: Float32Array }> {
     this.resetProgress();
-    return this.call({ op: "solvePrinted", opts: opts as unknown as Record<string, unknown> });
+    return this.call({ op: "solvePrinted", opts });
   }
 
   /** FDM build simulation (inherent strain): warping + bed peel. Leaves the
@@ -252,11 +263,7 @@ export class EngineClient {
     ) => void
   ): Promise<{ stats: BuildSimStats; displacements: Float32Array }> {
     this.resetProgress();
-    return this.call(
-      { op: "buildSim", opts: opts as unknown as Record<string, unknown> },
-      [],
-      onProgress as unknown as ((data: unknown, density: Float32Array) => void) | undefined
-    );
+    return this.call({ op: "buildSim", opts }, [], onProgress as Pending["onProgress"]);
   }
 
   /** Constrained undamped modal analysis: the lowest `numModes` natural
@@ -269,11 +276,9 @@ export class EngineClient {
   ): Promise<{ result: ModalAnalysisResult; displacements: Float32Array }> {
     this.resetProgress();
     return this.call(
-      { op: "modalAnalysis", opts: opts as unknown as Record<string, unknown> },
+      { op: "modalAnalysis", opts },
       [],
-      onProgress
-        ? ((data: unknown) => onProgress(data as ModalProgress)) as Pending["onProgress"]
-        : undefined
+      onProgress ? (data: unknown) => onProgress(data as ModalProgress) : undefined
     );
   }
 
