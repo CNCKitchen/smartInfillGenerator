@@ -189,13 +189,23 @@ export interface Material {
    *  density-blind (0 % and 100 % infill warp identically). Rough printed value;
    *  uncalibrated. 0 ⇒ pure-elastic release. */
   yieldStrength: number;
+  /** Build-sim: locking temperature in °C — where the material stops relaxing
+   *  on cool-down: Tg (amorphous) / near Tc (semi-crystalline). With `cte` set,
+   *  the build-sim shrink is DERIVED (CTE × lock→room) and the temperature
+   *  ladder is enabled; unset ⇒ the raw `shrink`/`shrinkZ` legacy path. */
+  tLock?: number;
+  /** Build-sim: effective printed-part CTE in 1/°C (in-plane). Folds
+   *  raster/air-gap effects into one coefficient. */
+  cte?: number;
+  /** Build-sim: through-layer (Z) CTE in 1/°C; unset = isotropic (= cte). */
+  cteZ?: number;
 }
 
 export const DEFAULT_MATERIALS: Material[] = [
-  { name: "PLA", e0: 3500, nu: 0.35, density: 1.24, strength: 50, strengthZ: 35, shrink: 0.004, shrinkZ: 0.002, yieldStrength: 45 },
-  { name: "PETG", e0: 2100, nu: 0.37, density: 1.27, strength: 45, strengthZ: 34, shrink: 0.004, shrinkZ: 0.002, yieldStrength: 40 },
-  { name: "ABS", e0: 2250, nu: 0.37, density: 1.05, strength: 38, strengthZ: 25, shrink: 0.008, shrinkZ: 0.004, yieldStrength: 33 },
-  { name: "ASA", e0: 2400, nu: 0.37, density: 1.07, strength: 43, strengthZ: 29, shrink: 0.006, shrinkZ: 0.003, yieldStrength: 38 },
+  { name: "PLA", e0: 3500, nu: 0.35, density: 1.24, strength: 50, strengthZ: 35, shrink: 0.004, shrinkZ: 0.002, yieldStrength: 45, tLock: 60, cte: 96e-6 },
+  { name: "PETG", e0: 2100, nu: 0.37, density: 1.27, strength: 45, strengthZ: 34, shrink: 0.004, shrinkZ: 0.002, yieldStrength: 40, tLock: 80, cte: 68e-6 },
+  { name: "ABS", e0: 2250, nu: 0.37, density: 1.05, strength: 38, strengthZ: 25, shrink: 0.008, shrinkZ: 0.004, yieldStrength: 33, tLock: 100, cte: 88e-6 },
+  { name: "ASA", e0: 2400, nu: 0.37, density: 1.07, strength: 43, strengthZ: 29, shrink: 0.006, shrinkZ: 0.003, yieldStrength: 38, tLock: 100, cte: 90e-6 },
 ];
 
 export type PatternKey = "gyroid" | "cubic" | "grid";

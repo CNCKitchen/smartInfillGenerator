@@ -27,7 +27,7 @@ import type {
   VoxelInfo,
 } from "./types";
 import { DEFAULT_CURVES, DEFAULT_MATERIALS, RESOLUTIONS, RESULT_FIELDS } from "./types";
-import { getBuildMaterial, shrinkFromPhysics, ROOM_TEMP_C } from "./materials";
+import { shrinkFromPhysics, ROOM_TEMP_C } from "./materials";
 import { fitCylinderFromSelection } from "./cylinderFit";
 import { CONTOUR_BANDS, CONTOUR_BANDS_MIN, CONTOUR_BANDS_MAX, jet, bandHexColors } from "./viewer/colormaps";
 import {
@@ -124,6 +124,11 @@ function loadSettings(): PersistedSettings {
               typeof m.yieldStrength === "number" && m.yieldStrength > 0
                 ? m.yieldStrength
                 : Math.round(0.9 * strength),
+            // Optional thermal data (physics-derived build-sim shrink). Old
+            // saves simply lack it — the raw-shrink legacy path applies.
+            tLock: typeof m.tLock === "number" ? m.tLock : undefined,
+            cte: typeof m.cte === "number" && m.cte > 0 ? m.cte : undefined,
+            cteZ: typeof m.cteZ === "number" && m.cteZ > 0 ? m.cteZ : undefined,
           };
         });
       if (!fallback.materials.length) fallback.materials = DEFAULT_MATERIALS.map((m) => ({ ...m }));
@@ -492,12 +497,11 @@ interface AppState {
   appMode: "optimize" | "buildsim";
   /** Build-sim: which state to deform by (off-bed sprung shape or on the bed). */
   buildState: "released" | "bonded";
-  /** Build-sim material preset id (see BUILD_MATERIALS). "custom" = use the raw
-   *  material shrink with no temperature ladder (legacy path). */
-  buildMaterial: string;
-  /** Build-sim bed temperature (°C) — sent as tBed when a preset is active. */
+  /** Build-sim bed temperature (°C) — sent as tBed when the active material
+   *  carries thermal data (tLock + cte). Process setting, not material. */
   buildBedTemp: number;
-  /** Build-sim chamber temperature (°C) — sent as tChamber when a preset is active. */
+  /** Build-sim chamber temperature (°C) — sent as tChamber when the active
+   *  material carries thermal data. */
   buildChamberTemp: number;
   /** Build-sim live progress (activated layers); null when not running. */
   buildProgress: { done: number; total: number } | null;
@@ -795,9 +799,6 @@ interface AppState {
   setFreeFree(on: boolean): void;
   setAppMode(m: "optimize" | "buildsim"): void;
   setBuildState(s: "released" | "bonded"): void | Promise<void>;
-  /** Pick a build-sim material preset ("custom" = raw material shrink). A
-   *  preset also fills its typical bed/chamber temperatures. */
-  setBuildMaterial(id: string): void;
   setBuildBedTemp(v: number): void;
   setBuildChamberTemp(v: number): void;
   setMeshDensity(on: boolean): void;
@@ -2205,7 +2206,6 @@ function collectSettings(s: AppState) {
     smoothStress: s.smoothStress,
     materialStress: s.materialStress,
     analyzeMode: s.analyzeMode,
-    buildMaterial: s.buildMaterial,
     buildBedTemp: s.buildBedTemp,
     buildChamberTemp: s.buildChamberTemp,
     budget: s.budget,
@@ -2359,7 +2359,6 @@ export const useStore = create<AppState>((set, get) => ({
   freeFree: false,
   appMode: "optimize",
   buildState: "released",
-  buildMaterial: "custom",
   buildBedTemp: 60,
   buildChamberTemp: 25,
   buildProgress: null,
@@ -3312,16 +3311,6 @@ export const useStore = create<AppState>((set, get) => ({
       set({ buildResult: null });
     }
   },
-  setBuildMaterial(id) {
-    const m = getBuildMaterial(id);
-    // A preset fills its typical bed/chamber temperatures; Custom keeps the
-    // raw material shrink (legacy path — no temperature ladder is sent).
-    set(
-      m
-        ? { buildMaterial: m.id, buildBedTemp: m.defaultBed, buildChamberTemp: m.defaultChamber }
-        : { buildMaterial: "custom" }
-    );
-  },
   setBuildBedTemp(v) {
     set({ buildBedTemp: Math.min(200, Math.max(0, v)) });
   },
@@ -3744,22 +3733,23 @@ export const useStore = create<AppState>((set, get) => ({
               : `skin resolved by ${out.stats.skinLayers} cell layer${out.stats.skinLayers === 1 ? "" : "s"}`)
         );
       } else if (buildsim) {
-        // Eigenstrain shrinks. A material PRESET derives them from physics
-        // (CTE × lock→room cooling) and enables the temperature ladder;
-        // Custom uses the raw material shrink with no temperatures (legacy
-        // path). Transverse isotropy: in-plane (XY) vs through-layer (Z).
-        const preset = getBuildMaterial(st0.buildMaterial);
-        const phys = preset ? shrinkFromPhysics(preset, ROOM_TEMP_C) : null;
-        const shrink = phys ? phys.shrink : -Math.abs(st0.material.shrink);
-        const shrinkZ = phys ? phys.shrinkZ : -Math.abs(st0.material.shrinkZ ?? st0.material.shrink);
+        // Eigenstrain shrinks from the ONE active Properties material. With
+        // thermal data (tLock + cte) they derive from physics (CTE × lock→room
+        // cooling) and the temperature ladder is enabled; without it the raw
+        // material shrink is sent with no temperatures (legacy path).
+        // Transverse isotropy: in-plane (XY) vs through-layer (Z).
+        const mat = st0.material;
+        const phys = shrinkFromPhysics(mat, ROOM_TEMP_C);
+        const shrink = phys ? phys.shrink : -Math.abs(mat.shrink);
+        const shrinkZ = phys ? phys.shrinkZ : -Math.abs(mat.shrinkZ ?? mat.shrink);
         // Yield enables the plastic step that makes the released warp depend on
         // infill density (without it a uniform shrink releases density-blind).
-        const yieldStrength = Math.max(0, st0.material.yieldStrength ?? 0);
+        const yieldStrength = Math.max(0, mat.yieldStrength ?? 0);
         appendLog(
           set,
-          `Build sim — ${preset ? preset.label : st0.material.name}, shrink XY ${(Math.abs(shrink) * 100).toFixed(2)}% · Z ${(Math.abs(shrinkZ) * 100).toFixed(2)}% (${
-            preset
-              ? `physics: lock ${preset.tLock} °C → ${ROOM_TEMP_C} °C, bed ${st0.buildBedTemp} °C, chamber ${st0.buildChamberTemp} °C`
+          `Build sim — ${mat.name}, shrink XY ${(Math.abs(shrink) * 100).toFixed(2)}% · Z ${(Math.abs(shrinkZ) * 100).toFixed(2)}% (${
+            phys
+              ? `physics: lock ${mat.tLock} °C → ${ROOM_TEMP_C} °C, bed ${st0.buildBedTemp} °C, chamber ${st0.buildChamberTemp} °C`
               : "material"
           }), ` +
             `${yieldStrength > 0 ? `yield ${yieldStrength} MPa (plastic)` : "elastic"}, ` +
@@ -3804,11 +3794,11 @@ export const useStore = create<AppState>((set, get) => ({
             state: st0.buildState,
             exaggeration: exag,
             yieldStrength,
-            // All four temperatures together enable the ladder; Custom sends
-            // none (legacy behavior).
-            ...(preset
+            // All four temperatures together enable the ladder; a material
+            // without thermal data sends none (legacy behavior).
+            ...(phys && mat.tLock != null
               ? {
-                  tLock: preset.tLock,
+                  tLock: mat.tLock,
                   tBed: st0.buildBedTemp,
                   tChamber: st0.buildChamberTemp,
                   tFinal: ROOM_TEMP_C,
@@ -4611,8 +4601,9 @@ export const useStore = create<AppState>((set, get) => ({
         smoothStress: st.smoothStress,
         materialStress: st.materialStress,
         analyzeMode: st.analyzeMode,
-        // Pre-temperature-ladder projects: default to the legacy raw-shrink path.
-        buildMaterial: st.buildMaterial ?? "custom",
+        // Pre-temperature-ladder projects lack the temps (and older files may
+        // carry a now-removed `buildMaterial` preset id — silently ignored;
+        // the ONE Properties material drives the build sim).
         buildBedTemp: st.buildBedTemp ?? 60,
         buildChamberTemp: st.buildChamberTemp ?? 25,
         budget: st.budget,

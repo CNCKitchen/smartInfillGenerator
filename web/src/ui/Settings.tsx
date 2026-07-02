@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useShallow } from "zustand/shallow";
 import { useStore } from "../store";
 import { NumInput } from "./NumInput";
@@ -50,8 +50,10 @@ export function SettingsModal() {
         <div className="dim small">
           E, σₜ (in-layer tensile strength) and σₜᶻ (layer adhesion — tension across the layers,
           typically 50–80% of σₜ) in MPa, ρ in g/cm³. The strengths drive the safety-factor
-          plots; the worst-case factor uses whichever limit governs. Editing the material in use
-          invalidates current results. Saved in this browser.
+          plots; the worst-case factor uses whichever limit governs. Tg and CTE (optional) derive
+          the build-sim shrink from physics and enable its temperature ladder; blank = the raw
+          Shrink % path. Editing the material in use invalidates current results. Saved in this
+          browser.
         </div>
         <table className="settingstable">
           <thead>
@@ -63,8 +65,11 @@ export function SettingsModal() {
               <th>σₜ ({unitLabel("stress")})</th>
               <th>σₜᶻ ({unitLabel("stress")})</th>
               <th title="Build-sim yield stress — enables the elastic–perfectly-plastic step so the released warp responds to infill density (0 = pure-elastic, density-blind)">σy ({unitLabel("stress")})</th>
-              <th title="Build-sim IN-PLANE (XY) process shrink — the dominant warp driver (inherent strain)">Shrink % (XY)</th>
-              <th title="Build-sim THROUGH-LAYER (Z) process shrink — transverse isotropy; usually less than in-plane">Shrink % (Z)</th>
+              <th title="Build-sim IN-PLANE (XY) process shrink — the dominant warp driver (inherent strain). Used only when Tg/CTE are blank">Shrink % (XY)</th>
+              <th title="Build-sim THROUGH-LAYER (Z) process shrink — transverse isotropy; usually less than in-plane. Used only when Tg/CTE are blank">Shrink % (Z)</th>
+              <th title="Build-sim locking temperature in °C: Tg (amorphous) / ~Tc (semi-crystalline). With a CTE, the shrink derives from physics (CTE × lock→room) and the temperature ladder turns on; blank = raw shrink (legacy)">Tg (°C)</th>
+              <th title="Build-sim effective printed-part CTE, in-plane (XY), in ppm/°C; blank = raw shrink (legacy)">CTE (ppm/°C)</th>
+              <th title="Build-sim through-layer (Z) CTE in ppm/°C; blank = isotropic (= XY)">CTE Z (ppm/°C)</th>
               <th />
             </tr>
           </thead>
@@ -164,6 +169,36 @@ export function SettingsModal() {
                     step={0.1}
                     onCommit={(v) =>
                       s.updateMaterial(i, { ...m, shrinkZ: Math.max(0, v) / 100 })
+                    }
+                  />
+                </td>
+                <td>
+                  <OptNumInput
+                    value={m.tLock}
+                    min={0}
+                    step={5}
+                    onCommit={(v) =>
+                      s.updateMaterial(i, { ...m, tLock: v == null ? undefined : Math.max(0, v) })
+                    }
+                  />
+                </td>
+                <td>
+                  <OptNumInput
+                    value={ppm(m.cte)}
+                    min={0}
+                    step={1}
+                    onCommit={(v) =>
+                      s.updateMaterial(i, { ...m, cte: v == null ? undefined : Math.max(0, v) / 1e6 })
+                    }
+                  />
+                </td>
+                <td>
+                  <OptNumInput
+                    value={ppm(m.cteZ)}
+                    min={0}
+                    step={1}
+                    onCommit={(v) =>
+                      s.updateMaterial(i, { ...m, cteZ: v == null ? undefined : Math.max(0, v) / 1e6 })
                     }
                   />
                 </td>
@@ -330,6 +365,54 @@ export function SettingsModal() {
         </div>
       </div>
     </div>
+  );
+}
+
+/** 1/°C → ppm/°C for display, rounded so 96e-6 shows as 96, not 96.00000000000001. */
+function ppm(v: number | undefined): number | undefined {
+  return v == null ? undefined : +(v * 1e6).toFixed(3);
+}
+
+/** NumInput variant for OPTIONAL fields: an empty box means "unset" and
+ *  commits `undefined` (on blur, so mid-edit clearing doesn't unset). */
+function OptNumInput({
+  value,
+  onCommit,
+  ...rest
+}: {
+  value: number | undefined;
+  onCommit: (v: number | undefined) => void;
+} & Omit<React.InputHTMLAttributes<HTMLInputElement>, "value" | "onChange" | "type">) {
+  const [text, setText] = useState<string>(value == null ? "" : String(value));
+  const focused = useRef(false);
+  useEffect(() => {
+    if (!focused.current) setText(value == null ? "" : String(value));
+  }, [value]);
+  return (
+    <input
+      type="number"
+      value={text}
+      placeholder="—"
+      onFocus={() => {
+        focused.current = true;
+      }}
+      onChange={(e) => {
+        setText(e.target.value);
+        const n = Number(e.target.value);
+        if (e.target.value !== "" && Number.isFinite(n)) onCommit(n);
+      }}
+      onBlur={(e) => {
+        focused.current = false;
+        const raw = e.target.value.trim();
+        if (raw === "") onCommit(undefined);
+        else {
+          const n = Number(raw);
+          if (Number.isFinite(n)) onCommit(n);
+        }
+        setText(value == null ? "" : String(value));
+      }}
+      {...rest}
+    />
   );
 }
 

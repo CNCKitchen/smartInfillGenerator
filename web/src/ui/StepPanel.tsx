@@ -17,7 +17,7 @@ import {
 import { NumInput } from "./NumInput";
 import { UnitInput } from "./UnitInput";
 import { RESULT_FIELDS, type Bc, type ForceMode, type LoadStep, type PatternKey } from "../types";
-import { BUILD_MATERIALS, getBuildMaterial, shrinkFromPhysics, ROOM_TEMP_C } from "../materials";
+import { shrinkFromPhysics, ROOM_TEMP_C } from "../materials";
 import { fmtDisp, fmtLen, lenUnit, rampCss } from "./fmt";
 import { bcLabel, KIND_DOT, KIND_LABEL, SUPPORT_KINDS } from "./bcmeta";
 import {
@@ -1493,10 +1493,8 @@ function StepBuildSim() {
     useShallow((s) => ({
       material: s.material,
       buildState: s.buildState,
-      buildMaterial: s.buildMaterial,
       buildBedTemp: s.buildBedTemp,
       buildChamberTemp: s.buildChamberTemp,
-      setBuildMaterial: s.setBuildMaterial,
       setBuildBedTemp: s.setBuildBedTemp,
       setBuildChamberTemp: s.setBuildChamberTemp,
       runSolve: s.runSolve,
@@ -1511,28 +1509,28 @@ function StepBuildSim() {
   const bp = s.buildProgress;
   const br = s.buildResult;
   const pct = bp && bp.total > 0 ? Math.round((bp.done / bp.total) * 100) : 0;
-  const preset = getBuildMaterial(s.buildMaterial);
-  const phys = preset ? shrinkFromPhysics(preset, ROOM_TEMP_C) : null;
+  // ONE material: the Properties selection drives the build sim too. Thermal
+  // data (tLock + cte) derives the shrink from physics; without it the raw
+  // material shrink applies (legacy path).
+  const phys = shrinkFromPhysics(s.material, ROOM_TEMP_C);
   return (
     <>
       <div className="group">
         <div className="g-label">
-          <span>Material model</span>
+          <span>Material</span>
+          <b>{s.material.name}</b>
         </div>
-        <select value={s.buildMaterial} onChange={(e) => s.setBuildMaterial(e.target.value)}>
-          {BUILD_MATERIALS.map((m) => (
-            <option key={m.id} value={m.id}>
-              {m.label}
-            </option>
-          ))}
-        </select>
-        {preset && phys ? (
+        {phys ? (
           <div className="dim small">
             Inherent-strain warp via sequential layer activation. Shrink from physics — locks at{" "}
-            {preset.tLock} °C ({preset.semiCrystalline ? "Tc" : "Tg"}), CTE{" "}
-            {(preset.cte * 1e6).toFixed(0)} ppm/°C: XY {(Math.abs(phys.shrink) * 100).toFixed(2)}% ·
-            Z {(Math.abs(phys.shrinkZ) * 100).toFixed(2)}% (lock → {ROOM_TEMP_C} °C room).
-            Uncalibrated: the warp shape is meaningful, the absolute magnitude is not.
+            {s.material.tLock} °C (Tg/Tc), CTE {((s.material.cte ?? 0) * 1e6).toFixed(0)} ppm/°C: XY{" "}
+            {(Math.abs(phys.shrink) * 100).toFixed(2)}% · Z{" "}
+            {(Math.abs(phys.shrinkZ) * 100).toFixed(2)}% (lock → {ROOM_TEMP_C} °C room) — from
+            Tg/CTE, edit in{" "}
+            <button className="linkbtn" onClick={() => s.openSettings(true)}>
+              ⚙ Settings
+            </button>
+            . Uncalibrated: the warp shape is meaningful, the absolute magnitude is not.
           </div>
         ) : (
           <div className="dim small">
@@ -1546,7 +1544,7 @@ function StepBuildSim() {
           </div>
         )}
       </div>
-      {preset && (
+      {phys && (
         <>
           <div className="duo">
             <div className="group">
