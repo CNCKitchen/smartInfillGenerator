@@ -61,11 +61,22 @@ pub struct Level {
     ke64: [[f64; 24]; 24],
     /// Per-cell stiffness factor; exactly 0.0 = cell skipped entirely.
     pub eps: Vec<f32>,
-    /// Non-void cell indices grouped by parity color (no shared nodes within a color).
-    colors: [Vec<u32>; 8],
+    /// Non-void cells grouped into contiguous z-slab ranges for two-phase
+    /// parallel scatter: even-indexed slabs run concurrently (phase A), then
+    /// odd (phase B). Every slab spans ≥1 whole z-plane of cells, so two
+    /// same-phase slabs are ≥2 cells apart in z and never share nodes. Cells
+    /// are natural-order within a slab and slab cuts are balanced by active-
+    /// cell count — one contiguous sweep per thread instead of the former 8
+    /// stride-2 parity-color passes (2 joins per apply instead of 8, and far
+    /// better cache locality).
+    slabs: Vec<Vec<u32>>,
     /// Per-DOF mask: Dirichlet-fixed or inactive (no solid neighbor cell).
     pub constrained: Vec<bool>,
-    /// Per-node inverted 3x3 diagonal block (row-major 9), zeroed at constrained rows/cols.
+    /// Per-node inverted 3x3 diagonal block, stored SYMMETRIC-packed as 6
+    /// floats [d00,d01,d02,d11,d12,d22] (the block is symmetric; `invert3` of
+    /// a symmetric matrix is bitwise-symmetric since the paired cofactors are
+    /// identical expressions). Zeroed at constrained rows/cols. 6/9 of the
+    /// memory — this is the dominant stream of the smoother.
     dinv: Vec<f32>,
     /// Penalty springs (node, unit direction, stiffness N/mm) — frictionless supports.
     springs: Vec<(u32, [f64; 3], f64)>,
@@ -130,7 +141,7 @@ impl Level {
             ke,
             ke64,
             eps,
-            colors: Default::default(),
+            slabs: Vec::new(),
             constrained: vec![false; ndof],
             dinv: Vec::new(),
             springs,
@@ -139,7 +150,7 @@ impl Level {
             pi_t: Vec::new(),
             pi_w: Vec::new(),
         };
-        level.build_colors();
+        level.build_slabs();
         level.build_constrained(fixed);
         level.build_dinv();
         level.refresh_lmax();
@@ -233,20 +244,45 @@ impl Level {
         Self::new(nx, ny, nz, self.h * 2.0, eps, ke64, &fixed, springs)
     }
 
-    fn build_colors(&mut self) {
-        let mut colors: [Vec<u32>; 8] = Default::default();
+    /// Cut the active cells into z-slabs balanced by active-cell count (cuts
+    /// only at whole z-plane boundaries — the two-phase safety invariant).
+    /// Depends only on the void set, which `update_eps` never changes, so it
+    /// is built once per level.
+    fn build_slabs(&mut self) {
+        let plane_cells = self.nx * self.ny;
+        let mut plane = vec![0usize; self.nz];
+        for (cz, cnt) in plane.iter_mut().enumerate() {
+            *cnt = self.eps[cz * plane_cells..(cz + 1) * plane_cells]
+                .iter()
+                .filter(|&&e| e > 0.0)
+                .count();
+        }
+        let total: usize = plane.iter().sum();
+        // ~4 slabs per thread in each phase for load balance; ≥1 plane per slab.
+        #[cfg(feature = "parallel")]
+        let want = (8 * rayon::current_num_threads()).clamp(1, self.nz.max(1));
+        #[cfg(not(feature = "parallel"))]
+        let want = 1;
+        let per = (total / want).max(1);
+        let mut slabs: Vec<Vec<u32>> = Vec::new();
+        let mut cur: Vec<u32> = Vec::new();
+        let mut acc = 0usize;
         for cz in 0..self.nz {
-            for cy in 0..self.ny {
-                for cx in 0..self.nx {
-                    let ci = (cz * self.ny + cy) * self.nx + cx;
-                    if self.eps[ci] > 0.0 {
-                        let color = (cx & 1) | ((cy & 1) << 1) | ((cz & 1) << 2);
-                        colors[color].push(ci as u32);
-                    }
+            for i in cz * plane_cells..(cz + 1) * plane_cells {
+                if self.eps[i] > 0.0 {
+                    cur.push(i as u32);
                 }
             }
+            acc += plane[cz];
+            if acc >= per && slabs.len() + 1 < want {
+                slabs.push(std::mem::take(&mut cur));
+                acc = 0;
+            }
         }
-        self.colors = colors;
+        if !cur.is_empty() {
+            slabs.push(cur);
+        }
+        self.slabs = slabs;
     }
 
     fn build_constrained(&mut self, fixed: &[bool]) {
@@ -291,14 +327,14 @@ impl Level {
                 }
             }
         }
-        let mut dinv = vec![0f32; 9 * self.node_count()];
+        let mut dinv = vec![0f32; 6 * self.node_count()];
         let (nx, ny, nz) = (self.nx, self.ny, self.nz);
         let (mx, my) = (self.mx, self.my);
         let eps = &self.eps;
         let constrained = &self.constrained;
-        par::chunks_mut_indexed(&mut dinv, 9 * NODE_CHUNK, |off, chunk| {
-            let n0 = off / 9;
-            for (k, blk) in chunk.chunks_mut(9).enumerate() {
+        par::chunks_mut_indexed(&mut dinv, 6 * NODE_CHUNK, |off, chunk| {
+            let n0 = off / 6;
+            for (k, blk) in chunk.chunks_mut(6).enumerate() {
                 let n = n0 + k;
                 let x = n % mx;
                 let y = (n / mx) % my;
@@ -356,14 +392,15 @@ impl Level {
                     continue;
                 }
                 if let Some(inv) = invert3(&acc) {
-                    for r in 0..3 {
-                        for c in 0..3 {
-                            blk[3 * r + c] = if constrained[3 * n + r] || constrained[3 * n + c] {
-                                0.0
-                            } else {
-                                inv[r][c] as f32
-                            };
-                        }
+                    // Symmetric-packed upper triangle [00,01,02,11,12,22].
+                    for (slot, (r, c)) in
+                        [(0, 0), (0, 1), (0, 2), (1, 1), (1, 2), (2, 2)].into_iter().enumerate()
+                    {
+                        blk[slot] = if constrained[3 * n + r] || constrained[3 * n + c] {
+                            0.0
+                        } else {
+                            inv[r][c] as f32
+                        };
                     }
                 }
             }
@@ -418,17 +455,18 @@ impl Level {
         par::fill(y, 0.0);
         {
             let ys = UnsafeSlice::new(y);
-            // Threaded: 8 parity colors so scatter-adds never race.
+            // Threaded: two phases of z-slabs; same-phase slabs never share nodes.
             #[cfg(feature = "parallel")]
-            for color in 0..8 {
-                // SAFETY: cells within one color never share nodes.
-                par::for_each(&self.colors[color], |&ci| unsafe {
-                    self.apply_cell(ci as usize, self.eps[ci as usize], x, &ys);
+            for phase in 0..2 {
+                let slabs: Vec<&Vec<u32>> = self.slabs.iter().skip(phase).step_by(2).collect();
+                // SAFETY: same-phase slabs are ≥2 cells apart in z.
+                par::for_each(&slabs, |slab| {
+                    for &ci in slab.iter() {
+                        unsafe { self.apply_cell(ci as usize, self.eps[ci as usize], x, &ys) };
+                    }
                 });
             }
-            // Sequential: no races possible — one natural-order pass beats
-            // 8 strided color passes on cache locality (measured ~2% on 1M
-            // cells; mainly it avoids building the color lists at all).
+            // Sequential: no races possible — one natural-order pass.
             #[cfg(not(feature = "parallel"))]
             for (ci, &e) in self.eps.iter().enumerate() {
                 if e > 0.0 {
@@ -510,10 +548,15 @@ impl Level {
         {
             let ys = UnsafeSlice::new(y);
             #[cfg(feature = "parallel")]
-            for color in 0..8 {
-                // SAFETY: cells within one color never share nodes.
-                par::for_each(&self.colors[color], |&ci| unsafe {
-                    self.apply_cell64(ci as usize, eps[ci as usize] as f64, x, &ys);
+            for phase in 0..2 {
+                let slabs: Vec<&Vec<u32>> = self.slabs.iter().skip(phase).step_by(2).collect();
+                // SAFETY: same-phase slabs are ≥2 cells apart in z.
+                par::for_each(&slabs, |slab| {
+                    for &ci in slab.iter() {
+                        unsafe {
+                            self.apply_cell64(ci as usize, eps[ci as usize] as f64, x, &ys)
+                        };
+                    }
                 });
             }
             #[cfg(not(feature = "parallel"))]
@@ -553,19 +596,51 @@ impl Level {
         }
     }
 
-    /// w = Dinv (r - t)  where t = K z was computed by the caller.
-    fn dinv_residual(&self, w: &mut [f32], r: &[f32], t: &[f32]) {
+    /// Fused Chebyshev step: per node `w = Dinv·(r − t); d = a·d + b·w;
+    /// z += d` in ONE pass (element-wise identical to the former
+    /// dinv_residual → axpby → axpy sequence, which made three). The smoother
+    /// is bandwidth-bound and dinv is its dominant stream, so fewer passes is
+    /// the whole game.
+    fn cheb_step_fused(&self, z: &mut [f32], d: &mut [f32], r: &[f32], t: &[f32], a: f32, b: f32) {
         let dinv = &self.dinv;
-        par::chunks_mut_indexed(w, 3 * NODE_CHUNK, |off, wc| {
+        par::chunks2_mut_indexed(z, d, 3 * NODE_CHUNK, |off, zc, dc| {
             let n0 = off / 3;
-            for (k, wn) in wc.chunks_mut(3).enumerate() {
+            for (k, (zn, dn)) in zc.chunks_mut(3).zip(dc.chunks_mut(3)).enumerate() {
                 let n = n0 + k;
-                let d = &dinv[9 * n..9 * n + 9];
+                let di = &dinv[6 * n..6 * n + 6];
                 let rr =
                     [r[3 * n] - t[3 * n], r[3 * n + 1] - t[3 * n + 1], r[3 * n + 2] - t[3 * n + 2]];
-                for row in 0..3 {
-                    wn[row] =
-                        d[3 * row] * rr[0] + d[3 * row + 1] * rr[1] + d[3 * row + 2] * rr[2];
+                let w = [
+                    di[0] * rr[0] + di[1] * rr[1] + di[2] * rr[2],
+                    di[1] * rr[0] + di[3] * rr[1] + di[4] * rr[2],
+                    di[2] * rr[0] + di[4] * rr[1] + di[5] * rr[2],
+                ];
+                for c in 0..3 {
+                    dn[c] = a * dn[c] + b * w[c];
+                    zn[c] += dn[c];
+                }
+            }
+        });
+    }
+
+    /// Fused zero-guess first step: `z = d = f·Dinv·r` in one pass
+    /// (replaces fill + diag_apply + axpby + axpy).
+    fn cheb_first_fused(&self, z: &mut [f32], d: &mut [f32], r: &[f32], f: f32) {
+        let dinv = &self.dinv;
+        par::chunks2_mut_indexed(z, d, 3 * NODE_CHUNK, |off, zc, dc| {
+            let n0 = off / 3;
+            for (k, (zn, dn)) in zc.chunks_mut(3).zip(dc.chunks_mut(3)).enumerate() {
+                let n = n0 + k;
+                let di = &dinv[6 * n..6 * n + 6];
+                let rr = [r[3 * n], r[3 * n + 1], r[3 * n + 2]];
+                let w = [
+                    di[0] * rr[0] + di[1] * rr[1] + di[2] * rr[2],
+                    di[1] * rr[0] + di[3] * rr[1] + di[4] * rr[2],
+                    di[2] * rr[0] + di[4] * rr[1] + di[5] * rr[2],
+                ];
+                for c in 0..3 {
+                    dn[c] = f * w[c];
+                    zn[c] = dn[c];
                 }
             }
         });
@@ -575,13 +650,12 @@ impl Level {
     /// Dinv*K spectrum on [lmax/CHEB_EIG_RATIO, lmax]. A fixed polynomial —
     /// same operator every call — so MG stays a constant SPD preconditioner.
     /// `from_zero` skips the first residual apply (pre-smoothing starts at 0).
-    /// Workspaces: t (K z), w (Dinv residual), d (direction).
+    /// Workspaces: t (K z), d (direction).
     fn cheb_smooth(
         &self,
         z: &mut [f32],
         r: &[f32],
         t: &mut [f32],
-        w: &mut [f32],
         d: &mut [f32],
         degree: usize,
         from_zero: bool,
@@ -594,21 +668,16 @@ impl Level {
         let mut rho = 1.0 / sigma;
         // First step: d = (1/theta) * Dinv*(r - K z); z += d.
         if from_zero {
-            par::fill(z, 0.0);
-            self.diag_apply(r, w);
+            self.cheb_first_fused(z, d, r, (1.0 / theta) as f32);
         } else {
             self.apply(z, t);
-            self.dinv_residual(w, r, t);
+            self.cheb_step_fused(z, d, r, t, 0.0, (1.0 / theta) as f32);
         }
-        par::axpby(d, 0.0, (1.0 / theta) as f32, w);
-        par::axpy(z, 1.0, d);
         for _ in 1..degree {
             self.apply(z, t);
-            self.dinv_residual(w, r, t);
             let rho_new = 1.0 / (2.0 * sigma - rho);
             // d = (rho_new*rho) d + (2 rho_new / delta) w; z += d
-            par::axpby(d, (rho_new * rho) as f32, (2.0 * rho_new / delta) as f32, w);
-            par::axpy(z, 1.0, d);
+            self.cheb_step_fused(z, d, r, t, (rho_new * rho) as f32, (2.0 * rho_new / delta) as f32);
             rho = rho_new;
         }
     }
@@ -620,12 +689,11 @@ impl Level {
             let n0 = off / 3;
             for (k, zn) in zc.chunks_mut(3).enumerate() {
                 let n = n0 + k;
-                let d = &dinv[9 * n..9 * n + 9];
+                let d = &dinv[6 * n..6 * n + 6];
                 let rr = [r[3 * n], r[3 * n + 1], r[3 * n + 2]];
-                for row in 0..3 {
-                    zn[row] =
-                        d[3 * row] * rr[0] + d[3 * row + 1] * rr[1] + d[3 * row + 2] * rr[2];
-                }
+                zn[0] = d[0] * rr[0] + d[1] * rr[1] + d[2] * rr[2];
+                zn[1] = d[1] * rr[0] + d[3] * rr[1] + d[4] * rr[2];
+                zn[2] = d[2] * rr[0] + d[4] * rr[1] + d[5] * rr[2];
             }
         });
     }
@@ -772,9 +840,7 @@ fn v_cycle(levels: &[Level], ws: &mut Workspaces, l: usize) {
     }
     let level = &levels[l];
     // Pre-smooth (zero initial guess).
-    level.cheb_smooth(
-        &mut ws.z[l], &ws.r[l], &mut ws.t[l], &mut ws.t2[l], &mut ws.d[l], NU1, true,
-    );
+    level.cheb_smooth(&mut ws.z[l], &ws.r[l], &mut ws.t[l], &mut ws.d[l], NU1, true);
     // Coarse-grid correction.
     level.apply(&ws.z[l], &mut ws.t[l]);
     par::sub(&mut ws.t2[l], &ws.r[l], &ws.t[l]);
@@ -785,9 +851,7 @@ fn v_cycle(levels: &[Level], ws: &mut Workspaces, l: usize) {
         prolong_add(level, &levels[l + 1], &zb[0], &mut za[l]);
     }
     // Post-smooth.
-    level.cheb_smooth(
-        &mut ws.z[l], &ws.r[l], &mut ws.t[l], &mut ws.t2[l], &mut ws.d[l], NU2, false,
-    );
+    level.cheb_smooth(&mut ws.z[l], &ws.r[l], &mut ws.t[l], &mut ws.d[l], NU2, false);
 }
 
 /// Block-diagonal preconditioned CG for the coarsest level (small). `scratch`

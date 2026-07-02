@@ -155,7 +155,119 @@ pub fn chunks_mut_indexed<F: Fn(usize, &mut [f32]) + Sync>(data: &mut [f32], chu
     }
 }
 
+/// Like `chunks_mut_indexed` but over TWO mutable slices in lockstep (the
+/// fused smoother updates z and d in one pass).
+pub fn chunks2_mut_indexed<F: Fn(usize, &mut [f32], &mut [f32]) + Sync>(
+    a: &mut [f32],
+    b: &mut [f32],
+    chunk: usize,
+    f: F,
+) {
+    debug_assert_eq!(a.len(), b.len());
+    #[cfg(feature = "parallel")]
+    a.par_chunks_mut(chunk)
+        .zip(b.par_chunks_mut(chunk))
+        .enumerate()
+        .for_each(|(i, (ac, bc))| f(i * chunk, ac, bc));
+    #[cfg(not(feature = "parallel"))]
+    for (i, (ac, bc)) in a.chunks_mut(chunk).zip(b.chunks_mut(chunk)).enumerate() {
+        f(i * chunk, ac, bc);
+    }
+}
+
+/// Parallel iteration over chunk ranges [start, end) of a length-`len` index
+/// space (sequential fallback: one whole-range call). The blocked driver for
+/// kernels that stream several vectors in lockstep (modal Rayleigh–Ritz).
+pub fn for_each_range<F: Fn(usize, usize) + Sync>(len: usize, chunk: usize, f: F) {
+    #[cfg(feature = "parallel")]
+    {
+        let nch = len.div_ceil(chunk).max(1);
+        (0..nch).into_par_iter().for_each(|i| {
+            let s = i * chunk;
+            f(s, (s + chunk).min(len));
+        });
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        let _ = chunk;
+        f(0, len);
+    }
+}
+
+/// Blocked parallel map-reduce over chunk ranges (associative `add`; chunked
+/// summation order differs from a single pass — callers accept that).
+pub fn map_reduce_ranges<T, F, A, Z>(len: usize, chunk: usize, f: F, add: A, zero: Z) -> T
+where
+    T: Send,
+    F: Fn(usize, usize) -> T + Sync,
+    A: Fn(T, T) -> T + Sync + Send,
+    Z: Fn() -> T + Sync + Send,
+{
+    #[cfg(feature = "parallel")]
+    {
+        let nch = len.div_ceil(chunk).max(1);
+        (0..nch)
+            .into_par_iter()
+            .map(|i| {
+                let s = i * chunk;
+                f(s, (s + chunk).min(len))
+            })
+            .reduce(zero, add)
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        let _ = (add, zero, chunk);
+        f(0, len)
+    }
+}
+
 // ---- f64 variants for the outer (mixed-precision) CG loop ----
+
+/// f64 twin of `chunks_mut_indexed`.
+pub fn chunks_mut_indexed64<F: Fn(usize, &mut [f64]) + Sync>(
+    data: &mut [f64],
+    chunk: usize,
+    f: F,
+) {
+    #[cfg(feature = "parallel")]
+    data.par_chunks_mut(chunk).enumerate().for_each(|(i, c)| f(i * chunk, c));
+    #[cfg(not(feature = "parallel"))]
+    for (i, c) in data.chunks_mut(chunk).enumerate() {
+        f(i * chunk, c);
+    }
+}
+
+/// Weighted dot `Σ w[i]·a[i]·b[i]` (the modal M-inner-product; lumped mass is
+/// diagonal). Chunk-parallel with f64 accumulation per chunk.
+pub fn dot_w64(w: &[f64], a: &[f64], b: &[f64]) -> f64 {
+    debug_assert!(w.len() == a.len() && a.len() == b.len());
+    map_reduce_ranges(
+        a.len(),
+        CHUNK64,
+        |s, e| {
+            let (wc, ac, bc) = (&w[s..e], &a[s..e], &b[s..e]);
+            let mut acc = 0.0;
+            for i in 0..ac.len() {
+                acc += wc[i] * ac[i] * bc[i];
+            }
+            acc
+        },
+        |x, y| x + y,
+        || 0.0,
+    )
+}
+
+/// v *= s
+pub fn scale64(v: &mut [f64], s: f64) {
+    each_chunk_mut(v, |c| {
+        for x in c.iter_mut() {
+            *x *= s;
+        }
+    });
+}
+
+/// Chunk size for the f64 range helpers (bytes-comparable to `CHUNK` for f32).
+pub const CHUNK64: usize = 1 << 13;
 
 pub fn axpy64(y: &mut [f64], a: f64, x: &[f64]) {
     zip_chunks_mut(y, x, |yc, xc| {
@@ -248,5 +360,16 @@ impl<'a, T> UnsafeSlice<'a, T> {
     pub unsafe fn get_mut(&self, i: usize) -> &mut T {
         debug_assert!(i < self.len);
         &mut *self.ptr.add(i)
+    }
+
+    /// Reborrow a sub-range as a plain mutable slice (vectorizes better than
+    /// per-element `get_mut` in blocked kernels).
+    /// # Safety
+    /// No two concurrent calls may overlap ranges.
+    #[inline(always)]
+    #[allow(clippy::mut_from_ref)]
+    pub unsafe fn slice_mut(&self, start: usize, len: usize) -> &mut [T] {
+        debug_assert!(start + len <= self.len);
+        std::slice::from_raw_parts_mut(self.ptr.add(start), len)
     }
 }

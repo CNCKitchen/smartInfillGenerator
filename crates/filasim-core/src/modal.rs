@@ -95,14 +95,88 @@ fn lumped_mass(solver: &MgSolver, vfrac: &[f32], density: f64) -> Vec<f64> {
     m
 }
 
-/// `⟨a, b⟩_M = Σ mᵢ aᵢ bᵢ` (lumped mass is diagonal).
+/// `⟨a, b⟩_M = Σ mᵢ aᵢ bᵢ` (lumped mass is diagonal). Chunk-parallel.
 #[inline]
 fn m_dot(a: &[f64], b: &[f64], m: &[f64]) -> f64 {
-    let mut s = 0.0;
-    for i in 0..a.len() {
-        s += m[i] * a[i] * b[i];
+    crate::par::dot_w64(m, a, b)
+}
+
+/// Blocked chunk size for the Rayleigh–Ritz kernels: big enough to amortize
+/// the parallel dispatch, small enough that a chunk of every basis column
+/// (q ≤ ~3·28) plus the outputs stays cache-resident.
+const RR_CHUNK: usize = 2048;
+
+/// Symmetric Gram matrix `g[a·q+b] = Σᵢ colsₐ[i]·kcolsᵦ[i]` (K symmetric, so
+/// only the upper triangle is computed and mirrored — same convention as the
+/// scalar loops it replaces). ONE blocked pass over the data instead of q²/2
+/// full-length passes: the former per-pair dot loops were the modal
+/// bottleneck (sequential + one cache line per column per element).
+fn gram_sym(cols: &[Vec<f64>], kcols: &[Vec<f64>]) -> Vec<f64> {
+    let q = cols.len();
+    let n = cols[0].len();
+    let mut g = crate::par::map_reduce_ranges(
+        n,
+        RR_CHUNK,
+        |s, e| {
+            let mut part = vec![0f64; q * q];
+            for a in 0..q {
+                let ca = &cols[a][s..e];
+                for b in a..q {
+                    let kb = &kcols[b][s..e];
+                    let mut acc = 0.0;
+                    for i in 0..ca.len() {
+                        acc += ca[i] * kb[i];
+                    }
+                    part[a * q + b] += acc;
+                }
+            }
+            part
+        },
+        |mut x, y| {
+            for (xi, yi) in x.iter_mut().zip(&y) {
+                *xi += yi;
+            }
+            x
+        },
+        || vec![0f64; q * q],
+    );
+    for a in 0..q {
+        for b in (a + 1)..q {
+            g[b * q + a] = g[a * q + b];
+        }
     }
-    s
+    g
+}
+
+/// Blocked basis combination `outs[k] = Σ_{j≥j0} coeff[j·stride + k0+k]·cols[j]`
+/// (outs fully overwritten). One parallel pass over the data; per chunk, every
+/// source column is streamed once and the p accumulators stay in cache —
+/// replaces the per-element j-loop that touched q cache lines per entry.
+fn combine(cols: &[Vec<f64>], coeff: &[f64], stride: usize, j0: usize, k0: usize, outs: &mut [Vec<f64>]) {
+    let n = cols[0].len();
+    let slices: Vec<crate::par::UnsafeSlice<f64>> =
+        outs.iter_mut().map(|o| crate::par::UnsafeSlice::new(o)).collect();
+    crate::par::for_each_range(n, RR_CHUNK, |s, e| {
+        let len = e - s;
+        // SAFETY: chunk ranges are disjoint across parallel calls, and each
+        // `slice_mut` reborrow is the only live borrow of that column's range.
+        for sl in &slices {
+            unsafe { sl.slice_mut(s, len) }.fill(0.0);
+        }
+        for (j, cj) in cols.iter().enumerate().skip(j0) {
+            let cj = &cj[s..e];
+            for (k, sl) in slices.iter().enumerate() {
+                let w = coeff[j * stride + k0 + k];
+                if w == 0.0 {
+                    continue;
+                }
+                let o = unsafe { sl.slice_mut(s, len) };
+                for i in 0..len {
+                    o[i] += w * cj[i];
+                }
+            }
+        }
+    });
 }
 
 /// M-orthonormalize the columns in place (modified Gram–Schmidt in the
@@ -115,16 +189,11 @@ fn m_orthonormalize(cols: &mut [Vec<f64>], m: &[f64]) {
         let mut cj = std::mem::take(&mut cols[j]);
         for ck in cols.iter().take(j) {
             let dot = m_dot(&cj, ck, m);
-            for i in 0..cj.len() {
-                cj[i] -= dot * ck[i];
-            }
+            crate::par::axpy64(&mut cj, -dot, ck);
         }
         let nrm = m_dot(&cj, &cj, m).max(0.0).sqrt();
         if nrm > 1e-150 {
-            let inv = 1.0 / nrm;
-            for v in cj.iter_mut() {
-                *v *= inv;
-            }
+            crate::par::scale64(&mut cj, 1.0 / nrm);
         }
         cols[j] = cj;
     }
@@ -275,27 +344,28 @@ pub fn rigid_body_anchor_springs(
     springs
 }
 
-/// L2 norm.
-#[inline]
-fn l2(v: &[f64]) -> f64 {
-    v.iter().map(|x| x * x).sum::<f64>().sqrt()
-}
-
 /// Expand a compact free-DOF vector into the full node-grid layout `full`
 /// (constrained entries of `full` must already be zero and stay zero).
+/// Parallel: free_idx entries are distinct, so writes never collide.
 #[inline]
 fn scatter(free_idx: &[usize], c: &[f64], full: &mut [f64]) {
-    for (j, &i) in free_idx.iter().enumerate() {
-        full[i] = c[j];
-    }
+    let fs = crate::par::UnsafeSlice::new(full);
+    crate::par::for_each_range(c.len(), crate::par::CHUNK64, |s, e| {
+        for j in s..e {
+            // SAFETY: free-DOF indices are unique.
+            unsafe { *fs.get_mut(free_idx[j]) = c[j] };
+        }
+    });
 }
 
 /// Gather the free DOFs of a full vector into a compact vector.
 #[inline]
 fn gather(free_idx: &[usize], full: &[f64], c: &mut [f64]) {
-    for (j, &i) in free_idx.iter().enumerate() {
-        c[j] = full[i];
-    }
+    crate::par::chunks_mut_indexed64(c, crate::par::CHUNK64, |off, cc| {
+        for (jj, v) in cc.iter_mut().enumerate() {
+            *v = full[free_idx[off + jj]];
+        }
+    });
 }
 
 /// Rayleigh–Ritz on an M-orthonormal block `x` with `kx = K·x`: rotate both to
@@ -303,58 +373,101 @@ fn gather(free_idx: &[usize], full: &[f64], c: &mut [f64]) {
 /// `x` M-orthonormal ⇒ the projected mass is the identity, so this is a plain
 /// symmetric eigenproblem on `H = xᵀ K x`.
 fn ritz_rotate(x: &mut [Vec<f64>], kx: &mut [Vec<f64>], p: usize) -> Vec<f64> {
-    let n = x[0].len();
-    let mut h = vec![0f64; p * p];
-    for a in 0..p {
-        for b in a..p {
-            let mut s = 0.0;
-            for i in 0..n {
-                s += x[a][i] * kx[b][i];
-            }
-            h[a * p + b] = s;
-            h[b * p + a] = s;
-        }
-    }
+    let h = gram_sym(&x[..p], &kx[..p]);
     let (theta, c) = jacobi_eig(&h, p);
     let xo = x.to_vec();
     let kxo = kx.to_vec();
-    for k in 0..p {
-        for i in 0..n {
-            let (mut sx, mut sk) = (0.0, 0.0);
-            for j in 0..p {
-                let cc = c[j * p + k];
-                sx += cc * xo[j][i];
-                sk += cc * kxo[j][i];
-            }
-            x[k][i] = sx;
-            kx[k][i] = sk;
-        }
-    }
+    combine(&xo, &c, p, 0, 0, &mut x[..p]);
+    combine(&kxo, &c, p, 0, 0, &mut kx[..p]);
     theta
 }
 
-/// M-orthonormalize columns in place (modified Gram–Schmidt, M-inner-product),
-/// DROPPING columns that collapse below a tolerance (rank-deficient) so the
-/// LOBPCG basis `[X | W | P]` stays full rank.
-fn m_orthonormalize_drop(cols: &mut Vec<Vec<f64>>, m: &[f64]) {
+/// Weighted rectangular Gram `g[a·nb+b] = Σᵢ m[i]·colsₐ[i]·colsᵦ[i]` in one
+/// blocked parallel pass.
+fn gram_w(a: &[Vec<f64>], b: &[Vec<f64>], m: &[f64]) -> Vec<f64> {
+    let (na, nb) = (a.len(), b.len());
+    let n = m.len();
+    crate::par::map_reduce_ranges(
+        n,
+        RR_CHUNK,
+        |s, e| {
+            let mut part = vec![0f64; na * nb];
+            for ai in 0..na {
+                let ac = &a[ai][s..e];
+                let mc = &m[s..e];
+                for bi in 0..nb {
+                    let bc = &b[bi][s..e];
+                    let mut acc = 0.0;
+                    for i in 0..ac.len() {
+                        acc += mc[i] * ac[i] * bc[i];
+                    }
+                    part[ai * nb + bi] += acc;
+                }
+            }
+            part
+        },
+        |mut x, y| {
+            for (xi, yi) in x.iter_mut().zip(&y) {
+                *xi += yi;
+            }
+            x
+        },
+        || vec![0f64; na * nb],
+    )
+}
+
+/// Blocked `outs[k] -= Σⱼ coeff[j·stride + k]·cols[j]` (the projection
+/// subtraction of a blocked classical Gram–Schmidt step).
+fn combine_sub(cols: &[Vec<f64>], coeff: &[f64], stride: usize, outs: &mut [Vec<f64>]) {
+    let n = cols[0].len();
+    let slices: Vec<crate::par::UnsafeSlice<f64>> =
+        outs.iter_mut().map(|o| crate::par::UnsafeSlice::new(o)).collect();
+    crate::par::for_each_range(n, RR_CHUNK, |s, e| {
+        let len = e - s;
+        for (j, cj) in cols.iter().enumerate() {
+            let cj = &cj[s..e];
+            for (k, sl) in slices.iter().enumerate() {
+                let w = coeff[j * stride + k];
+                if w == 0.0 {
+                    continue;
+                }
+                // SAFETY: chunk ranges are disjoint across parallel calls.
+                let o = unsafe { sl.slice_mut(s, len) };
+                for i in 0..len {
+                    o[i] -= w * cj[i];
+                }
+            }
+        }
+    });
+}
+
+/// Orthonormalize the W/P block against the TRUSTED M-orthonormal X block
+/// (one blocked classical-GS projection — X comes straight out of the Ritz
+/// rotation, so it is M-orthonormal by construction and is left untouched,
+/// which also keeps its K-images exactly valid), then among themselves
+/// (modified Gram–Schmidt, DROPPING columns that collapse below tolerance so
+/// the LOBPCG basis `[X | W | P]` stays full rank). Returns the kept columns.
+fn m_orthonormalize_rest(xb: &[Vec<f64>], mut rest: Vec<Vec<f64>>, m: &[f64]) -> Vec<Vec<f64>> {
+    if rest.is_empty() {
+        return rest;
+    }
+    // rest_j -= Σ_k ⟨x_k, rest_j⟩_M · x_k, all columns in two blocked passes.
+    let g = gram_w(xb, &rest, m); // g[k·nr + j] = ⟨x_k, rest_j⟩_M
+    combine_sub(xb, &g, rest.len(), &mut rest);
+    // MGS with drop among the remaining columns.
     let mut kept: Vec<Vec<f64>> = Vec::new();
-    for mut cj in std::mem::take(cols) {
+    for mut cj in rest {
         for k in &kept {
             let dot = m_dot(&cj, k, m);
-            for i in 0..cj.len() {
-                cj[i] -= dot * k[i];
-            }
+            crate::par::axpy64(&mut cj, -dot, k);
         }
         let nrm = m_dot(&cj, &cj, m).max(0.0).sqrt();
         if nrm > 1e-7 {
-            let inv = 1.0 / nrm;
-            for v in cj.iter_mut() {
-                *v *= inv;
-            }
+            crate::par::scale64(&mut cj, 1.0 / nrm);
             kept.push(cj);
         }
     }
-    *cols = kept;
+    kept
 }
 
 /// Solve `K v = λ M v` for the lowest `cfg.num_modes` pairs.
@@ -432,7 +545,6 @@ pub fn analyze(
     let mut converged = false;
     let mut iters = 0;
     let mut r = vec![0f64; nf];
-    let mut wv = vec![0f64; nf];
     // The eigenVALUES (frequencies — what the user wants) converge well before
     // the eigenVECTOR residual, especially when the multigrid preconditioner is
     // weak (slender/thin parts). So stop when the requested frequencies stop
@@ -452,12 +564,19 @@ pub fn analyze(
         let mut wblk: Vec<Vec<f64>> = Vec::with_capacity(p);
         let mut max_rel = 0.0f64;
         for k in 0..p {
-            for i in 0..nf {
-                r[i] = kx[k][i] - theta[k] * mc[i] * x[k][i];
+            {
+                let (kxk, xk, th) = (&kx[k], &x[k], theta[k]);
+                crate::par::chunks_mut_indexed64(&mut r, crate::par::CHUNK64, |off, rc| {
+                    for (t, ri) in rc.iter_mut().enumerate() {
+                        let i = off + t;
+                        *ri = kxk[i] - th * mc[i] * xk[i];
+                    }
+                });
             }
             if k < num_modes {
                 // Relative residual of the requested (non-guard) modes.
-                max_rel = max_rel.max(l2(&r) / l2(&kx[k]).max(1e-300));
+                max_rel =
+                    max_rel.max(crate::par::norm2_64(&r) / crate::par::norm2_64(&kx[k]).max(1e-300));
             }
             // W ≈ K⁻¹ R via PRECOND_CYCLES multigrid V-cycles (stationary
             // iteration: z += Vcycle(R − K z)). More cycles = stronger
@@ -475,9 +594,10 @@ pub fn analyze(
                     full_out[i] += kbuf2[i];
                 }
             }
-            gather(&free_idx, &full_out, &mut wv);
+            let mut w = vec![0f64; nf];
+            gather(&free_idx, &full_out, &mut w);
             total_inner_iters += PRECOND_CYCLES;
-            wblk.push(wv.clone());
+            wblk.push(w);
             if crate::cancel::requested() {
                 return Err(SolveError::Cancelled);
             }
@@ -496,54 +616,35 @@ pub fn analyze(
             converged = true;
             break;
         }
-        // Rayleigh–Ritz over S = [X | W | P], M-orthonormalized (rank-deficient
-        // columns dropped). X is already orthonormal, so it survives as the
-        // first `nx` columns and the rest come from the W/P blocks.
+        // Rayleigh–Ritz over S = [X | W | P]. X comes out of the Ritz rotation
+        // M-orthonormal by construction, so it enters the basis untouched and
+        // its K-images (kx) stay exactly valid — only the kept W/P columns
+        // need orthonormalization and a fresh K-apply.
         let nx = x.len();
-        let mut basis: Vec<Vec<f64>> = Vec::with_capacity(3 * p);
-        basis.extend(x.iter().cloned());
-        basis.append(&mut wblk);
-        basis.extend(pblk.iter().cloned());
-        m_orthonormalize_drop(&mut basis, &mc);
+        let mut rest: Vec<Vec<f64>> = Vec::with_capacity(2 * p);
+        rest.extend(wblk);
+        rest.append(&mut pblk);
+        let rest = m_orthonormalize_rest(&x, rest, &mc);
+        let mut basis = std::mem::take(&mut x);
+        let mut kb = std::mem::take(&mut kx);
+        for col in rest {
+            let mut o = vec![0f64; nf];
+            apply_kc!(&col, &mut o);
+            basis.push(col);
+            kb.push(o);
+        }
         let q = basis.len();
-        let mut kb: Vec<Vec<f64>> = vec![vec![0f64; nf]; q];
-        for col in 0..q {
-            apply_kc!(&basis[col], &mut kb[col]);
-        }
         // Projected stiffness SK = Sᵀ K S (Sᵀ M S = I); smallest p eigenpairs.
-        let mut sk = vec![0f64; q * q];
-        for a in 0..q {
-            for bb in a..q {
-                let mut s = 0.0;
-                for i in 0..nf {
-                    s += basis[a][i] * kb[bb][i];
-                }
-                sk[a * q + bb] = s;
-                sk[bb * q + a] = s;
-            }
-        }
+        let sk = gram_sym(&basis, &kb);
         let (th_all, cmat) = jacobi_eig(&sk, q);
         // New X / KX = basis · C[:,0:p]; P = the [W,P]-part of that combination
         // (the "locally optimal" conjugate direction).
         let mut xnew = vec![vec![0f64; nf]; p];
         let mut kxnew = vec![vec![0f64; nf]; p];
         let mut pnew = vec![vec![0f64; nf]; p];
-        for k in 0..p {
-            for i in 0..nf {
-                let (mut sx, mut skx, mut sp) = (0.0, 0.0, 0.0);
-                for j in 0..q {
-                    let c = cmat[j * q + k];
-                    sx += c * basis[j][i];
-                    skx += c * kb[j][i];
-                    if j >= nx {
-                        sp += c * basis[j][i];
-                    }
-                }
-                xnew[k][i] = sx;
-                kxnew[k][i] = skx;
-                pnew[k][i] = sp;
-            }
-        }
+        combine(&basis, &cmat, q, 0, 0, &mut xnew);
+        combine(&kb, &cmat, q, 0, 0, &mut kxnew);
+        combine(&basis, &cmat, q, nx, 0, &mut pnew);
         x = xnew;
         kx = kxnew;
         pblk = pnew;
