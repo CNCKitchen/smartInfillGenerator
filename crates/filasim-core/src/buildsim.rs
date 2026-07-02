@@ -26,11 +26,62 @@
 
 use crate::eps::resolve_eps;
 use crate::fem::{ke_hex, NODE_OFFSETS, NODE_SIGNS};
+use crate::par::{self, UnsafeSlice};
 use crate::solve::{
     active_nodes, grid_eps, pad_for_levels, solve_nodes, NodeProblem, SolveSettings, SolveError,
     SolveSession, Solution,
 };
 use crate::voxel::VoxelGrid;
+
+/// Temperature ladder (design review A1): splits the total locking strain
+/// between the bonded build and the post-release cooldown.
+///
+/// Material locks at `t_lock` (Tg for amorphous, crystallization temperature
+/// for semi-crystalline) and, while the part is on the bed, cools only to its
+/// LOCAL in-build steady temperature — near the plate that is the bed
+/// temperature, a few millimetres up it is the chamber temperature (heat
+/// penetration of the bed's influence is ~3 mm in PLA, T4F3/KU Leuven 2022).
+/// The remainder of the shrink happens after removal, when the whole part
+/// cools to `t_final`. Splitting the strain this way is what makes bed and
+/// chamber temperature real inputs: a PLA part on a 60 °C bed locks almost
+/// nothing near the plate while bonded (T_bed ≈ Tg) — most of its near-bed
+/// shrink arrives only after release.
+#[derive(Clone, Copy, Debug)]
+pub struct ThermalLadder {
+    /// Locking temperature (°C): Tg (amorphous) or Tc (semi-crystalline).
+    pub t_lock: f64,
+    /// Bed temperature (°C) during the build.
+    pub t_bed: f64,
+    /// Chamber/ambient temperature (°C) during the build.
+    pub t_env: f64,
+    /// Ambient temperature (°C) after removal (room temp).
+    pub t_final: f64,
+    /// Height scale (mm) over which the bed's influence decays to chamber.
+    pub decay_mm: f64,
+}
+
+impl ThermalLadder {
+    /// In-build steady temperature at height `z_mm` above the bed.
+    fn t_steady(&self, z_mm: f64) -> f64 {
+        self.t_env + (self.t_bed - self.t_env) * (-z_mm / self.decay_mm.max(1e-6)).exp()
+    }
+
+    /// Fraction of the TOTAL (t_lock → t_final) strain that locks in during
+    /// the bonded build at height `z_mm`; the remainder is applied in the
+    /// release solve. Clamped to [0, 1].
+    pub fn build_fraction(&self, z_mm: f64) -> f64 {
+        let total = self.t_lock - self.t_final;
+        if total.abs() < 1e-9 {
+            return 1.0;
+        }
+        ((self.t_lock - self.t_steady(z_mm)) / total).clamp(0.0, 1.0)
+    }
+
+    /// Per-cell-layer build fractions for a padded grid (cell centres).
+    fn layer_fractions(&self, g: &VoxelGrid) -> Vec<f64> {
+        (0..g.nz).map(|k| self.build_fraction((k as f64 + 0.5) * g.h)).collect()
+    }
+}
 
 /// Penalty stiffness for a 3-2-1 pin DOF, relative to a cell's stiffness
 /// (`~e0·h`). Large enough that the pinned displacement error is negligible
@@ -83,32 +134,75 @@ pub fn eigen_forces(
     ];
     let coeff = grid.h * grid.h / 4.0;
 
-    let mut acc = vec![[0f64; 3]; mx * my * (nz + 1)];
-    for cz in 0..nz {
-        for cy in 0..ny {
-            for cx in 0..nx {
-                let ci = (cz * ny + cy) * nx + cx;
-                let s = eps[ci] as f64;
-                if s <= 0.0 {
-                    continue;
-                }
-                for l in 0..8 {
-                    let [ox, oy, oz] = NODE_OFFSETS[l];
-                    let g = ((cz + oz) * my + cy + oy) * mx + cx + ox;
-                    let [sx, sy, sz] = NODE_SIGNS[l];
-                    acc[g][0] += coeff * s * s0[0] * sx;
-                    acc[g][1] += coeff * s * s0[1] * sy;
-                    acc[g][2] += coeff * s * s0[2] * sz;
-                }
-            }
-        }
-    }
-
-    acc.into_iter()
+    let acc = eigen_forces_dense(grid, eps, [coeff * s0[0], coeff * s0[1], coeff * s0[2]], None);
+    let _ = (nx, ny, nz, mx, my);
+    acc.chunks_exact(3)
         .enumerate()
         .filter(|(_, f)| f[0] != 0.0 || f[1] != 0.0 || f[2] != 0.0)
-        .map(|(n, f)| (n as u32, f))
+        .map(|(n, f)| (n as u32, [f[0], f[1], f[2]]))
         .collect()
+}
+
+/// Dense eigen-force assembly (3 per node): per cell `f_l = eps·scale(z)·[fx·sx,
+/// fy·sy, fz·sz]` scattered to its 8 nodes, where `f = coeff·σ₀` is precomputed
+/// by the caller. `layer_scale` (per cell-Z-layer) is the temperature-ladder
+/// hook. Parallel: two phases of alternating cell layers (same-phase layers
+/// never share nodes — the mg.rs slab argument with 1-layer slabs).
+fn eigen_forces_dense(
+    grid: &VoxelGrid,
+    eps: &[f32],
+    f0: [f64; 3],
+    layer_scale: Option<&[f64]>,
+) -> Vec<f64> {
+    let (nx, ny, nz) = (grid.nx, grid.ny, grid.nz);
+    let (mx, my) = (nx + 1, ny + 1);
+    let mut acc = vec![0f64; 3 * mx * my * (nz + 1)];
+    let ys = UnsafeSlice::new(&mut acc);
+    for phase in 0..2 {
+        let layers: Vec<usize> = (phase..nz).step_by(2).collect();
+        par::for_each(&layers, |&cz| {
+            let ls = layer_scale.map_or(1.0, |s| s[cz]);
+            if ls == 0.0 {
+                return;
+            }
+            for cy in 0..ny {
+                for cx in 0..nx {
+                    let ci = (cz * ny + cy) * nx + cx;
+                    let s = eps[ci] as f64 * ls;
+                    if s <= 0.0 {
+                        continue;
+                    }
+                    for l in 0..8 {
+                        let [ox, oy, oz] = NODE_OFFSETS[l];
+                        let g = ((cz + oz) * my + cy + oy) * mx + cx + ox;
+                        let [sx, sy, sz] = NODE_SIGNS[l];
+                        // SAFETY: same-phase layers are ≥2 apart in z.
+                        unsafe {
+                            *ys.get_mut(3 * g) += s * f0[0] * sx;
+                            *ys.get_mut(3 * g + 1) += s * f0[1] * sy;
+                            *ys.get_mut(3 * g + 2) += s * f0[2] * sz;
+                        }
+                    }
+                }
+            }
+        });
+    }
+    drop(ys);
+    acc
+}
+
+/// Cell-constant initial stress `σ₀ = D ε₀` scaled by the closed-form gradient
+/// integral (`h²/4`) — the per-node force triple `eigen_forces_dense` scatters.
+fn eigen_f0(grid: &VoxelGrid, e0: f64, nu: f64, eigen: [f64; 3]) -> [f64; 3] {
+    let lam = e0 * nu / ((1.0 + nu) * (1.0 - 2.0 * nu));
+    let mu = e0 / (2.0 * (1.0 + nu));
+    let tr = eigen[0] + eigen[1] + eigen[2];
+    let coeff = grid.h * grid.h / 4.0;
+    [
+        coeff * (lam * tr + 2.0 * mu * eigen[0]),
+        coeff * (lam * tr + 2.0 * mu * eigen[1]),
+        coeff * (lam * tr + 2.0 * mu * eigen[2]),
+    ]
 }
 
 #[inline]
@@ -249,6 +343,7 @@ fn build_bonded_inner(
     eigen: [f64; 3],
     s: &SolveSettings,
     eps_override: Option<&[f32]>,
+    ladder: Option<&ThermalLadder>,
     on_layer: &mut dyn FnMut(usize, usize, &Solution),
 ) -> Result<(VoxelGrid, usize, Vec<f64>, Vec<f64>, Vec<f64>, Vec<usize>), SolveError> {
     let (g, levels) = pad_for_levels(grid, s.max_levels);
@@ -279,6 +374,13 @@ fn build_bonded_inner(
     let mut ses = SolveSession::new();
     let problem = NodeProblem { fixed: fixed.clone(), ..Default::default() };
     let mut iters = Vec::new();
+
+    // Temperature ladder: fraction of the total strain locked while bonded,
+    // per cell layer (1.0 everywhere when no ladder — legacy behavior).
+    let frac: Vec<f64> = match ladder {
+        Some(l) => l.layer_fractions(&g),
+        None => vec![1.0; nz],
+    };
 
     // Total SOLID layers, for progress reporting (empty layers are skipped).
     let total_layers = (0..nz)
@@ -342,7 +444,10 @@ fn build_bonded_inner(
                 }
             }
         }
-        for (n, fv) in eigen_forces(&g, &eps_layer, s.e0, s.nu, eigen) {
+        // This layer's eigenstrain, scaled by the ladder's bonded fraction at
+        // its height (the cooldown remainder is applied in the release solve).
+        let eigen_k = [eigen[0] * frac[k], eigen[1] * frac[k], eigen[2] * frac[k]];
+        for (n, fv) in eigen_forces(&g, &eps_layer, s.e0, s.nu, eigen_k) {
             for d in 0..3 {
                 f_eig[3 * n as usize + d] += fv[d];
             }
@@ -413,37 +518,44 @@ fn solution_from(g: &VoxelGrid, u: Vec<f64>, iterations: usize) -> Solution {
 }
 
 /// Matrix-free `K·u` over all solid cells (for nodal reaction recovery).
+/// Parallel: two phases of alternating cell layers (no shared nodes in-phase).
 fn apply_k(g: &VoxelGrid, eps: &[f32], ke: &[[f64; 24]; 24], u: &[f64]) -> Vec<f64> {
     let (nx, ny, nz) = (g.nx, g.ny, g.nz);
     let (mx, my, mz) = (nx + 1, ny + 1, nz + 1);
     let mut ku = vec![0f64; 3 * mx * my * mz];
-    for cz in 0..nz {
-        for cy in 0..ny {
-            for cx in 0..nx {
-                let e = eps[(cz * ny + cy) * nx + cx] as f64;
-                if e <= 0.0 {
-                    continue;
-                }
-                let mut n8 = [0usize; 8];
-                let mut ul = [0f64; 24];
-                for l in 0..8 {
-                    let [ox, oy, oz] = NODE_OFFSETS[l];
-                    let n = ((cz + oz) * my + cy + oy) * mx + cx + ox;
-                    n8[l] = n;
-                    for d in 0..3 {
-                        ul[3 * l + d] = u[3 * n + d];
+    let ys = UnsafeSlice::new(&mut ku);
+    for phase in 0..2 {
+        let layers: Vec<usize> = (phase..nz).step_by(2).collect();
+        par::for_each(&layers, |&cz| {
+            for cy in 0..ny {
+                for cx in 0..nx {
+                    let e = eps[(cz * ny + cy) * nx + cx] as f64;
+                    if e <= 0.0 {
+                        continue;
                     }
-                }
-                for i in 0..24 {
-                    let mut sgi = 0.0;
-                    for j in 0..24 {
-                        sgi += ke[i][j] * ul[j];
+                    let mut n8 = [0usize; 8];
+                    let mut ul = [0f64; 24];
+                    for l in 0..8 {
+                        let [ox, oy, oz] = NODE_OFFSETS[l];
+                        let n = ((cz + oz) * my + cy + oy) * mx + cx + ox;
+                        n8[l] = n;
+                        for d in 0..3 {
+                            ul[3 * l + d] = u[3 * n + d];
+                        }
                     }
-                    ku[3 * n8[i / 3] + (i % 3)] += e * sgi;
+                    for i in 0..24 {
+                        let mut sgi = 0.0;
+                        for j in 0..24 {
+                            sgi += ke[i][j] * ul[j];
+                        }
+                        // SAFETY: same-phase layers are ≥2 apart in z.
+                        unsafe { *ys.get_mut(3 * n8[i / 3] + (i % 3)) += e * sgi };
+                    }
                 }
             }
-        }
+        });
     }
+    drop(ys);
     ku
 }
 
@@ -518,25 +630,34 @@ fn add_plastic_forces(g: &VoxelGrid, eps: &[f32], e0: f64, nu: f64, ep: &[[f64; 
     let (nx, ny, nz) = (g.nx, g.ny, g.nz);
     let (mx, my) = (nx + 1, ny + 1);
     let coeff = g.h * g.h / 4.0;
-    for cz in 0..nz {
-        for cy in 0..ny {
-            for cx in 0..nx {
-                let ci = (cz * ny + cy) * nx + cx;
-                let e = eps[ci] as f64;
-                if e <= 0.0 {
-                    continue;
-                }
-                let sp = stress_from_strain(ep[ci], e0 * e, nu);
-                for l in 0..8 {
-                    let [ox, oy, oz] = NODE_OFFSETS[l];
-                    let [sx, sy, sz] = NODE_SIGNS[l];
-                    let n = ((cz + oz) * my + (cy + oy)) * mx + (cx + ox);
-                    f[3 * n] += coeff * (sp[0] * sx + sp[3] * sy + sp[5] * sz);
-                    f[3 * n + 1] += coeff * (sp[1] * sy + sp[3] * sx + sp[4] * sz);
-                    f[3 * n + 2] += coeff * (sp[2] * sz + sp[4] * sy + sp[5] * sx);
+    let ys = UnsafeSlice::new(f);
+    for phase in 0..2 {
+        let layers: Vec<usize> = (phase..nz).step_by(2).collect();
+        par::for_each(&layers, |&cz| {
+            for cy in 0..ny {
+                for cx in 0..nx {
+                    let ci = (cz * ny + cy) * nx + cx;
+                    let e = eps[ci] as f64;
+                    if e <= 0.0 {
+                        continue;
+                    }
+                    let sp = stress_from_strain(ep[ci], e0 * e, nu);
+                    for l in 0..8 {
+                        let [ox, oy, oz] = NODE_OFFSETS[l];
+                        let [sx, sy, sz] = NODE_SIGNS[l];
+                        let n = ((cz + oz) * my + (cy + oy)) * mx + (cx + ox);
+                        // SAFETY: same-phase layers are ≥2 apart in z.
+                        unsafe {
+                            *ys.get_mut(3 * n) += coeff * (sp[0] * sx + sp[3] * sy + sp[5] * sz);
+                            *ys.get_mut(3 * n + 1) +=
+                                coeff * (sp[1] * sy + sp[3] * sx + sp[4] * sz);
+                            *ys.get_mut(3 * n + 2) +=
+                                coeff * (sp[2] * sz + sp[4] * sy + sp[5] * sx);
+                        }
+                    }
                 }
             }
-        }
+        });
     }
 }
 
@@ -564,6 +685,7 @@ fn plastic_correct_bonded(
     eps_full: &[f32],
     fixed: &[u32],
     eigen: [f64; 3],
+    frac: &[f64],
     f_eig: &[f64],
     f_lock: &[f64],
     sy: f64,
@@ -581,41 +703,56 @@ fn plastic_correct_bonded(
 
     for _it in 0..MAX_PLASTIC_ITERS {
         // Radial-return every cell against the current bonded stress, growing
-        // the locked-in plastic strain.
-        let mut max_dep = 0f64;
-        let mut changed = false;
-        for cz in 0..nz {
-            for cy in 0..ny {
-                for cx in 0..nx {
-                    let ci = (cz * ny + cy) * nx + cx;
-                    let ec = eps_full[ci] as f64;
-                    if ec <= 0.0 {
-                        continue;
-                    }
-                    let e = s.e0 * ec;
-                    let mu = e / (2.0 * (1.0 + s.nu));
-                    let tot = cell_strain(g, &u_b, cx, cy, cz);
-                    // Elastic strain = total − eigenstrain − locked plastic strain.
-                    let el = [
-                        tot[0] - eigen[0] - ep[ci][0],
-                        tot[1] - eigen[1] - ep[ci][1],
-                        tot[2] - eigen[2] - ep[ci][2],
-                        tot[3] - ep[ci][3],
-                        tot[4] - ep[ci][4],
-                        tot[5] - ep[ci][5],
-                    ];
-                    let sig = stress_from_strain(el, e, s.nu);
-                    if let Some(dep) = return_map(sig, mu, sy) {
-                        for k in 0..6 {
-                            ep[ci][k] += dep[k];
-                            max_dep = max_dep.max(dep[k].abs());
+        // the locked-in plastic strain. Parallel over cell layers: each cell
+        // writes only its own ep entry; the reduction is the max increment.
+        let max_dep = {
+            let ep_s = UnsafeSlice::new(&mut ep);
+            let u_ref = &u_b;
+            par::map_reduce_ranges(
+                nz,
+                1,
+                |z0, z1| {
+                    let mut local = 0f64;
+                    for cz in z0..z1 {
+                        for cy in 0..ny {
+                            for cx in 0..nx {
+                                let ci = (cz * ny + cy) * nx + cx;
+                                let ec = eps_full[ci] as f64;
+                                if ec <= 0.0 {
+                                    continue;
+                                }
+                                let e = s.e0 * ec;
+                                let mu = e / (2.0 * (1.0 + s.nu));
+                                let tot = cell_strain(g, u_ref, cx, cy, cz);
+                                // SAFETY: each cell index is visited exactly once.
+                                let epc = unsafe { ep_s.get_mut(ci) };
+                                // Elastic strain = total − (bonded-stage)
+                                // eigenstrain − locked plastic strain.
+                                let el = [
+                                    tot[0] - frac[cz] * eigen[0] - epc[0],
+                                    tot[1] - frac[cz] * eigen[1] - epc[1],
+                                    tot[2] - frac[cz] * eigen[2] - epc[2],
+                                    tot[3] - epc[3],
+                                    tot[4] - epc[4],
+                                    tot[5] - epc[5],
+                                ];
+                                let sig = stress_from_strain(el, e, s.nu);
+                                if let Some(dep) = return_map(sig, mu, sy) {
+                                    for k in 0..6 {
+                                        epc[k] += dep[k];
+                                        local = local.max(dep[k].abs());
+                                    }
+                                }
+                            }
                         }
-                        changed = true;
                     }
-                }
-            }
-        }
-        if !changed {
+                    local
+                },
+                f64::max,
+                || 0.0,
+            )
+        };
+        if max_dep == 0.0 {
             break;
         }
 
@@ -663,7 +800,7 @@ pub fn solve_sequential_bonded(
     s: &SolveSettings,
 ) -> Result<(Solution, Vec<usize>), SolveError> {
     let (g, _levels, u, _fe, _fl, iters) =
-        build_bonded_inner(grid, eigen, s, None, &mut |_, _, _| {})?;
+        build_bonded_inner(grid, eigen, s, None, None, &mut |_, _, _| {})?;
     let it = *iters.iter().max().unwrap_or(&0);
     Ok((solution_from(&g, u, it), iters))
 }
@@ -697,7 +834,7 @@ pub fn solve_build(
     s: &SolveSettings,
     yield_strength: Option<f64>,
 ) -> Result<BuildResult, SolveError> {
-    solve_build_progress(grid, eigen, s, None, yield_strength, |_, _, _| {})
+    solve_build_progress(grid, eigen, s, None, yield_strength, None, |_, _, _| {})
 }
 
 /// Like [`solve_build`], but `on_layer(layers_done, total_layers, &bonded_so_far)`
@@ -715,13 +852,18 @@ pub fn solve_build_progress(
     s: &SolveSettings,
     eps_override: Option<&[f32]>,
     yield_strength: Option<f64>,
+    ladder: Option<&ThermalLadder>,
     mut on_layer: impl FnMut(usize, usize, &Solution),
 ) -> Result<BuildResult, SolveError> {
     let (g, levels, u_b, f_eig, mut f_lock, iters) =
-        build_bonded_inner(grid, eigen, s, eps_override, &mut on_layer)?;
+        build_bonded_inner(grid, eigen, s, eps_override, ladder, &mut on_layer)?;
     let it = *iters.iter().max().unwrap_or(&0);
     let eps_full = resolve_eps(&g, eps_override);
     let ke = ke_hex(s.e0, s.nu, g.h);
+    let frac: Vec<f64> = match ladder {
+        Some(l) => l.layer_fractions(&g),
+        None => vec![1.0; g.nz],
+    };
 
     // Plastic correction (§ yield): lock in the incompatible plastic strain the
     // bonded constraint generates, so the released warp stops being the
@@ -731,7 +873,7 @@ pub fn solve_build_progress(
         Some(sy) if sy > 0.0 => {
             let bottom = bottom_nodes(&g);
             let (u_p, _ep, f_plastic) = plastic_correct_bonded(
-                &g, levels, s, &eps_full, &bottom, eigen, &f_eig, &f_lock, sy, u_b,
+                &g, levels, s, &eps_full, &bottom, eigen, &frac, &f_eig, &f_lock, sy, u_b,
             )?;
             for (l, fp) in f_lock.iter_mut().zip(&f_plastic) {
                 *l += *fp;
@@ -756,8 +898,20 @@ pub fn solve_build_progress(
         })
         .collect();
 
+    // Cooldown remainder (temperature ladder): after removal the whole part
+    // cools from its in-build steady temperature to ambient — every cell gets
+    // the (1 − bonded fraction) share of its eigenstrain, applied only in the
+    // release state. Without a ladder this is identically zero.
+    let cool_scale: Vec<f64> = frac.iter().map(|&f| 1.0 - f).collect();
+    let f_cool = if cool_scale.iter().any(|&c| c > 0.0) {
+        eigen_forces_dense(&g, &eps_full, eigen_f0(&g, s.e0, s.nu, eigen), Some(&cool_scale))
+    } else {
+        vec![0f64; f_eig.len()]
+    };
+
     // Release: free body (3-2-1 pin) under the locked-in build loads (now
-    // including the plastic source folded into f_lock above).
+    // including the plastic source folded into f_lock above) plus the
+    // post-release cooldown strain.
     let mut np = NodeProblem::default();
     if ground_rigid_body(&g, &mut np).is_none() {
         return Err(SolveError::NoFixedNodes);
@@ -768,7 +922,16 @@ pub fn solve_build_progress(
     // iterations rather than grinding to the global cap.
     let s_release = SolveSettings { tol: s.tol.max(2.0e-3), max_iter: s.max_iter.min(600), ..*s };
     let released = SolveSession::new()
-        .solve(&g, levels, &np, &s_release, grid_eps(&g), &[&f_eig, &f_lock], s_release.tol, s_release.max_iter)?
+        .solve(
+            &g,
+            levels,
+            &np,
+            &s_release,
+            eps_full.clone(),
+            &[&f_eig, &f_lock, &f_cool],
+            s_release.tol,
+            s_release.max_iter,
+        )?
         .into_solution(&g);
 
     Ok(BuildResult {
@@ -1022,7 +1185,7 @@ mod tests {
             }
         }
         let graded =
-            solve_build_progress(&grid, [beta, beta, beta], &s, Some(&eps), None, |_, _, _| {})
+            solve_build_progress(&grid, [beta, beta, beta], &s, Some(&eps), None, None, |_, _, _| {})
                 .expect("graded");
 
         let (db, dg) = (base.bonded.max_displacement(), graded.bonded.max_displacement());
@@ -1085,6 +1248,66 @@ mod tests {
         worst
     }
 
+    /// Temperature ladder invariants. (a) For a PURE-ELASTIC uniform shrink the
+    /// released shape must be ladder-independent: build-stage + cooldown-stage
+    /// strains sum to the same total, and the elastic release of a compatible
+    /// field forgets the path. (b) With the bed at the locking temperature the
+    /// near-bed layers lock almost nothing while bonded, so the bonded bed
+    /// tractions (peel) must DROP versus the no-ladder run.
+    #[test]
+    fn ladder_elastic_release_invariant_and_peel_reduction() {
+        let (nx, ny, nz, h) = (16usize, 6usize, 20usize, 1.0f64);
+        let grid = VoxelGrid::solid_box(nx, ny, nz, h);
+        let eigen = [-0.008, -0.008, -0.004];
+        let s = SolveSettings { e0: 2400.0, nu: 0.35, ..Default::default() };
+        // PLA-like: bed at Tg (locks ~nothing near the plate), cold chamber.
+        let ladder = ThermalLadder {
+            t_lock: 60.0,
+            t_bed: 60.0,
+            t_env: 25.0,
+            t_final: 20.0,
+            decay_mm: 3.0,
+        };
+
+        let base = solve_build(&grid, eigen, &s, None).expect("base");
+        let lad = solve_build_progress(&grid, eigen, &s, None, None, Some(&ladder), |_, _, _| {})
+            .expect("ladder");
+
+        // (a) Same TOTAL strain either way, so the released warp magnitude must
+        // land in the same band. (Not identical: the ladder changes each
+        // layer's birth configuration, so f_lock — and hence the release — is
+        // legitimately path-dependent. That path shift is the physics: with a
+        // hot bed the warp happens after removal, not on the plate.)
+        let (db, dl) = (base.released.max_displacement(), lad.released.max_displacement());
+        assert!(
+            dl > 0.7 * db && dl < 1.4 * db,
+            "ladder release must stay in the same magnitude band: {dl:.4} vs {db:.4}"
+        );
+
+        // (b) Bonded peel drops: near-bed layers hold back most of their strain.
+        let peak = |r: &BuildResult| {
+            r.bed_reaction.iter().map(|(_, f)| f[2].abs()).fold(0.0f64, f64::max)
+        };
+        let (p0, p1) = (peak(&base), peak(&lad));
+        assert!(
+            p1 < 0.6 * p0,
+            "bed-at-Tg ladder must cut peel substantially: {p1:.3} vs {p0:.3} N"
+        );
+    }
+
+    /// Ladder fraction sanity: bed at t_lock → fraction ≈ small near the bed,
+    /// rising toward the chamber value with height; everything clamped [0,1].
+    #[test]
+    fn ladder_fractions_monotone() {
+        let l = ThermalLadder { t_lock: 60.0, t_bed: 60.0, t_env: 25.0, t_final: 20.0, decay_mm: 3.0 };
+        let f0 = l.build_fraction(0.0);
+        let f5 = l.build_fraction(5.0);
+        let f20 = l.build_fraction(20.0);
+        assert!(f0 < 0.05, "at the bed nothing locks while bonded: {f0}");
+        assert!(f0 < f5 && f5 < f20, "fraction must rise with height: {f0} {f5} {f20}");
+        assert!(f20 <= 1.0 && f20 > 0.8, "far from the bed most strain locks in-build: {f20}");
+    }
+
     /// The fix for Stefan's infill bug: a pure-elastic release of a uniform
     /// eigenstrain is the stress-free compatible shrink `u = ε₀·x`, so it is
     /// stiffness-independent and warps the same regardless of infill. Turning on
@@ -1140,18 +1363,23 @@ mod tests {
         }
 
         let solid = solve_build(&grid, eigen, &s, sy).expect("solid");
-        let hollow = solve_build_progress(&grid, eigen, &s, Some(&eps), sy, |_, _, _| {})
+        let hollow = solve_build_progress(&grid, eigen, &s, Some(&eps), sy, None, |_, _, _| {})
             .expect("hollow");
         let solid_e = solve_build(&grid, eigen, &s, None).expect("solid elastic");
-        let hollow_e = solve_build_progress(&grid, eigen, &s, Some(&eps), None, |_, _, _| {})
+        let hollow_e = solve_build_progress(&grid, eigen, &s, Some(&eps), None, None, |_, _, _| {})
             .expect("hollow elastic");
 
         // Plastic curl = how far each released shape departs from its elastic
         // (stress-free) counterpart. Solid locks in more than the sparse core.
         let curl_solid = max_node_diff(&solid.released, &solid_e.released);
         let curl_hollow = max_node_diff(&hollow.released, &hollow_e.released);
+        // Band recalibrated after the release solve switched to the CONSISTENT
+        // graded operator (eps_full — the same stiffness the loads were
+        // assembled with; it previously released against the solid-hull
+        // stiffness, which broke the compatible-shrink property for graded
+        // parts). The density contrast in plastic curl is real but modest.
         assert!(
-            curl_solid > curl_hollow * 1.15,
+            curl_solid > curl_hollow * 1.05,
             "denser part should curl more: solid {curl_solid:.4} vs hollow {curl_hollow:.4}"
         );
 

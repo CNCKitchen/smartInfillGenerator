@@ -569,6 +569,18 @@ export interface BuildSimOptions {
   /** Material yield stress (MPa); >0 enables the plastic step so the released
    *  warp depends on infill density. 0/omitted = pure-elastic (density-blind). */
   yieldStrength?: number;
+  /** Locking temperature (°C): Tg amorphous / Tc semi-crystalline. All four
+   *  temperatures must be present to enable the temperature ladder; omitting
+   *  any keeps the legacy uniform-shrink behavior. */
+  tLock?: number;
+  /** Bed temperature (°C). */
+  tBed?: number;
+  /** Chamber/ambient temperature (°C). */
+  tChamber?: number;
+  /** Final (room) temperature (°C) after removal from the bed. */
+  tFinal?: number;
+  /** Bed heat-penetration depth in mm (engine default 3.0). */
+  decayMm?: number;
 }
 
 /** Build-sim stats. `maxDisplacement` is the shown state; bonded/released give

@@ -452,6 +452,33 @@ struct BuildSimOpts {
     /// correction so the released warp depends on geometry/infill density;
     /// `0`/omitted falls back to the pure-elastic (density-blind) release.
     yield_strength: f64,
+    /// Temperature ladder (all °C; lock+bed+chamber+final required to enable):
+    /// splits the shrink between the bonded build (lock → local in-build
+    /// steady temperature) and the post-release cooldown (steady → ambient).
+    /// Omitted = legacy behavior (full strain while bonded).
+    t_lock: Option<f64>,
+    t_bed: Option<f64>,
+    t_chamber: Option<f64>,
+    t_final: Option<f64>,
+    /// Bed heat-penetration depth (mm) of the ladder. Default 3.0 mm.
+    decay_mm: Option<f64>,
+}
+
+impl BuildSimOpts {
+    fn ladder(&self) -> Option<filasim_core::buildsim::ThermalLadder> {
+        match (self.t_lock, self.t_bed, self.t_chamber, self.t_final) {
+            (Some(t_lock), Some(t_bed), Some(t_env), Some(t_final)) => {
+                Some(filasim_core::buildsim::ThermalLadder {
+                    t_lock,
+                    t_bed,
+                    t_env,
+                    t_final,
+                    decay_mm: self.decay_mm.unwrap_or(3.0),
+                })
+            }
+            _ => None,
+        }
+    }
 }
 
 impl Default for BuildSimOpts {
@@ -462,6 +489,11 @@ impl Default for BuildSimOpts {
             state: "released".into(),
             exaggeration: 10.0,
             yield_strength: 0.0,
+            t_lock: None,
+            t_bed: None,
+            t_chamber: None,
+            t_final: None,
+            decay_mm: None,
         }
     }
 }
@@ -1425,12 +1457,14 @@ impl Model {
         // responds to geometry/infill density (otherwise a uniform eigenstrain
         // releases to the same density-blind compatible shrink).
         let yield_strength = (opts.yield_strength > 0.0).then_some(opts.yield_strength);
+        let ladder = opts.ladder();
         let r = filasim_core::buildsim::solve_build_progress(
             &grid,
             eigen,
             &self.settings,
             eps_override.as_deref(),
             yield_strength,
+            ladder.as_ref(),
             |done, total, sol| {
                 // Throttle the (expensive) hull build to ~30 preview frames. On
                 // sent frames the payload is the deformed ACTIVATED voxel hull

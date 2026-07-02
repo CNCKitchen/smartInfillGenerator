@@ -17,6 +17,7 @@ import {
 import { NumInput } from "./NumInput";
 import { UnitInput } from "./UnitInput";
 import { RESULT_FIELDS, type Bc, type ForceMode, type LoadStep, type PatternKey } from "../types";
+import { BUILD_MATERIALS, getBuildMaterial, shrinkFromPhysics, ROOM_TEMP_C } from "../materials";
 import { fmtDisp, fmtLen, lenUnit, rampCss } from "./fmt";
 import { bcLabel, KIND_DOT, KIND_LABEL, SUPPORT_KINDS } from "./bcmeta";
 import {
@@ -1492,6 +1493,12 @@ function StepBuildSim() {
     useShallow((s) => ({
       material: s.material,
       buildState: s.buildState,
+      buildMaterial: s.buildMaterial,
+      buildBedTemp: s.buildBedTemp,
+      buildChamberTemp: s.buildChamberTemp,
+      setBuildMaterial: s.setBuildMaterial,
+      setBuildBedTemp: s.setBuildBedTemp,
+      setBuildChamberTemp: s.setBuildChamberTemp,
       runSolve: s.runSolve,
       busy: s.busy,
       stats: s.stats,
@@ -1504,19 +1511,77 @@ function StepBuildSim() {
   const bp = s.buildProgress;
   const br = s.buildResult;
   const pct = bp && bp.total > 0 ? Math.round((bp.done / bp.total) * 100) : 0;
+  const preset = getBuildMaterial(s.buildMaterial);
+  const phys = preset ? shrinkFromPhysics(preset, ROOM_TEMP_C) : null;
   return (
     <>
       <div className="group">
-        <div className="dim small">
-          Inherent-strain warp via sequential layer activation. Shrink is a material property (
-          <b>{s.material.name}</b>: XY {(s.material.shrink * 100).toFixed(2)}% · Z{" "}
-          {((s.material.shrinkZ ?? s.material.shrink) * 100).toFixed(2)}%) — edit it in{" "}
-          <button className="linkbtn" onClick={() => s.openSettings(true)}>
-            ⚙ Settings
-          </button>
-          . Uncalibrated: the warp shape is meaningful, the absolute magnitude is not.
+        <div className="g-label">
+          <span>Material model</span>
         </div>
+        <select value={s.buildMaterial} onChange={(e) => s.setBuildMaterial(e.target.value)}>
+          {BUILD_MATERIALS.map((m) => (
+            <option key={m.id} value={m.id}>
+              {m.label}
+            </option>
+          ))}
+        </select>
+        {preset && phys ? (
+          <div className="dim small">
+            Inherent-strain warp via sequential layer activation. Shrink from physics — locks at{" "}
+            {preset.tLock} °C ({preset.semiCrystalline ? "Tc" : "Tg"}), CTE{" "}
+            {(preset.cte * 1e6).toFixed(0)} ppm/°C: XY {(Math.abs(phys.shrink) * 100).toFixed(2)}% ·
+            Z {(Math.abs(phys.shrinkZ) * 100).toFixed(2)}% (lock → {ROOM_TEMP_C} °C room).
+            Uncalibrated: the warp shape is meaningful, the absolute magnitude is not.
+          </div>
+        ) : (
+          <div className="dim small">
+            Inherent-strain warp via sequential layer activation. Shrink is a material property (
+            <b>{s.material.name}</b>: XY {(s.material.shrink * 100).toFixed(2)}% · Z{" "}
+            {((s.material.shrinkZ ?? s.material.shrink) * 100).toFixed(2)}%) — edit it in{" "}
+            <button className="linkbtn" onClick={() => s.openSettings(true)}>
+              ⚙ Settings
+            </button>
+            . Uncalibrated: the warp shape is meaningful, the absolute magnitude is not.
+          </div>
+        )}
       </div>
+      {preset && (
+        <>
+          <div className="duo">
+            <div className="group">
+              <div className="g-label">
+                <span>Bed temp</span>
+                <b>°C</b>
+              </div>
+              <NumInput
+                value={s.buildBedTemp}
+                step={5}
+                min={0}
+                max={200}
+                onCommit={(v) => s.setBuildBedTemp(v)}
+              />
+            </div>
+            <div className="group">
+              <div className="g-label">
+                <span>Chamber temp</span>
+                <b>°C</b>
+              </div>
+              <NumInput
+                value={s.buildChamberTemp}
+                step={5}
+                min={0}
+                max={150}
+                onCommit={(v) => s.setBuildChamberTemp(v)}
+              />
+            </div>
+          </div>
+          <div className="dim small">
+            Bed & chamber set the temperature ladder — which layers are still warm while the part
+            builds. The total shrink (lock → room) is unchanged.
+          </div>
+        </>
+      )}
       <div className="toolrow">
         <button className="primary" onClick={() => void s.runSolve()} disabled={!!s.busy}>
           Run build simulation
