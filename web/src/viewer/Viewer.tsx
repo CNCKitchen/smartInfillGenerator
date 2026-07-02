@@ -149,6 +149,13 @@ export function Viewer() {
     sceneRef.current?.setTool(tool, brushRadius, brushErase);
   }, [tool, brushRadius, brushErase]);
 
+  // Loads/fixtures are structural-workspace concepts: hide their markers in
+  // the Build Sim workspace (its physics has no applied loads).
+  const appMode = useStore((s) => s.appMode);
+  useEffect(() => {
+    sceneRef.current?.setBcMarkersEnabled(appMode !== "buildsim");
+  }, [appMode]);
+
   // Hover value probe: a formatter whenever a contour legend is on screen
   // (result fields, density views, mesh-view element density).
   const viewMode = useStore((s) => s.viewMode);

@@ -1594,6 +1594,9 @@ function clearLiveResultView(set: (p: Partial<AppState>) => void, get: () => App
     legendMin: null,
     legendMax: null,
     buildResult: null,
+    // The exaggeration belonged to the result being cleared (Build Sim derives
+    // a result-specific deformScale) — don't leak it into the next workspace.
+    deformScale: 1,
   });
   session.invalidateSolution();
   sceneEvents.onLegendRange?.(null, null);
@@ -3279,14 +3282,18 @@ export const useStore = create<AppState>((set, get) => ({
     try {
       const out = await engine.setBuildState(s);
       const maxDisp = out.stats.maxDisplacement;
-      // Hold the ×10 geometric exaggeration: shown factor = autoScale·deformScale,
-      // autoScale = 0.08·diag/maxDisp, so deformScale = 10/autoScale.
+      // Hold the CURRENTLY SHOWN geometric exaggeration across the flip (the
+      // two states have different max |u|, so the scene re-anchors autoScale =
+      // 0.08·diag/maxDisp below): shown = autoScale·deformScale, so set
+      // deformScale = shown/autoScale(new). This also preserves a factor the
+      // user typed into the legend.
+      const shown = get().autoScale * get().deformScale;
       const bb = get().model?.bbox;
       let deformScale = get().deformScale;
-      if (bb) {
+      if (bb && Number.isFinite(shown)) {
         const diag = Math.hypot(bb[3] - bb[0], bb[4] - bb[1], bb[5] - bb[2]);
         const autoS = (0.08 * diag) / Math.max(maxDisp, 1e-9);
-        deformScale = 10 / autoS;
+        deformScale = shown / autoS;
       }
       const cur = get().stats;
       set({
@@ -3294,7 +3301,9 @@ export const useStore = create<AppState>((set, get) => ({
         deformScale,
       });
       sceneEvents.onDisplacements?.(out.displacements, {
-        maxDisplacement: referenceMaxDisp(get().results, maxDisp),
+        // This state's OWN anchor — the roster reference would silently change
+        // the shown factor between on-bed and released.
+        maxDisplacement: maxDisp,
       });
       sceneEvents.onViewState?.("deformed", deformScale);
       // Stress fields are state-dependent (residual stress differs on bed vs
@@ -3304,7 +3313,7 @@ export const useStore = create<AppState>((set, get) => ({
       await pushScalarField(set, get);
       appendLog(
         set,
-        `Build state → ${s === "released" ? "released (off bed)" : "on bed"} · max |u| ${maxDisp.toExponential(2)} mm ×10`
+        `Build state → ${s === "released" ? "released (off bed)" : "on bed"} · max |u| ${maxDisp.toExponential(2)} mm ×${Number.isFinite(shown) ? +shown.toFixed(1) : 1}`
       );
     } catch {
       // The cached states no longer match the current grid — force a re-run.
@@ -3756,10 +3765,12 @@ export const useStore = create<AppState>((set, get) => ({
             `${st0.buildState === "released" ? "released (off-bed)" : "on-bed"} state` +
             " — sequential inherent-strain warp + bed peel (coarse grid) …"
         );
-        // Live preview on the VOXEL hull at 10× exaggeration: only the printed
-        // (activated) cells, jet-colored by |u|, with the displacement legend —
-        // so it reads like the final result as it builds.
-        const exag = 10;
+        // Live preview on the VOXEL hull: only the printed (activated) cells,
+        // jet-colored by |u|, with the displacement legend — so it reads like
+        // the final result as it builds. True scale (×1) by default: warp is a
+        // real mm quantity users compare against their printer/tolerances; the
+        // legend's "exaggerated ×" control raises it on demand.
+        const exag = 1;
         const previewStats = (maxU: number) =>
           ({
             iterations: 0,
@@ -3770,8 +3781,8 @@ export const useStore = create<AppState>((set, get) => ({
             residuals: [],
             tol: get().solveTol,
           }) as SolveStats;
-        // The live preview hull bakes 10× geometric exaggeration. Pin autoScale=1
-        // so the legend reads exactly ×10 (autoScale·deformScale) and `stats` so
+        // The live preview hull bakes the geometric exaggeration. Pin autoScale=1
+        // so the legend reads exactly ×exag (autoScale·deformScale) and `stats` so
         // the legend even shows (it gates on viewMode==="deformed" && stats).
         set({
           busy: "Build sim…",
@@ -3825,15 +3836,16 @@ export const useStore = create<AppState>((set, get) => ({
         sceneEvents.onBuildActive?.(null);
         set({ buildProgress: null });
         displacements = out.displacements;
-        // Final exaggeration: match the preview's 10× GEOMETRIC. The scene's
+        // Final exaggeration: match the preview's GEOMETRIC ×exag. The scene's
         // autoScale = 0.08·diag/maxDisp, and the shown factor is autoScale·
-        // deformScale, so deformScale = 10/autoScale → exactly ×10 (not the
-        // ~230× that deformScale=10 would give on top of autoScale).
+        // deformScale, so deformScale = exag/autoScale. The displacement anchor
+        // below MUST be this run's own max |u| (not referenceMaxDisp) or the
+        // factor silently multiplies by buildMax/staticMin.
         const bb = get().model?.bbox;
         if (bb) {
           const diag = Math.hypot(bb[3] - bb[0], bb[4] - bb[1], bb[5] - bb[2]);
           const autoS = (0.08 * diag) / Math.max(out.stats.maxDisplacement, 1e-9);
-          set({ deformScale: 10 / autoS });
+          set({ deformScale: exag / autoS });
         }
         // Synthesize a SolveStats so the deformed view + dock render uniformly.
         stats = {
@@ -3908,7 +3920,12 @@ export const useStore = create<AppState>((set, get) => ({
       });
       sceneEvents.onScalarField?.(null);
       sceneEvents.onDisplacements?.(displacements, {
-        maxDisplacement: referenceMaxDisp(get().results, stats.maxDisplacement),
+        // Build sim anchors on its OWN max |u|: its deformScale was derived
+        // from that (shown = autoScale·deformScale = ×exag exactly). Anchoring
+        // on the roster would multiply the factor by buildMax/staticMin.
+        maxDisplacement: buildsim
+          ? stats.maxDisplacement
+          : referenceMaxDisp(get().results, stats.maxDisplacement),
       });
       sceneEvents.onViewState?.("deformed", get().deformScale);
       // Voxel result surface active: reload its hull for the new solution.

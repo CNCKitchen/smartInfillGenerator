@@ -141,6 +141,9 @@ export class SceneManager {
   /** Force arrows + support glyphs (classic FEA triangles), setup view only. */
   private bcMarkers = new THREE.Group();
   private markerDisposables: { dispose(): void }[] = [];
+  /** Loads/fixtures belong to the structural workspace — the Build Sim
+   *  workspace disables them wholesale (its physics has no applied loads). */
+  private bcMarkersEnabled = true;
 
   // Axis gizmo (inset, bottom-right)
   private gizmoScene = new THREE.Scene();
@@ -232,7 +235,9 @@ export class SceneManager {
     colors: () => this.colors,
     uvs: () => this.uvs,
     triCount: () => this.triCount,
-    bcs: () => this.bcs,
+    // The Build Sim workspace hides loads/fixtures entirely (arrows AND face
+    // tint) — an empty list here erases the tint on the next repaint.
+    bcs: () => (this.bcMarkersEnabled ? this.bcs : []),
     activeBcId: () => this.activeBcId,
     patchToTris: () => this.patchToTris,
     viewMode: () => this.viewMode,
@@ -1020,8 +1025,17 @@ export class SceneManager {
     this.bcMarkers.add(label);
   }
 
+  /** Workspace gate for the load/fixture display (false in Build Sim): hides
+   *  the marker glyphs and repaints the surface without the BC face tint. */
+  setBcMarkersEnabled(on: boolean) {
+    if (on === this.bcMarkersEnabled) return;
+    this.bcMarkersEnabled = on;
+    this.colorMgr.repaint();
+    this.updateMarkerVisibility();
+  }
+
   private updateMarkerVisibility() {
-    this.bcMarkers.visible = this.viewMode === "setup";
+    this.bcMarkers.visible = this.bcMarkersEnabled && this.viewMode === "setup";
   }
 
   private selectionCentroid(tris: Uint32Array): THREE.Vector3 {
