@@ -4,15 +4,21 @@
 // Imperative three.js layer: mesh display, patch hover/select, brush,
 // BC coloring + support glyphs, axis gizmo, rigid-body-mode animation,
 // deformed-shape overlay (with looping animation), density/region/voxel views.
+// Orchestrates the extracted managers: ColorManager (surface coloring/LUTs),
+// GizmoController (section + symmetry plane rigs), ResultSurfaceManager
+// (result meshes + displacement application), CalloutManager (value callouts
+// + min/max markers).
 
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
-import { TransformControls } from "three/addons/controls/TransformControls.js";
 import type { Bc, LoadedModel } from "../types";
 import type { Tool, ViewMode } from "../store";
-import { CONTOUR_BANDS, jet, ramp, type RGB } from "./colormaps";
+import { ramp } from "./colormaps";
 import type { OptRegion } from "../engine/EngineClient";
-import { format } from "../units";
+import { BC_COLORS, ColorManager } from "./ColorManager";
+import { GizmoController } from "./GizmoController";
+import { CalloutManager } from "./CalloutManager";
+import { ResultSurfaceManager } from "./ResultSurfaceManager";
 
 /** Named orthographic camera presets (keyboard Ctrl + 0–6). Axes follow the
  *  Z-up / Blender convention: "front" is the −Y face, matching the default
@@ -30,29 +36,6 @@ const VIEW_KEYS: Record<string, CameraView> = {
   "6": "right",
 };
 
-const BASE_COLOR = new THREE.Color(0x9aa3ad);
-// Hover highlight: saturated amber, unmistakable against the gray part and
-// every BC color (a light gray tint was too close to the base material).
-const HOVER_TINT = new THREE.Color(0xffb224);
-
-/** A fixed value callout pinned to a surface point in a contour view. Its 3D
- *  anchor is recomputed each frame from the (possibly deformed) source mesh:
- *  `point` callouts from a face + barycentric coords, `max`/`min` from a soup
- *  vertex index. The value itself is captured once (it doesn't move). */
-interface Callout {
-  kind: "point" | "max" | "min";
-  mesh: THREE.Mesh;
-  faceIndex: number; // point: hit face; max/min: -1
-  bary: THREE.Vector3; // point only
-  vertexIndex: number; // max/min: soup vertex; point: -1
-  value: number;
-  dot: HTMLDivElement;
-  chip: HTMLDivElement;
-  line: SVGLineElement;
-}
-
-const SVG_NS = "http://www.w3.org/2000/svg";
-
 /** PNG bytes of a 2D canvas (decode the data URL to a Uint8Array). */
 function pngBytesFromCanvas(c: HTMLCanvasElement): Uint8Array | null {
   const url = c.toDataURL("image/png");
@@ -62,17 +45,6 @@ function pngBytesFromCanvas(c: HTMLCanvasElement): Uint8Array | null {
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
   return out;
 }
-// Deepened for the light Werkbank stage; KIND_DOT in StepPanel.tsx must match.
-const BC_COLORS: Record<string, THREE.Color> = {
-  fixed: new THREE.Color(0x2563eb),
-  frictionless: new THREE.Color(0x0e9cbf),
-  displacement: new THREE.Color(0x7c3aed),
-  elastic: new THREE.Color(0x1f9d6b),
-  force: new THREE.Color(0xd93025),
-  pressure: new THREE.Color(0xc97b10),
-  bearing: new THREE.Color(0xb5179e),
-  moment: new THREE.Color(0xe8590c),
-};
 
 export interface SceneCallbacks {
   /** Patch clicked in select mode: toggle its triangles in the active BC. */
@@ -152,22 +124,6 @@ export class SceneManager {
   private activeBcId: string | null = null;
   /** BCs deactivated in the active load step — drawn translucent. */
   private inactiveBcs: Set<string> = new Set();
-  private triBcColor: (THREE.Color | null)[] = [];
-  private hoverPatch: number | null = null;
-  /** Set by repaint() (full color rewrite), cleared after the next render. While
-   *  set, setHover uploads in full too, so its partial range can't shadow a
-   *  pending full rewrite (three uploads partially whenever updateRanges is set). */
-  private colorsDirtyFull = false;
-  private _hoverCol = new THREE.Color();
-
-  // ---- fixed value callouts (contour views) ----
-  private callouts: Callout[] = [];
-  /** In-progress modifier gesture: ctrl = point, shift = max-in-box, alt = min. */
-  private annoDrag: { mode: "point" | "max" | "min"; x0: number; y0: number; x1: number; y1: number } | null =
-    null;
-  private annoRectEl: HTMLDivElement | null = null; // rubber-band for box drags
-  private annoSvg: SVGSVGElement | null = null; // leader-line layer
-  private _calloutWorld = new THREE.Vector3();
 
   private tool: Tool = "orbit";
   private brushRadius = 3;
@@ -192,47 +148,9 @@ export class SceneManager {
   private viewW = 0;
   private viewH = 0;
 
-  // Analysis (voxel) mesh
-  private voxelGroup = new THREE.Group();
-  private voxelDisposables: { dispose(): void }[] = [];
-
-  // Build-sim live preview: faint full-hull ghost (deactivated voxels) + a
-  // growing deformed active hull (already-printed voxels, exaggeration baked in).
-  private buildGroup = new THREE.Group();
-  private buildGhost: THREE.Object3D | null = null;
-  private buildActive: THREE.Object3D | null = null;
-  // Build-sim bed-peel heatmap: a flat jet-colored soup lying on the plate.
-  private peelMap: THREE.Object3D | null = null;
-
-  // Rigid-body-mode animation
-  private rbmMode: { t: number[]; r: number[]; center: number[] } | null = null;
-  private rbmAmp = 1;
-
-  // Result views
-  private displacements: Float32Array | null = null;
-  private vertexDensity: Float32Array | null = null;
-  /** Results on the analysis voxel hull (exact nodal displacements) —
-   *  alternate surface for the deformed view, toggled by resultSurface. */
-  private resultSurface: "stl" | "voxel" = "stl";
-  private voxRes: {
-    group: THREE.Group;
-    geo: THREE.BufferGeometry;
-    base: Float32Array;
-    disp: Float32Array;
-    uvs: Float32Array;
-    lineGeo: THREE.BufferGeometry | null;
-    lineBase: Float32Array | null;
-    lineDisp: Float32Array | null;
-  } | null = null;
-  private voxResDisposables: { dispose(): void }[] = [];
   private regionMeshes: THREE.Mesh[] = [];
   private regionVisible: boolean[] = [];
   private viewMode: ViewMode = "setup";
-  private deformScale = 1;
-  private autoScale = 1;
-  private deformAnimate = false;
-  /** Modal mode-shape animation: symmetric ± swing instead of 0 → max. */
-  private modalAnim = false;
 
   /** FPS readout (sampled ~2×/s) — set by the Viewer to display a counter. */
   onFps?: (fps: number) => void;
@@ -245,59 +163,27 @@ export class SceneManager {
   // and render the body opaque (no moiré against the coincident envelope).
   private resultSolid = false;
 
-  // Scalar result field (stress/strain) overriding displacement colors.
-  // flip = inverted colormap (safety factor: red marks the LOW values).
-  private scalarField: {
-    values: Float32Array;
-    min: number;
-    max: number;
-    flip: boolean;
-  } | null = null;
-  /** User override of the color-scale range (click-to-edit legend). */
-  private legendRange: { min: number | null; max: number | null } = { min: null, max: null };
-  /** Displacement coloring quantity: -1 = |u| magnitude, 0/1/2 = signed
-   *  X/Y/Z component. Only consulted on the displacement fallback (a scalar
-   *  stress/strain field, when present, always takes precedence). */
-  private dispComponent = -1;
-  /** Last auto range reported for a displacement component — de-dupes the
-   *  store writes that feed the legend. */
-  private lastDispRange: { min: number; max: number } | null = null;
-
-  // Min/max value markers for the active result plot.
-  private extremesOn = false;
-  private extremesUnit = "";
-  private extremeData: { minIdx: number; maxIdx: number; minVal: number; maxVal: number } | null =
-    null;
-  // Min/max value marks as DOM overlays projected each frame (see `tick`), so
-  // they keep a constant screen size and stay subtle — matching the hover
-  // probe — instead of world-scaled sprites that balloon as you zoom in.
-  private extremeEls: {
-    minDot: HTMLDivElement;
-    minChip: HTMLDivElement;
-    maxDot: HTMLDivElement;
-    maxChip: HTMLDivElement;
-  } | null = null;
-  private extremeWorld = { min: new THREE.Vector3(), max: new THREE.Vector3() };
-  private extremeVisible = false;
-  private extremeScratch = new THREE.Vector3();
-
   // Section plane: clipping + stencil caps + combined transform gizmo
   // (translate along the normal only + two rotation rings).
   private sectionOn = false;
   private sectionPlane = new THREE.Plane(new THREE.Vector3(-1, 0, 0), 0);
-  private sectionProxy = new THREE.Object3D();
-  private sectionTranslate: TransformControls | null = null;
-  private sectionRotate: TransformControls | null = null;
-  private sectionQuad: THREE.Group | null = null;
-  private sectionQuadDisposables: { dispose(): void }[] = [];
+  private sectionGizmo = new GizmoController(
+    "section",
+    {
+      scene: this.scene,
+      camera: () => this.camera,
+      domElement: () => this.renderer.domElement,
+      onDraggingChanged: (dragging) => {
+        this.controls.enabled = !dragging && this.tool !== "brush";
+      },
+      onChanged: () => this.onSectionChanged(),
+      bboxDiag: () => this.bboxDiag,
+      partBbox: () => this.partBbox,
+    },
+    this.sectionPlane
+  );
   private capPart: THREE.Object3D[] = [];
   private capVoxel: THREE.Object3D[] = [];
-  /** Per-vertex element density of the current voxel hull (0–1: skin = 1,
-   *  interior = infill ratio / optimized density, composite cells blended). */
-  private voxelDensity: Float32Array | null = null;
-  private meshDensity = false;
-  // Force the density ramp on mesh cells (inherent-strain layer view).
-  private meshFieldColor = false;
   /** The voxel hull already carries the section cut in its geometry. */
   private voxelCutActive = false;
   private capDisposables: { dispose(): void }[] = [];
@@ -307,29 +193,77 @@ export class SceneManager {
   // it's being edited — the store gates on step/busy, the scene additionally
   // hides it in result views.
   private symEnabled = false;
-  private symProxy = new THREE.Object3D();
-  private symTranslate: TransformControls | null = null;
-  private symRotate: TransformControls | null = null;
-  private symQuad: THREE.Group | null = null;
-  private symQuadDisposables: { dispose(): void }[] = [];
+  private symGizmo = new GizmoController("symmetry", {
+    scene: this.scene,
+    camera: () => this.camera,
+    domElement: () => this.renderer.domElement,
+    onDraggingChanged: (dragging) => {
+      this.controls.enabled = !dragging && this.tool !== "brush";
+    },
+    onChanged: () => this.onSymmetryChanged(),
+    bboxDiag: () => this.bboxDiag,
+    partBbox: () => this.partBbox,
+  });
 
   // Hover value probe: contour value next to the cursor on result/density
   // surfaces. The formatter doubles as the on/off switch (null = off).
   private probeEl: HTMLDivElement | null = null;
   private probeFormat: ((v: number) => string) | null = null;
 
-  // Colormaps are sampled per-fragment from 1D LUT textures via the uv
-  // channel — per-vertex colors interpolate straight through RGB and turn
-  // jet into blue→purple→red on coarse meshes.
-  private lutJet = makeLut(jet);
-  private lutRamp = makeLut(ramp);
   private uvs: Float32Array | null = null;
-  private scalarMode: "none" | "jet" | "ramp" | "flat" = "none";
-  /** Discrete contour bands: the jet LUT is quantized into `bandCount` flat
-   *  steps (toggled by clicking the legend, count set by scrolling it). Result
-   *  fields only — the density ramp stays smooth. */
-  private banded = false;
-  private bandCount = CONTOUR_BANDS;
+
+  // Result-surface data + meshes (voxel hull, voxel result, build preview,
+  // displacement application). Shared state flows through accessors.
+  private results: ResultSurfaceManager = new ResultSurfaceManager({
+    scene: this.scene,
+    geometry: () => this.geometry,
+    basePositions: () => this.basePositions,
+    viewMode: () => this.viewMode,
+    bboxDiag: () => this.bboxDiag,
+    lutJet: () => this.colorMgr.lutJet,
+    peelClippingPlanes: () => (this.sectionOn ? [this.sectionPlane] : null),
+    onPositionsApplied: () => this.callouts.updateExtremeMarkers(true),
+  });
+
+  // Surface coloring: BC repaint/hover tint, scalar-field LUT paths, banding.
+  private colorMgr: ColorManager = new ColorManager({
+    mesh: () => this.mesh,
+    geometry: () => this.geometry,
+    colors: () => this.colors,
+    uvs: () => this.uvs,
+    triCount: () => this.triCount,
+    bcs: () => this.bcs,
+    activeBcId: () => this.activeBcId,
+    patchToTris: () => this.patchToTris,
+    viewMode: () => this.viewMode,
+    displacements: () => this.results.displacements,
+    vertexDensity: () => this.results.vertexDensity,
+    hasOptShape: () => !!this.optShapeMesh,
+    voxResultActive: () => this.results.voxResultActive(),
+    voxRes: () => this.results.voxRes,
+    trackExtremes: (values) => this.callouts.trackExtremes(values),
+    clearExtremes: () => this.callouts.clearExtremes(),
+    onResultRange: (min, max) => this.callbacks.onResultRange?.(min, max),
+  });
+
+  // Fixed value callouts + min/max extreme markers (DOM overlays).
+  private callouts: CalloutManager = new CalloutManager({
+    camera: () => this.camera,
+    canvasRect: () => this.renderer.domElement.getBoundingClientRect(),
+    viewSize: () => ({ w: this.viewW, h: this.viewH }),
+    viewMode: () => this.viewMode,
+    hasMesh: () => !!this.mesh,
+    probeFormat: () => this.probeFormat,
+    probeSource: () => this.probeSource(),
+    resultGeometry: () => {
+      const vox = this.results.voxResultActive();
+      return {
+        geom: vox ? this.results.voxRes!.geo : this.geometry,
+        disp: vox ? this.results.voxRes!.disp : this.results.displacements,
+      };
+    },
+    onLog: (msg) => this.callbacks.onLog?.(msg),
+  });
 
   private clock = new THREE.Clock();
   private callbacks: SceneCallbacks = {};
@@ -382,15 +316,15 @@ export class SceneManager {
     this.scene.add(grid);
 
     this.scene.add(this.bcMarkers);
-    this.scene.add(this.voxelGroup);
-    this.scene.add(this.buildGroup);
+    this.scene.add(this.results.voxelGroup);
+    this.scene.add(this.results.buildGroup);
     this.buildGizmo();
 
     canvas.addEventListener("pointermove", this.onPointerMove);
     canvas.addEventListener("pointerdown", this.onPointerDown);
     canvas.addEventListener("pointerup", this.onPointerUp);
     canvas.addEventListener("pointerleave", () => {
-      this.setHover(null);
+      this.colorMgr.setHover(null);
       if (this.probeEl) this.probeEl.style.display = "none";
       if (this.brushCursor) this.brushCursor.visible = false;
       if (this.pickCursor) this.pickCursor.visible = false;
@@ -407,45 +341,9 @@ export class SceneManager {
       this.probeEl.style.display = "none";
       canvas.parentElement.appendChild(this.probeEl);
 
-      // Min/max marks: a small colored dot at the extreme point + a probe-style
-      // value chip beside it, both placed every frame from the 3D location.
-      const parent = canvas.parentElement;
-      const mk = (kind: "min" | "max") => {
-        const dot = document.createElement("div");
-        dot.className = `extreme-dot ${kind}`;
-        const chip = document.createElement("div");
-        chip.className = `probe extreme-chip ${kind}`;
-        dot.style.display = chip.style.display = "none";
-        parent.append(dot, chip);
-        return { dot, chip };
-      };
-      const lo = mk("min");
-      const hi = mk("max");
-      this.extremeEls = {
-        minDot: lo.dot,
-        minChip: lo.chip,
-        maxDot: hi.dot,
-        maxChip: hi.chip,
-      };
-
-      // Fixed value callouts: a leader-line SVG layer (behind the chips) and a
-      // rubber-band rectangle for the shift/alt box drags.
-      const svg = document.createElementNS(SVG_NS, "svg");
-      svg.setAttribute("class", "callout-lines");
-      svg.style.cssText =
-        "position:absolute;inset:0;width:100%;height:100%;pointer-events:none;overflow:visible;";
-      parent.insertBefore(svg, this.probeEl); // under the probe/chips/dots
-      this.annoSvg = svg;
-
-      const rect = document.createElement("div");
-      rect.className = "callout-rubber";
-      rect.style.cssText =
-        "position:absolute;display:none;border:1px dashed #2b2f36;background:rgba(255,178,36,.12);pointer-events:none;";
-      parent.appendChild(rect);
-      this.annoRectEl = rect;
-
-      // Capture phase so it beats OrbitControls' own canvas pointerdown.
-      parent.addEventListener("pointerdown", this.onAnnoDownCapture, true);
+      // Min/max marks + fixed value callouts (DOM overlays, leader lines, and
+      // the modifier-gated gestures) live in the callout manager.
+      this.callouts.attach(canvas.parentElement, this.probeEl);
     }
 
     const loop = () => {
@@ -470,19 +368,12 @@ export class SceneManager {
     this.disposed = true;
     document.removeEventListener("pointermove", this.onOrbitMove);
     document.removeEventListener("pointerup", this.onOrbitUp);
-    document.removeEventListener("pointermove", this.onAnnoMove);
-    document.removeEventListener("pointerup", this.onAnnoUp);
-    document.removeEventListener("keydown", this.onAnnoKey);
     document.removeEventListener("keydown", this.onViewKey);
-    this.canvas?.parentElement?.removeEventListener("pointerdown", this.onAnnoDownCapture, true);
-    this.clearCallouts();
+    this.callouts.dispose();
     this.canvas?.removeEventListener("wheel", this.onWheel);
     this.canvas?.removeEventListener("webglcontextlost", this.onGlLost);
     this.canvas?.removeEventListener("webglcontextrestored", this.onGlRestored);
     this.probeEl?.remove();
-    this.annoSvg?.remove();
-    this.annoRectEl?.remove();
-    if (this.extremeEls) for (const el of Object.values(this.extremeEls)) el.remove();
     if (this.wireframeLines) {
       this.wireframeLines.geometry.dispose();
       (this.wireframeLines.material as THREE.Material).dispose();
@@ -580,7 +471,7 @@ export class SceneManager {
     // The pick-direction preview arrow follows the pointer (shown on hover in
     // onPointerMove); just clear it when leaving the tool.
     if (this.pickArrow && tool !== "pickdir") this.pickArrow.visible = false;
-    if (tool !== "select" && tool !== "place") this.setHover(null);
+    if (tool !== "select" && tool !== "place") this.colorMgr.setHover(null);
   }
 
   // ---------- axis gizmo ----------
@@ -621,11 +512,10 @@ export class SceneManager {
     this.triCount = model.triCount;
     this.basePositions = new Float32Array(model.positions);
     this.colors = new Float32Array(this.triCount * 9);
-    this.displacements = null;
-    this.dispComponent = -1;
-    this.lastDispRange = null;
-    this.vertexDensity = null;
-    this.rbmMode = null;
+    this.results.displacements = null;
+    this.colorMgr.resetDispComponent();
+    this.results.vertexDensity = null;
+    this.results.rbmMode = null;
     this.viewMode = "setup";
     this.setRegions(null);
     this.setVoxelMesh(null, null);
@@ -640,7 +530,7 @@ export class SceneManager {
     this.uvs = new Float32Array(this.triCount * 3 * 2);
     this.geometry.setAttribute("uv", new THREE.BufferAttribute(this.uvs, 2));
     this.geometry.computeVertexNormals();
-    this.scalarMode = "none";
+    this.colorMgr.resetScalarMode();
 
     const material = new THREE.MeshStandardMaterial({
       vertexColors: true,
@@ -659,9 +549,9 @@ export class SceneManager {
     this.setPatchIds(model.patchIds);
     this.bcs = [];
     this.activeBcId = null;
-    this.scalarField = null;
+    this.colorMgr.clearScalarField();
     this.rebuildBcMarkers();
-    this.repaint();
+    this.colorMgr.repaint();
 
     // Fit camera (parallel projection: frustum half-height from the bbox).
     const [lx, ly, lz, hx, hy, hz] = model.bbox;
@@ -712,13 +602,13 @@ export class SceneManager {
     }
 
     // Section plane follows the new part.
-    if (this.sectionTranslate) {
-      this.sectionProxy.position.copy(this.controls.target);
-      this.buildSectionQuad(); // resize to the new part
-      this.syncSectionFromProxy();
+    if (this.sectionGizmo.exists()) {
+      this.sectionGizmo.proxy.position.copy(this.controls.target);
+      this.sectionGizmo.buildQuad(); // resize to the new part
+      this.sectionGizmo.sync();
       this.rebuildCapGroups();
     }
-    if (this.symTranslate) this.buildSymQuad(); // symmetry plane too
+    if (this.symGizmo.exists()) this.symGizmo.buildQuad(); // symmetry plane too
     this.refreshClipping();
   }
 
@@ -741,7 +631,7 @@ export class SceneManager {
     this.controls.update();
     this.buildWireframe(); // re-derive from the moved geometry
     this.rebuildBcMarkers();
-    this.repaint();
+    this.colorMgr.repaint();
   }
 
   setPatchIds(patchIds: Uint32Array) {
@@ -756,8 +646,8 @@ export class SceneManager {
       }
       list.push(t);
     }
-    this.hoverPatch = null;
-    this.repaint();
+    this.colorMgr.resetHover();
+    this.colorMgr.repaint();
   }
 
   // ---------- BC display ----------
@@ -766,7 +656,7 @@ export class SceneManager {
     this.bcs = bcs;
     this.activeBcId = activeBcId;
     this.inactiveBcs = inactive ?? new Set();
-    this.repaint();
+    this.colorMgr.repaint();
     this.rebuildBcMarkers();
   }
 
@@ -1168,78 +1058,6 @@ export class SceneManager {
     return acc.lengthSq() > 1e-20 ? acc.normalize() : null;
   }
 
-  /** Recompute the full per-triangle color buffer. */
-  private repaint() {
-    if (!this.colors || !this.geometry) return;
-    const triColor: (THREE.Color | null)[] = new Array(this.triCount).fill(null);
-    for (const bc of this.bcs) {
-      const col = BC_COLORS[bc.kind] ?? new THREE.Color(0x888888);
-      const isActive = bc.id === this.activeBcId;
-      const c = isActive ? col.clone().lerp(new THREE.Color(0xffffff), 0.25) : col;
-      for (const t of bc.tris) triColor[t] = c;
-    }
-    this.triBcColor = triColor;
-    const hover = this.hoverPatch !== null ? this.patchToTris.get(this.hoverPatch) : undefined;
-    const hoverSet = hover ? new Set(hover) : null;
-    for (let t = 0; t < this.triCount; t++) {
-      let c = triColor[t] ?? BASE_COLOR;
-      if (hoverSet?.has(t)) {
-        c = triColor[t] ? triColor[t]!.clone().lerp(HOVER_TINT, 0.65) : HOVER_TINT;
-      }
-      for (let v = 0; v < 3; v++) {
-        this.colors[9 * t + 3 * v] = c.r;
-        this.colors[9 * t + 3 * v + 1] = c.g;
-        this.colors[9 * t + 3 * v + 2] = c.b;
-      }
-    }
-    const attr = this.geometry.getAttribute("color") as THREE.BufferAttribute;
-    attr.clearUpdateRanges(); // a full rewrite supersedes any pending hover range
-    this.colorsDirtyFull = true;
-    attr.needsUpdate = true;
-  }
-
-  /** Hover is only ever a 2-patch delta, so don't rebuild the whole color buffer
-   *  (a ~1.8M-float rewrite + full VBO upload on a big STL). Restore the tris of
-   *  the previously-hovered patch to their base color, tint the newly-hovered
-   *  patch, and upload only the touched span. Base colors live in `triBcColor`,
-   *  kept current by repaint(). */
-  private setHover(patch: number | null) {
-    if (patch === this.hoverPatch) return;
-    const prev = this.hoverPatch;
-    this.hoverPatch = patch;
-    if (!this.colors || !this.geometry) return;
-    let lo = Infinity;
-    let hi = -Infinity;
-    const paint = (t: number, c: THREE.Color) => {
-      const o = 9 * t;
-      for (let v = 0; v < 3; v++) {
-        this.colors![o + 3 * v] = c.r;
-        this.colors![o + 3 * v + 1] = c.g;
-        this.colors![o + 3 * v + 2] = c.b;
-      }
-      if (t < lo) lo = t;
-      if (t > hi) hi = t;
-    };
-    if (prev !== null) {
-      const tris = this.patchToTris.get(prev);
-      if (tris) for (const t of tris) paint(t, this.triBcColor[t] ?? BASE_COLOR);
-    }
-    if (patch !== null) {
-      const tris = this.patchToTris.get(patch);
-      if (tris)
-        for (const t of tris) {
-          const base = this.triBcColor[t];
-          paint(t, base ? this._hoverCol.copy(base).lerp(HOVER_TINT, 0.65) : HOVER_TINT);
-        }
-    }
-    if (hi < lo) return; // both patches empty / unknown
-    const attr = this.geometry.getAttribute("color") as THREE.BufferAttribute;
-    // A full rewrite is already queued this frame: don't add a partial range, or
-    // three would upload only it and drop the rest of the rewrite.
-    if (!this.colorsDirtyFull) attr.addUpdateRange(9 * lo, 9 * (hi - lo + 1));
-    attr.needsUpdate = true;
-  }
-
   // ---------- picking ----------
 
   private rayTri(ev: PointerEvent): THREE.Intersection | null {
@@ -1295,7 +1113,7 @@ export class SceneManager {
       const hit = this.rayTri(ev);
       const patch =
         hit && hit.faceIndex != null && this.patchIds ? this.patchIds[hit.faceIndex] : null;
-      this.setHover(patch);
+      this.colorMgr.setHover(patch);
     } else if (this.tool === "brush") {
       const hit = this.rayTri(ev);
       if (hit && this.brushCursor) {
@@ -1392,9 +1210,6 @@ export class SceneManager {
     // Move + release on document so a drag that leaves the canvas still tracks.
     document.addEventListener("pointermove", this.onOrbitMove);
     document.addEventListener("pointerup", this.onOrbitUp);
-    document.addEventListener("pointermove", this.onAnnoMove);
-    document.addEventListener("pointerup", this.onAnnoUp);
-    document.addEventListener("keydown", this.onAnnoKey);
     document.addEventListener("keydown", this.onViewKey);
     canvas.addEventListener("wheel", this.onWheel, { passive: false });
   }
@@ -1407,8 +1222,8 @@ export class SceneManager {
       if (o && (o as THREE.Mesh).isMesh && o.visible) list.push(o);
     };
     if (this.mesh?.visible) list.push(this.mesh);
-    if (this.voxelGroup.visible) this.voxelGroup.children.forEach(add);
-    if (this.voxRes?.group.visible) this.voxRes.group.children.forEach(add);
+    if (this.results.voxelGroup.visible) this.results.voxelGroup.children.forEach(add);
+    if (this.results.voxRes?.group.visible) this.results.voxRes.group.children.forEach(add);
     add(this.optShapeMesh);
     for (const m of this.regionMeshes) add(m);
     return list;
@@ -1568,39 +1383,39 @@ export class SceneManager {
   /** The surface currently carrying probeable values, with a per-vertex
    *  value accessor (vertex index into the non-indexed soup). */
   private probeSource(): { mesh: THREE.Mesh; valueAt: (i: number) => number } | null {
-    if (this.voxResultActive()) {
-      const vr = this.voxRes!;
+    if (this.results.voxResultActive()) {
+      const vr = this.results.voxRes!;
       const m = vr.group.children.find((c): c is THREE.Mesh => c instanceof THREE.Mesh);
       if (!m) return null;
-      const sf = this.scalarField;
+      const sf = this.colorMgr.scalarFieldData;
       if (sf && sf.values.length * 2 === vr.uvs.length) {
         return { mesh: m, valueAt: (i) => sf.values[i] };
       }
       const d = vr.disp;
-      return { mesh: m, valueAt: (i) => this.dispValueAt(d, i) };
+      return { mesh: m, valueAt: (i) => this.colorMgr.dispValueAt(d, i) };
     }
-    if (this.viewMode === "deformed" && this.mesh && this.displacements) {
-      const sf = this.scalarField;
+    if (this.viewMode === "deformed" && this.mesh && this.results.displacements) {
+      const sf = this.colorMgr.scalarFieldData;
       if (sf && this.uvs && sf.values.length * 2 === this.uvs.length) {
         return { mesh: this.mesh, valueAt: (i) => sf.values[i] };
       }
-      const d = this.displacements;
-      return { mesh: this.mesh, valueAt: (i) => this.dispValueAt(d, i) };
+      const d = this.results.displacements;
+      return { mesh: this.mesh, valueAt: (i) => this.colorMgr.dispValueAt(d, i) };
     }
     if (
       (this.viewMode === "density" || this.viewMode === "infill") &&
       this.mesh &&
-      this.vertexDensity
+      this.results.vertexDensity
     ) {
-      const v = this.vertexDensity;
+      const v = this.results.vertexDensity;
       return { mesh: this.mesh, valueAt: (i) => v[i] };
     }
-    if (this.viewMode === "mesh" && this.meshDensity && this.voxelDensity) {
-      const hull = this.voxelGroup.children.find(
+    if (this.viewMode === "mesh" && this.results.meshDensity && this.results.voxelDensity) {
+      const hull = this.results.voxelGroup.children.find(
         (c): c is THREE.Mesh => c instanceof THREE.Mesh
       );
       if (!hull) return null;
-      const v = this.voxelDensity;
+      const v = this.results.voxelDensity;
       return { mesh: hull, valueAt: (i) => v[i] };
     }
     return null;
@@ -1647,43 +1462,7 @@ export class SceneManager {
     el.style.top = `${ev.clientY - rect.top + 14}px`;
   }
 
-  // ---------- fixed value callouts (contour views) ----------
-
-  /** Capture-phase pointerdown on the viewport parent — runs BEFORE OrbitControls'
-   *  own canvas listener so we can claim a modifier gesture and stop it. (Orbit-
-   *  Controls remaps shift/ctrl + left-drag to a PAN; returning from the bubble-
-   *  phase handler is too late, so we block it here.) */
-  private onAnnoDownCapture = (ev: PointerEvent) => {
-    if (ev.button !== 0 || !this.mesh) return;
-    const mode = ev.ctrlKey ? "point" : ev.shiftKey ? "max" : ev.altKey ? "min" : null;
-    if (!mode || !this.probeFormat || !this.probeSource()) return;
-    ev.stopImmediatePropagation(); // block OrbitControls pan + our own handlers
-    ev.preventDefault();
-    this.annoDrag = { mode, x0: ev.clientX, y0: ev.clientY, x1: ev.clientX, y1: ev.clientY };
-  };
-
-  private onAnnoMove = (ev: PointerEvent) => {
-    if (!this.annoDrag) return;
-    this.annoDrag.x1 = ev.clientX;
-    this.annoDrag.y1 = ev.clientY;
-    if (this.annoDrag.mode !== "point") this.drawAnnoRect();
-  };
-
-  private onAnnoUp = () => {
-    const drag = this.annoDrag;
-    if (!drag) return;
-    this.annoDrag = null;
-    if (this.annoRectEl) this.annoRectEl.style.display = "none";
-    if (drag.mode === "point") {
-      this.addPointCallout(drag.x1, drag.y1);
-    } else if (Math.abs(drag.x1 - drag.x0) > 3 && Math.abs(drag.y1 - drag.y0) > 3) {
-      this.addExtremeCallout(drag.mode, drag);
-    }
-  };
-
-  private onAnnoKey = (ev: KeyboardEvent) => {
-    if (ev.key === "Escape" && this.callouts.length) this.clearCallouts();
-  };
+  // ---------- camera view keys ----------
 
   /** Ctrl/⌘ + 0–6 snap the camera to a named orthographic view (slicer
    *  convention): 0 default ISO, 1 top, 2 bottom, 3 front, 4 behind, 5 left,
@@ -1699,372 +1478,61 @@ export class SceneManager {
     this.setCameraView(view);
   };
 
-  private drawAnnoRect() {
-    const r = this.annoRectEl;
-    const d = this.annoDrag;
-    if (!r || !d) return;
-    const rect = this.renderer.domElement.getBoundingClientRect();
-    r.style.display = "block";
-    r.style.left = `${Math.min(d.x0, d.x1) - rect.left}px`;
-    r.style.top = `${Math.min(d.y0, d.y1) - rect.top}px`;
-    r.style.width = `${Math.abs(d.x1 - d.x0)}px`;
-    r.style.height = `${Math.abs(d.y1 - d.y0)}px`;
-  }
-
-  /** Ctrl-click: the field value interpolated at the clicked surface point. */
-  private addPointCallout(clientX: number, clientY: number) {
-    const src = this.probeSource();
-    if (!src || !src.mesh.visible) return;
-    const rect = this.renderer.domElement.getBoundingClientRect();
-    this.pointer.x = ((clientX - rect.left) / rect.width) * 2 - 1;
-    this.pointer.y = -((clientY - rect.top) / rect.height) * 2 + 1;
-    this.raycaster.setFromCamera(this.pointer, this.camera);
-    const hits = this.raycaster.intersectObject(src.mesh, false);
-    const hit = hits.length ? hits[0] : null;
-    if (!hit || hit.faceIndex == null) return;
-    const pos = (src.mesh.geometry.getAttribute("position") as THREE.BufferAttribute)
-      .array as Float32Array;
-    const f = hit.faceIndex;
-    const tri = new THREE.Triangle(
-      new THREE.Vector3(pos[9 * f], pos[9 * f + 1], pos[9 * f + 2]),
-      new THREE.Vector3(pos[9 * f + 3], pos[9 * f + 4], pos[9 * f + 5]),
-      new THREE.Vector3(pos[9 * f + 6], pos[9 * f + 7], pos[9 * f + 8])
-    );
-    const bary = new THREE.Vector3();
-    tri.getBarycoord(hit.point, bary);
-    const value =
-      bary.x * src.valueAt(3 * f) + bary.y * src.valueAt(3 * f + 1) + bary.z * src.valueAt(3 * f + 2);
-    this.createCallout({ kind: "point", mesh: src.mesh, faceIndex: f, bary, vertexIndex: -1, value });
-  }
-
-  /** Shift/Alt box drag: the highest (max) / lowest (min) field value among the
-   *  surface points whose projection falls inside the dragged box. */
-  private addExtremeCallout(
-    mode: "max" | "min",
-    d: { x0: number; y0: number; x1: number; y1: number }
-  ) {
-    const src = this.probeSource();
-    if (!src || !src.mesh.visible) return;
-    const rect = this.renderer.domElement.getBoundingClientRect();
-    const ndc = (cx: number, cy: number): [number, number] => [
-      ((cx - rect.left) / rect.width) * 2 - 1,
-      -((cy - rect.top) / rect.height) * 2 + 1,
-    ];
-    const [ax, ay] = ndc(d.x0, d.y0);
-    const [bx, by] = ndc(d.x1, d.y1);
-    const loX = Math.min(ax, bx);
-    const hiX = Math.max(ax, bx);
-    const loY = Math.min(ay, by);
-    const hiY = Math.max(ay, by);
-    const pos = (src.mesh.geometry.getAttribute("position") as THREE.BufferAttribute)
-      .array as Float32Array;
-    const mw = src.mesh.matrixWorld;
-    const p = this._calloutWorld;
-    const n = (pos.length / 3) | 0;
-    let bestI = -1;
-    let bestV = mode === "max" ? -Infinity : Infinity;
-    for (let i = 0; i < n; i++) {
-      p.set(pos[3 * i], pos[3 * i + 1], pos[3 * i + 2]).applyMatrix4(mw).project(this.camera);
-      if (p.z < -1 || p.z > 1 || p.x < loX || p.x > hiX || p.y < loY || p.y > hiY) continue;
-      const v = src.valueAt(i);
-      if (mode === "max" ? v > bestV : v < bestV) {
-        bestV = v;
-        bestI = i;
-      }
-    }
-    if (bestI < 0) return;
-    this.createCallout({
-      kind: mode,
-      mesh: src.mesh,
-      faceIndex: -1,
-      bary: new THREE.Vector3(),
-      vertexIndex: bestI,
-      value: bestV,
-    });
-  }
-
-  private createCallout(c: Omit<Callout, "dot" | "chip" | "line">) {
-    const parent = this.canvas?.parentElement;
-    if (!parent || !this.annoSvg) return;
-    const label = this.probeFormat ? this.probeFormat(c.value) : `${c.value}`;
-    const dot = document.createElement("div");
-    dot.style.cssText =
-      "position:absolute;width:9px;height:9px;margin:-5px 0 0 -5px;border-radius:50%;" +
-      "background:#ffb224;border:1.5px solid #2b2f36;box-shadow:0 0 0 1px rgba(255,255,255,.7);" +
-      "pointer-events:none;z-index:5;";
-    const chip = document.createElement("div");
-    chip.className = "probe";
-    chip.style.position = "absolute";
-    chip.style.pointerEvents = "none";
-    chip.style.zIndex = "5";
-    chip.textContent = label;
-    const line = document.createElementNS(SVG_NS, "line");
-    line.setAttribute("stroke", "#2b2f36");
-    line.setAttribute("stroke-width", "1.25");
-    this.annoSvg.appendChild(line);
-    parent.append(dot, chip);
-    const callout: Callout = { ...c, dot, chip, line };
-    this.callouts.push(callout);
-    this.projectCallout(callout);
-    const w = this.calloutWorld(callout);
-    if (w) {
-      this.callbacks.onLog?.(
-        `callout ${label} @ (${w.x.toFixed(1)}, ${w.y.toFixed(1)}, ${w.z.toFixed(1)}) mm`
-      );
-    }
-  }
-
-  /** Current world anchor of a callout from the (possibly deformed) mesh. */
-  private calloutWorld(c: Callout): THREE.Vector3 | null {
-    const attr = c.mesh.geometry.getAttribute("position") as THREE.BufferAttribute | undefined;
-    const pos = attr?.array as Float32Array | undefined;
-    if (!pos) return null;
-    const out = this._calloutWorld;
-    if (c.kind === "point") {
-      const f = c.faceIndex;
-      if (9 * f + 8 >= pos.length) return null;
-      out.set(
-        c.bary.x * pos[9 * f] + c.bary.y * pos[9 * f + 3] + c.bary.z * pos[9 * f + 6],
-        c.bary.x * pos[9 * f + 1] + c.bary.y * pos[9 * f + 4] + c.bary.z * pos[9 * f + 7],
-        c.bary.x * pos[9 * f + 2] + c.bary.y * pos[9 * f + 5] + c.bary.z * pos[9 * f + 8]
-      );
-    } else {
-      const i = c.vertexIndex;
-      if (3 * i + 2 >= pos.length) return null;
-      out.set(pos[3 * i], pos[3 * i + 1], pos[3 * i + 2]);
-    }
-    return out.applyMatrix4(c.mesh.matrixWorld);
-  }
-
-  private projectCallout(c: Callout) {
-    const w = this.calloutWorld(c);
-    const hide = () => {
-      c.dot.style.display = c.chip.style.display = "none";
-      c.line.style.display = "none";
-    };
-    if (!w || !c.mesh.visible) return hide();
-    const v = w.project(this.camera); // mutates the shared scratch in place
-    if (v.z < -1 || v.z > 1) return hide();
-    const x = (v.x * 0.5 + 0.5) * this.viewW;
-    const y = (-v.y * 0.5 + 0.5) * this.viewH;
-    c.dot.style.display = c.chip.style.display = c.line.style.display = "block";
-    c.dot.style.left = `${x}px`;
-    c.dot.style.top = `${y}px`;
-    c.chip.style.left = `${x + 14}px`;
-    c.chip.style.top = `${y + 12}px`;
-    c.line.setAttribute("x1", `${x}`);
-    c.line.setAttribute("y1", `${y}`);
-    c.line.setAttribute("x2", `${x + 14}`);
-    c.line.setAttribute("y2", `${y + 12}`);
-  }
-
-  private updateCallouts() {
-    for (const c of this.callouts) this.projectCallout(c);
-  }
-
-  /** Drop all callouts — a new result field / view / surface invalidates them. */
-  private clearCallouts() {
-    for (const c of this.callouts) {
-      c.dot.remove();
-      c.chip.remove();
-      c.line.remove();
-    }
-    this.callouts.length = 0;
-  }
-
   // ---------- rigid-body-mode animation ----------
 
   setRbmMode(mode: { t: number[]; r: number[]; center: number[] } | null) {
-    this.rbmMode = mode;
-    if (mode && this.basePositions) {
-      // Normalize amplitude: peak surface motion = 6% of bbox diagonal.
-      let maxU = 1e-12;
-      const p = this.basePositions;
-      for (let i = 0; i < p.length; i += 3) {
-        const u = this.modeDisplacement(mode, p[i], p[i + 1], p[i + 2]);
-        maxU = Math.max(maxU, Math.hypot(u[0], u[1], u[2]));
-      }
-      this.rbmAmp = (0.06 * this.bboxDiag) / maxU;
-    }
-    if (!mode) this.applyPositions(); // restore
-  }
-
-  private modeDisplacement(
-    mode: { t: number[]; r: number[]; center: number[] },
-    x: number,
-    y: number,
-    z: number
-  ): [number, number, number] {
-    const dx = x - mode.center[0];
-    const dy = y - mode.center[1];
-    const dz = z - mode.center[2];
-    return [
-      mode.t[0] + mode.r[1] * dz - mode.r[2] * dy,
-      mode.t[1] + mode.r[2] * dx - mode.r[0] * dz,
-      mode.t[2] + mode.r[0] * dy - mode.r[1] * dx,
-    ];
+    this.results.setRbmMode(mode);
   }
 
   // ---------- result views ----------
 
   setDisplacements(disp: Float32Array | null, stats: { maxDisplacement: number } | null) {
-    this.displacements = disp;
+    this.results.setDisplacements(disp, stats);
     // A new solution resets the field picker to |u| (store side); keep the
     // coloring component in step so it never colors by a stale X/Y/Z choice.
-    this.dispComponent = -1;
-    this.lastDispRange = null;
-    if (disp && stats && stats.maxDisplacement > 0) {
-      this.autoScale = (0.08 * this.bboxDiag) / stats.maxDisplacement;
-    } else {
-      this.autoScale = 1;
-    }
-    this.callbacks.onAutoScale?.(this.autoScale);
+    this.colorMgr.resetDispComponent();
+    this.callbacks.onAutoScale?.(this.results.autoScale);
     this.refreshView();
   }
 
   /** Choose what the deformed view colors by: -1 = |u| magnitude, 0/1/2 =
    *  signed X/Y/Z displacement component. */
   setDispComponent(comp: number) {
-    if (this.dispComponent === comp) return;
-    this.clearCallouts(); // values belong to the previous field
-    this.dispComponent = comp;
-    this.lastDispRange = null; // force a fresh range report for the new field
+    if (!this.colorMgr.setDispComponent(comp)) return;
+    this.callouts.clearCallouts(); // values belong to the previous field
     this.refreshView();
   }
 
-  /** Per-vertex scalar for the active displacement field: |u| magnitude or the
-   *  signed component. `d` is the surface's 3-per-vertex displacement buffer. */
-  private dispValueAt(d: Float32Array, i: number): number {
-    const c = this.dispComponent;
-    return c < 0 ? Math.hypot(d[3 * i], d[3 * i + 1], d[3 * i + 2]) : d[3 * i + c];
-  }
-
-  /** Build the per-vertex displacement scalar array and the color-scale bounds
-   *  for the active field, honoring any user legend override. Reports the auto
-   *  range to the legend for signed components (|u| uses the solve stat). */
-  private dispFieldValues(d: Float32Array): { values: Float32Array; lo: number; hi: number } {
-    const comp = this.dispComponent;
-    const n = d.length / 3;
-    const values = new Float32Array(n);
-    let dmin = Infinity;
-    let dmax = -Infinity;
-    for (let i = 0; i < n; i++) {
-      const v = comp < 0 ? Math.hypot(d[3 * i], d[3 * i + 1], d[3 * i + 2]) : d[3 * i + comp];
-      values[i] = v;
-      if (v < dmin) dmin = v;
-      if (v > dmax) dmax = v;
-    }
-    // |u| anchors the scale at 0; a signed component spans its own min/max.
-    const autoLo = comp < 0 ? 0 : dmin;
-    const autoHi = comp < 0 ? Math.max(dmax, 1e-12) : dmax;
-    // Report the auto range for BOTH |u| and the signed components so the
-    // legend bound follows the active result (de-duped in reportDispRange).
-    this.reportDispRange(autoLo, autoHi);
-    const lo = this.legendRange.min ?? autoLo;
-    const hi = this.legendRange.max ?? autoHi;
-    return { values, lo, hi };
-  }
-
-  private reportDispRange(min: number, max: number) {
-    const last = this.lastDispRange;
-    if (last && last.min === min && last.max === max) return;
-    this.lastDispRange = { min, max };
-    this.callbacks.onResultRange?.(min, max);
-  }
-
   setVertexDensity(density: Float32Array | null) {
-    this.vertexDensity = density;
+    this.results.vertexDensity = density;
     this.refreshView();
   }
 
   setDeformAnimate(on: boolean) {
-    this.deformAnimate = on;
-    if (!on) this.applyPositions(); // restore full deflection
+    this.results.deformAnimate = on;
+    if (!on) this.results.applyPositions(); // restore full deflection
   }
 
   /** Modal result active: animate as a symmetric ± swing (a vibrating mode
    *  passes through the undeformed shape) rather than the 0 → max loop. */
   setModalAnim(on: boolean) {
-    this.modalAnim = on;
-  }
-
-  /** Flat-shaded soup mesh for the live build preview. */
-  private buildHullMesh(positions: Float32Array, ghost: boolean): THREE.Mesh {
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-    geo.computeVertexNormals();
-    const mat = new THREE.MeshStandardMaterial({
-      color: ghost ? 0x9aa0a6 : 0xe8722b,
-      roughness: 0.85,
-      metalness: 0.05,
-      flatShading: true,
-      side: THREE.DoubleSide,
-      transparent: ghost,
-      opacity: ghost ? 0.12 : 1,
-      depthWrite: !ghost,
-    });
-    return new THREE.Mesh(geo, mat);
-  }
-
-  private disposeMesh(obj: THREE.Object3D | null) {
-    if (!obj) return;
-    const m = obj as THREE.Mesh;
-    m.geometry?.dispose();
-    (m.material as THREE.Material | undefined)?.dispose();
+    this.results.modalAnim = on;
   }
 
   /** Faint full-hull ghost (the deactivated voxels) for the build preview.
    *  null clears it. */
   setBuildGhost(positions: Float32Array | null) {
-    if (this.buildGhost) {
-      this.buildGroup.remove(this.buildGhost);
-      this.disposeMesh(this.buildGhost);
-      this.buildGhost = null;
-    }
-    if (positions && positions.length) {
-      this.buildGhost = this.buildHullMesh(positions, true);
-      this.buildGroup.add(this.buildGhost);
-    }
-    this.updateBuildVisibility();
+    this.results.setBuildGhost(positions);
+    // refreshView handles preview vs normal visibility (see its early branch).
+    this.refreshView();
   }
 
   /** Growing deformed active hull (already-printed voxels, exaggeration baked
    *  in), jet-colored by normalised |u| (`mags`, 0–1). Replaced each preview
    *  frame; null clears it. */
   setBuildActive(positions: Float32Array | null, mags?: Float32Array | null) {
-    if (this.buildActive) {
-      this.buildGroup.remove(this.buildActive);
-      this.disposeMesh(this.buildActive);
-      this.buildActive = null;
-    }
-    if (positions && positions.length) {
-      const geo = new THREE.BufferGeometry();
-      geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-      geo.computeVertexNormals();
-      const n = positions.length / 3;
-      const colors = new Float32Array(positions.length);
-      for (let i = 0; i < n; i++) {
-        const [r, g, b] = jet(mags && i < mags.length ? mags[i] : 0);
-        colors[3 * i] = r;
-        colors[3 * i + 1] = g;
-        colors[3 * i + 2] = b;
-      }
-      geo.setAttribute("color", new THREE.BufferAttribute(colors, 3));
-      const mat = new THREE.MeshStandardMaterial({
-        vertexColors: true,
-        roughness: 0.85,
-        metalness: 0.05,
-        flatShading: true,
-        side: THREE.DoubleSide,
-      });
-      this.buildActive = new THREE.Mesh(geo, mat);
-      this.buildGroup.add(this.buildActive);
-    }
-    this.updateBuildVisibility();
-  }
-
-  /** refreshView handles preview vs normal visibility (see its early branch). */
-  private updateBuildVisibility() {
+    this.results.setBuildActive(positions, mags);
+    // refreshView handles preview vs normal visibility (see its early branch).
     this.refreshView();
   }
 
@@ -2072,32 +1540,7 @@ export class SceneManager {
    *  by `values / max`. Sits in world space under the part so the peel reads
    *  from a top/iso view. null clears it. */
   setPeelMap(positions: Float32Array | null, values: Float32Array | null, max: number) {
-    if (this.peelMap) {
-      this.scene.remove(this.peelMap);
-      this.disposeMesh(this.peelMap);
-      this.peelMap = null;
-    }
-    if (positions && positions.length) {
-      const geo = new THREE.BufferGeometry();
-      geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-      const n = positions.length / 3;
-      const colors = new Float32Array(positions.length);
-      const inv = max > 0 ? 1 / max : 0;
-      for (let i = 0; i < n; i++) {
-        const [r, g, b] = jet(values && i < values.length ? values[i] * inv : 0);
-        colors[3 * i] = r;
-        colors[3 * i + 1] = g;
-        colors[3 * i + 2] = b;
-      }
-      geo.setAttribute("color", new THREE.BufferAttribute(colors, 3));
-      const mat = new THREE.MeshBasicMaterial({
-        vertexColors: true,
-        side: THREE.DoubleSide,
-        clippingPlanes: this.sectionOn ? [this.sectionPlane] : null,
-      });
-      this.peelMap = new THREE.Mesh(geo, mat);
-      this.scene.add(this.peelMap);
-    }
+    this.results.setPeelMap(positions, values, max);
     // Part visibility depends on whether the peel map is shown.
     this.refreshView();
   }
@@ -2107,38 +1550,8 @@ export class SceneManager {
     edges: Float32Array | null,
     density?: Float32Array | null
   ) {
-    for (const d of this.voxelDisposables) d.dispose();
-    this.voxelDisposables = [];
-    this.voxelGroup.clear();
-    this.voxelDensity = density ?? null;
-    if (hull && hull.length) {
-      const geo = new THREE.BufferGeometry();
-      geo.setAttribute("position", new THREE.BufferAttribute(hull, 3));
-      geo.setAttribute("color", new THREE.BufferAttribute(new Float32Array(hull.length), 3));
-      geo.computeVertexNormals(); // soup → flat per-face normals
-      const mat = new THREE.MeshStandardMaterial({
-        color: 0xffffff, // actual color lives in the vertex attribute
-        vertexColors: true,
-        roughness: 0.85,
-        metalness: 0.05,
-        flatShading: true,
-        side: THREE.DoubleSide,
-        polygonOffset: true,
-        polygonOffsetFactor: 1,
-        polygonOffsetUnits: 1,
-      });
-      this.voxelDisposables.push(geo, mat);
-      this.voxelGroup.add(new THREE.Mesh(geo, mat));
-      this.applyMeshTint();
-    }
-    if (edges && edges.length) {
-      const geo = new THREE.BufferGeometry();
-      geo.setAttribute("position", new THREE.BufferAttribute(edges, 3));
-      const mat = new THREE.LineBasicMaterial({ color: 0x2a2d30, transparent: true, opacity: 0.45 });
-      this.voxelDisposables.push(geo, mat);
-      this.voxelGroup.add(new THREE.LineSegments(geo, mat));
-    }
-    if (this.sectionTranslate) this.rebuildCapGroups();
+    this.results.setVoxelMesh(hull, edges, density);
+    if (this.sectionGizmo.exists()) this.rebuildCapGroups();
     this.refreshClipping();
     this.refreshView();
   }
@@ -2151,81 +1564,28 @@ export class SceneManager {
     edges: Float32Array | null,
     edgeDisp: Float32Array | null
   ) {
-    if (this.voxRes) {
-      this.scene.remove(this.voxRes.group);
-      for (const d of this.voxResDisposables) d.dispose();
-    }
-    this.voxRes = null;
-    this.voxResDisposables = [];
-    if (positions && disp && positions.length) {
-      const group = new THREE.Group();
-      const geo = new THREE.BufferGeometry();
-      // The attribute gets a copy: the original stays as the morph base.
-      geo.setAttribute("position", new THREE.BufferAttribute(positions.slice(), 3));
-      const uvs = new Float32Array((positions.length / 3) * 2);
-      geo.setAttribute("uv", new THREE.BufferAttribute(uvs, 2));
-      geo.computeVertexNormals(); // soup → flat per-face normals
-      const mat = new THREE.MeshStandardMaterial({
-        map: this.lutJet,
-        roughness: 0.85,
-        metalness: 0.05,
-        flatShading: true,
-        side: THREE.DoubleSide,
-        polygonOffset: true,
-        polygonOffsetFactor: 1,
-        polygonOffsetUnits: 1,
-      });
-      this.voxResDisposables.push(geo, mat);
-      group.add(new THREE.Mesh(geo, mat));
-      let lineGeo: THREE.BufferGeometry | null = null;
-      let lineBase: Float32Array | null = null;
-      let lineDisp: Float32Array | null = null;
-      if (edges && edgeDisp && edges.length) {
-        lineGeo = new THREE.BufferGeometry();
-        lineGeo.setAttribute("position", new THREE.BufferAttribute(edges.slice(), 3));
-        const lmat = new THREE.LineBasicMaterial({
-          color: 0x2a2d30,
-          transparent: true,
-          opacity: 0.35,
-        });
-        this.voxResDisposables.push(lineGeo, lmat);
-        group.add(new THREE.LineSegments(lineGeo, lmat));
-        lineBase = edges;
-        lineDisp = edgeDisp;
-      }
-      group.visible = false;
-      this.scene.add(group);
-      this.voxRes = { group, geo, base: positions, disp, uvs, lineGeo, lineBase, lineDisp };
-    }
+    this.results.setVoxelResult(positions, disp, edges, edgeDisp);
     this.refreshClipping();
     this.refreshView();
   }
 
   /** Switch the deformed view between the smooth STL and the voxel hull. */
   setResultSurface(surface: "stl" | "voxel") {
-    if (this.resultSurface === surface) return;
-    this.clearCallouts(); // pinned to the previous surface's vertices
-    this.resultSurface = surface;
+    if (!this.results.setResultSurface(surface)) return;
+    this.callouts.clearCallouts(); // pinned to the previous surface's vertices
     this.refreshView();
-  }
-
-  /** Voxel result surface currently driving the deformed view. */
-  private voxResultActive(): boolean {
-    return this.viewMode === "deformed" && this.resultSurface === "voxel" && !!this.voxRes;
   }
 
   /** Color the mesh-view cells by element density (0–1 ramp). */
   setMeshDensity(on: boolean) {
-    this.meshDensity = on;
-    this.applyMeshTint();
+    this.results.setMeshDensity(on);
   }
 
   /** Force the 0–1 ramp on the mesh-view cells regardless of the density toggle
    *  — used by the inherent-strain layer view (the value channel carries the
    *  normalised source strength). */
   setMeshFieldColor(on: boolean) {
-    this.meshFieldColor = on;
-    this.applyMeshTint();
+    this.results.setMeshFieldColor(on);
   }
 
   /** Voxel-true section active: the cut lives in the geometry, so the voxel
@@ -2235,34 +1595,6 @@ export class SceneManager {
     this.voxelCutActive = on;
     this.refreshClipping();
     this.updateSectionVisibility();
-  }
-
-  private applyMeshTint() {
-    const hullMesh = this.voxelGroup.children.find(
-      (c): c is THREE.Mesh => c instanceof THREE.Mesh
-    );
-    if (!hullMesh) return;
-    const colors = hullMesh.geometry.getAttribute("color") as THREE.BufferAttribute | undefined;
-    if (!colors) return;
-    const arr = colors.array as Float32Array;
-    const density = this.voxelDensity;
-    // Element-density plot: the same blue→cyan→yellow→red ramp as the
-    // infill-density legend, plain 0–1 scale (1 = solid skin). Off: the
-    // flat chassis gray-blue.
-    const c = new THREE.Color();
-    for (let v = 0; v < arr.length / 3; v++) {
-      if ((this.meshDensity || this.meshFieldColor) && density) {
-        c.setRGB(...ramp(Math.min(1, Math.max(0, density[v]))));
-        arr[3 * v] = c.r;
-        arr[3 * v + 1] = c.g;
-        arr[3 * v + 2] = c.b;
-      } else {
-        arr[3 * v] = 0.494;
-        arr[3 * v + 1] = 0.545;
-        arr[3 * v + 2] = 0.6;
-      }
-    }
-    colors.needsUpdate = true;
   }
 
   /** Live optimization skeleton or density-threshold cutaway mesh. When a
@@ -2293,7 +1625,7 @@ export class SceneManager {
         }
         geo.setAttribute("uv", new THREE.BufferAttribute(uv, 2));
         mat = new THREE.MeshStandardMaterial({
-          map: this.lutRamp,
+          map: this.colorMgr.lutRamp,
           roughness: 0.55,
           metalness: 0.05,
           side: THREE.DoubleSide,
@@ -2553,9 +1885,9 @@ export class SceneManager {
   }
 
   setViewState(mode: ViewMode, deformScale: number) {
-    if (this.viewMode !== mode) this.clearCallouts(); // callouts are per-view
+    if (this.viewMode !== mode) this.callouts.clearCallouts(); // callouts are per-view
     this.viewMode = mode;
-    this.deformScale = deformScale;
+    this.results.deformScale = deformScale;
     this.refreshView();
   }
 
@@ -2565,44 +1897,27 @@ export class SceneManager {
    *  compression, green ≈ unloaded, red = tension) — must match the store's
    *  symmetric `fieldRange` so the legend agrees with the surface. */
   setScalarField(values: Float32Array | null, flip = false, signed = false) {
-    this.clearCallouts(); // values belong to the previous field
-    if (values && values.length) {
-      let min = Infinity;
-      let max = -Infinity;
-      for (let i = 0; i < values.length; i++) {
-        min = Math.min(min, values[i]);
-        max = Math.max(max, values[i]);
-      }
-      if (signed) {
-        const m = Math.max(Math.abs(min), Math.abs(max), 1e-12);
-        min = -m;
-        max = m;
-      }
-      this.scalarField = { values, min, max, flip };
-    } else {
-      this.scalarField = null;
-    }
+    this.callouts.clearCallouts(); // values belong to the previous field
+    this.colorMgr.setScalarField(values, flip, signed);
     this.refreshView();
   }
 
   /** Clamp the color scale to a user range (null = auto). */
   setLegendRange(min: number | null, max: number | null) {
-    this.legendRange = { min, max };
+    this.colorMgr.setLegendRange(min, max);
     this.refreshView();
   }
 
   /** Toggle the min/max location markers; unit drives label formatting. */
   setShowExtremes(on: boolean, unit: string) {
-    this.extremesOn = on;
-    this.extremesUnit = unit;
+    this.callouts.setShowExtremes(on, unit);
     this.refreshView();
   }
 
   /** Re-format the pinned value callouts after a display-unit change (their chip
    *  text is captured once at creation; `probeFormat` reads the live unit). */
   relabelCallouts() {
-    if (!this.probeFormat) return;
-    for (const c of this.callouts) c.chip.textContent = this.probeFormat(c.value);
+    this.callouts.relabelCallouts();
   }
 
   // ---------- section plane ----------
@@ -2616,8 +1931,8 @@ export class SceneManager {
   }
 
   flipSection() {
-    this.sectionProxy.rotateX(Math.PI); // local +Z (= plane normal) flips
-    this.syncSectionFromProxy();
+    this.sectionGizmo.proxy.rotateX(Math.PI); // local +Z (= plane normal) flips
+    this.sectionGizmo.sync();
   }
 
   setSectionAxis(axis: "x" | "y" | "z") {
@@ -2627,8 +1942,8 @@ export class SceneManager {
         : axis === "y"
           ? new THREE.Vector3(0, 1, 0)
           : new THREE.Vector3(0, 0, 1);
-    this.sectionProxy.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), n);
-    this.syncSectionFromProxy();
+    this.sectionGizmo.proxy.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), n);
+    this.sectionGizmo.sync();
   }
 
   // ---------- symmetry plane (optimizer constraint) ----------
@@ -2638,18 +1953,18 @@ export class SceneManager {
    *  additionally hides the plane in result views. */
   setSymmetry(enabled: boolean, normal: [number, number, number], c: number) {
     this.symEnabled = enabled;
-    if (enabled) this.ensureSymObjects();
-    if (!this.symTranslate) return;
+    if (enabled) this.symGizmo.ensure(); // re-ensuring refreshes the quad size
+    if (!this.symGizmo.exists()) return;
     const n = new THREE.Vector3(...normal);
     if (n.lengthSq() < 1e-12) n.set(1, 0, 0);
     n.normalize();
-    this.symProxy.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), n);
+    this.symGizmo.proxy.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), n);
     // Any point on the plane works; pick the one closest to the part center
     // so the gizmo and quad sit centered on the part (robust to camera pans).
     const ctr = this.partCenter();
     const d = n.dot(ctr) - c;
-    this.symProxy.position.copy(ctr).addScaledVector(n, -d);
-    this.updateSymQuadSize(); // refit the quad to the part at this orientation
+    this.symGizmo.proxy.position.copy(ctr).addScaledVector(n, -d);
+    this.symGizmo.updateQuadSize(); // refit the quad to the part at this orientation
     this.updateSymVisibility();
   }
 
@@ -2662,12 +1977,11 @@ export class SceneManager {
       : this.controls.target.clone();
   }
 
-  private emitSymmetryMoved() {
-    const n = new THREE.Vector3(0, 0, 1).applyQuaternion(this.symProxy.quaternion);
-    // Tilting the plane (rotate ring) changes which part dimensions it spans —
-    // refit the quad live so it always reads as "the size of the part".
-    this.updateSymQuadSize();
-    this.callbacks.onSymmetryMoved?.([n.x, n.y, n.z], n.dot(this.symProxy.position));
+  /** Symmetry gizmo drag (objectChange → sync): the quad was already refit;
+   *  report the plane n·p = c to the store. */
+  private onSymmetryChanged() {
+    const n = new THREE.Vector3(0, 0, 1).applyQuaternion(this.symGizmo.proxy.quaternion);
+    this.callbacks.onSymmetryMoved?.([n.x, n.y, n.z], n.dot(this.symGizmo.proxy.position));
   }
 
   /** Hide the plane outside editing contexts (result views). */
@@ -2677,182 +1991,33 @@ export class SceneManager {
       this.viewMode !== "deformed" &&
       this.viewMode !== "density" &&
       this.viewMode !== "infill";
-    this.symProxy.visible = show;
-    for (const tc of [this.symTranslate, this.symRotate]) {
-      if (tc) {
-        tc.enabled = show;
-        tc.getHelper().visible = show;
-      }
-    }
-  }
-
-  private ensureSymObjects() {
-    if (this.symTranslate) {
-      this.buildSymQuad(); // refresh size to the current part
-      return;
-    }
-    this.scene.add(this.symProxy);
-    const make = (
-      mode: "translate" | "rotate",
-      size: number,
-      cfg: (tc: TransformControls) => void
-    ) => {
-      const tc = new TransformControls(this.camera, this.renderer.domElement);
-      tc.setMode(mode);
-      tc.setSpace("local");
-      tc.setSize(size);
-      cfg(tc);
-      tc.addEventListener("dragging-changed", (e: { value?: unknown }) => {
-        this.controls.enabled = !e.value && this.tool !== "brush";
-      });
-      tc.addEventListener("objectChange", () => this.emitSymmetryMoved());
-      tc.attach(this.symProxy);
-      this.scene.add(tc.getHelper());
-      return tc;
-    };
-    // Same combined gizmo as the section plane: translate along the normal
-    // only, two rotation rings (spinning about the normal is a no-op).
-    this.symTranslate = make("translate", 0.7, (tc) => {
-      tc.showX = false;
-      tc.showY = false;
-    });
-    this.symRotate = make("rotate", 1.0, (tc) => {
-      tc.showZ = false;
-    });
-    this.buildSymQuad();
-  }
-
-  /** Translucent orange rectangle marking the symmetry plane (child of the
-   *  proxy — distinct from the blue section plane). Built as a unit quad and
-   *  scaled to the part by {@link updateSymQuadSize}. */
-  private buildSymQuad() {
-    if (this.symQuad) {
-      this.symProxy.remove(this.symQuad);
-      for (const d of this.symQuadDisposables) d.dispose();
-      this.symQuadDisposables = [];
-    }
-    const group = new THREE.Group();
-    const quadGeo = new THREE.PlaneGeometry(1, 1);
-    const quadMat = new THREE.MeshBasicMaterial({
-      color: 0xd97706,
-      transparent: true,
-      opacity: 0.1,
-      side: THREE.DoubleSide,
-      depthWrite: false,
-    });
-    const edgeGeo = new THREE.EdgesGeometry(quadGeo);
-    const edgeMat = new THREE.LineBasicMaterial({
-      color: 0xd97706,
-      transparent: true,
-      opacity: 0.8,
-    });
-    this.symQuadDisposables.push(quadGeo, quadMat, edgeGeo, edgeMat);
-    group.add(new THREE.Mesh(quadGeo, quadMat));
-    group.add(new THREE.LineSegments(edgeGeo, edgeMat));
-    this.symQuad = group;
-    this.symProxy.add(group);
-    this.updateSymQuadSize();
-  }
-
-  /** Scale the unit quad so it spans the part: its two in-plane axes get the
-   *  extent of the part's AABB projected onto them (so an axis-aligned plane
-   *  is exactly the perpendicular part dimensions, and a tilted one stays the
-   *  silhouette size). Falls back to the bbox diagonal before a model loads. */
-  private updateSymQuadSize() {
-    if (!this.symQuad) return;
-    const b = this.partBbox;
-    if (!b) {
-      const d = this.bboxDiag * 1.1;
-      this.symQuad.scale.set(d, d, 1);
-      return;
-    }
-    const dim = new THREE.Vector3(b[3] - b[0], b[4] - b[1], b[5] - b[2]);
-    const q = this.symProxy.quaternion;
-    const ex = new THREE.Vector3(1, 0, 0).applyQuaternion(q);
-    const ey = new THREE.Vector3(0, 1, 0).applyQuaternion(q);
-    // Projected AABB extent along a world axis e: Σ |e·axis|·dim_axis.
-    const span = (e: THREE.Vector3) =>
-      Math.abs(e.x) * dim.x + Math.abs(e.y) * dim.y + Math.abs(e.z) * dim.z;
-    this.symQuad.scale.set(span(ex) || 1, span(ey) || 1, 1);
+    this.symGizmo.setVisible(show);
   }
 
   // ---------- section plane objects ----------
 
   private ensureSectionObjects() {
-    if (!this.sectionTranslate) {
-      this.sectionProxy.position.copy(this.controls.target);
-      this.sectionProxy.quaternion.setFromUnitVectors(
+    if (!this.sectionGizmo.exists()) {
+      this.sectionGizmo.proxy.position.copy(this.controls.target);
+      this.sectionGizmo.proxy.quaternion.setFromUnitVectors(
         new THREE.Vector3(0, 0, 1),
         new THREE.Vector3(1, 0, 0)
       );
-      this.scene.add(this.sectionProxy);
-      const make = (mode: "translate" | "rotate", size: number, cfg: (tc: TransformControls) => void) => {
-        const tc = new TransformControls(this.camera, this.renderer.domElement);
-        tc.setMode(mode);
-        tc.setSpace("local");
-        tc.setSize(size);
-        cfg(tc);
-        tc.addEventListener("dragging-changed", (e: { value?: unknown }) => {
-          this.controls.enabled = !e.value && this.tool !== "brush";
-        });
-        tc.addEventListener("objectChange", () => this.syncSectionFromProxy());
-        tc.attach(this.sectionProxy);
-        this.scene.add(tc.getHelper());
-        return tc;
-      };
-      // One combined gizmo: the plane cuts everything, so tangential motion
-      // is meaningless — only the normal arrow translates; two rings rotate
-      // (spinning about the normal is a no-op and stays hidden).
-      this.sectionTranslate = make("translate", 0.75, (tc) => {
-        tc.showX = false;
-        tc.showY = false;
-      });
-      this.sectionRotate = make("rotate", 1.05, (tc) => {
-        tc.showZ = false;
-      });
-      this.buildSectionQuad();
-      this.syncSectionFromProxy();
+      this.sectionGizmo.ensure();
+      this.sectionGizmo.sync();
     }
     this.rebuildCapGroups();
   }
 
-  /** Translucent plane rectangle, child of the proxy so it is ALWAYS
-   *  centered on the gizmo (PlaneHelper centers on the world origin's
-   *  foot point instead, which strands the gizmo off to one side). */
-  private buildSectionQuad() {
-    if (this.sectionQuad) {
-      this.sectionProxy.remove(this.sectionQuad);
-      for (const d of this.sectionQuadDisposables) d.dispose();
-      this.sectionQuadDisposables = [];
-    }
-    const d = this.bboxDiag * 1.15;
-    const group = new THREE.Group();
-    const quadGeo = new THREE.PlaneGeometry(d, d);
-    const quadMat = new THREE.MeshBasicMaterial({
-      color: 0x2e6fd0,
-      transparent: true,
-      opacity: 0.08,
-      side: THREE.DoubleSide,
-      depthWrite: false,
-    });
-    const edgeGeo = new THREE.EdgesGeometry(quadGeo);
-    const edgeMat = new THREE.LineBasicMaterial({ color: 0x2e6fd0, transparent: true, opacity: 0.7 });
-    this.sectionQuadDisposables.push(quadGeo, quadMat, edgeGeo, edgeMat);
-    group.add(new THREE.Mesh(quadGeo, quadMat));
-    group.add(new THREE.LineSegments(edgeGeo, edgeMat));
-    this.sectionQuad = group;
-    this.sectionProxy.add(group);
-  }
-
-  private syncSectionFromProxy() {
-    const n = new THREE.Vector3(0, 0, 1).applyQuaternion(this.sectionProxy.quaternion);
-    this.sectionPlane.setFromNormalAndCoplanarPoint(n, this.sectionProxy.position);
+  /** Section gizmo moved (drag or programmatic): the plane was already
+   *  re-derived from the proxy; keep the stencil caps on it and notify. */
+  private onSectionChanged() {
     // Caps lie exactly on the plane.
     for (const group of [this.capPart, this.capVoxel]) {
       const cap = group[2] as THREE.Mesh | undefined;
       if (cap) {
-        cap.position.copy(this.sectionProxy.position);
-        cap.quaternion.copy(this.sectionProxy.quaternion);
+        cap.position.copy(this.sectionGizmo.proxy.position);
+        cap.quaternion.copy(this.sectionGizmo.proxy.quaternion);
       }
     }
     this.emitSectionMoved();
@@ -2913,8 +2078,8 @@ export class SceneManager {
     const cap = new THREE.Mesh(capGeo, capMat);
     cap.renderOrder = order + 0.1;
     cap.onAfterRender = (renderer) => renderer.clearStencil();
-    cap.position.copy(this.sectionProxy.position);
-    cap.quaternion.copy(this.sectionProxy.quaternion);
+    cap.position.copy(this.sectionGizmo.proxy.position);
+    cap.quaternion.copy(this.sectionGizmo.proxy.quaternion);
     const group = [back, front, cap];
     for (const o of group) this.scene.add(o);
     return group;
@@ -2922,7 +2087,7 @@ export class SceneManager {
 
   /** (Re)create cap groups for the part mesh and the voxel hull. */
   private rebuildCapGroups() {
-    if (!this.sectionTranslate) return; // section never enabled yet
+    if (!this.sectionGizmo.exists()) return; // section never enabled yet
     for (const o of [...this.capPart, ...this.capVoxel]) this.scene.remove(o);
     for (const d of this.capDisposables) d.dispose();
     this.capPart = [];
@@ -2931,7 +2096,9 @@ export class SceneManager {
     if (this.geometry) {
       this.capPart = this.makeCapGroup(this.geometry, 0x76808c, 1);
     }
-    const hull = this.voxelGroup.children.find((c): c is THREE.Mesh => c instanceof THREE.Mesh);
+    const hull = this.results.voxelGroup.children.find(
+      (c): c is THREE.Mesh => c instanceof THREE.Mesh
+    );
     if (hull) {
       this.capVoxel = this.makeCapGroup(hull.geometry as THREE.BufferGeometry, 0x5f6c7b, 3);
     }
@@ -2963,8 +2130,8 @@ export class SceneManager {
     };
     apply(this.mesh?.material, partPlanes);
     apply(this.wireframeLines?.material, partPlanes);
-    for (const c of this.voxelGroup.children) apply((c as THREE.Mesh).material, voxelPlanes);
-    for (const c of this.voxRes?.group.children ?? []) {
+    for (const c of this.results.voxelGroup.children) apply((c as THREE.Mesh).material, voxelPlanes);
+    for (const c of this.results.voxRes?.group.children ?? []) {
       apply((c as THREE.Mesh).material, planes);
     }
     for (const m of this.regionMeshes) apply(m.material, planes);
@@ -2972,19 +2139,13 @@ export class SceneManager {
   }
 
   private updateSectionVisibility() {
-    const gizmoVisible = this.sectionOn;
-    for (const tc of [this.sectionTranslate, this.sectionRotate]) {
-      if (tc) {
-        tc.getHelper().visible = gizmoVisible;
-        tc.enabled = gizmoVisible;
-      }
-    }
-    this.sectionProxy.visible = gizmoVisible; // carries the plane quad
+    // Gizmo helpers + the proxy (which carries the plane quad).
+    this.sectionGizmo.setVisible(this.sectionOn);
     // Caps only where an OPAQUE solid is being cut (ghosted part: see inside).
     const mat = this.mesh?.material as THREE.MeshStandardMaterial | undefined;
     const partCap = this.sectionOn && !!this.mesh?.visible && !!mat && !mat.transparent;
     for (const o of this.capPart) o.visible = partCap;
-    const voxCap = this.sectionOn && this.voxelGroup.visible && !this.voxelCutActive;
+    const voxCap = this.sectionOn && this.results.voxelGroup.visible && !this.voxelCutActive;
     for (const o of this.capVoxel) o.visible = voxCap;
   }
 
@@ -2993,16 +2154,16 @@ export class SceneManager {
     if (!this.mesh) return;
     // Build-sim live preview overrides everything: only the growing active hull
     // is shown; the normal model/voxel/result surfaces are hidden.
-    if (this.buildActive || this.buildGhost) {
-      this.buildGroup.visible = true;
+    if (this.results.buildActive || this.results.buildGhost) {
+      this.results.buildGroup.visible = true;
       this.mesh.visible = false;
-      this.voxelGroup.visible = false;
-      if (this.voxRes) this.voxRes.group.visible = false;
+      this.results.voxelGroup.visible = false;
+      if (this.results.voxRes) this.results.voxRes.group.visible = false;
       if (this.wireframeLines) this.wireframeLines.visible = false;
       this.bcMarkers.visible = false;
       return;
     }
-    this.buildGroup.visible = false;
+    this.results.buildGroup.visible = false;
     const mat = this.mesh.material as THREE.MeshStandardMaterial;
     const infill = this.viewMode === "infill";
     // Density view with an opt shape (live skeleton / cutaway): ghost the
@@ -3017,7 +2178,7 @@ export class SceneManager {
     mat.opacity = ghost ? 0.15 : 1.0;
     mat.depthWrite = !ghost;
     mat.needsUpdate = true;
-    const voxResult = this.voxResultActive();
+    const voxResult = this.results.voxResultActive();
     // Part Topo: the optimized body IS the result — drop the original envelope
     // hull in the density/regions views so it doesn't moiré against the
     // coincident body surface (the carved regions sit inside it; the retained
@@ -3025,9 +2186,9 @@ export class SceneManager {
     const hideHull = this.resultSolid && (this.viewMode === "density" || infill);
     // Bed-peel heatmap on screen: hide the part so the plate map reads cleanly
     // (no need to look under or through the model).
-    this.mesh.visible = !voxResult && !hideHull && !this.peelMap;
-    this.voxelGroup.visible = this.viewMode === "mesh";
-    if (this.voxRes) this.voxRes.group.visible = voxResult;
+    this.mesh.visible = !voxResult && !hideHull && !this.results.peelMap;
+    this.results.voxelGroup.visible = this.viewMode === "mesh";
+    if (this.results.voxRes) this.results.voxRes.group.visible = voxResult;
     // Wireframe overlay: undeformed model views only (its lines are built from
     // the rest shape, so it would not track a deformed result).
     if (this.wireframeLines) {
@@ -3043,184 +2204,16 @@ export class SceneManager {
     this.updateSectionVisibility();
     this.updateSymVisibility();
     this.refreshClipping(); // mesh view exempts the ghost STL from the cut
-    this.applyPositions();
-    this.applyColors();
+    this.results.applyPositions();
+    this.colorMgr.applyColors();
   }
 
   /** Set discrete contour banding + the band count. Rewrites the SHARED jet LUT
    *  in place (both the smooth surface and the voxel-result surface sample it, so
    *  they update together) — quantized into `count` flat steps with nearest
    *  sampling for crisp band edges, or the smooth ramp when off. */
-  setBanded(on: boolean, count = this.bandCount) {
-    if (this.banded === on && this.bandCount === count) return;
-    this.banded = on;
-    this.bandCount = count;
-    const tex = this.lutJet;
-    const data = tex.image.data as Uint8Array;
-    const n = data.length / 4;
-    for (let i = 0; i < n; i++) {
-      let t = i / (n - 1);
-      if (on) {
-        const b = Math.min(count - 1, Math.floor(t * count));
-        t = (b + 0.5) / count; // band-center color
-      }
-      const [r, g, bl] = jet(t);
-      data[4 * i] = Math.round(255 * r);
-      data[4 * i + 1] = Math.round(255 * g);
-      data[4 * i + 2] = Math.round(255 * bl);
-      data[4 * i + 3] = 255;
-    }
-    tex.magFilter = on ? THREE.NearestFilter : THREE.LinearFilter;
-    tex.minFilter = on ? THREE.NearestFilter : THREE.LinearFilter;
-    tex.needsUpdate = true;
-    this.repaint();
-  }
-
-  /** Switch the part material between BC vertex colors, a scalar LUT, or a flat
-   *  uni-color (the translucent envelope used when the readout lives elsewhere
-   *  — e.g. the density cutaway carries the colors, the part is just a shell). */
-  private setSurfaceMaterialMode(mode: "none" | "jet" | "ramp" | "flat") {
-    if (!this.mesh || mode === this.scalarMode) return;
-    this.scalarMode = mode;
-    const mat = this.mesh.material as THREE.MeshStandardMaterial;
-    if (mode === "none") {
-      mat.map = null;
-      mat.vertexColors = true;
-      mat.color.setHex(0xffffff); // vertex colors carry the actual color
-    } else if (mode === "flat") {
-      mat.map = null;
-      mat.vertexColors = false;
-      mat.color.setHex(0xc9c6bf); // neutral Werkbank-chassis envelope tone
-    } else {
-      mat.map = mode === "jet" ? this.lutJet : this.lutRamp;
-      mat.vertexColors = false;
-      mat.color.setHex(0xffffff); // LUT map supplies the color
-    }
-    mat.needsUpdate = true;
-  }
-
-  /** Write a scalar (or |u|) into the voxel hull's uv channel (jet LUT). */
-  private colorVoxelResult() {
-    const vr = this.voxRes!;
-    const uvAttr = vr.geo.getAttribute("uv") as THREE.BufferAttribute;
-    const sf = this.scalarField;
-    if (sf && sf.values.length * 2 === vr.uvs.length) {
-      const lo = this.legendRange.min ?? sf.min;
-      const hi = this.legendRange.max ?? sf.max;
-      const inv = hi - lo > 1e-30 ? 1 / (hi - lo) : 0;
-      for (let i = 0; i < sf.values.length; i++) {
-        const t = Math.min(1, Math.max(0, (sf.values[i] - lo) * inv));
-        vr.uvs[2 * i] = sf.flip ? 1 - t : t;
-        vr.uvs[2 * i + 1] = 0.5;
-      }
-      uvAttr.array.set(vr.uvs);
-      uvAttr.needsUpdate = true;
-      this.trackExtremes(sf.values, 1);
-      return;
-    }
-    const { values, lo, hi } = this.dispFieldValues(vr.disp);
-    const inv = hi - lo > 1e-30 ? 1 / (hi - lo) : 0;
-    for (let i = 0; i < values.length; i++) {
-      vr.uvs[2 * i] = Math.min(1, Math.max(0, (values[i] - lo) * inv));
-      vr.uvs[2 * i + 1] = 0.5;
-    }
-    uvAttr.array.set(vr.uvs);
-    uvAttr.needsUpdate = true;
-    this.trackExtremes(values, 1);
-  }
-
-  private applyColors() {
-    if (!this.geometry || !this.colors || !this.uvs) return;
-    const uvAttr = this.geometry.getAttribute("uv") as THREE.BufferAttribute;
-    if (this.voxResultActive()) {
-      this.colorVoxelResult();
-      this.repaint();
-      return;
-    }
-    if (this.viewMode === "deformed" && this.displacements) {
-      const sf = this.scalarField;
-      if (sf && sf.values.length * 2 === this.uvs.length) {
-        // Stress/strain field coloring (user range override clamps).
-        const lo = this.legendRange.min ?? sf.min;
-        const hi = this.legendRange.max ?? sf.max;
-        const inv = hi - lo > 1e-30 ? 1 / (hi - lo) : 0;
-        for (let i = 0; i < sf.values.length; i++) {
-          const t = Math.min(1, Math.max(0, (sf.values[i] - lo) * inv));
-          this.uvs[2 * i] = sf.flip ? 1 - t : t;
-          this.uvs[2 * i + 1] = 0.5;
-        }
-        uvAttr.needsUpdate = true;
-        this.setSurfaceMaterialMode("jet");
-        this.trackExtremes(sf.values, 1);
-        return;
-      }
-      const { values, lo, hi } = this.dispFieldValues(this.displacements);
-      const inv = hi - lo > 1e-30 ? 1 / (hi - lo) : 0;
-      for (let i = 0; i < values.length; i++) {
-        this.uvs[2 * i] = Math.min(1, Math.max(0, (values[i] - lo) * inv));
-        this.uvs[2 * i + 1] = 0.5;
-      }
-      uvAttr.needsUpdate = true;
-      this.setSurfaceMaterialMode("jet");
-      this.trackExtremes(values, 1);
-      return;
-    }
-    if (this.viewMode === "density" && this.vertexDensity) {
-      // With a cutaway/skeleton present, the dense interior is shown there
-      // (color-coded); the part is just a flat translucent envelope so the
-      // density isn't also smeared onto its mostly-skin outer surface.
-      if (this.optShapeMesh) {
-        this.setSurfaceMaterialMode("flat");
-        this.extremeData = null;
-        this.updateExtremeMarkers();
-        this.repaint();
-        return;
-      }
-      // No cutaway: paint the density straight onto the surface.
-      for (let i = 0; i < this.vertexDensity.length; i++) {
-        this.uvs[2 * i] = Math.min(1, this.vertexDensity[i] / 0.8);
-        this.uvs[2 * i + 1] = 0.5;
-      }
-      uvAttr.needsUpdate = true;
-      this.setSurfaceMaterialMode("ramp");
-      return;
-    }
-    this.setSurfaceMaterialMode("none");
-    this.extremeData = null;
-    this.updateExtremeMarkers();
-    this.repaint();
-  }
-
-  // ---------- min/max markers ----------
-
-  private trackExtremes(values: Float32Array | ArrayLike<number>, _stride: number) {
-    let minIdx = 0;
-    let maxIdx = 0;
-    let minVal = Infinity;
-    let maxVal = -Infinity;
-    for (let i = 0; i < values.length; i++) {
-      const v = values[i];
-      if (v < minVal) {
-        minVal = v;
-        minIdx = i;
-      }
-      if (v > maxVal) {
-        maxVal = v;
-        maxIdx = i;
-      }
-    }
-    this.extremeData = { minIdx, maxIdx, minVal, maxVal };
-    this.updateExtremeMarkers();
-  }
-
-  private fmtExtreme(v: number): string {
-    // `extremesUnit` is the field's canonical unit tag ("mm" | "MPa" | "×" | "")
-    // from the store; route through the display-unit registry so markers match
-    // the legend. Values are canonical.
-    if (this.extremesUnit === "×") return `${v.toFixed(2)}×`; // safety factor
-    if (this.extremesUnit === "mm") return format(v, "length");
-    if (this.extremesUnit === "MPa") return format(v, "stress");
-    return v === 0 ? "0" : format(v, "strain"); // dimensionless strain
+  setBanded(on: boolean, count?: number) {
+    this.colorMgr.setBanded(on, count);
   }
 
   /** Small screen-aligned value chip (canvas-rendered text on a light pill),
@@ -3249,134 +2242,24 @@ export class SceneManager {
     return sprite;
   }
 
-  /** Refresh the min/max marks: store the DISPLAYED extreme world positions
-   *  (projected to the screen each frame in `tick`) and update their value
-   *  chips. Visibility/placement of the DOM overlays happens in
-   *  `projectExtremes`. */
-  private updateExtremeMarkers(positionsOnly = false) {
-    const vox = this.voxResultActive();
-    const geom = vox ? this.voxRes!.geo : this.geometry;
-    const disp = vox ? this.voxRes!.disp : this.displacements;
-    this.extremeVisible =
-      this.extremesOn &&
-      this.viewMode === "deformed" &&
-      !!this.extremeData &&
-      !!geom &&
-      !!disp;
-    const els = this.extremeEls;
-    if (!this.extremeVisible || !this.extremeData || !els) {
-      this.projectExtremes(); // hide the overlays
-      return;
-    }
-    const pos = (geom!.getAttribute("position") as THREE.BufferAttribute).array as Float32Array;
-    const d = this.extremeData;
-    this.extremeWorld.min.set(pos[3 * d.minIdx], pos[3 * d.minIdx + 1], pos[3 * d.minIdx + 2]);
-    this.extremeWorld.max.set(pos[3 * d.maxIdx], pos[3 * d.maxIdx + 1], pos[3 * d.maxIdx + 2]);
-    if (!positionsOnly) {
-      els.minChip.textContent = `min ${this.fmtExtreme(d.minVal)}`;
-      els.maxChip.textContent = `max ${this.fmtExtreme(d.maxVal)}`;
-    }
-  }
-
-  /** Project the stored extreme positions to screen pixels and place the DOM
-   *  marks. Called every frame from `tick` (the camera may have moved). */
-  private projectExtremes() {
-    const els = this.extremeEls;
-    if (!els) return;
-    if (!this.extremeVisible) {
-      for (const el of [els.minDot, els.minChip, els.maxDot, els.maxChip]) {
-        el.style.display = "none";
-      }
-      return;
-    }
-    this.placeExtreme(els.minDot, els.minChip, this.extremeWorld.min);
-    this.placeExtreme(els.maxDot, els.maxChip, this.extremeWorld.max);
-  }
-
-  private placeExtreme(dot: HTMLDivElement, chip: HTMLDivElement, world: THREE.Vector3) {
-    const v = this.extremeScratch.copy(world).project(this.camera);
-    if (v.z < -1 || v.z > 1) {
-      dot.style.display = chip.style.display = "none"; // behind the camera
-      return;
-    }
-    const x = (v.x * 0.5 + 0.5) * this.viewW;
-    const y = (-v.y * 0.5 + 0.5) * this.viewH;
-    dot.style.display = chip.style.display = "block";
-    dot.style.left = `${x}px`;
-    dot.style.top = `${y}px`;
-    chip.style.left = `${x + 9}px`;
-    chip.style.top = `${y + 9}px`;
-  }
-
-  private applyPositions(rbmOffset?: number, deformFactor = 1, animating = false) {
-    if (!this.geometry || !this.basePositions) return;
-    const attr = this.geometry.getAttribute("position") as THREE.BufferAttribute;
-    const out = attr.array as Float32Array;
-    const base = this.basePositions;
-    if (out.length !== base.length) return; // mid-model-swap: sizes disagree
-    if (this.rbmMode && rbmOffset !== undefined) {
-      const m = this.rbmMode;
-      const s = rbmOffset * this.rbmAmp;
-      for (let i = 0; i < base.length; i += 3) {
-        const u = this.modeDisplacement(m, base[i], base[i + 1], base[i + 2]);
-        out[i] = base[i] + s * u[0];
-        out[i + 1] = base[i + 1] + s * u[1];
-        out[i + 2] = base[i + 2] + s * u[2];
-      }
-    } else if (this.displacements && this.viewMode === "deformed") {
-      const d = this.displacements;
-      const s = this.autoScale * this.deformScale * deformFactor;
-      for (let i = 0; i < base.length; i++) out[i] = base[i] + s * d[i];
-    } else {
-      out.set(base);
-    }
-    attr.needsUpdate = true;
-    // Recomputing vertex normals over the whole surface soup is the dominant
-    // per-frame cost of the mode-shape / deflection animation (a 300k-tri part
-    // is ~900k verts). During playback we keep the rest-pose normals: on a fast
-    // swing the stale shading is imperceptible next to the color field, and the
-    // one-shot applyPositions() on stop refreshes them. This roughly triples
-    // playback FPS on large meshes.
-    if (!animating) this.geometry.computeVertexNormals();
-    this.morphVoxelResult(deformFactor, animating);
-    // Markers ride the displayed (deformed/animated) vertices.
-    this.updateExtremeMarkers(true);
-  }
-
-  /** Deform the voxel-result hull (and its cell edges) like the part. */
-  private morphVoxelResult(deformFactor: number, animating = false) {
-    const vr = this.voxRes;
-    if (!vr || !vr.group.visible) return;
-    const s = this.autoScale * this.deformScale * deformFactor;
-    const attr = vr.geo.getAttribute("position") as THREE.BufferAttribute;
-    const out = attr.array as Float32Array;
-    for (let i = 0; i < vr.base.length; i++) out[i] = vr.base[i] + s * vr.disp[i];
-    attr.needsUpdate = true;
-    if (!animating) vr.geo.computeVertexNormals();
-    if (vr.lineGeo && vr.lineBase && vr.lineDisp) {
-      const la = vr.lineGeo.getAttribute("position") as THREE.BufferAttribute;
-      const lo = la.array as Float32Array;
-      for (let i = 0; i < vr.lineBase.length; i++) {
-        lo[i] = vr.lineBase[i] + s * vr.lineDisp[i];
-      }
-      la.needsUpdate = true;
-    }
-  }
-
   private tick() {
     if (this.contextLost) return; // GPU is mid-reset — don't touch the dead context
-    if (this.rbmMode) {
+    if (this.results.rbmMode) {
       const t = this.clock.getElapsedTime();
-      this.applyPositions(Math.sin(t * 2.0 * Math.PI * 0.66), 1, true);
-    } else if (this.deformAnimate && this.viewMode === "deformed" && this.displacements) {
+      this.results.applyPositions(Math.sin(t * 2.0 * Math.PI * 0.66), 1, true);
+    } else if (
+      this.results.deformAnimate &&
+      this.viewMode === "deformed" &&
+      this.results.displacements
+    ) {
       const t = this.clock.getElapsedTime();
       // Modal: symmetric ± swing (+A → 0 → −A → 0), a vibrating mode shape.
       // Static deflection: one-sided 0 → max → 0 loop. Both at a 2.4 s period
       // (fixed VISUAL rate — the real frequency is shown as a number, not speed).
-      const frac = this.modalAnim
+      const frac = this.results.modalAnim
         ? Math.sin((2 * Math.PI * t) / 2.4)
         : 0.5 - 0.5 * Math.cos((2 * Math.PI * t) / 2.4);
-      this.applyPositions(undefined, frac, true);
+      this.results.applyPositions(undefined, frac, true);
     }
     this.controls.update();
     const r = this.renderer;
@@ -3385,7 +2268,7 @@ export class SceneManager {
     r.setViewport(0, 0, this.viewW, this.viewH);
     r.clear();
     r.render(this.scene, this.camera);
-    this.colorsDirtyFull = false; // the color buffer (if any) was just uploaded
+    this.colorMgr.markColorsUploaded(); // the color buffer (if any) was just uploaded
     // Axis gizmo inset, bottom-right.
     const s = 104;
     const m = 10;
@@ -3404,8 +2287,8 @@ export class SceneManager {
     r.setScissorTest(false);
     r.setViewport(0, 0, this.viewW, this.viewH);
     // Reproject the min/max marks + fixed callouts now the camera is settled.
-    this.projectExtremes();
-    this.updateCallouts();
+    this.callouts.projectExtremes();
+    this.callouts.updateCallouts();
   }
 }
 
@@ -3424,24 +2307,4 @@ function makeTextSprite(text: string, color: number): THREE.Sprite {
   const sprite = new THREE.Sprite(mat);
   sprite.scale.setScalar(0.62);
   return sprite;
-}
-
-/** Bake a colormap (see ./colormaps) into a 1D texture, sampled per-fragment
- * via uv.x. The same `jet`/`ramp` feed the legend bars, so they stay in sync. */
-function makeLut(fn: (t: number) => RGB): THREE.DataTexture {
-  const n = 256;
-  const data = new Uint8Array(n * 4);
-  for (let i = 0; i < n; i++) {
-    const [r, g, b] = fn(i / (n - 1));
-    data[4 * i] = Math.round(255 * r);
-    data[4 * i + 1] = Math.round(255 * g);
-    data[4 * i + 2] = Math.round(255 * b);
-    data[4 * i + 3] = 255;
-  }
-  const tex = new THREE.DataTexture(data, n, 1, THREE.RGBAFormat);
-  tex.colorSpace = THREE.SRGBColorSpace;
-  tex.minFilter = THREE.LinearFilter;
-  tex.magFilter = THREE.LinearFilter;
-  tex.needsUpdate = true;
-  return tex;
 }
