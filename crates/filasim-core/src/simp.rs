@@ -13,13 +13,14 @@
 //! Update scheme: classic optimality criteria with move limits + a linear
 //! density filter (radius ~1.6 cells) against checkerboards and slivers.
 
+use crate::eps::EMIN_REL;
 use crate::fem::ke_hex;
 use crate::mg::Level;
 use crate::selfsupport::SelfSupportFilter;
 use crate::solve::{solve_cached, NodeProblem, SolverCache, SolveSettings};
 use crate::voxel::VoxelGrid;
 
-const EMIN_REL: f32 = 1e-6;
+pub use crate::eps::build_eps;
 
 #[derive(Clone, Copy, Debug)]
 pub struct OptimizeParams {
@@ -663,36 +664,6 @@ fn cell_strain_energy(
     }
 }
 
-/// Build the per-cell stiffness factors for a given interior density field.
-/// Infill law E/E0 = coeff * x^exponent, capped at solid (1.0). A design
-/// cell partially covered by the wall band (`skin_frac` > 0, composite skin)
-/// gets the volume-fraction blend of solid and infill — the same
-/// homogenization step as the infill law itself, applied at the surface.
-/// Everything additionally scales by the cell's OCCUPANCY (`grid.scale`,
-/// cut boundary cells < 1) so staircase cells don't carry full stiffness.
-pub fn build_eps(
-    grid: &VoxelGrid,
-    skin: &[u32],
-    design_cells: &[u32],
-    skin_frac: &[f32],
-    x: &[f64],
-    exponent: f64,
-    coeff: f64,
-) -> Vec<f32> {
-    let mut eps = vec![0f32; grid.cell_count()];
-    for &c in skin {
-        eps[c as usize] = grid.scale[c as usize];
-    }
-    for (k, &c) in design_cells.iter().enumerate() {
-        let rel = (coeff * x[k].powf(exponent)).min(1.0);
-        let e_infill = EMIN_REL as f64 + (1.0 - EMIN_REL as f64) * rel;
-        let f = skin_frac[k] as f64;
-        eps[c as usize] =
-            (grid.scale[c as usize] as f64 * (f + (1.0 - f) * e_infill)) as f32;
-    }
-    eps
-}
-
 /// Assemble the rhs once (forces are density-independent).
 pub fn build_rhs(grid: &VoxelGrid, problem: &NodeProblem) -> Vec<f64> {
     let (mx, my, mz) = (grid.nx + 1, grid.ny + 1, grid.nz + 1);
@@ -825,7 +796,6 @@ pub fn optimize_cached(
         None
     };
     let ke64 = ke_hex(settings.e0, settings.nu, grid.h);
-    let b = build_rhs(grid, problem);
 
     let (nx, ny, nz) = (grid.nx, grid.ny, grid.nz);
     let ndof = 3 * (nx + 1) * (ny + 1) * (nz + 1);
@@ -862,12 +832,9 @@ pub fn optimize_cached(
     // pattern); iterations only swap stiffness values in.
     let eps0 = build_eps(grid, &skin, &design_cells, &skin_frac, &x, params.exponent, params.coeff);
     let cache = SolverCache::prepare(slot, grid, levels, problem, settings, eps0);
-    let mut bb = b.clone();
-    for (i, c) in cache.solver.levels[0].constrained.iter().enumerate() {
-        if *c {
-            bb[i] = 0.0;
-        }
-    }
+    // The loop's solves ride the session warm start (cache.last_u); seed it
+    // with u0 (or zeros) so the first solve starts exactly there.
+    cache.last_u.copy_from_slice(&u);
 
     // ---- MULTI-LOAD setup (DESIGN §13). For each EXTRA case: a hierarchy
     // (grouped by constraint signature — `None` shares the primary's, else an
@@ -924,7 +891,9 @@ pub fn optimize_cached(
         for c in extra_caches.iter_mut() {
             c.solver.update_eps(eps.clone());
         }
-        cache.solver.update_eps(eps);
+        // Unconditional refresh every iteration (the prepare inside
+        // solve_cached then sees eps unchanged and skips its own update).
+        slot.as_mut().unwrap().solver.update_eps(eps.clone());
         // Inexact inner solves are standard in topology optimization: while
         // the layout is forming, sensitivity noise is tolerated (filter +
         // move limits), so cap the MGCG work. Once the design slows down,
@@ -932,28 +901,36 @@ pub fn optimize_cached(
         // keep creeping toward the true solution for tens of iterations and
         // the design never becomes stationary.
         let (tol_i, cap_i) = if last_mean_change < 0.012 { (2e-4, 60) } else { (5e-4, 15) };
-        let inner = cache.solver.solve_warm(&bb, &mut u, tol_i, cap_i);
-        if crate::cancel::requested() {
-            return Err(OptimizeError::Cancelled);
-        }
+        let r = match solve_cached(slot, grid, levels, problem, settings, eps, tol_i, cap_i) {
+            Err(crate::solve::SolveError::Cancelled) => return Err(OptimizeError::Cancelled),
+            r => r?,
+        };
+        let inner = r.stats;
+        u = r.u;
         // Multi-load: solve every extra case on its group's hierarchy (same
         // inner schedule), each warm-started from its own running displacement.
         for j in 0..extra_bb.len() {
             match extra_group[j] {
                 None => {
-                    cache.solver.solve_warm(&extra_bb[j], &mut extra_u[j], tol_i, cap_i);
+                    slot.as_mut()
+                        .unwrap()
+                        .solver
+                        .solve_warm(&extra_bb[j], &mut extra_u[j], tol_i, cap_i);
                 }
                 Some(i) => {
                     extra_caches[i].solver.solve_warm(&extra_bb[j], &mut extra_u[j], tol_i, cap_i);
                 }
             }
         }
-        compliance = 0.0;
-        for i in 0..ndof {
-            compliance += bb[i] * u[i];
-        }
+        compliance = r.compliance;
 
-        cell_strain_energy(&cache.solver.levels[0], &ke64, &u, &design_cells, &mut se);
+        cell_strain_energy(
+            &slot.as_ref().unwrap().solver.levels[0],
+            &ke64,
+            &u,
+            &design_cells,
+            &mut se,
+        );
         // MULTI-LOAD: aggregate the weighted-sum compliance objective. The
         // per-cell sensitivity is the strain-energy weighted sum
         // se = Σ(wᵢ/Σw)·seᵢ (DESIGN §13) — done BEFORE the composite-cell scale
@@ -974,7 +951,7 @@ pub fn optimize_cached(
                 let fj = extra_w[j] * inv;
                 compliance += fj * cj;
                 let lvl = match extra_group[j] {
-                    None => &cache.solver.levels[0],
+                    None => &slot.as_ref().unwrap().solver.levels[0],
                     Some(i) => &extra_caches[i].solver.levels[0],
                 };
                 cell_strain_energy(lvl, &ke64, &extra_u[j], &design_cells, &mut se_tmp);
@@ -1097,9 +1074,8 @@ pub fn optimize_cached(
     if !sym_partner.is_empty() {
         symmetrize(&mut x_phys, &sym_partner, &mut sym_buf);
     }
-    // Leave the final displacement in the cache: the verification solves
-    // that follow warm-start from it.
-    cache.last_u.copy_from_slice(&u);
+    // The final displacement is already in the cache (each solve leaves its
+    // field as the warm start): the verification solves that follow reuse it.
 
     Ok(OptimizeResult {
         x: x_phys,
@@ -1245,23 +1221,8 @@ pub fn solve_with_eps_cached(
     eps: Vec<f32>,
 ) -> Result<(crate::solve::Solution, f64), crate::solve::SolveError> {
     let r = solve_cached(slot, grid, levels, problem, settings, eps, settings.tol, settings.max_iter)?;
-    let (mx, my, mz) = (grid.nx + 1, grid.ny + 1, grid.nz + 1);
-    Ok((
-        crate::solve::Solution {
-            u: r.u.iter().map(|&v| v as f32).collect(),
-            mx,
-            my,
-            mz,
-            h: grid.h,
-            origin: grid.origin,
-            active: crate::solve::active_nodes(grid),
-            iterations: r.stats.iterations,
-            rel_residual: r.stats.rel_residual,
-            converged: r.stats.converged,
-            residuals: r.residuals,
-        },
-        r.compliance,
-    ))
+    let c = r.compliance;
+    Ok((r.into_solution(grid), c))
 }
 
 #[cfg(test)]

@@ -16,6 +16,7 @@ pub mod bvh;
 pub mod cancel;
 pub mod check;
 pub mod cylinder;
+pub mod eps;
 pub mod fem;
 pub mod mesh;
 pub mod mg;

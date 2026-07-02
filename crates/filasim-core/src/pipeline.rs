@@ -20,8 +20,9 @@ use crate::bins::{
     assign_bins_mass, cleanup_small_regions, cluster_levels, extract_region, taubin_smooth,
     RegionMesh,
 };
+use crate::eps::build_eps;
 use crate::simp::{
-    build_eps, classify_cells, evaluate_cached, evaluate_cached_stats, optimize_cached, LoadSet,
+    classify_cells, evaluate_cached, evaluate_cached_stats, optimize_cached, LoadSet,
     OptimizeError, OptimizeParams, OptimizeProgress,
 };
 use crate::solve::{NodeProblem, SolveSettings, SolverCache};

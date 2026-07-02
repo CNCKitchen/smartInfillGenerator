@@ -15,6 +15,7 @@
 //!   linearly with h on cube cells), trilinear prolongation, restriction = P^T.
 //! - Dirichlet/inactive DOFs are masked: vectors stay zero there throughout.
 
+use crate::eps::average_coarse_eps;
 use crate::fem::{invert3, ke_diag_blocks, NODE_OFFSETS};
 use crate::par::{self, UnsafeSlice};
 
@@ -641,33 +642,6 @@ fn clamp_pc_eps(eps: &mut [f32]) -> bool {
         }
     }
     changed
-}
-
-/// Child-averaged stiffness for the next-coarser grid (fine dims must be even).
-fn average_coarse_eps(fine_eps: &[f32], fnx: usize, fny: usize, fnz: usize) -> Vec<f32> {
-    assert!(fnx % 2 == 0 && fny % 2 == 0 && fnz % 2 == 0);
-    let (nx, ny, nz) = (fnx / 2, fny / 2, fnz / 2);
-    let mut eps = vec![0f32; nx * ny * nz];
-    for cz in 0..nz {
-        for cy in 0..ny {
-            for cx in 0..nx {
-                let mut s = 0f32;
-                for dz in 0..2 {
-                    for dy in 0..2 {
-                        for dx in 0..2 {
-                            s += fine_eps[((2 * cz + dz) * fny + 2 * cy + dy) * fnx + 2 * cx + dx];
-                        }
-                    }
-                }
-                // Plain child average. Occupancy-boosted variants were tried
-                // for thin-shell parts (Benchy) and measurably HURT
-                // convergence (+8-12% iterations) — the softer operator is
-                // the better preconditioner here.
-                eps[(cz * ny + cy) * nx + cx] = s / 8.0;
-            }
-        }
-    }
-    eps
 }
 
 /// Trilinear parent weights of fine node coordinate x (even: one parent).

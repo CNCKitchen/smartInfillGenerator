@@ -12,8 +12,7 @@ use crate::fem::ke_hex;
 use crate::mg::{Level, MgSolver};
 use crate::voxel::VoxelGrid;
 
-/// Relative stiffness floor for non-void gray cells (SIMP-style soft floor).
-const EMIN_REL: f32 = 1e-6;
+pub use crate::eps::grid_eps;
 
 #[derive(Clone, Copy, Debug)]
 pub struct BoxRegion {
@@ -346,17 +345,6 @@ impl Solution {
     }
 }
 
-/// Per-cell stiffness factors for a plain solid solve (grid occupancy).
-pub fn grid_eps(grid: &VoxelGrid) -> Vec<f32> {
-    let mut eps = vec![0f32; grid.cell_count()];
-    for (i, &sc) in grid.scale.iter().enumerate() {
-        if sc > 0.0 {
-            eps[i] = EMIN_REL + (1.0 - EMIN_REL) * sc;
-        }
-    }
-    eps
-}
-
 /// Solver hierarchy + warm-start cache across solves. The expensive setup of
 /// a solve (parity colors, constraint masks, block-Jacobi inverses, the
 /// coarsened hierarchy, the smoother's eigenvalue estimate) depends only on
@@ -482,6 +470,57 @@ pub struct CachedSolve {
     pub compliance: f64,
 }
 
+impl CachedSolve {
+    /// Package as a full [`Solution`] on the (padded) `grid` the solve ran on.
+    pub fn into_solution(self, grid: &VoxelGrid) -> Solution {
+        Solution {
+            u: self.u.iter().map(|&v| v as f32).collect(),
+            mx: grid.nx + 1,
+            my: grid.ny + 1,
+            mz: grid.nz + 1,
+            h: grid.h,
+            origin: grid.origin,
+            active: active_nodes(grid),
+            iterations: self.stats.iterations,
+            rel_residual: self.stats.rel_residual,
+            converged: self.stats.converged,
+            residuals: self.residuals,
+        }
+    }
+}
+
+/// A solver slot plus the canonical assemble-RHS → warm-solve → extract cycle
+/// as one method. `solve` optionally adds full-length extra RHS terms (e.g.
+/// buildsim's accumulated eigenstrain/lock forces) on top of `problem.forces`,
+/// so callers with dense force fields skip the sparse round-trip.
+#[derive(Default)]
+pub struct SolveSession {
+    pub slot: Option<SolverCache>,
+}
+
+impl SolveSession {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `solve_cached` on the owned slot, with each slice of `extra_rhs`
+    /// (length = ndof) added to the rhs IN ORDER after `problem.forces`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn solve(
+        &mut self,
+        grid: &VoxelGrid,
+        levels: usize,
+        problem: &NodeProblem,
+        s: &SolveSettings,
+        eps: Vec<f32>,
+        extra_rhs: &[&[f64]],
+        tol: f64,
+        max_iter: usize,
+    ) -> Result<CachedSolve, SolveError> {
+        solve_slot(&mut self.slot, grid, levels, problem, s, eps, extra_rhs, tol, max_iter)
+    }
+}
+
 pub fn solve_cached(
     slot: &mut Option<SolverCache>,
     grid: &VoxelGrid,
@@ -489,6 +528,21 @@ pub fn solve_cached(
     problem: &NodeProblem,
     s: &SolveSettings,
     eps: Vec<f32>,
+    tol: f64,
+    max_iter: usize,
+) -> Result<CachedSolve, SolveError> {
+    solve_slot(slot, grid, levels, problem, s, eps, &[], tol, max_iter)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn solve_slot(
+    slot: &mut Option<SolverCache>,
+    grid: &VoxelGrid,
+    levels: usize,
+    problem: &NodeProblem,
+    s: &SolveSettings,
+    eps: Vec<f32>,
+    extra_rhs: &[&[f64]],
     tol: f64,
     max_iter: usize,
 ) -> Result<CachedSolve, SolveError> {
@@ -504,6 +558,12 @@ pub fn solve_cached(
     for &(n, f) in &problem.forces {
         for d in 0..3 {
             b[3 * n as usize + d] += f[d];
+        }
+    }
+    for ex in extra_rhs {
+        debug_assert_eq!(ex.len(), ndof);
+        for (bi, &e) in b.iter_mut().zip(*ex) {
+            *bi += e;
         }
     }
     for (i, c) in cache.solver.levels[0].constrained.iter().enumerate() {
@@ -557,22 +617,9 @@ pub fn solve_nodes_cached(
     s: &SolveSettings,
 ) -> Result<Solution, SolveError> {
     let r = solve_cached(slot, grid, levels, problem, s, grid_eps(grid), s.tol, s.max_iter)?;
-    let (mx, my, mz) = (grid.nx + 1, grid.ny + 1, grid.nz + 1);
     // Hitting the cap is reported, not fatal: the iterate is the best
     // available approximation and usually visually indistinguishable.
-    Ok(Solution {
-        u: r.u.iter().map(|&v| v as f32).collect(),
-        mx,
-        my,
-        mz,
-        h: grid.h,
-        origin: grid.origin,
-        active: active_nodes(grid),
-        iterations: r.stats.iterations,
-        rel_residual: r.stats.rel_residual,
-        converged: r.stats.converged,
-        residuals: r.residuals,
-    })
+    Ok(r.into_solution(grid))
 }
 
 pub fn solve_static(problem: &StaticProblem) -> Result<Solution, SolveError> {

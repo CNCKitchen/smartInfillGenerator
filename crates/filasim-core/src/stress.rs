@@ -13,6 +13,8 @@
 use crate::fem::{NODE_OFFSETS, NODE_SIGNS};
 use crate::voxel::VoxelGrid;
 
+pub use crate::eps::material_factor;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FieldKind {
     /// von Mises stress (MPa).
@@ -126,28 +128,6 @@ pub fn recover_nodal(grid: &VoxelGrid, cell_values: &[f32]) -> Vec<f32> {
     sum
 }
 
-/// Occupancy-decoupled (material) modulus/strength factor per cell.
-///
-/// The solve scales each cell's stiffness by `eps = occupancy × material
-/// density`, where `grid.scale` is the finite-cell geometric occupancy (for a
-/// plain solid solve `eps == grid.scale`). That occupancy scaling is correct
-/// for stiffness and mass, but a cut boundary cell is *fully dense material
-/// partially covering its cube* — scaling its stress by the occupancy
-/// under-reads the true material stress and paints the staircase stripes seen
-/// on curved skins. This returns `eps / occupancy` (clamped to 1): the material
-/// density factor alone (1 for solid/skin, rel(ρ) for graded infill), so a
-/// stress evaluated with it is the TRUE material / homogenized macro stress
-/// with the meshing artifact removed. Void cells (occupancy 0) stay 0.
-///
-/// Feed this to `cell_field` in place of `eps`. Using the SAME factor for the
-/// SF allowable leaves the safety factor unchanged (the factor cancels in
-/// allowable / stress).
-pub fn material_factor(grid: &VoxelGrid, eps: &[f32]) -> Vec<f32> {
-    eps.iter()
-        .zip(&grid.scale)
-        .map(|(&e, &occ)| if occ > 0.0 { (e / occ).min(1.0) } else { 0.0 })
-        .collect()
-}
 
 /// Selected scalar per cell (cell-center evaluation); 0.0 for void cells.
 /// `u` is the padded nodal displacement field (3 per node), `eps` the

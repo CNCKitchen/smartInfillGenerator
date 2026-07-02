@@ -24,10 +24,11 @@
 //! anisotropy of §2 when `εz` differs). Per-cell orientation/density scaling,
 //! the bed shell and peel-reaction extraction are follow-ups.
 
+use crate::eps::resolve_eps;
 use crate::fem::{ke_hex, NODE_OFFSETS, NODE_SIGNS};
 use crate::solve::{
-    active_nodes, grid_eps, pad_for_levels, solve_cached, solve_nodes, NodeProblem, SolveSettings,
-    SolveError, SolverCache, Solution,
+    active_nodes, grid_eps, pad_for_levels, solve_nodes, NodeProblem, SolveSettings, SolveError,
+    SolveSession, Solution,
 };
 use crate::voxel::VoxelGrid;
 
@@ -108,24 +109,6 @@ pub fn eigen_forces(
         .filter(|(_, f)| f[0] != 0.0 || f[1] != 0.0 || f[2] != 0.0)
         .map(|(n, f)| (n as u32, f))
         .collect()
-}
-
-/// Per-cell stiffness/eigen-strain field for the padded build grid.
-///
-/// Default (`None`): the geometric occupancy → eps map (`grid_eps`), i.e. the
-/// part as a **solid hull** (every interior voxel full density). When the
-/// optimizer has produced a graded infill field, that field is passed as
-/// `over` so the build sim sees the **as-printed density**: sparse infill is
-/// both softer *and* lays down less contracting material, so both its stiffness
-/// and its inherent-strain force scale by the same per-cell `eps` — which the
-/// assembly already does (see [`eigen_forces`] and the birth-lock loop). The
-/// override must match the padded cell count; otherwise we fall back to the
-/// hull so a stale field can never desync the grid.
-fn resolve_eps(g: &VoxelGrid, over: Option<&[f32]>) -> Vec<f32> {
-    match over {
-        Some(e) if e.len() == g.cell_count() => e.to_vec(),
-        _ => grid_eps(g),
-    }
 }
 
 #[inline]
@@ -293,7 +276,8 @@ fn build_bonded_inner(
     let mut f_eig = vec![0f64; ndof];
     let mut f_lock = vec![0f64; ndof];
 
-    let mut slot: Option<SolverCache> = None;
+    let mut ses = SolveSession::new();
+    let problem = NodeProblem { fixed: fixed.clone(), ..Default::default() };
     let mut iters = Vec::new();
 
     // Total SOLID layers, for progress reporting (empty layers are skipped).
@@ -365,15 +349,16 @@ fn build_bonded_inner(
         }
 
         // Total equilibrium of the active structure: K u = f_eig + f_lock.
-        let forces: Vec<(u32, [f64; 3])> = (0..mx * my * mz)
-            .filter_map(|n| {
-                let f = [f_eig[3 * n] + f_lock[3 * n], f_eig[3 * n + 1] + f_lock[3 * n + 1], f_eig[3 * n + 2] + f_lock[3 * n + 2]];
-                (f[0] != 0.0 || f[1] != 0.0 || f[2] != 0.0).then_some((n as u32, f))
-            })
-            .collect();
-        let problem = NodeProblem { fixed: fixed.clone(), forces, ..Default::default() };
-        let res =
-            solve_cached(&mut slot, &g, levels, &problem, s, eps_cur.clone(), s.tol, s.max_iter)?;
+        let res = ses.solve(
+            &g,
+            levels,
+            &problem,
+            s,
+            eps_cur.clone(),
+            &[&f_eig, &f_lock],
+            s.tol,
+            s.max_iter,
+        )?;
         u_total = res.u;
         // Keep dormant nodes at nominal so the next layer is truly born at 0.
         for n in 0..mx * my * mz {
@@ -591,7 +576,8 @@ fn plastic_correct_bonded(
     let mut f_plastic = vec![0f64; ndof];
     let eigen_mag =
         1.0e-9_f64.max(eigen[0].abs().max(eigen[1].abs()).max(eigen[2].abs()));
-    let mut slot: Option<SolverCache> = None;
+    let mut ses = SolveSession::new();
+    let problem = NodeProblem { fixed: fixed.to_vec(), ..Default::default() };
 
     for _it in 0..MAX_PLASTIC_ITERS {
         // Radial-return every cell against the current bonded stress, growing
@@ -636,27 +622,16 @@ fn plastic_correct_bonded(
         // Re-equilibrate the bonded structure with the updated plastic load.
         f_plastic.iter_mut().for_each(|v| *v = 0.0);
         add_plastic_forces(g, eps_full, s.e0, s.nu, &ep, &mut f_plastic);
-        let forces: Vec<(u32, [f64; 3])> = (0..ndof / 3)
-            .filter_map(|n| {
-                let f = [
-                    f_eig[3 * n] + f_lock[3 * n] + f_plastic[3 * n],
-                    f_eig[3 * n + 1] + f_lock[3 * n + 1] + f_plastic[3 * n + 1],
-                    f_eig[3 * n + 2] + f_lock[3 * n + 2] + f_plastic[3 * n + 2],
-                ];
-                (f[0] != 0.0 || f[1] != 0.0 || f[2] != 0.0).then_some((n as u32, f))
-            })
-            .collect();
-        let problem = NodeProblem { fixed: fixed.to_vec(), forces, ..Default::default() };
         // Intermediate iterates feed the next return-map, not the final field, so
         // a relaxed tol + iteration cap keeps each pass cheap (warm-started from
-        // the previous pass via `slot`). The final release runs its own solve.
-        let res = solve_cached(
-            &mut slot,
+        // the previous pass via the session). The final release runs its own solve.
+        let res = ses.solve(
             g,
             levels,
             &problem,
             s,
             eps_full.to_vec(),
+            &[f_eig, f_lock, &f_plastic],
             s.tol.max(2.0e-3),
             s.max_iter.min(400),
         )?;
@@ -783,14 +758,7 @@ pub fn solve_build_progress(
 
     // Release: free body (3-2-1 pin) under the locked-in build loads (now
     // including the plastic source folded into f_lock above).
-    let nnodes = (g.nx + 1) * (g.ny + 1) * (g.nz + 1);
-    let forces: Vec<(u32, [f64; 3])> = (0..nnodes)
-        .filter_map(|n| {
-            let f = [f_eig[3 * n] + f_lock[3 * n], f_eig[3 * n + 1] + f_lock[3 * n + 1], f_eig[3 * n + 2] + f_lock[3 * n + 2]];
-            (f[0] != 0.0 || f[1] != 0.0 || f[2] != 0.0).then_some((n as u32, f))
-        })
-        .collect();
-    let mut np = NodeProblem { forces, ..Default::default() };
+    let mut np = NodeProblem::default();
     if ground_rigid_body(&g, &mut np).is_none() {
         return Err(SolveError::NoFixedNodes);
     }
@@ -799,7 +767,9 @@ pub fn solve_build_progress(
     // SHAPE is fine well before machine tolerance, so relax it and cap the
     // iterations rather than grinding to the global cap.
     let s_release = SolveSettings { tol: s.tol.max(2.0e-3), max_iter: s.max_iter.min(600), ..*s };
-    let released = solve_nodes(&g, levels, &np, &s_release)?;
+    let released = SolveSession::new()
+        .solve(&g, levels, &np, &s_release, grid_eps(&g), &[&f_eig, &f_lock], s_release.tol, s_release.max_iter)?
+        .into_solution(&g);
 
     Ok(BuildResult {
         bonded: solution_from(&g, u_b, it),
