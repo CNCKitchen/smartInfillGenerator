@@ -10,6 +10,7 @@ import {
   type SlicerFlavor,
 } from "./engine/EngineClient";
 import { EngineSession } from "./engine/EngineSession";
+import type { SectionVolume } from "./engine/EngineProtocol";
 import { ENVELOPE_STEP, FieldServer, isEnvelope } from "./engine/FieldServer";
 import type {
   Bc,
@@ -1032,13 +1033,17 @@ function pushScalarField(set: SetState, get: () => AppState): Promise<void> {
         resultField: s.resultField,
         resultSurface: s.resultSurface,
         results: s.results,
+        sectionOn: s.sectionOn,
       };
     },
     {
       setFieldRange: (range) => set({ fieldRange: range }),
-      scalarField: (values, flip, signed) => sceneEvents.onScalarField?.(values, flip, signed),
+      scalarField: (values, flip, signed, range) =>
+        sceneEvents.onScalarField?.(values, flip, signed, range),
       peelMap: (positions, values, max) => sceneEvents.onPeelMap?.(positions, values, max),
       dispComponent: (comp) => sceneEvents.onDispComponent?.(comp),
+      sectionVolume: (data) => sceneEvents.onSectionVolume?.(data),
+      log: (msg) => appendLog(set, msg),
     }
   );
 }
@@ -1253,8 +1258,18 @@ export interface SceneEvents {
   onRegionVisibility?: (visible: boolean[]) => void;
   /** Stress/strain scalars for the deformed view (null = |u| colors).
    *  flip inverts the colormap (safety factor: red = critical LOW);
-   *  signed centers the color scale on 0 (signed von Mises: ±tension). */
-  onScalarField?: (values: Float32Array | null, flip?: boolean, signed?: boolean) => void;
+   *  signed centers the color scale on 0 (signed von Mises: ±tension);
+   *  range widens the auto color scale (interior extremes — legend, surface
+   *  and section cap share one honest scale). */
+  onScalarField?: (
+    values: Float32Array | null,
+    flip?: boolean,
+    signed?: boolean,
+    range?: { min: number; max: number }
+  ) => void;
+  /** Volumetric section payload for the capped section view (null clears —
+   *  the cap falls back to its plain cut color). */
+  onSectionVolume?: (data: SectionVolume | null) => void;
   /** Color the deformed view by a displacement quantity: -1 = |u| magnitude,
    *  0/1/2 = signed X/Y/Z component (computed from the displacement buffer). */
   onDispComponent?: (comp: number) => void;
@@ -2524,10 +2539,18 @@ export const useStore = create<AppState>((set, get) => ({
         legendMax: null,
         busy: null,
         notice:
-          (model as LoadedModel & { meshObjects?: number }).meshObjects &&
-          (model as LoadedModel & { meshObjects?: number }).meshObjects! > 1
-            ? "3MF contained multiple meshes — analyzing the largest body only."
-            : null,
+          [
+            // 3MF only: import keeps the largest mesh object (STEP keeps all
+            // shells, so its shell count must not trigger this message).
+            /\.3mf$/i.test(name) && model.meshObjects > 1
+              ? "3MF contained multiple meshes — analyzing the largest body only."
+              : null,
+            model.bodyCount > 1
+              ? `Part contains ${model.bodyCount} separate bodies. filaSim cannot connect separate bodies — they only fuse where gaps are smaller than the voxel size. Merge them in CAD if they should act as one part.`
+              : null,
+          ]
+            .filter(Boolean)
+            .join(" ") || null,
       });
       session.invalidateSolution();
       // Clear stale overlays BEFORE the model swap so nothing survives even
@@ -2552,6 +2575,12 @@ export const useStore = create<AppState>((set, get) => ({
         set,
         `Loaded "${name}" — ${model.triCount.toLocaleString()} display triangles, bbox ${bx.toFixed(1)}×${by.toFixed(1)}×${bz.toFixed(1)} mm`
       );
+      if (model.bodyCount > 1) {
+        appendLog(
+          set,
+          `  ${model.bodyCount} separate bodies — not connected in the simulation (bodies only fuse across sub-voxel gaps)`
+        );
+      }
     } catch (e) {
       set({ busy: null, error: e instanceof Error ? e.message : String(e) });
     }
@@ -3928,6 +3957,9 @@ export const useStore = create<AppState>((set, get) => ({
           : referenceMaxDisp(get().results, stats.maxDisplacement),
       });
       sceneEvents.onViewState?.("deformed", get().deformScale);
+      // Active section plane: fetch the volumetric payload for the capped
+      // section (|u| colors are client-side, so nothing else re-pushes here).
+      if (get().sectionOn) void pushScalarField(set, get);
       // Voxel result surface active: reload its hull for the new solution.
       if (get().resultSurface === "voxel") {
         try {
@@ -4150,6 +4182,7 @@ export const useStore = create<AppState>((set, get) => ({
       sceneEvents.onAnimateDeformed?.(true);
       sceneEvents.onDisplacements?.(displacements, { maxDisplacement: 1 });
       sceneEvents.onViewState?.("deformed", get().deformScale);
+      if (get().sectionOn) void pushScalarField(set, get); // section cap volume
       if (get().resultSurface === "voxel") {
         try {
           await session.loadVoxelResult();
@@ -4885,6 +4918,11 @@ export const useStore = create<AppState>((set, get) => ({
     sceneEvents.onSectionState?.(on);
     // Mesh view sections by dropping whole cells, not by plane-clipping.
     if (get().viewMode === "mesh") void refreshMeshView(set, get);
+    // Result views: (re)push the field so the volumetric section payload is
+    // fetched for the cap (displacement fields skip it while the plane is off).
+    if (on && get().viewMode === "deformed" && get().hasResult) {
+      void pushScalarField(set, get);
+    }
   },
 
   flipSection() {

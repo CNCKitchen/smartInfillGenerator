@@ -111,6 +111,7 @@ self.onmessage = async (ev: MessageEvent<EngineWorkerRequest>) => {
           triCount: model.triangle_count(),
           bbox: Array.from(model.bbox()) as LoadedModelData["bbox"],
           meshObjects: model.mesh_object_count(),
+          bodyCount: model.body_count(),
           hasCadFaces: model.has_cad_faces(),
         };
         reply(msg, data, [positions.buffer, patchIds.buffer]);
@@ -436,6 +437,33 @@ self.onmessage = async (ev: MessageEvent<EngineWorkerRequest>) => {
         reply(msg, values, [values.buffer]);
         return;
       }
+      case "sectionVolume": {
+        const arr = requireModel().section_volume(msg.kind);
+        const values = arr[0] as Float32Array;
+        const disp = arr[1] as Float32Array;
+        const meta = arr[2] as Float64Array;
+        const range = Number.isNaN(meta[7])
+          ? null
+          : {
+              min: meta[7],
+              max: meta[8],
+              minAt: [meta[9], meta[10], meta[11]] as [number, number, number],
+              maxAt: [meta[12], meta[13], meta[14]] as [number, number, number],
+            };
+        reply(
+          msg,
+          {
+            values,
+            disp,
+            dims: [meta[0], meta[1], meta[2]] as [number, number, number],
+            origin: [meta[3], meta[4], meta[5]] as [number, number, number],
+            h: meta[6],
+            range,
+          },
+          [values.buffer, disp.buffer]
+        );
+        return;
+      }
       case "stashResult":
         requireModel().stash_result(msg.resultId);
         break;
@@ -496,6 +524,7 @@ self.onmessage = async (ev: MessageEvent<EngineWorkerRequest>) => {
             triCount: model.triangle_count(),
             bbox: Array.from(model.bbox()) as LoadedModelData["bbox"],
             meshObjects: model.mesh_object_count(),
+            bodyCount: model.body_count(),
             hasCadFaces: model.has_cad_faces(),
           },
         };

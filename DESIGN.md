@@ -116,6 +116,25 @@ Reference points:
   interior = the print-settings infill ratio, or the OPTIMIZED per-cell density once an
   optimization result exists; composite surface cells blend by wall fraction). Works with
   the voxel-true section; legend shows the ramp and what the interior value means.
+- **Capped section view (2026-07):** the section plane cuts like CAD, not like a clipped
+  depth buffer. A stencil-buffer cap (three.js clipping-stencil technique: clipped back
+  faces increment, front faces decrement, a plane quad fills where ≠ 0) closes the cut on
+  every opaque surface — part mesh, mesh-view voxel hull, and the voxel-result surface.
+  The quad is double-sided (the cut is viewed from the REMOVED side, where a one-sided
+  quad culls away — the pre-2026-07 "hollow" look) and plain cuts use a clay tone
+  (`CUT_FACE_COLOR`) clearly distinct from the part gray. In result views the cap is
+  FIELD-MAPPED: `Model::section_volume` ships the recovered nodal field over the whole
+  solution grid (void-adjacent nodes back-filled so the smooth surface can overhang the
+  voxelization) plus the padded nodal displacements; both live as 3D textures and the cap
+  fragment shader un-deforms its sample point (2 fixed-point steps of x = p − s·u(x),
+  exaggeration-aware), trilinearly samples the field (manual texelFetch taps — no
+  float-linear extension), and colors through the SHARED jet LUT — so banding, legend
+  overrides, and |u|/component switches apply to the cut face automatically. The same
+  payload reports the INTERIOR (solid-cell) extremes: the color range is widened to
+  volume min/max (a skin+infill part often peaks at the perimeter/infill interface, not
+  on the skin) and a log advisory names the interior peak and its location whenever it
+  exceeds the surface max (or undercuts the surface min-SF). Envelope results and peel
+  maps keep the plain cap (no single engine solution to slice).
 - **Hover value probe (2026-06):** whenever a contour legend is on screen (result fields,
   density/regions views, mesh-view element density) the cursor carries a DRO-style readout
   of the value under it — barycentric interpolation on the displayed (possibly deformed)
@@ -316,7 +335,7 @@ Reference points:
 - **Materials:** presets PLA, PETG, ABS, ASA (E₀, ν, density, tensile strength σₜ, layer
   adhesion σₜᶻ), user-editable. Safety factors (2026-06): three fields — "material"
   (σₜ·rel(ρ)/σᵥM), "layer adhesion" (σₜᶻ·rel(ρ) vs TENSION σzz across the layers, Z-up
-  build direction; compression cannot delaminate → SF 99), and the default "worst case"
+  build direction; compression cannot delaminate → SF = cap, 10), and the default "worst case"
   = per-cell min of both (the results dock states which limit governs). Graded infill's
   allowables scale with the same Gibson-Ashby factor as its stiffness; inverted colormap,
   red = critical low. ADVISORY readouts: STRENGTH anisotropy is modeled this way, but

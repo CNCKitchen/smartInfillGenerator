@@ -2,6 +2,7 @@
 // Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
 
 import { engine } from "./EngineClient";
+import type { SectionVolume } from "./EngineProtocol";
 
 //! Owns the per-solution engine-session STATE that used to live as loose
 //! module-level `let`s in the store: the fetched-field caches (one for the STL
@@ -26,6 +27,9 @@ export class EngineSession {
   private fieldCache = new Map<string, Float32Array>();
   /** Same, sized for the voxel-hull surface. */
   private voxFieldCache = new Map<string, Float32Array>();
+  /** Per-kind volumetric section payloads (nodal field + displacements) for
+   *  the capped section view — invalidated with the STL field cache. */
+  private sectionVolumeCache = new Map<string, SectionVolume>();
   /** Is the voxel-hull geometry for the CURRENT solution in the scene? */
   private voxelLoaded = false;
 
@@ -41,15 +45,25 @@ export class EngineSession {
     (vox ? this.voxFieldCache : this.fieldCache).set(kind, values);
   }
 
+  sectionVolumeOf(kind: string): SectionVolume | undefined {
+    return this.sectionVolumeCache.get(kind);
+  }
+
+  setSectionVolume(kind: string, data: SectionVolume) {
+    this.sectionVolumeCache.set(kind, data);
+  }
+
   /** Drop the STL-surface fields (stress belongs to the previous solution). */
   clearFields() {
     this.fieldCache.clear();
+    this.sectionVolumeCache.clear();
   }
 
   /** Drop BOTH surface caches (post-processing toggle re-fetches the field). */
   clearAllFields() {
     this.fieldCache.clear();
     this.voxFieldCache.clear();
+    this.sectionVolumeCache.clear();
   }
 
   // ---- voxel-result hull ----
@@ -67,7 +81,7 @@ export class EngineSession {
 
   /** The full "new solution" reset: STL fields + voxel result both stale. */
   invalidateSolution() {
-    this.fieldCache.clear();
+    this.clearFields();
     this.invalidateVoxelResult();
   }
 

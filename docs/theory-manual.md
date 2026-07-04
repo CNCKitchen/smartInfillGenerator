@@ -276,11 +276,12 @@ order; the skin carries full strength). Implemented in
 | SF field | Definition | Failure mode |
 |---|---|---|
 | **Material** (`sfm`) | `σₜ · rel(ρ) / σ_vM` | bulk yield/fracture against von-Mises stress |
-| **Layer adhesion** (`sfz`) | `σₜᶻ · rel(ρ) / σ_zz` for **σ_zz > 0 only** | delamination — tension across the print layers; compression cannot delaminate → SF = 99 |
+| **Layer adhesion** (`sfz`) | `σₜᶻ · rel(ρ) / σ_zz` for **σ_zz > 0 only** | delamination — tension across the print layers; compression cannot delaminate → SF = cap |
 | **Worst case** (`sf`, default) | per-cell `min(sfm, sfz)` | the governing limit; the dock states which one governs |
 
 where `rel(ρ)` is the cell's relative stiffness factor (`= eps`, i.e. occupancy ×
-infill/skin blend). All SFs are **capped at 99**.
+infill/skin blend). All SFs are **capped at 10** (`SF_CAP`) — beyond that the
+number carries no engineering meaning and would flatten the color scale.
 
 > **Advisory only.** Strength anisotropy is modeled this way, but stiffness
 > anisotropy and **shear-mode** delamination (Mode-II, in-plane shear across
@@ -715,7 +716,7 @@ number.
 **Strength / safety factors**
 - **Advisory, not certified.** Material and layer-adhesion SFs screen for bulk
   yield and tensile delamination respectively. **Shear-mode (Mode-II)
-  delamination is not modeled.** SFs are capped at 99.
+  delamination is not modeled.** SFs are capped at 10.
 
 **Discretization**
 - **Voxel staircase.** Curved/inclined surfaces are stair-stepped; cut-cell

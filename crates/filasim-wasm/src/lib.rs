@@ -11,7 +11,7 @@ use filasim_core::attach::{assemble, check_problem, BcKind, BcSpec};
 use filasim_core::bins::{extract_iso, extract_region, taubin_smooth, RegionMesh};
 use filasim_core::mesh::TriMesh;
 use filasim_core::pipeline::{smooth_regions, solid_keep_bins};
-use filasim_core::segment::{segment, Segmentation};
+use filasim_core::segment::{body_count, segment, Segmentation};
 use filasim_core::simp::OptimizeParams;
 use filasim_core::solve::{
     active_nodes, pad_for_levels, solve_nodes_cached, SolveSettings, Solution, SolverCache,
@@ -33,6 +33,12 @@ extern "C" {
 pub use wasm_bindgen_rayon::init_thread_pool;
 
 const GRAVITY_MM_S2: [f64; 3] = [0.0, 0.0, -9810.0];
+
+/// Display cap for the safety-factor fields (`sf`/`sfm`/`sfz`). Above ~10 the
+/// exact number carries no engineering meaning, and a huge cap flattens the
+/// color scale's useful 1–5 band into a sliver. Also the sentinel for "cannot
+/// fail" cells (compressive σzz in `sfz`).
+const SF_CAP: f32 = 10.0;
 
 /// Printable-geometry clamp bands — the single engine-side authority the
 /// optimize and solve-printed paths derive the analyzed solid wall from (and
@@ -613,6 +619,11 @@ pub struct Model {
     parents: Vec<u32>,
     name: String,
     mesh_objects: usize,
+    /// Disconnected solid bodies in the imported mesh (internal cavity shells
+    /// and debris excluded — see [`body_count`]). UI warns when > 1: the
+    /// solver never joins separate bodies, they only fuse where voxelization
+    /// bridges sub-cell gaps.
+    bodies: usize,
     seg: Segmentation,
     /// STEP only: BREP-face id per ORIGINAL-mesh triangle. Lets the user switch
     /// surface patches to exact CAD faces (`use_cad_faces`). None for STL/3MF.
@@ -923,12 +934,14 @@ impl Model {
             Some(fot) => remap_segmentation(&cad_segmentation(fot), &parents),
             None => remap_segmentation(&segment(&mesh_orig, 10.0), &parents),
         };
+        let bodies = body_count(&mesh_orig);
         Ok(Model {
             mesh,
             mesh_orig,
             parents,
             name: name.to_string(),
             mesh_objects,
+            bodies,
             seg,
             cad_face_of_orig,
             bcs: Vec::new(),
@@ -964,6 +977,12 @@ impl Model {
     /// Number of mesh objects found in the imported file (UI warns when >1).
     pub fn mesh_object_count(&self) -> u32 {
         self.mesh_objects as u32
+    }
+
+    /// Disconnected solid bodies in the working mesh (cavity shells and debris
+    /// don't count). UI warns when > 1 — the solver can't join separate bodies.
+    pub fn body_count(&self) -> u32 {
+        self.bodies as u32
     }
 
     pub fn triangle_count(&self) -> u32 {
@@ -2783,14 +2802,14 @@ impl Model {
         // strength). "sfm" checks the material against σ_vM; "sfz" checks
         // layer adhesion against TENSION across the layers (σzz > 0 only —
         // compression doesn't delaminate); "sf" is the per-cell worst of
-        // both. All capped at 99.
+        // both. All capped at SF_CAP.
         let sf_material = || -> Vec<f32> {
             let mut c = cell_field_eigen(
                 grid, &sol.u, self.settings.e0, self.settings.nu, factor, eigen, FieldKind::VonMises,
             );
             for (i, v) in c.iter_mut().enumerate() {
                 let allow = self.strength as f32 * factor[i];
-                *v = (allow / v.max(1e-9)).min(99.0);
+                *v = (allow / v.max(1e-9)).min(SF_CAP);
             }
             c
         };
@@ -2800,7 +2819,7 @@ impl Model {
                 cell_field_eigen(grid, &sol.u, self.settings.e0, self.settings.nu, factor, eigen, szz);
             for (i, v) in c.iter_mut().enumerate() {
                 let allow = self.strength_z as f32 * factor[i];
-                *v = if *v <= 1e-9 { 99.0 } else { (allow / *v).min(99.0) };
+                *v = if *v <= 1e-9 { SF_CAP } else { (allow / *v).min(SF_CAP) };
             }
             Ok(c)
         };
@@ -2828,7 +2847,7 @@ impl Model {
     /// "sf" — safety factor σ_allow/σ_vM, where the allowable of graded
     /// infill scales with the SAME relative factor as its stiffness
     /// (Gibson–Ashby strength tracks stiffness to first order; the skin
-    /// carries the full tensile strength). Capped at 99.
+    /// carries the full tensile strength). Capped at `SF_CAP`.
     /// Evaluated at cell centers with the eps the solve actually used.
     /// With smooth_stress on, the per-cell field is recovered to the nodes
     /// (volume-averaged) and interpolated AT the surface vertex — the
@@ -2895,6 +2914,86 @@ impl Model {
             out.extend_from_slice(&[v, v, v]);
         }
         Ok(out)
+    }
+
+    /// Volumetric section payload for the CAD-style capped section view: the
+    /// recovered NODAL scalar field over the FULL solution grid (void-adjacent
+    /// nodes back-filled from valid neighbors so the cap can interpolate right
+    /// up to the skin), the padded nodal displacement field (3/node, straight
+    /// from the solve — the cap un-deforms its sample point with it in the
+    /// exaggerated view), the grid layout, and the interior (solid-cell)
+    /// min/max with their cell-center locations — the true field extremes,
+    /// which for a skin+infill part often sit INSIDE (perimeter/infill
+    /// interface), not on the surface. Kinds as in `result_field`;
+    /// displacement kinds ("u"|"ux"|"uy"|"uz") return an EMPTY values array
+    /// (the cap shader derives them from `disp` directly) and NaN range.
+    /// Returns [values f32 (N|0), disp f32 (3N), meta f64
+    /// [mx,my,mz, ox,oy,oz, h, min,max, minx,miny,minz, maxx,maxy,maxz]].
+    pub fn section_volume(&self, kind: &str) -> Result<js_sys::Array, JsValue> {
+        let sol =
+            self.solution.as_ref().ok_or_else(|| err("no solution — run Solve or Optimize"))?;
+        let (grid, _, _) = self.solution_grid()?;
+        let (mx, my, mz) = (grid.nx + 1, grid.ny + 1, grid.nz + 1);
+        let mut meta = [f64::NAN; 15];
+        meta[0] = mx as f64;
+        meta[1] = my as f64;
+        meta[2] = mz as f64;
+        meta[3] = grid.origin[0];
+        meta[4] = grid.origin[1];
+        meta[5] = grid.origin[2];
+        meta[6] = grid.h;
+        let disp_kind = matches!(kind, "u" | "ux" | "uy" | "uz");
+        let values: Vec<f32> = if disp_kind {
+            Vec::new()
+        } else {
+            let cells = self.cell_values(kind)?;
+            let (nx, ny) = (grid.nx, grid.ny);
+            // Interior extremes over FULL cells only (occupancy ≈ 1, i.e.
+            // entirely inside the part). Boundary cut cells are excluded on
+            // purpose: their centers can lie OUTSIDE the mesh (the marker
+            // would float in air) and with material-stress decoupling their
+            // values are the SURFACE story, which the surface plot already
+            // tells. The interior story is the full cells — perimeter/infill
+            // interface and inward.
+            let mut vmin = f32::INFINITY;
+            let mut vmax = f32::NEG_INFINITY;
+            let (mut cmin, mut cmax) = (0usize, 0usize);
+            for (ci, (&v, &s)) in cells.iter().zip(&grid.scale).enumerate() {
+                if s < 0.999 {
+                    continue;
+                }
+                if v < vmin {
+                    vmin = v;
+                    cmin = ci;
+                }
+                if v > vmax {
+                    vmax = v;
+                    cmax = ci;
+                }
+            }
+            if vmin.is_finite() {
+                let center = |ci: usize| {
+                    let (cx, cy, cz) = (ci % nx, (ci / nx) % ny, ci / (nx * ny));
+                    [
+                        grid.origin[0] + (cx as f64 + 0.5) * grid.h,
+                        grid.origin[1] + (cy as f64 + 0.5) * grid.h,
+                        grid.origin[2] + (cz as f64 + 0.5) * grid.h,
+                    ]
+                };
+                meta[7] = vmin as f64;
+                meta[8] = vmax as f64;
+                meta[9..12].copy_from_slice(&center(cmin));
+                meta[12..15].copy_from_slice(&center(cmax));
+            }
+            let mut nodal = recover_nodal(grid, &cells);
+            fill_nodal_gaps(&mut nodal, mx, my, mz);
+            nodal
+        };
+        Ok(js_sys::Array::of3(
+            &js_sys::Float32Array::from(values.as_slice()),
+            &js_sys::Float32Array::from(sol.u.as_slice()),
+            &js_sys::Float64Array::from(meta.as_slice()),
+        ))
     }
 
     /// Project 3MF with part + modifiers for the chosen slicer flavor:
@@ -3440,6 +3539,67 @@ fn sample_nodal_values(
         }
     }
     out
+}
+
+/// Back-fill NaN nodes (no adjacent solid cell — see `recover_nodal`) with
+/// the mean of their valid 6-neighbors, two passes: the section cap samples
+/// the field wherever the SMOOTH surface is solid, which can overhang the
+/// voxelization by a node or two. Remaining deep-void NaNs become 0 (never
+/// sampled — no cross-section pixel is that far from a solid cell).
+fn fill_nodal_gaps(nodal: &mut [f32], mx: usize, my: usize, mz: usize) {
+    for _ in 0..2 {
+        let src = nodal.to_vec();
+        let mut changed = false;
+        for z in 0..mz {
+            for y in 0..my {
+                for x in 0..mx {
+                    let i = (z * my + y) * mx + x;
+                    if !src[i].is_nan() {
+                        continue;
+                    }
+                    let mut s = 0f32;
+                    let mut n = 0u32;
+                    let mut add = |j: usize| {
+                        if !src[j].is_nan() {
+                            s += src[j];
+                            n += 1;
+                        }
+                    };
+                    if x > 0 {
+                        add(i - 1);
+                    }
+                    if x + 1 < mx {
+                        add(i + 1);
+                    }
+                    if y > 0 {
+                        add(i - mx);
+                    }
+                    if y + 1 < my {
+                        add(i + mx);
+                    }
+                    if z > 0 {
+                        add(i - mx * my);
+                    }
+                    if z + 1 < mz {
+                        add(i + mx * my);
+                    }
+                    drop(add);
+                    if n > 0 {
+                        nodal[i] = s / n as f32;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    for v in nodal.iter_mut() {
+        if v.is_nan() {
+            *v = 0.0;
+        }
+    }
 }
 
 /// Nodal displacement for xyz points that lie ON grid nodes (voxel hull

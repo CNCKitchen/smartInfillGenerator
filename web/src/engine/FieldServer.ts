@@ -27,6 +27,7 @@
 //! store adapts it through the narrow `FieldSink` and stays the only writer.
 
 import { engine } from "./EngineClient";
+import type { SectionVolume } from "./EngineProtocol";
 import type { EngineSession } from "./EngineSession";
 
 /** Sentinel `loadStepId` for the envelope pseudo-step (DESIGN §13): the worst
@@ -53,6 +54,9 @@ export interface FieldDisplayState {
   resultField: string;
   resultSurface: "stl" | "voxel";
   results: readonly FieldResultRef[];
+  /** Section plane active: the volumetric payload for the capped section is
+   *  worth fetching (displacement fields skip it entirely when off). */
+  sectionOn: boolean;
 }
 
 /** Narrow apply surface the store hands in: state writes (`fieldRange`) and
@@ -63,12 +67,25 @@ export interface FieldSink {
   setFieldRange(range: { min: number; max: number }): void;
   /** `sceneEvents.onScalarField` — contour values (null = |u| colors);
    *  flip inverts the colormap (safety factor: red = critical LOW);
-   *  signed centers the color scale on 0 (signed von Mises: ±tension). */
-  scalarField(values: Float32Array | null, flip?: boolean, signed?: boolean): void;
+   *  signed centers the color scale on 0 (signed von Mises: ±tension);
+   *  `range` overrides the auto (surface min/max) color range — used to
+   *  widen the scale to the interior extremes so legend, surface, and the
+   *  section cap all share one honest scale. */
+  scalarField(
+    values: Float32Array | null,
+    flip?: boolean,
+    signed?: boolean,
+    range?: { min: number; max: number }
+  ): void;
   /** `sceneEvents.onPeelMap` — bed-peel heatmap on the plate (nulls clear). */
   peelMap(positions: Float32Array | null, values: Float32Array | null, max: number): void;
   /** `sceneEvents.onDispComponent` — -1 = |u|, 0/1/2 = signed X/Y/Z. */
   dispComponent(comp: number): void;
+  /** `sceneEvents.onSectionVolume` — volumetric payload for the capped
+   *  section (null = no volume for this display: envelope/peel/off). */
+  sectionVolume(data: SectionVolume | null): void;
+  /** Optional log line (interior-extreme advisories). */
+  log?(msg: string): void;
 }
 
 /** Displacement component index for a field, or null for an engine field. */
@@ -151,6 +168,7 @@ export class FieldServer {
     // deformed shade and drop any stress coloring. Anchored at 0, N, uncalibrated.
     if (kind === "peel" || kind === "peelshear") {
       sink.scalarField(null);
+      sink.sectionVolume(null); // the plate heatmap has no volumetric field
       const { positions, values } = await engine.peelMap(kind as "peel" | "peelshear");
       if (!sameField(kind)(read())) return;
       let max = 0;
@@ -169,6 +187,11 @@ export class FieldServer {
       // follows the ACTIVE result instead of a stale solve stat. Don't null it
       // here — the scene repopulates it synchronously as it colors.
       sink.dispComponent(dispComp);
+      // The cap only needs the nodal displacements (the shader derives |u| /
+      // components itself) — skip the fetch entirely while no plane is cutting.
+      const vol = read().sectionOn ? await this.fetchSectionVolume(kind, sink) : null;
+      if (!sameField(kind)(read())) return; // user moved on mid-fetch
+      sink.sectionVolume(vol);
       return;
     }
     const vox = s.resultSurface === "voxel";
@@ -177,12 +200,21 @@ export class FieldServer {
       values = vox ? await engine.voxelResultField(kind) : await engine.resultField(kind);
       this.session.setField(kind, vox, values);
     }
+    // The volumetric payload rides along for every stress/strain/SF field: its
+    // interior (solid-cell) extremes widen the color range below — on a
+    // skin+infill part the true peak often sits INSIDE, at the perimeter/
+    // infill interface, not on the surface.
+    const volume = await this.fetchSectionVolume(kind, sink);
     if (!sameField(kind)(read())) return; // user moved on mid-fetch
     let min = Infinity;
     let max = -Infinity;
     for (let i = 0; i < values.length; i++) {
       min = Math.min(min, values[i]);
       max = Math.max(max, values[i]);
+    }
+    if (volume?.range) {
+      min = Math.min(min, volume.range.min);
+      max = Math.max(max, volume.range.max);
     }
     // Signed von Mises is a diverging field: center the scale on 0 so red =
     // tension, blue = compression, green ≈ unloaded (and the legend reads ±M).
@@ -194,7 +226,53 @@ export class FieldServer {
     }
     sink.setFieldRange({ min, max });
     // Safety factor: invert the colormap so red marks the critical LOW.
-    sink.scalarField(values, kind.startsWith("sf"), signed);
+    sink.scalarField(values, kind.startsWith("sf"), signed, { min, max });
+    sink.sectionVolume(volume);
+  }
+
+  /** Fetch (or reuse) the volumetric section payload for `kind`, logging an
+   *  interior-extreme advisory once per fresh fetch when the critical value
+   *  lives inside the part rather than on its surface. Returns null when the
+   *  engine has no matching solution (stale result switch mid-fetch). */
+  private async fetchSectionVolume(kind: string, sink: FieldSink): Promise<SectionVolume | null> {
+    const hit = this.session.sectionVolumeOf(kind);
+    if (hit) return hit;
+    let volume: SectionVolume;
+    try {
+      volume = await engine.sectionVolume(kind);
+    } catch {
+      return null; // solution vanished mid-fetch — the next push retries
+    }
+    this.session.setSectionVolume(kind, volume);
+    if (volume.range) {
+      const surface = this.session.fieldOf(kind, false) ?? this.session.fieldOf(kind, true);
+      if (surface && surface.length) {
+        let sMin = Infinity;
+        let sMax = -Infinity;
+        for (let i = 0; i < surface.length; i++) {
+          if (surface[i] < sMin) sMin = surface[i];
+          if (surface[i] > sMax) sMax = surface[i];
+        }
+        const r = volume.range;
+        const at = (p: [number, number, number]) =>
+          `(${p[0].toFixed(1)}, ${p[1].toFixed(1)}, ${p[2].toFixed(1)}) mm`;
+        // Additive margin from the field's magnitude (multiplicative would
+        // invert for signed fields whose extreme is negative).
+        const eps = 0.02 * Math.max(Math.abs(sMin), Math.abs(sMax));
+        if (kind.startsWith("sf") && r.min < sMin - eps) {
+          sink.log?.(
+            `${kind}: minimum ${r.min.toFixed(2)} sits INSIDE the part at ${at(r.minAt)} ` +
+              `(surface min ${sMin.toFixed(2)}) — cut a section through it to inspect.`
+          );
+        } else if (!kind.startsWith("sf") && r.max > sMax + eps) {
+          sink.log?.(
+            `${kind}: peak ${r.max.toFixed(2)} sits INSIDE the part at ${at(r.maxAt)} ` +
+              `(surface max ${sMax.toFixed(2)}) — cut a section through it to inspect.`
+          );
+        }
+      }
+    }
+    return volume;
   }
 
   /** Push the envelope's worst-case `field` as a scalar contour on the
@@ -207,6 +285,10 @@ export class FieldServer {
     kind: string,
     field: string
   ): Promise<void> {
+    // An envelope is a client-side reduction across steps — there is no single
+    // engine solution to slice, so the section cap falls back to its plain cut
+    // color.
+    sink.sectionVolume(null);
     const values = await this.computeEnvelopeField(read, kind, field);
     // Bail if the user moved on (switched result or field) during the reduction.
     if (!sameEnvelope(kind, field)(read())) return;

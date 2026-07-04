@@ -47,6 +47,26 @@ export class GizmoController {
   private rotate: TransformControls | null = null;
   private quad: THREE.Group | null = null;
   private quadDisposables: { dispose(): void }[] = [];
+  /** Mirrors setVisible — the hover arbiter must not re-enable a hidden rig. */
+  private shown = false;
+
+  /** Hover arbitration between the two overlapping TransformControls: each
+   *  raycasts its own fat invisible pickers independently, and the rotation
+   *  rings pass right THROUGH the arrow-tip region — so aiming at the arrow
+   *  routinely started a ROTATE. The arrow wins: whenever the translate
+   *  control hovers its axis, the rotate control is disabled (highlight
+   *  cleared) so its pointerdown is a no-op. Registered AFTER the controls'
+   *  own listeners, so both hover states are fresh when it runs. */
+  private arbitrateHover = () => {
+    const t = this.translate;
+    const r = this.rotate;
+    if (!t || !r || t.dragging || r.dragging) return;
+    const wantRotate = this.shown && t.axis === null;
+    if (r.enabled !== wantRotate) {
+      r.enabled = wantRotate;
+      if (!wantRotate) r.axis = null; // drop the ring highlight under the arrow
+    }
+  };
 
   constructor(
     private readonly kind: PlaneGizmoKind,
@@ -99,11 +119,15 @@ export class GizmoController {
     this.rotate = make("rotate", cfg.rotateSize, (tc) => {
       tc.showZ = false;
     });
+    // After the controls' own pointermove listeners → their hover state is
+    // current when the arbiter decides (see arbitrateHover).
+    this.host.domElement().addEventListener("pointermove", this.arbitrateHover);
     this.buildQuad();
   }
 
   /** Show/hide + enable/disable the whole rig (proxy carries the quad). */
   setVisible(show: boolean) {
+    this.shown = show;
     this.proxy.visible = show;
     for (const tc of [this.translate, this.rotate]) {
       if (tc) {

@@ -91,6 +91,21 @@ const nTri = model.triangle_count();
 assert(nTri > 5000 && nTri <= 160_000, `coarse STL subdivided for display (${nTri} tris)`);
 assert(model.patch_count() === 6, `6 patches segmented (got ${model.patch_count()})`);
 assert(model.positions().length === nTri * 9, "positions buffer 9 floats/tri");
+assert(model.body_count() === 1, `single box is one body (got ${model.body_count()})`);
+
+// Multi-body detection: two disconnected boxes in one STL → UI warns that the
+// solver can't connect separate bodies.
+{
+  const a = boxStl([0, 0, 0], [10, 10, 10]);
+  const b = boxStl([30, 0, 0], [40, 10, 10]);
+  const two = new Uint8Array(a.length + b.length - 84); // drop b's header
+  two.set(a);
+  two.set(b.subarray(84), a.length);
+  new DataView(two.buffer).setUint32(80, 24, true); // triangle count 12+12
+  const m2 = new Model(two, "two boxes");
+  assert(m2.body_count() === 2, `two separated boxes detected (got ${m2.body_count()})`);
+  m2.free();
+}
 
 const bbox = Array.from(model.bbox());
 assert(Math.abs(bbox[3] - 40) < 1e-4, "bbox hi.x = 40");
@@ -165,11 +180,11 @@ assert(svmf.length === nTri * 3 && svmf.every((v, i) => Math.abs(Math.abs(v) - v
 assert(fmin(svmf) < 0 && fmax(svmf) > 0, "bending: signed von Mises spans compression + tension");
 const ezzf = model.result_field("ezz");
 assert(ezzf.length === nTri * 3, "strain field per vertex");
-// Safety factor: sigma_t·rel(rho) / sigma_vM, capped at 99.
+// Safety factor: sigma_t·rel(rho) / sigma_vM, capped at 10 (SF_CAP).
 const sff = model.result_field("sf");
-assert(sff.length === nTri * 3 && sff.every((v) => Number.isFinite(v) && v > 0 && v <= 99),
+assert(sff.length === nTri * 3 && sff.every((v) => Number.isFinite(v) && v > 0 && v <= 10),
   "safety factor field per vertex (finite, positive, capped)");
-assert(fmin(sff) > 1 && fmin(sff) < 99,
+assert(fmin(sff) > 1 && fmin(sff) <= 10,
   `min safety factor sensible for a lightly loaded beam (${fmin(sff).toFixed(1)})`);
 
 // --- color 3MF export: the active field painted into discrete filament bands ---
@@ -325,7 +340,7 @@ model.add_force(sel(0, "max"), 0, 0, -5);
   // Stress/SF on the printed solution use the homogenized eps.
   const sfPrinted = model.result_field("sf");
   const sfPrintedMin = fmin(sfPrinted);
-  assert(sfPrinted.every((v) => Number.isFinite(v) && v > 0 && v <= 99), "printed SF field sane");
+  assert(sfPrinted.every((v) => Number.isFinite(v) && v > 0 && v <= 10), "printed SF field sane");
   assert(sfPrintedMin < sfSolidMin,
     `printed min SF below solid's (${sfPrintedMin.toFixed(1)} < ${sfSolidMin.toFixed(1)})`);
 

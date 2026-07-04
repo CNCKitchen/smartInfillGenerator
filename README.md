@@ -183,6 +183,10 @@ The strongest check is the mesh-independent solid↔infill ratio: because both s
 - PrusaSlicer-flavor 3MF writer, golden FEA comparisons, anisotropy, and STEP
   import remain per DESIGN.md.
 - Multi-mesh 3MF imports analyze the largest body only (warned in-app).
+- Imports containing several disconnected bodies raise an in-app warning:
+  separate bodies are never joined by the solver — they only fuse where
+  voxelization bridges sub-cell gaps. Internal cavity shells (hollow parts)
+  are recognized and don't count as extra bodies.
 
 ## License
 

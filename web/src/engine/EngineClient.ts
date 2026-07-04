@@ -3,14 +3,16 @@
 
 // Promise wrapper around the engine worker.
 
-import type { Bc, CheckReport, CylFit, LoadedModel, SolveStats, VoxelInfo } from "../types";
+import type { Bc, CheckReport, CylFit, SolveStats, VoxelInfo } from "../types";
 import { EngineError } from "./EngineProtocol";
 import type {
   BcPayload,
   EngineRequests,
   EngineResponses,
   EngineWorkerMessage,
+  LoadedModelData,
   Op,
+  SectionVolume,
 } from "./EngineProtocol";
 
 interface Pending {
@@ -119,7 +121,7 @@ export class EngineClient {
     return n > 0 ? Array.from(this.progressData.subarray(0, n)) : [];
   }
 
-  load(bytes: ArrayBuffer, name: string): Promise<LoadedModel> {
+  load(bytes: ArrayBuffer, name: string): Promise<LoadedModelData> {
     return this.call({ op: "load", bytes, name }, [bytes]);
   }
 
@@ -346,6 +348,13 @@ export class EngineClient {
     return this.call({ op: "resultField", kind });
   }
 
+  /** Volumetric section payload (nodal field over the full solution grid +
+   *  nodal displacements + interior extremes) for the capped section view.
+   *  Kinds as in `resultField`, plus "u"|"ux"|"uy"|"uz" (disp-only). */
+  sectionVolume(kind: string): Promise<SectionVolume> {
+    return this.call({ op: "sectionVolume", kind });
+  }
+
   /** Build-sim bed-peel traction per surface vertex: "peel" = upward lift,
    *  "peelshear" = bed shear. MPa, mesh-independent, uncalibrated indicator. */
   peelField(kind: "peel" | "peelshear"): Promise<Float32Array> {
@@ -428,7 +437,7 @@ export class EngineClient {
    *  openProjectRestore. */
   openProjectModel(
     bytes: ArrayBuffer
-  ): Promise<{ manifest: string; model: LoadedModel & { meshObjects?: number } }> {
+  ): Promise<{ manifest: string; model: LoadedModelData }> {
     return this.call({ op: "openProjectModel", bytes }, [bytes]);
   }
 

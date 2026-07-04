@@ -9,6 +9,46 @@ compatibility or simulation results; patch releases are fixes only.
 
 ## [Unreleased]
 
+### Added
+- CAD-style capped section view: the section plane closes the cut with a solid
+  cap (distinct clay cut-face color) instead of exposing a hollow interior; the
+  cap also covers the voxel-result surface, which previously had no cap at all.
+- Result fields mapped onto the section cap: the cut face shows the volumetric
+  stress/strain/SF/displacement field inside the part (new `sectionVolume`
+  engine op — recovered nodal field + nodal displacements as 3D textures,
+  exaggeration-aware inverse mapping, shared LUT so banding and legend ranges
+  apply).
+- Interior-aware result extremes: the color range now includes the solid-cell
+  (interior) min/max — on skin+infill parts the true peak often sits at the
+  perimeter/infill interface — and the log names the interior peak location
+  when it exceeds the surface extreme.
+- Keyboard camera shortcuts (slicer layout): plain 1–6 snap to top / bottom /
+  front / rear / left / right, F fits the part into the current viewport
+  without changing the view direction. Ctrl/⌘ + 0–6 keep working (0 = default
+  isometric).
+- Third "mark min / max" marker: a hollow-ring "max (interior)" mark (or
+  "min (interior)" for safety factors) appears at the interior extreme
+  whenever it beats the surface value by more than 2%; hidden otherwise.
+  Interior extremes are taken over FULL cells only (occupancy ≈ 1) — boundary
+  cut cells belong to the surface plot and their centers can lie outside the
+  mesh.
+
+### Fixed
+- Section cap was invisible when the cut was viewed from the removed side
+  (one-sided cap quad was back-face culled), which made a sectioned part look
+  hollow.
+- Section/symmetry gizmo: hovering the move arrow no longer grabs a rotation
+  ring — the rings' invisible pick zones pass right through the arrow-tip
+  region, so drags meant as a shift often rotated the plane instead. The
+  translate arrow now has hover priority.
+- Section plane now always starts through the part's bounding-box center and
+  re-centers when the part is replaced or rotated (it used to spawn at the
+  orbit target, which lands off-part after panning).
+- Section plane opens toward the viewer: on activation the normal follows the
+  dominant view axis with the near half clipped (it used to cut the far half,
+  showing the intact surface), and the X/Y/Z snap buttons pick the
+  camera-facing sign too.
+
 ## [0.1.0] - 2026-07-02
 
 First versioned release. Everything below is the state of the project at this point.

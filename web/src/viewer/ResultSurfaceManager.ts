@@ -28,6 +28,10 @@ export interface ResultHost {
   peelClippingPlanes(): THREE.Plane[] | null;
   /** The displayed vertices moved — extreme markers ride them. */
   onPositionsApplied(): void;
+  /** The displacement exaggeration actually applied to the displayed vertices
+   *  (autoScale·deformScale·animFactor; 0 outside the deformed view) — the
+   *  section cap's shader un-deforms its field sample point with it. */
+  onDeformScale?(s: number): void;
 }
 
 export class ResultSurfaceManager {
@@ -396,12 +400,15 @@ export class ResultSurfaceManager {
         out[i + 1] = base[i + 1] + s * u[1];
         out[i + 2] = base[i + 2] + s * u[2];
       }
+      this.host.onDeformScale?.(0);
     } else if (this.displacements && this.host.viewMode() === "deformed") {
       const d = this.displacements;
       const s = this.autoScale * this.deformScale * deformFactor;
       for (let i = 0; i < base.length; i++) out[i] = base[i] + s * d[i];
+      this.host.onDeformScale?.(s);
     } else {
       out.set(base);
+      this.host.onDeformScale?.(0);
     }
     attr.needsUpdate = true;
     // Recomputing vertex normals over the whole surface soup is the dominant

@@ -458,11 +458,64 @@ a.iconbtn:hover {
   gap: 10px;
 }
 
-.toolrow,
-.addrow {
+.toolrow {
   display: flex;
   gap: 6px;
   flex-wrap: wrap;
+}
+
+/* Add-BC buttons: a fixed 2-per-row grid (supports and loads each form 2×2). */
+.addrow {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+
+.addrow.lsadd {
+  grid-template-columns: 1fr;
+}
+
+/* Fusion-style hover help card (HelpTip.tsx). Portal to <body>; never takes
+   the mouse, so it can overlap the viewer without stealing orbit drags. */
+.helpcard {
+  position: fixed;
+  z-index: 90; /* above toasts/settings (50), below the consent dialog (100) */
+  width: 300px;
+  padding: 12px 14px;
+  background: var(--panel);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.22);
+  pointer-events: none;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+.helpcard > b {
+  display: block;
+  margin-bottom: 2px;
+  font-size: 13px;
+}
+
+.helpcard p {
+  margin: 6px 0 0;
+  color: var(--ink);
+}
+
+.helpcard img {
+  display: block;
+  max-width: 100%;
+  margin-top: 10px;
+  border-radius: var(--r);
+}
+
+/* Compact variant for former native-title hints (TitleTipLayer). */
+.helpcard.tip {
+  width: auto;
+  max-width: 320px;
+  padding: 7px 10px;
+  font-size: 12px;
+  line-height: 1.45;
 }
 
 .toolrow button,
@@ -2033,10 +2086,19 @@ input[type="number"] {
 .extreme-dot.max {
   background: #ef4444;
 }
+/* Interior extreme: hollow ring = the point sits INSIDE the part (shown only
+   when the volumetric extreme beats the surface one). */
+.extreme-dot.interior {
+  background: #fff;
+  border: 2.5px solid #ef4444;
+}
 .extreme-chip.min {
   color: #1d5fc4;
 }
 .extreme-chip.max {
+  color: #c2330e;
+}
+.extreme-chip.interior {
   color: #c2330e;
 }
 

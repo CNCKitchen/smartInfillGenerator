@@ -19,7 +19,8 @@ import { UnitInput } from "./UnitInput";
 import { RESULT_FIELDS, type Bc, type ForceMode, type LoadStep, type PatternKey } from "../types";
 import { shrinkFromPhysics, ROOM_TEMP_C } from "../materials";
 import { fmtDisp, fmtLen, lenUnit, rampCss } from "./fmt";
-import { bcLabel, KIND_DOT, KIND_LABEL, SUPPORT_KINDS } from "./bcmeta";
+import { BC_HELP, bcLabel, KIND_DOT, KIND_LABEL, SUPPORT_KINDS } from "./bcmeta";
+import { HelpTip } from "./HelpTip";
 import {
   format,
   unitLabel,
@@ -266,6 +267,9 @@ function StepModel() {
             </div>
           </div>
           <div className="group">
+            <SurfacePatchControl />
+          </div>
+          <div className="group">
             <div className="g-label">
               <span>Rescale</span>
               <b className="dim">wrong import unit?</b>
@@ -288,9 +292,6 @@ function StepModel() {
               An STL imported in the wrong unit comes in 25.4× off. Rescale here without re-importing —
               the bounding box in the status bar confirms the size.
             </div>
-          </div>
-          <div className="group">
-            <SurfacePatchControl />
           </div>
         </>
       )}
@@ -330,10 +331,18 @@ function StepBcs() {
           <BcRow key={bc.id} bc={bc} />
         ))}
         <div className="addrow">
-          <button onClick={() => s.addBc("fixed")}>+ Fixed</button>
-          <button onClick={() => s.addBc("elastic")}>+ Elastic</button>
-          <button onClick={() => s.addBc("frictionless")}>+ Frictionless</button>
-          <button onClick={() => s.addBc("displacement")}>+ Displacement</button>
+          <HelpTip help={BC_HELP.fixed}>
+            <button onClick={() => s.addBc("fixed")}>+ Fixed</button>
+          </HelpTip>
+          <HelpTip help={BC_HELP.elastic}>
+            <button onClick={() => s.addBc("elastic")}>+ Elastic</button>
+          </HelpTip>
+          <HelpTip help={BC_HELP.frictionless}>
+            <button onClick={() => s.addBc("frictionless")}>+ Frictionless</button>
+          </HelpTip>
+          <HelpTip help={BC_HELP.displacement}>
+            <button onClick={() => s.addBc("displacement")}>+ Displacement</button>
+          </HelpTip>
         </div>
       </div>
 
@@ -345,10 +354,18 @@ function StepBcs() {
           <BcRow key={bc.id} bc={bc} />
         ))}
         <div className="addrow">
-          <button onClick={() => s.addBc("force")}>+ Force</button>
-          <button onClick={() => s.addBc("pressure")}>+ Pressure</button>
-          <button onClick={() => s.addBc("bearing")}>+ Bearing</button>
-          <button onClick={() => s.addBc("moment")}>+ Moment</button>
+          <HelpTip help={BC_HELP.force}>
+            <button onClick={() => s.addBc("force")}>+ Force</button>
+          </HelpTip>
+          <HelpTip help={BC_HELP.moment}>
+            <button onClick={() => s.addBc("moment")}>+ Moment</button>
+          </HelpTip>
+          <HelpTip help={BC_HELP.bearing}>
+            <button onClick={() => s.addBc("bearing")}>+ Bearing load</button>
+          </HelpTip>
+          <HelpTip help={BC_HELP.pressure}>
+            <button onClick={() => s.addBc("pressure")}>+ Pressure</button>
+          </HelpTip>
         </div>
       </div>
 

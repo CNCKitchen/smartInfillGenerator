@@ -46,6 +46,10 @@ export function Viewer() {
   useEffect(() => {
     const scene = new SceneManager();
     sceneRef.current = scene;
+    // Dev-only automation hook: e2e scripts inspect the live scene.
+    if (import.meta.env.DEV) {
+      (window as unknown as { __sceneMgr: SceneManager }).__sceneMgr = scene;
+    }
     scene.onFps = (f) => setFps(f);
     scene.init(canvasRef.current!, {
       onPickPatch: (tris, additive) => {
@@ -116,8 +120,9 @@ export function Viewer() {
     sceneEvents.onResultSolid = (solid) => scene.setResultSolid(solid);
     sceneEvents.captureThumbnail = () => scene.captureThumbnail();
     sceneEvents.onRegionVisibility = (vis) => scene.setRegionVisibility(vis);
-    sceneEvents.onScalarField = (v, flip, signed) =>
-      scene.setScalarField(v, flip ?? false, signed ?? false);
+    sceneEvents.onScalarField = (v, flip, signed, range) =>
+      scene.setScalarField(v, flip ?? false, signed ?? false, range ?? null);
+    sceneEvents.onSectionVolume = (data) => scene.setSectionVolume(data);
     sceneEvents.onDispComponent = (comp) => scene.setDispComponent(comp);
     sceneEvents.onVoxelResult = (p, d, e, ed) => scene.setVoxelResult(p, d, e, ed);
     sceneEvents.onResultSurface = (s) => scene.setResultSurface(s);

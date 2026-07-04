@@ -146,6 +146,20 @@ export class ColorManager {
     return this.scalarField;
   }
 
+  /** The color normalization the LAST applyColors actually used (legend
+   *  overrides included) — the section cap samples the same LUT with the
+   *  same range so cap and surface always agree. Null outside result views. */
+  get appliedRange(): { lo: number; hi: number; flip: boolean } | null {
+    return this.lastApplied;
+  }
+
+  /** Active displacement coloring component (-1 = |u|, 0/1/2 = X/Y/Z). */
+  get dispComponentValue(): number {
+    return this.dispComponent;
+  }
+
+  private lastApplied: { lo: number; hi: number; flip: boolean } | null = null;
+
   /** The color buffer (if any) was just uploaded with the render. */
   markColorsUploaded() {
     this.colorsDirtyFull = false;
@@ -185,19 +199,33 @@ export class ColorManager {
    *  `flip` inverts the colormap (safety factor: red = the critical LOW).
    *  `signed` centers the color scale on 0 (signed von Mises: blue =
    *  compression, green ≈ unloaded, red = tension) — must match the store's
-   *  symmetric `fieldRange` so the legend agrees with the surface. */
-  setScalarField(values: Float32Array | null, flip = false, signed = false) {
+   *  symmetric `fieldRange` so the legend agrees with the surface.
+   *  `range` overrides the auto (surface min/max) scale — the FieldServer
+   *  widens it to the interior (volumetric) extremes so legend, surface and
+   *  section cap share one honest scale. */
+  setScalarField(
+    values: Float32Array | null,
+    flip = false,
+    signed = false,
+    range: { min: number; max: number } | null = null
+  ) {
     if (values && values.length) {
-      let min = Infinity;
-      let max = -Infinity;
-      for (let i = 0; i < values.length; i++) {
-        min = Math.min(min, values[i]);
-        max = Math.max(max, values[i]);
-      }
-      if (signed) {
-        const m = Math.max(Math.abs(min), Math.abs(max), 1e-12);
-        min = -m;
-        max = m;
+      let min: number;
+      let max: number;
+      if (range) {
+        ({ min, max } = range);
+      } else {
+        min = Infinity;
+        max = -Infinity;
+        for (let i = 0; i < values.length; i++) {
+          min = Math.min(min, values[i]);
+          max = Math.max(max, values[i]);
+        }
+        if (signed) {
+          const m = Math.max(Math.abs(min), Math.abs(max), 1e-12);
+          min = -m;
+          max = m;
+        }
       }
       this.scalarField = { values, min, max, flip };
     } else {
@@ -389,6 +417,7 @@ export class ColorManager {
       const lo = this.legendRange.min ?? sf.min;
       const hi = this.legendRange.max ?? sf.max;
       writeFieldUvs(vr.uvs, sf.values, lo, hi, sf.flip);
+      this.lastApplied = { lo, hi, flip: sf.flip };
       uvAttr.array.set(vr.uvs);
       uvAttr.needsUpdate = true;
       this.host.trackExtremes(sf.values);
@@ -396,6 +425,7 @@ export class ColorManager {
     }
     const { values, lo, hi } = this.dispFieldValues(vr.disp);
     writeFieldUvs(vr.uvs, values, lo, hi, false);
+    this.lastApplied = { lo, hi, flip: false };
     uvAttr.array.set(vr.uvs);
     uvAttr.needsUpdate = true;
     this.host.trackExtremes(values);
@@ -410,6 +440,7 @@ export class ColorManager {
     const uvs = this.host.uvs();
     if (!geometry || !colors || !uvs) return;
     const uvAttr = geometry.getAttribute("uv") as THREE.BufferAttribute;
+    this.lastApplied = null; // set by the result-coloring branches below
     if (this.host.voxResultActive()) {
       this.colorVoxelResult();
       this.repaint();
@@ -423,6 +454,7 @@ export class ColorManager {
         const lo = this.legendRange.min ?? sf.min;
         const hi = this.legendRange.max ?? sf.max;
         writeFieldUvs(uvs, sf.values, lo, hi, sf.flip);
+        this.lastApplied = { lo, hi, flip: sf.flip };
         uvAttr.needsUpdate = true;
         this.setSurfaceMaterialMode("jet");
         this.host.trackExtremes(sf.values);
@@ -430,6 +462,7 @@ export class ColorManager {
       }
       const { values, lo, hi } = this.dispFieldValues(displacements);
       writeFieldUvs(uvs, values, lo, hi, false);
+      this.lastApplied = { lo, hi, flip: false };
       uvAttr.needsUpdate = true;
       this.setSurfaceMaterialMode("jet");
       this.host.trackExtremes(values);

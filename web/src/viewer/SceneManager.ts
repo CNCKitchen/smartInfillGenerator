@@ -19,13 +19,22 @@ import { BC_COLORS, ColorManager } from "./ColorManager";
 import { GizmoController } from "./GizmoController";
 import { CalloutManager } from "./CalloutManager";
 import { ResultSurfaceManager } from "./ResultSurfaceManager";
+import { SectionFieldCap } from "./SectionFieldCap";
+import type { SectionVolume } from "../engine/EngineProtocol";
 
-/** Named orthographic camera presets (keyboard Ctrl + 0–6). Axes follow the
- *  Z-up / Blender convention: "front" is the −Y face, matching the default
+/** Cut-face color of the capped section view — a matte clay clearly distinct
+ *  from the part gray (CAD convention: the section face reads as "cut
+ *  material", not as more surface). Result views replace it with the
+ *  field-mapped cap (SectionFieldCap). */
+const CUT_FACE_COLOR = 0xbe7b4d;
+
+/** Named orthographic camera presets (keyboard 1–6 / Ctrl + 0–6). Axes follow
+ *  the Z-up / Blender convention: "front" is the −Y face, matching the default
  *  isometric corner the part is framed from on load. */
 export type CameraView = "default" | "top" | "bottom" | "front" | "behind" | "left" | "right";
 
-/** Digit (KeyboardEvent.key) → camera preset for the Ctrl + 0–6 shortcuts. */
+/** Digit (KeyboardEvent.key) → camera preset, slicer (Bambu/Orca) layout.
+ *  Plain 1–6 snap the views; Ctrl/⌘ + 0–6 also work (0 = default ISO). */
 const VIEW_KEYS: Record<string, CameraView> = {
   "0": "default",
   "1": "top",
@@ -187,6 +196,8 @@ export class SceneManager {
   );
   private capPart: THREE.Object3D[] = [];
   private capVoxel: THREE.Object3D[] = [];
+  /** Cap group for the voxel-RESULT surface (deformed results on the hull). */
+  private capVoxRes: THREE.Object3D[] = [];
   /** The voxel hull already carries the section cut in its geometry. */
   private voxelCutActive = false;
   private capDisposables: { dispose(): void }[] = [];
@@ -226,6 +237,7 @@ export class SceneManager {
     lutJet: () => this.colorMgr.lutJet,
     peelClippingPlanes: () => (this.sectionOn ? [this.sectionPlane] : null),
     onPositionsApplied: () => this.callouts.updateExtremeMarkers(true),
+    onDeformScale: (s) => this.sectionField.setDefScale(s),
   });
 
   // Surface coloring: BC repaint/hover tint, scalar-field LUT paths, banding.
@@ -251,6 +263,10 @@ export class SceneManager {
     onResultRange: (min, max) => this.callbacks.onResultRange?.(min, max),
   });
 
+  // Field-mapped section cap: colors the cut face by the volumetric result
+  // field (shares the ColorManager's jet LUT, so banding follows along).
+  private sectionField = new SectionFieldCap(this.colorMgr.lutJet);
+
   // Fixed value callouts + min/max extreme markers (DOM overlays).
   private callouts: CalloutManager = new CalloutManager({
     camera: () => this.camera,
@@ -267,6 +283,7 @@ export class SceneManager {
         disp: vox ? this.results.voxRes!.disp : this.results.displacements,
       };
     },
+    interiorDisplayedPos: (rest, out) => this.sectionField.displacedPoint(rest, out),
     onLog: (msg) => this.callbacks.onLog?.(msg),
   });
 
@@ -384,6 +401,7 @@ export class SceneManager {
       (this.wireframeLines.material as THREE.Material).dispose();
     }
     for (const d of this.pickArrowDisposables) d.dispose();
+    this.sectionField.dispose();
     this.renderer?.dispose();
   }
 
@@ -467,6 +485,43 @@ export class SceneManager {
     this.lastOrbitPivot = center.clone();
   }
 
+  /** Fit the part into the current viewport WITHOUT changing the view
+   *  direction (keyboard F): re-center the orbit target on the part and size
+   *  the frustum to the bbox's projected extent plus a small margin. */
+  fitView() {
+    if (!this.camera || !this.controls) return;
+    const b = this.partBbox;
+    if (!b) return;
+    const center = this.partCenter();
+    const dir = this.camera.position.clone().sub(this.controls.target);
+    if (dir.lengthSq() < 1e-12) dir.set(0.7, -0.8, 0.55);
+    dir.normalize();
+    this.camera.position.copy(center).addScaledVector(dir, this.bboxDiag * 2.2);
+    this.controls.target.copy(center);
+    this.camera.near = this.bboxDiag / 100;
+    this.camera.far = this.bboxDiag * 50;
+    this.camera.lookAt(center); // same axis + up → the view only re-frames
+    this.camera.updateMatrixWorld();
+    // Projected half-extents of the bbox corners on the camera's screen axes.
+    const right = new THREE.Vector3().setFromMatrixColumn(this.camera.matrixWorld, 0);
+    const up = new THREE.Vector3().setFromMatrixColumn(this.camera.matrixWorld, 1);
+    let ex = 0;
+    let ey = 0;
+    const p = new THREE.Vector3();
+    for (let i = 0; i < 8; i++) {
+      p.set(b[i & 1 ? 3 : 0], b[i & 2 ? 4 : 1], b[i & 4 ? 5 : 2]).sub(center);
+      ex = Math.max(ex, Math.abs(p.dot(right)));
+      ey = Math.max(ey, Math.abs(p.dot(up)));
+    }
+    const aspect = this.viewH > 0 ? this.viewW / this.viewH : 1;
+    this.camera.zoom = 1; // wheel zoom is baked into the fitted frustum
+    this.orthoHalf = Math.max(ey, ex / aspect, 1e-6) * 1.08;
+    this.updateFrustum();
+    this.controls.update();
+    // Re-pivot the next orbit drag on the part centre, not a stale surface hit.
+    this.lastOrbitPivot = center.clone();
+  }
+
   setTool(tool: Tool, brushRadius: number, brushErase: boolean) {
     this.tool = tool;
     this.brushRadius = brushRadius;
@@ -521,6 +576,7 @@ export class SceneManager {
     this.colorMgr.resetDispComponent();
     this.results.vertexDensity = null;
     this.results.rbmMode = null;
+    this.sectionField.setVolume(null); // volumetric field belongs to the old part
     this.viewMode = "setup";
     this.setRegions(null);
     this.setVoxelMesh(null, null);
@@ -606,9 +662,10 @@ export class SceneManager {
       this.scene.add(this.pickCursor);
     }
 
-    // Section plane follows the new part.
+    // Section plane follows the new part — through its CENTER (the orbit
+    // target may have been panned anywhere).
     if (this.sectionGizmo.exists()) {
-      this.sectionGizmo.proxy.position.copy(this.controls.target);
+      this.sectionGizmo.proxy.position.copy(this.partCenter());
       this.sectionGizmo.buildQuad(); // resize to the new part
       this.sectionGizmo.sync();
       this.rebuildCapGroups();
@@ -634,6 +691,14 @@ export class SceneManager {
     this.bboxDiag = Math.hypot(hx - lx, hy - ly, hz - lz) || this.bboxDiag;
     this.controls.target.set((lx + hx) / 2, (ly + hy) / 2, (lz + hz) / 2);
     this.controls.update();
+    // The part moved under the section plane — re-center the plane on the new
+    // bbox center so the cut stays through the part.
+    if (this.sectionGizmo.exists()) {
+      this.sectionGizmo.proxy.position.copy(this.partCenter());
+      this.sectionGizmo.buildQuad();
+      this.sectionGizmo.sync();
+      this.rebuildCapGroups();
+    }
     this.buildWireframe(); // re-derive from the moved geometry
     this.rebuildBcMarkers();
     this.colorMgr.repaint();
@@ -1478,16 +1543,23 @@ export class SceneManager {
 
   // ---------- camera view keys ----------
 
-  /** Ctrl/⌘ + 0–6 snap the camera to a named orthographic view (slicer
-   *  convention): 0 default ISO, 1 top, 2 bottom, 3 front, 4 behind, 5 left,
-   *  6 right. */
+  /** Camera keys (slicer convention): plain 1–6 snap to top / bottom / front /
+   *  behind / left / right, plain F fits the part into the current viewport;
+   *  Ctrl/⌘ + 0–6 also work (0 = default ISO — kept off the plain layer so a
+   *  stray 0 doesn't yank the camera). */
   private onViewKey = (ev: KeyboardEvent) => {
-    if ((!ev.ctrlKey && !ev.metaKey) || ev.altKey || ev.shiftKey) return;
-    // Don't hijack the digit while typing in a field (e.g. legend bound editor).
+    if (ev.altKey || ev.shiftKey) return;
+    // Don't hijack keys while typing in a field (e.g. legend bound editor).
     const t = ev.target as HTMLElement | null;
     if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
+    const mod = ev.ctrlKey || ev.metaKey;
+    if (!mod && (ev.key === "f" || ev.key === "F")) {
+      ev.preventDefault();
+      this.fitView();
+      return;
+    }
     const view = VIEW_KEYS[ev.key];
-    if (!view) return;
+    if (!view || (!mod && ev.key === "0")) return;
     ev.preventDefault();
     this.setCameraView(view);
   };
@@ -1579,6 +1651,7 @@ export class SceneManager {
     edgeDisp: Float32Array | null
   ) {
     this.results.setVoxelResult(positions, disp, edges, edgeDisp);
+    if (this.sectionGizmo.exists()) this.rebuildCapGroups(); // new voxRes geometry
     this.refreshClipping();
     this.refreshView();
   }
@@ -1910,10 +1983,22 @@ export class SceneManager {
    *  `signed` centers the color scale on 0 (signed von Mises: blue =
    *  compression, green ≈ unloaded, red = tension) — must match the store's
    *  symmetric `fieldRange` so the legend agrees with the surface. */
-  setScalarField(values: Float32Array | null, flip = false, signed = false) {
+  setScalarField(
+    values: Float32Array | null,
+    flip = false,
+    signed = false,
+    range: { min: number; max: number } | null = null
+  ) {
     this.callouts.clearCallouts(); // values belong to the previous field
-    this.colorMgr.setScalarField(values, flip, signed);
+    this.colorMgr.setScalarField(values, flip, signed, range);
     this.refreshView();
+  }
+
+  /** Volumetric payload for the field-mapped section cap (null clears — the
+   *  cap falls back to its plain cut color). */
+  setSectionVolume(data: SectionVolume | null) {
+    this.sectionField.setVolume(data);
+    this.syncCapField();
   }
 
   /** Clamp the color scale to a user range (null = auto). */
@@ -1950,14 +2035,30 @@ export class SceneManager {
   }
 
   setSectionAxis(axis: "x" | "y" | "z") {
-    const n =
-      axis === "x"
-        ? new THREE.Vector3(1, 0, 0)
-        : axis === "y"
-          ? new THREE.Vector3(0, 1, 0)
-          : new THREE.Vector3(0, 0, 1);
-    this.sectionGizmo.proxy.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), n);
+    this.sectionGizmo.proxy.quaternion.setFromUnitVectors(
+      new THREE.Vector3(0, 0, 1),
+      this.sectionNormalTowardCut(axis)
+    );
     this.sectionGizmo.sync();
+  }
+
+  /** Axis-aligned section normal SIGNED so the camera sits on the clipped
+   *  side — the cut always opens toward the viewer instead of hiding on the
+   *  part's far side. No `axis`: the dominant axis of the view direction
+   *  (initial plane on activation). Clipping keeps n·p + c ≥ 0, so "camera
+   *  clipped" means the normal points WITH the view direction. */
+  private sectionNormalTowardCut(axis?: "x" | "y" | "z"): THREE.Vector3 {
+    const dir = this.partCenter().sub(this.camera.position); // view direction
+    const a =
+      axis ??
+      (Math.abs(dir.x) >= Math.abs(dir.y) && Math.abs(dir.x) >= Math.abs(dir.z)
+        ? "x"
+        : Math.abs(dir.y) >= Math.abs(dir.z)
+          ? "y"
+          : "z");
+    const n = new THREE.Vector3(a === "x" ? 1 : 0, a === "y" ? 1 : 0, a === "z" ? 1 : 0);
+    if (n.dot(dir) < 0) n.negate();
+    return n;
   }
 
   // ---------- symmetry plane (optimizer constraint) ----------
@@ -2012,10 +2113,14 @@ export class SceneManager {
 
   private ensureSectionObjects() {
     if (!this.sectionGizmo.exists()) {
-      this.sectionGizmo.proxy.position.copy(this.controls.target);
+      // Through the PART's center — the orbit target may be panned anywhere,
+      // and the part re-centers/rotates on import and orientation changes.
+      // Normal along the dominant view axis, opening the cut TOWARD the
+      // camera (the near half is the clipped one).
+      this.sectionGizmo.proxy.position.copy(this.partCenter());
       this.sectionGizmo.proxy.quaternion.setFromUnitVectors(
         new THREE.Vector3(0, 0, 1),
-        new THREE.Vector3(1, 0, 0)
+        this.sectionNormalTowardCut()
       );
       this.sectionGizmo.ensure();
       this.sectionGizmo.sync();
@@ -2027,7 +2132,7 @@ export class SceneManager {
    *  re-derived from the proxy; keep the stencil caps on it and notify. */
   private onSectionChanged() {
     // Caps lie exactly on the plane.
-    for (const group of [this.capPart, this.capVoxel]) {
+    for (const group of [this.capPart, this.capVoxel, this.capVoxRes]) {
       const cap = group[2] as THREE.Mesh | undefined;
       if (cap) {
         cap.position.copy(this.sectionGizmo.proxy.position);
@@ -2081,6 +2186,9 @@ export class SceneManager {
       color,
       metalness: 0.05,
       roughness: 0.8,
+      // The cut is looked at from the REMOVED side — the quad backfaces the
+      // viewer there, so it must render double-sided or it culls away.
+      side: THREE.DoubleSide,
       stencilWrite: true,
       stencilRef: 0,
       stencilFunc: THREE.NotEqualStencilFunc,
@@ -2090,6 +2198,9 @@ export class SceneManager {
     });
     this.capDisposables.push(capGeo, capMat);
     const cap = new THREE.Mesh(capGeo, capMat);
+    // Result views swap in the field-mapped cap material (syncCapField);
+    // keep the plain one around to swap back.
+    cap.userData.plainMat = capMat;
     cap.renderOrder = order + 0.1;
     cap.onAfterRender = (renderer) => renderer.clearStencil();
     cap.position.copy(this.sectionGizmo.proxy.position);
@@ -2099,24 +2210,32 @@ export class SceneManager {
     return group;
   }
 
-  /** (Re)create cap groups for the part mesh and the voxel hull. */
+  /** (Re)create cap groups for the part mesh, the voxel hull, and the
+   *  voxel-result surface. */
   private rebuildCapGroups() {
     if (!this.sectionGizmo.exists()) return; // section never enabled yet
-    for (const o of [...this.capPart, ...this.capVoxel]) this.scene.remove(o);
+    for (const o of [...this.capPart, ...this.capVoxel, ...this.capVoxRes]) this.scene.remove(o);
     for (const d of this.capDisposables) d.dispose();
     this.capPart = [];
     this.capVoxel = [];
+    this.capVoxRes = [];
     this.capDisposables = [];
     if (this.geometry) {
-      this.capPart = this.makeCapGroup(this.geometry, 0x76808c, 1);
+      this.capPart = this.makeCapGroup(this.geometry, CUT_FACE_COLOR, 1);
     }
     const hull = this.results.voxelGroup.children.find(
       (c): c is THREE.Mesh => c instanceof THREE.Mesh
     );
     if (hull) {
-      this.capVoxel = this.makeCapGroup(hull.geometry as THREE.BufferGeometry, 0x5f6c7b, 3);
+      this.capVoxel = this.makeCapGroup(hull.geometry as THREE.BufferGeometry, CUT_FACE_COLOR, 3);
+    }
+    // The voxel-result geometry is displaced in place, so its stencil meshes
+    // track the deformed shape automatically.
+    if (this.results.voxRes) {
+      this.capVoxRes = this.makeCapGroup(this.results.voxRes.geo, CUT_FACE_COLOR, 5);
     }
     this.updateSectionVisibility();
+    this.syncCapField();
   }
 
   /** Push/remove the clipping plane on every content material. */
@@ -2161,6 +2280,36 @@ export class SceneManager {
     for (const o of this.capPart) o.visible = partCap;
     const voxCap = this.sectionOn && this.results.voxelGroup.visible && !this.voxelCutActive;
     for (const o of this.capVoxel) o.visible = voxCap;
+    const voxResCap = this.sectionOn && !!this.results.voxRes?.group.visible;
+    for (const o of this.capVoxRes) o.visible = voxResCap;
+  }
+
+  /** Swap the cap quads between the plain cut color and the field-mapped
+   *  material (result views with a loaded volume), and sync the shader's
+   *  color scale to the EXACT normalization the surface coloring used. */
+  private syncCapField() {
+    const useField = this.sectionField.active && this.viewMode === "deformed";
+    for (const group of [this.capPart, this.capVoxRes]) {
+      const cap = group[2] as THREE.Mesh | undefined;
+      if (!cap) continue;
+      const want = useField
+        ? this.sectionField.material
+        : (cap.userData.plainMat as THREE.Material);
+      if (cap.material !== want) cap.material = want;
+    }
+    const r = this.colorMgr.appliedRange;
+    if (useField && r) {
+      this.sectionField.setRange(r.lo, r.hi, r.flip, this.colorMgr.dispComponentValue);
+    }
+    // Third extreme marker: the volumetric (interior) extreme rides the same
+    // payload — shown by the CalloutManager only when it beats the surface.
+    const vol = this.sectionField.range;
+    const sf = this.colorMgr.scalarFieldData;
+    this.callouts.setInteriorExtreme(
+      vol && sf
+        ? { flip: sf.flip, min: vol.min, max: vol.max, minAt: vol.minAt, maxAt: vol.maxAt }
+        : null
+    );
   }
 
   /** Re-derive positions, colors, part opacity, and overlay visibility. */
@@ -2220,6 +2369,7 @@ export class SceneManager {
     this.refreshClipping(); // mesh view exempts the ghost STL from the cut
     this.results.applyPositions();
     this.colorMgr.applyColors();
+    this.syncCapField(); // cap follows the range applyColors just used
   }
 
   /** Set discrete contour banding + the band count. Rewrites the SHARED jet LUT

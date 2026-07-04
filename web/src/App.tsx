@@ -17,6 +17,7 @@ import { Disclaimer } from "./ui/Disclaimer";
 import { SupportBanner } from "./ui/SupportBanner";
 import { SupportModal } from "./ui/SupportModal";
 import { NerdLog } from "./ui/NerdLog";
+import { TitleTipLayer } from "./ui/HelpTip";
 import { Viewer } from "./viewer/Viewer";
 import { useStore } from "./store";
 import { engine } from "./engine/EngineClient";
@@ -73,6 +74,7 @@ export function App() {
       <ImprintModal />
       <SupportModal />
       <Disclaimer />
+      <TitleTipLayer />
     </div>
   );
 }

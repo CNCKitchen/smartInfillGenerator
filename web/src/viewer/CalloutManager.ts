@@ -48,8 +48,23 @@ export interface CalloutHost {
   /** Geometry + displacement buffer of the surface carrying the extremes
    *  (voxel-result hull when active, else the part mesh). */
   resultGeometry(): { geom: THREE.BufferGeometry | null; disp: Float32Array | null };
+  /** DISPLAYED world position of an interior rest-space point (rest +
+   *  exaggeration·u, from the volumetric section payload). False = no volume
+   *  loaded → the interior marker hides. */
+  interiorDisplayedPos(rest: [number, number, number], out: THREE.Vector3): boolean;
   /** A line for the nerd log (e.g. a placed value callout). */
   onLog(msg: string): void;
+}
+
+/** Interior (solid-cell) field extremes from the volumetric section payload —
+ *  candidate for the third marker. `flip` = inverted colormap (safety factor:
+ *  the critical extreme is the MIN). */
+export interface InteriorExtreme {
+  flip: boolean;
+  min: number;
+  max: number;
+  minAt: [number, number, number];
+  maxAt: [number, number, number];
 }
 
 export class CalloutManager {
@@ -78,9 +93,15 @@ export class CalloutManager {
     minChip: HTMLDivElement;
     maxDot: HTMLDivElement;
     maxChip: HTMLDivElement;
+    intDot: HTMLDivElement;
+    intChip: HTMLDivElement;
   } | null = null;
-  private extremeWorld = { min: new THREE.Vector3(), max: new THREE.Vector3() };
+  private extremeWorld = { min: new THREE.Vector3(), max: new THREE.Vector3(), int: new THREE.Vector3() };
   private extremeVisible = false;
+  private interiorVisible = false;
+  /** Interior extreme candidate (volumetric payload); marker shows only when
+   *  it BEATS the surface extreme (higher max / lower SF min). */
+  private interior: InteriorExtreme | null = null;
   private extremeScratch = new THREE.Vector3();
 
   constructor(private readonly host: CalloutHost) {}
@@ -92,7 +113,7 @@ export class CalloutManager {
     this.parent = parent;
     // Min/max marks: a small colored dot at the extreme point + a probe-style
     // value chip beside it, both placed every frame from the 3D location.
-    const mk = (kind: "min" | "max") => {
+    const mk = (kind: "min" | "max" | "interior") => {
       const dot = document.createElement("div");
       dot.className = `extreme-dot ${kind}`;
       const chip = document.createElement("div");
@@ -103,11 +124,14 @@ export class CalloutManager {
     };
     const lo = mk("min");
     const hi = mk("max");
+    const int = mk("interior");
     this.extremeEls = {
       minDot: lo.dot,
       minChip: lo.chip,
       maxDot: hi.dot,
       maxChip: hi.chip,
+      intDot: int.dot,
+      intChip: int.chip,
     };
 
     // Fixed value callouts: a leader-line SVG layer (behind the chips) and a
@@ -399,6 +423,13 @@ export class CalloutManager {
     this.updateExtremeMarkers();
   }
 
+  /** Interior extreme candidate (null = no volumetric payload). The marker
+   *  itself only shows when the interior value beats the surface extreme. */
+  setInteriorExtreme(interior: InteriorExtreme | null) {
+    this.interior = interior;
+    this.updateExtremeMarkers();
+  }
+
   private fmtExtreme(v: number): string {
     // `extremesUnit` is the field's canonical unit tag ("mm" | "MPa" | "×" | "")
     // from the store; route through the display-unit registry so markers match
@@ -430,9 +461,27 @@ export class CalloutManager {
     const d = this.extremeData;
     this.extremeWorld.min.set(pos[3 * d.minIdx], pos[3 * d.minIdx + 1], pos[3 * d.minIdx + 2]);
     this.extremeWorld.max.set(pos[3 * d.maxIdx], pos[3 * d.maxIdx + 1], pos[3 * d.maxIdx + 2]);
+    // Third marker: the volumetric (interior) extreme, only when it BEATS the
+    // surface by a margin (same 2% as the log advisory — a near-tie would just
+    // duplicate the surface marker) — the true critical value then sits inside
+    // the part (typically at the perimeter/infill interface). SF fields flip:
+    // their critical extreme is the MIN.
+    const int = this.interior;
+    // Additive margin from the field's magnitude (multiplicative would invert
+    // for signed fields whose extreme is negative).
+    const eps = 0.02 * Math.max(Math.abs(d.minVal), Math.abs(d.maxVal));
+    const beats = int && (int.flip ? int.min < d.minVal - eps : int.max > d.maxVal + eps);
+    this.interiorVisible = !!(
+      beats && this.host.interiorDisplayedPos(int!.flip ? int!.minAt : int!.maxAt, this.extremeWorld.int)
+    );
     if (!positionsOnly) {
       els.minChip.textContent = `min ${this.fmtExtreme(d.minVal)}`;
       els.maxChip.textContent = `max ${this.fmtExtreme(d.maxVal)}`;
+      if (int) {
+        els.intChip.textContent = int.flip
+          ? `min (interior) ${this.fmtExtreme(int.min)}`
+          : `max (interior) ${this.fmtExtreme(int.max)}`;
+      }
     }
   }
 
@@ -442,13 +491,18 @@ export class CalloutManager {
     const els = this.extremeEls;
     if (!els) return;
     if (!this.extremeVisible) {
-      for (const el of [els.minDot, els.minChip, els.maxDot, els.maxChip]) {
+      for (const el of [els.minDot, els.minChip, els.maxDot, els.maxChip, els.intDot, els.intChip]) {
         el.style.display = "none";
       }
       return;
     }
     this.placeExtreme(els.minDot, els.minChip, this.extremeWorld.min);
     this.placeExtreme(els.maxDot, els.maxChip, this.extremeWorld.max);
+    if (this.interiorVisible) {
+      this.placeExtreme(els.intDot, els.intChip, this.extremeWorld.int);
+    } else {
+      els.intDot.style.display = els.intChip.style.display = "none";
+    }
   }
 
   private placeExtreme(dot: HTMLDivElement, chip: HTMLDivElement, world: THREE.Vector3) {

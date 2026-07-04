@@ -4,7 +4,7 @@
 // Support banner — same call-to-action as bumpmesh.com. A dismissible pill
 // floated at the bottom-center of the viewport (clear of the section/wireframe
 // chips on the left and the axis gizmo on the right). Dismissal is remembered
-// in localStorage so it stays gone across sessions.
+// in sessionStorage so it stays gone for the current tab but returns next visit.
 
 import { useState } from "react";
 
@@ -13,7 +13,10 @@ const KEY = "filasim.supportBanner.dismissed";
 export function SupportBanner() {
   const [hidden, setHidden] = useState(() => {
     try {
-      return localStorage.getItem(KEY) === "1";
+      // Older builds persisted the dismissal in localStorage; drop that so the
+      // banner reappears for users who dismissed it back then.
+      localStorage.removeItem(KEY);
+      return sessionStorage.getItem(KEY) === "1";
     } catch {
       return false;
     }
@@ -21,9 +24,9 @@ export function SupportBanner() {
   if (hidden) return null;
   const dismiss = () => {
     try {
-      localStorage.setItem(KEY, "1");
+      sessionStorage.setItem(KEY, "1");
     } catch {
-      /* private mode — just hide for this session */
+      /* private mode — just hide via state */
     }
     setHidden(true);
   };

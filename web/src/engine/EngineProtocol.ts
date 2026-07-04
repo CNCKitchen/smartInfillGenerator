@@ -96,6 +96,7 @@ export interface EngineRequests {
   inherentStrainVoxels: { layerMax: number; shrinkXy: number; shrinkZ: number };
   voxelResults: Empty;
   voxelResultField: { kind: string };
+  sectionVolume: { kind: string };
   stashResult: { resultId: string };
   activateResult: { resultId: string };
   clearResults: Empty;
@@ -121,9 +122,11 @@ export interface EngineRequests {
 
 export type Op = keyof EngineRequests;
 
-/** Loaded-model payload as the worker actually builds it: `LoadedModel`
- *  plus the mesh-object count (UI warns when > 1). */
-export type LoadedModelData = LoadedModel & { meshObjects: number };
+/** Loaded-model payload as the worker actually builds it: `LoadedModel` plus
+ *  the mesh-object count (3MF only analyzes the largest object; UI warns when
+ *  > 1) and the disconnected-body count (the solver can't join separate
+ *  bodies; UI warns when > 1). */
+export type LoadedModelData = LoadedModel & { meshObjects: number; bodyCount: number };
 
 /** Patch segmentation update (resegment / useCadFaces). */
 export interface PatchUpdate {
@@ -135,6 +138,29 @@ export interface PatchUpdate {
 export interface SolveResult<S = SolveStats> {
   stats: S;
   displacements: Float32Array;
+}
+
+/** Volumetric section payload for the capped section view: the recovered
+ *  nodal scalar over the FULL solution grid (gap-filled — safe to sample
+ *  anywhere inside the part), the padded nodal displacements (the cap
+ *  shader un-deforms its sample point with them), the grid layout, and the
+ *  interior (solid-cell) extremes with their locations. `values` is empty
+ *  and `range` null for displacement kinds — the shader derives those from
+ *  `disp` directly. */
+export interface SectionVolume {
+  values: Float32Array;
+  disp: Float32Array;
+  /** Node counts per axis (nx+1, ny+1, nz+1). */
+  dims: [number, number, number];
+  /** Grid origin (mm); node i sits at origin + i·h. */
+  origin: [number, number, number];
+  h: number;
+  range: {
+    min: number;
+    max: number;
+    minAt: [number, number, number];
+    maxAt: [number, number, number];
+  } | null;
 }
 
 /** Response `data` per op (`void` = the generic `{ id, ok: true }` ack). */
@@ -186,6 +212,7 @@ export interface EngineResponses {
     edgeDisplacements: Float32Array;
   };
   voxelResultField: Float32Array;
+  sectionVolume: SectionVolume;
   stashResult: void;
   activateResult: Float32Array;
   clearResults: void;
