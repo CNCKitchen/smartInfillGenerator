@@ -684,3 +684,88 @@ solid volume, and bbox as QUALITY; time / Mcells·s⁻¹ as INFO.
 Solve **speed** is guarded by INFO metrics only (iteration counts, modal
 V-cycles — deterministic — plus wall-clock): the human reads the deltas before
 pushing; no hard time budget (machine/thread noise would make it flaky).
+
+## 15. Validate Orientation — pitch/roll layer-adhesion sweep (interview 2026-07-05)
+
+**Problem.** Print orientation decides where the layer planes lie, and layer adhesion is the
+weakest direction — but the tool only evaluates the orientation the model happens to be in
+(`sfz` against hard-coded +Z, lib.rs:2816). The user wants to find the *strongest* orientation:
+sweep pitch/roll, score each by the worst layer-adhesion safety factor, show the whole landscape
+as a heatmap, click any point to preview that orientation live, and commit the best one.
+(Inspiration: Ansys SpaceClaim's orientation map — but ours is physics-per-pixel, not heuristics.)
+
+**Key insight (kills the obvious cost).** The structural solve is **isotropic** (fem.rs:36) and
+loads/constraints rotate with the part, so the stress field in the part's frame is
+orientation-independent. Only the failure criterion depends on the build direction **n**.
+Therefore: **solve ONCE, keep the full per-cell stress tensor (all 6 components already exposed,
+stress.rs:18), and per orientation just project the traction on the layer plane** —
+σₙₙ = n·σ·n and shear τₙ = |σ·n − σₙₙ n|. The 37×37 heatmap costs one solve plus a trivially
+parallel tensor projection, not 1,369 re-solves. This also makes the criterion flip-symmetric
+(quadratic in n), so a hemisphere of orientations is the complete domain.
+
+| # | Topic | Decision |
+|---|-------|----------|
+| 1 | Failure criterion | **Combined normal-tension + shear interaction** on the layer plane: `(⟨σₙₙ⟩₊/Sᵗᶻ)² + (τₙ/Sˢᶻ)² ≤ 1/SF²`. Tension-only normal traction (compression never counts against adhesion — matches existing `sfz` semantics). New material-card property **`shear_strength_z` (Sˢᶻ)**, **default 0.6 · strength_z** until Stefan's shear test data lands; additive in PROJECT_SCHEMA = 1. At n = ẑ with τ ignored this reduces to today's `sfz`. |
+| 2 | Which design is scored | **The currently solved design** — the stress field of the currently selected result (uniform or optimized), so the heatmap always agrees with the viewport. NO per-orientation re-optimization (the self-support cone makes the design orientation-dependent — that's the post-Apply optimizer run, and the map marks itself stale after it). Hence the feature name: **"Validate Orientation"**, a decision aid on the design you have, not a global optimum claim. |
+| 3 | BC masking | Peaks at rigid constraints are mesh-divergent singularities; at loads they are real-ish (distributed tractions). **Mask a fixed ring (2–3 cells, graph distance) around constraint node sets only — never around force/pressure regions.** The per-BC node lists already exist (attach.rs:88). Masked cells are **greyed/ghosted in the viewport** while the panel is open, and the readout reports BOTH masked min-SF (drives the heatmap color) and unmasked min — nothing is silently hidden. Same mask everywhere (heatmap scoring + readout). |
+| 4 | Heatmap domain | **Square pitch × roll, each ±90°**, n = Rx(pitch)·Ry(roll)·ẑ — covers the hemisphere exactly once; (0°,0°) = current orientation. Yaw is irrelevant (rotation about ẑ changes neither layers nor overhangs). **Dense 5° sweep (37×37 = 1,369 samples) with a progress bar**; progressive 15°→5° refinement + principal-stress cell pruning are the fallback if too slow at ~1M cells. |
+| 5 | Score per pixel | Per cell per **load step** evaluate the criterion, **min across steps** (envelope semantics — a step's delamination is fatal regardless of optimizer weight), then min across unmasked cells. **Heatmap colors by layer-adhesion SF only** — the material (von Mises) SF is orientation-independent and would only flatten the map into a plateau; the selected-pixel readout shows all three (layer / material / overall SF). |
+| 6 | Preview vs Apply | **Clicking a pixel is always preview-only**: display-side rotation (build direction up, plate under z-min) + recolor with that n's per-cell layer SF; engine state untouched; closing the panel restores the view. Explicit **"Apply orientation"** commits: `transform()` (drops grid/solution/results, lib.rs:1045) → re-voxelize → auto re-solve → re-run the sweep so the map re-centers at the new (0°,0°). Readout shows **predicted vs re-solved** min layer SF so voxelization drift (stair-step realignment) is visible, not discovered. BC selections are index-based and survive the transform. Plate seating is display-only (no gravity in the solve). |
+| 7 | UI placement | **Inside station 5 · Optimize** as a collapsible "Validate orientation" section (NOT a new rail step, NOT in results — needs a solve, and the check→apply→re-optimize loop lives in Optimize anyway). Heatmap gets a flyout/expanded view; crosshair at (0,0), marker on the global best; Werkbank styling. |
+| 8 | Support volume (later) | Second metric in the SAME panel as a toggle/tab when it lands. It is NOT flip-symmetric, so its domain extends **roll to ±180°** (2:1 rectangle; the SF layer simply repeats in the outer half). Needs new overhang-face detection + support-volume estimation (selfsupport.rs is an optimizer density filter, not a detector). |
+
+**V1 exclusions.** Support volume (dec. 8), yaw, gravity/self-weight, per-orientation
+re-optimization, anisotropic *stiffness* (solve stays isotropic; only the failure criterion is
+directional), progressive refinement (dec. 4 fallback), user-tunable mask radius.
+
+**Build order** (each gated by regbench + wasm smoke test): **(1)** material card + criterion ✅
+DONE (2026-07-05) — `shear_strength_z` (default 0.6·Sᵗᶻ derived at use time; optional τᶻ column in
+the material card, blank = auto), `sfz`/`sf` cell values are the interaction criterion at n = ẑ;
+wasm `set_material` gained an optional 6th arg (old callers keep working); theory manual §4.7
+updated. **(2)** sweep kernel ✅ DONE (2026-07-05) — `filasim-core/src/orient.rs`: fused
+6-component tensor pass, closed-form principal-stress prune (drop cells whose best-possible SF
+stays ≥ cap at every n), 26-neighbor constraint-ring mask (`RING_DILATIONS = 2` + node seeding ≈
+3 cells; Fixed/Frictionless/Displacement only — loads and the compliant Elastic foundation stay
+scored), pixel-parallel sweep returning (scored, all) per pixel; 6 unit tests (hand-calc uniaxial /
+shear / compression, flip symmetry, prune bound). wasm API `orientation_sweep_begin(ids, stepDeg)`
+(ids = result-stash ids to fold worst-case, [] = current solution; returns meta JSON) →
+`orientation_sweep_rows(start, count)` (chunked so the worker posts progress between calls) →
+`orientation_sweep_end()`. Smoke: grid dims/cap/symmetry, center pixel ≤ min sfz, cantilever
+physics anchor (layers ⊥ X worse than flat), multi-step fold = elementwise min of per-step sweeps.
+**(3)** panel UI ✅ DONE (2026-07-05) — collapsible "Validate orientation" section in station
+5 · Optimize (`web/src/ui/ValidateOrientation.tsx`): jet-flipped canvas heatmap (matches the SF
+legend exactly — same colormap function), ＋ current / ◎ best / ◉ selection markers, chunked
+`orientationSweep` worker op with determinate progress bar (buildSim pattern), readout rows
+(scored + all-cells layer SF at the pixel, orientation-independent material floor via
+`materialSfMin` in the begin meta, best orientation, "material governs" hint). Click-to-preview:
+`layerSfField(dir, ids)` recolors via the scalar-field path (smoke-anchored: at n = ẑ it equals
+the `sfz` field elementwise) + `SceneManager.setOrientationPreview` rotates part/wireframe/BC
+markers/result groups about the part center, display-only; preview cleared on
+invalidation (`clearEnvelopeCache` + in-flight-sweep token) or Exit preview (full restore via
+re-activating the result). UX revisions after Stefan's first test (2026-07-05): section renamed
+**"Optimize orientation"**, always visible (not collapsed); axes are user-facing **rotation X /
+rotation Y** (= pitch/roll internally); sweep completion lands directly in the preview at the
+current orientation — part UNDEFORMED (zero-displacement push, envelope-style), STL surface
+forced, and `resultField` switched to `sfz` so the legend says "Safety factor — layer adhesion"
+instead of the previous field's label; Best / Current jump buttons; rotation X/Y NumInputs
+stepping 5° (snap to grid); heatmap supports DRAG (pointer capture) with trailing-edge coalescing
+of `layerSfField` fetches (one in flight, latest wins — the worker never floods); Best = the
+HIGHEST worst-case layer SF (max of the per-pixel minima); the map is DELETED whenever inputs
+change (`markResultsStale` — loads/material/print epochs — calls `clearOrientationSweep`, which
+also orphans an in-flight sweep); **"Include interlayer shear (τᶻ)" checkbox** — one engine flag
+(`set_layer_shear`, off ⇒ effective shear allowable = ∞) so the sfz/sf fields, the sweep and the
+preview all reduce to pure cross-layer tension identically (smoke: shear off ⇒ sfz never more
+critical); session setting, survives model reload/project restore, never invalidates the
+solution. Round 4 (2026-07-05, after voxel-mode testing): preview NULLS the volumetric section
+field on entry (the stale cap was probed in the old result's units under the SF formatter —
+"−10.85×" was really −10.85 MPa; envelope had the same discipline) and no longer forces the STL
+surface; **voxel display supported** via `layer_sf_voxel_field` (per-cell crisp, owning-cell
+value per hull vertex) with **constraint-ring cells returned as NaN and painted flat grey** —
+the shared LUTs are now 256×2 (row 0 colormap at uv.y 0.25, row 1 neutral grey at 0.75 for
+non-finite values; section-cap shader, density uv writers and `setBanded` updated to address
+row 0 explicitly; extremes tracker already skips NaN). The greyed-mask deferral from (3) is
+thereby DONE for the voxel surface; the smoothed STL surface stays unmasked by design (nodal
+recovery would smear NaN). Deferred to (4): GREYED mask cells in the viewport (needs a viewer feature; the panel's
+scored-vs-all numbers carry the honesty meanwhile) and plate seating in the preview pose.
+**(4)** Apply flow ← NEXT — transform + auto re-solve + re-sweep + predicted-vs-actual readout,
+greyed mask cells, preview plate seating.

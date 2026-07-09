@@ -642,6 +642,17 @@ pub struct Model {
     /// Layer-adhesion strength (MPa): tension PERPENDICULAR to the layers
     /// (σzz, build direction Z-up). Drives the conservative SF variants.
     strength_z: f64,
+    /// Interlayer SHEAR strength (MPa): sliding ALONG the layer plane
+    /// (τ = √(σyz²+σzx²), build direction Z-up). None = no measured value,
+    /// fall back to 0.6·strength_z (DESIGN §15). Second axis of the layer
+    /// failure criterion next to `strength_z`.
+    shear_strength_z: Option<f64>,
+    /// Include the shear term in the layer criterion (DESIGN §15 dec. 1).
+    /// Off ⇒ the effective shear allowable is infinite, so `sfz`, the
+    /// orientation sweep and the preview field all reduce to the pure
+    /// tension-across-layers criterion in one place. Display-side derived —
+    /// toggling never invalidates the solution.
+    layer_shear_on: bool,
     gravity_on: bool,
     target_cells: u32,
     /// Custom mode: pin the cell size to this exact value (mm) instead of
@@ -713,6 +724,20 @@ pub struct Model {
     /// replaying this one matrix reproduces the exact oriented working mesh
     /// (and thus the load/support triangle indices). Identity at import.
     transform_accum: [f64; 12],
+    /// Live orientation sweep (DESIGN §15): compact stress tensors + the
+    /// pitch/roll grid, built by `orientation_sweep_begin` and consumed
+    /// row-chunk by row-chunk by `orientation_sweep_rows` (so the worker can
+    /// post progress between calls). Owns copies — never dangles — but goes
+    /// stale with the results it was built from; the frontend runs
+    /// begin→rows→end as one operation. Dropped on `transform`.
+    sweep: Option<SweepCtx>,
+}
+
+/// See [`Model::sweep`]. Pixel layout (n per axis, roll fastest) is reported
+/// by `orientation_sweep_begin`'s meta JSON; here only the flat dir list.
+struct SweepCtx {
+    field: filasim_core::orient::SweepField,
+    dirs: Vec<[f32; 3]>,
 }
 
 /// One stashed solution for the result switcher: the displacement field and the
@@ -950,6 +975,8 @@ impl Model {
             density: 1.24e-9,  // PLA
             strength: 50.0,    // PLA tensile, MPa
             strength_z: 35.0,  // PLA layer adhesion, MPa
+            shear_strength_z: None, // derived 0.6·strength_z until measured
+            layer_shear_on: true,
             gravity_on: false,
             target_cells: 300_000,
             fixed_h: None,
@@ -967,6 +994,7 @@ impl Model {
             build_bonded: None,
             build_released: None,
             build_peel: None,
+            sweep: None,
             build_grid: None,
             build_eps: None,
             build_eigen: [0.0; 3],
@@ -1048,6 +1076,7 @@ impl Model {
         self.solution_eps = None;
         self.opt = None;
         self.results.clear(); // geometry moved — stashed results no longer align
+        self.sweep = None;
         Ok(())
     }
 
@@ -1086,7 +1115,8 @@ impl Model {
     }
 
     /// e0 in MPa, density in g/cm³, strengths in MPa (in-layer tensile and
-    /// layer-adhesion / cross-layer).
+    /// layer-adhesion / cross-layer). `shear_strength_z_mpa` is the interlayer
+    /// SHEAR strength; pass undefined/None to derive it as 0.6·strength_z.
     pub fn set_material(
         &mut self,
         e0: f64,
@@ -1094,14 +1124,33 @@ impl Model {
         density_g_cm3: f64,
         strength_mpa: f64,
         strength_z_mpa: f64,
+        shear_strength_z_mpa: Option<f64>,
     ) {
         self.settings.e0 = e0;
         self.settings.nu = nu;
         self.density = density_g_cm3 * 1e-9;
         self.strength = strength_mpa.max(0.1);
         self.strength_z = strength_z_mpa.max(0.1);
+        self.shear_strength_z = shear_strength_z_mpa.map(|v| v.max(0.1));
         self.solution = None;
         self.opt = None;
+    }
+
+    /// Effective interlayer shear strength (MPa): the measured value if set,
+    /// else the DESIGN §15 default 0.6·strength_z. INFINITE when the shear
+    /// term is toggled off — every consumer's τ term vanishes identically.
+    fn shear_strength_z_eff(&self) -> f64 {
+        if !self.layer_shear_on {
+            return f64::INFINITY;
+        }
+        self.shear_strength_z.unwrap_or(0.6 * self.strength_z)
+    }
+
+    /// Toggle the shear term of the layer criterion (display-side derived —
+    /// affects `sfz`/`sf` fields, the orientation sweep and its preview; the
+    /// solution stays valid).
+    pub fn set_layer_shear(&mut self, on: bool) {
+        self.layer_shear_on = on;
     }
 
     pub fn set_gravity(&mut self, on: bool) {
@@ -2800,9 +2849,10 @@ impl Model {
         // Safety factors: allowable = strength × the SAME relative factor as
         // the stiffness (Gibson–Ashby, first order; the skin carries full
         // strength). "sfm" checks the material against σ_vM; "sfz" checks
-        // layer adhesion against TENSION across the layers (σzz > 0 only —
-        // compression doesn't delaminate); "sf" is the per-cell worst of
-        // both. All capped at SF_CAP.
+        // layer adhesion via the DESIGN §15 interaction of tension across the
+        // layers (σzz > 0 only — compression doesn't delaminate) and shear
+        // along the layer plane: (⟨σzz⟩₊/Sᵗᶻ)² + (τ/Sˢᶻ)² = 1/SF²;
+        // "sf" is the per-cell worst of both. All capped at SF_CAP.
         let sf_material = || -> Vec<f32> {
             let mut c = cell_field_eigen(
                 grid, &sol.u, self.settings.e0, self.settings.nu, factor, eigen, FieldKind::VonMises,
@@ -2814,12 +2864,21 @@ impl Model {
             c
         };
         let sf_layer = || -> Result<Vec<f32>, JsValue> {
-            let szz = FieldKind::parse("szz").ok_or_else(|| err("szz field missing"))?;
-            let mut c =
-                cell_field_eigen(grid, &sol.u, self.settings.e0, self.settings.nu, factor, eigen, szz);
-            for (i, v) in c.iter_mut().enumerate() {
-                let allow = self.strength_z as f32 * factor[i];
-                *v = if *v <= 1e-9 { SF_CAP } else { (allow / *v).min(SF_CAP) };
+            let field = |name: &str| -> Result<Vec<f32>, JsValue> {
+                let k = FieldKind::parse(name).ok_or_else(|| err("stress field missing"))?;
+                Ok(cell_field_eigen(grid, &sol.u, self.settings.e0, self.settings.nu, factor, eigen, k))
+            };
+            let mut c = field("szz")?;
+            let tyz = field("syz")?;
+            let tzx = field("szx")?;
+            let ss = self.shear_strength_z_eff() as f32;
+            for i in 0..c.len() {
+                let allow_t = (self.strength_z as f32 * factor[i]).max(1e-9);
+                let allow_s = (ss * factor[i]).max(1e-9);
+                let sn = (c[i] / allow_t).max(0.0); // tension only
+                let tau2 = (tyz[i] * tyz[i] + tzx[i] * tzx[i]) / (allow_s * allow_s);
+                let q = sn * sn + tau2;
+                c[i] = if q <= 1e-18 { SF_CAP } else { (1.0 / q.sqrt()).min(SF_CAP) };
             }
             Ok(c)
         };
@@ -2914,6 +2973,254 @@ impl Model {
             out.extend_from_slice(&[v, v, v]);
         }
         Ok(out)
+    }
+
+    /// DESIGN §15 — begin an orientation sweep: build the compact per-cell
+    /// stress-tensor field (one entry per surviving cell across all folded
+    /// results) and the pitch/roll hemisphere grid. `ids` are result-stash ids
+    /// to fold worst-case (multi-load-step); an EMPTY list folds the current
+    /// solution only. Every folded result must live on the current analysis
+    /// grid (structural solves — the build sim is out of scope). The layer
+    /// criterion is the §15 tension+shear interaction against `strength_z` /
+    /// the effective interlayer shear strength; allowables scale with the
+    /// solve's per-cell stiffness factor exactly like the SF plots. A fixed
+    /// ring around rigid-constraint nodes (Fixed / Frictionless /
+    /// Displacement — NOT loads, NOT the compliant Elastic foundation) is
+    /// excluded from the scored value but still reported in the all-cells
+    /// value (§15 dec. 3). Returns JSON
+    /// `{ n, stepDeg, pixels, cellsSeen, cellsKept, scoredCells }`;
+    /// pixel index = i_pitch·n + i_roll, both axes −90°..+90°.
+    /// Resolve the results an orientation sweep folds: stash ids, or the
+    /// current solution for an empty list. Each must live on the current
+    /// analysis grid (structural solves — the build sim is out of scope).
+    /// Returns (solution, eps-with-scale-fallback) pairs.
+    fn sweep_folds(&self, ids: &js_sys::Array) -> Result<Vec<(&Solution, &[f32])>, JsValue> {
+        let (grid, _) = self.grid.as_ref().ok_or_else(|| err("no grid — run Solve first"))?;
+        let dims_ok = |sol: &Solution| {
+            sol.mx == grid.nx + 1 && sol.my == grid.ny + 1 && sol.mz == grid.nz + 1
+        };
+        let mut folds: Vec<(&Solution, &[f32])> = Vec::new();
+        if ids.length() == 0 {
+            let sol = self
+                .solution
+                .as_ref()
+                .ok_or_else(|| err("no solution — run Solve or Optimize"))?;
+            if !dims_ok(sol) {
+                return Err(err("orientation sweep needs a structural result on the analysis grid"));
+            }
+            folds.push((sol, self.solution_eps.as_deref().unwrap_or(grid.scale.as_slice())));
+        } else {
+            for id in ids.iter() {
+                let id =
+                    id.as_string().ok_or_else(|| err("orientation sweep: ids must be strings"))?;
+                let r = self
+                    .results
+                    .get(&id)
+                    .ok_or_else(|| err(&format!("unknown result '{id}'")))?;
+                if !dims_ok(&r.sol) {
+                    return Err(err(&format!("result '{id}' predates the current grid")));
+                }
+                folds.push((&r.sol, r.eps.as_deref().unwrap_or(grid.scale.as_slice())));
+            }
+        }
+        Ok(folds)
+    }
+
+    /// Constraint-ring mask for the current grid + BCs (rigid constraints
+    /// only — see `orientation_sweep_begin`).
+    fn constraint_ring(&self) -> Result<Vec<bool>, JsValue> {
+        use filasim_core::orient;
+        let (grid, _) = self.grid.as_ref().ok_or_else(|| err("no grid"))?;
+        let asm = assemble(&self.mesh, grid, &self.bcs, self.gravity_arg(), &self.settings)
+            .map_err(err)?;
+        let constraint_nodes: Vec<&[u32]> = self
+            .bcs
+            .iter()
+            .zip(&asm.bc_nodes)
+            .filter(|(bc, _)| {
+                matches!(
+                    bc.kind,
+                    BcKind::Fixed | BcKind::Frictionless | BcKind::Displacement(_, _)
+                )
+            })
+            .map(|(_, nodes)| nodes.as_slice())
+            .collect();
+        Ok(orient::constraint_ring_mask(grid, &constraint_nodes))
+    }
+
+    /// Per-CELL layer-adhesion SF for build direction `(a, b, c)`, min-folded
+    /// across the `ids` result set (see `sweep_folds`).
+    fn layer_sf_cells_folded(
+        &self,
+        a: f64,
+        b: f64,
+        c: f64,
+        ids: &js_sys::Array,
+    ) -> Result<Vec<f32>, JsValue> {
+        use filasim_core::orient;
+        let folds = self.sweep_folds(ids)?;
+        let (grid, _) = self.grid.as_ref().ok_or_else(|| err("no grid"))?;
+        let len = (a * a + b * b + c * c).sqrt().max(1e-12);
+        let n_dir = [a / len, b / len, c / len];
+        let strength_s = self.shear_strength_z_eff();
+        let mut cells: Option<Vec<f32>> = None;
+        for (sol, eps) in folds {
+            let f = orient::layer_sf_cells(
+                grid,
+                &sol.u,
+                self.settings.e0,
+                self.settings.nu,
+                eps,
+                [0.0; 3],
+                self.strength_z,
+                strength_s,
+                n_dir,
+                SF_CAP,
+            );
+            cells = Some(match cells {
+                None => f,
+                Some(mut acc) => {
+                    for (av, fv) in acc.iter_mut().zip(&f) {
+                        *av = av.min(*fv);
+                    }
+                    acc
+                }
+            });
+        }
+        Ok(cells.unwrap())
+    }
+
+    /// Per-vertex layer-adhesion SF for ONE build direction `n = (a, b, c)` —
+    /// the preview recolor when a heatmap pixel is clicked. Folds the same
+    /// result set as `orientation_sweep_begin` (elementwise min across load
+    /// steps), sampled to the display surface exactly like `result_field`
+    /// (smooth or per-cell). NOT ring-masked — the smoothed STL surface
+    /// hides nothing (greying happens on the per-cell voxel hull, below).
+    pub fn layer_sf_field(
+        &self,
+        a: f64,
+        b: f64,
+        c: f64,
+        ids: js_sys::Array,
+    ) -> Result<Vec<f32>, JsValue> {
+        let cells = self.layer_sf_cells_folded(a, b, c, &ids)?;
+        let (grid, _) = self.grid.as_ref().ok_or_else(|| err("no grid"))?;
+        if self.smooth_stress {
+            let nodal = recover_nodal(grid, &cells);
+            Ok(sample_nodal_values(&self.mesh.tris, grid, &nodal, &cells))
+        } else {
+            Ok(sample_cell_values(&self.mesh.tris, grid, &cells))
+        }
+    }
+
+    /// Voxel-hull variant of `layer_sf_field`: one value per hull vertex
+    /// (the owning cell's — crisp per-cell, like `voxel_result_field`).
+    /// Constraint-ring cells (excluded from the sweep SCORE, §15 dec. 3)
+    /// return NaN — the viewer paints them flat GREY, so the voxel view
+    /// shows exactly which cells the score ignores.
+    pub fn layer_sf_voxel_field(
+        &self,
+        a: f64,
+        b: f64,
+        c: f64,
+        ids: js_sys::Array,
+    ) -> Result<Vec<f32>, JsValue> {
+        let mut cells = self.layer_sf_cells_folded(a, b, c, &ids)?;
+        let ring = self.constraint_ring()?;
+        for (v, &m) in cells.iter_mut().zip(&ring) {
+            if m {
+                *v = f32::NAN;
+            }
+        }
+        let (grid, _) = self.grid.as_ref().ok_or_else(|| err("no grid"))?;
+        let (_tris, _edges, cell_of_tri) = grid.surface_mesh_where(&|_| true);
+        let mut out = Vec::with_capacity(cell_of_tri.len() * 3);
+        for &ci in &cell_of_tri {
+            let v = cells[ci as usize];
+            out.extend_from_slice(&[v, v, v]);
+        }
+        Ok(out)
+    }
+
+    pub fn orientation_sweep_begin(
+        &mut self,
+        ids: js_sys::Array,
+        step_deg: f64,
+    ) -> Result<String, JsValue> {
+        use filasim_core::orient;
+        self.sweep = None;
+        let step = step_deg.clamp(1.0, 45.0);
+        // Constraint-ring mask from the CURRENT BCs (per-BC node lists).
+        let ring = self.constraint_ring()?;
+        let folds = self.sweep_folds(&ids)?;
+        let (grid, _) = self.grid.as_ref().ok_or_else(|| err("no grid — run Solve first"))?;
+
+        let strength_s = self.shear_strength_z_eff();
+        let mut builder = orient::SweepBuilder::new(SF_CAP);
+        // Orientation-independent MATERIAL SF floor across the same folds —
+        // the readout's "orientation won't save this part" number (§15 dec. 5).
+        let mut sfm_min = SF_CAP;
+        for (sol, eps) in &folds {
+            builder.add_result(
+                grid,
+                &sol.u,
+                self.settings.e0,
+                self.settings.nu,
+                eps,
+                [0.0; 3],
+                self.strength_z,
+                strength_s,
+                &ring,
+            );
+            let vm = cell_field_eigen(
+                grid, &sol.u, self.settings.e0, self.settings.nu, eps, [0.0; 3],
+                FieldKind::VonMises,
+            );
+            for (i, v) in vm.iter().enumerate() {
+                if eps[i] > 0.0 && *v > 1e-9 {
+                    sfm_min = sfm_min.min((self.strength as f32 * eps[i] / v).min(SF_CAP));
+                }
+            }
+        }
+        let field = builder.finish();
+        let (n, dirs) = orient::hemisphere_grid(step);
+        let meta = serde_json::json!({
+            "n": n,
+            "stepDeg": step,
+            "pixels": n * n,
+            "cellsSeen": field.cells_seen,
+            "cellsKept": field.cells_kept(),
+            "scoredCells": field.scored_cells(),
+            "materialSfMin": sfm_min,
+        });
+        self.sweep = Some(SweepCtx { field, dirs });
+        Ok(meta.to_string())
+    }
+
+    /// Sweep pixels `[start, start+count)` of the flattened grid started by
+    /// `orientation_sweep_begin`. Returns `[scored, all]` — two Float32Arrays
+    /// of min layer-adhesion SF per pixel: `scored` excludes the constraint
+    /// ring, `all` hides nothing; both capped at SF_CAP. Chunk the calls so
+    /// the worker can post progress between them.
+    pub fn orientation_sweep_rows(&self, start: u32, count: u32) -> Result<js_sys::Array, JsValue> {
+        let ctx = self
+            .sweep
+            .as_ref()
+            .ok_or_else(|| err("no active sweep — call orientation_sweep_begin"))?;
+        let a = (start as usize).min(ctx.dirs.len());
+        let b = (a + count as usize).min(ctx.dirs.len());
+        let out = ctx.field.sweep(&ctx.dirs[a..b]);
+        let scored: Vec<f32> = out.iter().map(|v| v.0).collect();
+        let all: Vec<f32> = out.iter().map(|v| v.1).collect();
+        Ok(js_sys::Array::of2(
+            &js_sys::Float32Array::from(scored.as_slice()),
+            &js_sys::Float32Array::from(all.as_slice()),
+        ))
+    }
+
+    /// Drop the sweep context built by `orientation_sweep_begin`.
+    pub fn orientation_sweep_end(&mut self) {
+        self.sweep = None;
     }
 
     /// Volumetric section payload for the CAD-style capped section view: the

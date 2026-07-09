@@ -21,6 +21,7 @@ import { shrinkFromPhysics, ROOM_TEMP_C } from "../materials";
 import { fmtDisp, fmtLen, lenUnit, rampCss } from "./fmt";
 import { BC_HELP, bcLabel, KIND_DOT, KIND_LABEL, SUPPORT_KINDS } from "./bcmeta";
 import { HelpTip } from "./HelpTip";
+import { ValidateOrientation } from "./ValidateOrientation";
 import {
   format,
   unitLabel,
@@ -1994,6 +1995,8 @@ function StepOptimize() {
       {s.optSummary && (
         <div className="dim small">Results land in the panel on the right — export from step 6.</div>
       )}
+
+      <ValidateOrientation />
     </>
   );
 }

@@ -21,6 +21,7 @@ pub mod fem;
 pub mod mesh;
 pub mod mg;
 pub mod modal;
+pub mod orient;
 pub mod par;
 pub mod pipeline;
 pub mod progress;

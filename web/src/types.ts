@@ -173,6 +173,11 @@ export interface Material {
    *  (σzz, Z-up build direction). Typically 50–80% of σₜ — drives the
    *  conservative "worst case" safety factor. */
   strengthZ: number;
+  /** Interlayer SHEAR strength in MPa: sliding ALONG the layer plane
+   *  (τ = √(σyz²+σzx²), Z-up build direction) — the second axis of the
+   *  layer-adhesion failure criterion (DESIGN §15). Unset = no measured
+   *  value; the engine derives 0.6·strengthZ. */
+  shearStrengthZ?: number;
   /** Build-sim: IN-PLANE (XY) process shrink as a fraction (0.004 = 0.4%) — the
    *  dominant warp driver (in-plane contraction fought by the bed). The
    *  inherent-strain warp scales linearly with it. Uncalibrated rough defaults;

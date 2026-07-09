@@ -99,6 +99,7 @@ export function Viewer() {
     });
 
     sceneEvents.onModelLoaded = (m) => scene.setModel(m);
+    sceneEvents.onOrientationPreview = (d) => scene.setOrientationPreview(d);
     sceneEvents.onPatchIdsChanged = (ids) => scene.setPatchIds(ids);
     sceneEvents.onBcsChanged = (bcs, active, inactive) => scene.setBcs(bcs, active, inactive);
     sceneEvents.onAnimateMode = (mode) => scene.setRbmMode(mode);

@@ -137,7 +137,7 @@ self.onmessage = async (ev: MessageEvent<EngineWorkerRequest>) => {
         return;
       }
       case "setMaterial":
-        requireModel().set_material(msg.e0, msg.nu, msg.density, msg.strength, msg.strengthZ);
+        requireModel().set_material(msg.e0, msg.nu, msg.density, msg.strength, msg.strengthZ, msg.shearStrengthZ);
         break;
       case "setGravity":
         requireModel().set_gravity(msg.on);
@@ -325,6 +325,57 @@ self.onmessage = async (ev: MessageEvent<EngineWorkerRequest>) => {
         const stats = JSON.parse(requireModel().set_build_state(msg.state));
         const displacements = requireModel().vertex_displacements();
         reply(msg, { stats, displacements }, [displacements.buffer]);
+        return;
+      }
+      case "orientationSweep": {
+        // DESIGN §15: one blocking begin (tensor extraction + mask), then the
+        // pixel grid in row chunks so a progress push lands between calls.
+        const m = requireModel();
+        const meta = JSON.parse(m.orientation_sweep_begin(msg.ids, msg.stepDeg));
+        const total: number = meta.pixels;
+        const scored = new Float32Array(total);
+        const all = new Float32Array(total);
+        try {
+          const CHUNK = Math.max(meta.n * 2, 64); // ~2 pitch rows per push
+          for (let s = 0; s < total; s += CHUNK) {
+            const [sc, al] = m.orientation_sweep_rows(s, CHUNK);
+            scored.set(sc, s);
+            all.set(al, s);
+            (self as unknown as Worker).postMessage({
+              id: msg.id,
+              progress: true,
+              data: { done: Math.min(s + CHUNK, total), total },
+            });
+          }
+        } finally {
+          m.orientation_sweep_end();
+        }
+        reply(
+          msg,
+          {
+            n: meta.n,
+            stepDeg: meta.stepDeg,
+            scored,
+            all,
+            cellsSeen: meta.cellsSeen,
+            cellsKept: meta.cellsKept,
+            scoredCells: meta.scoredCells,
+            materialSfMin: meta.materialSfMin,
+          },
+          [scored.buffer, all.buffer]
+        );
+        return;
+      }
+      case "setLayerShear":
+        requireModel().set_layer_shear(msg.on);
+        break;
+      case "layerSfField": {
+        const m = requireModel();
+        const values =
+          msg.surface === "voxel"
+            ? m.layer_sf_voxel_field(msg.dir[0], msg.dir[1], msg.dir[2], msg.ids)
+            : m.layer_sf_field(msg.dir[0], msg.dir[1], msg.dir[2], msg.ids);
+        reply(msg, values, [values.buffer]);
         return;
       }
       case "optimize": {

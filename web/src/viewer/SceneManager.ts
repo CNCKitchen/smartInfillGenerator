@@ -558,6 +558,33 @@ export class SceneManager {
 
   // ---------- model ----------
 
+  /** DESIGN §15 display-only orientation preview: rotate the part (mesh,
+   *  wireframe, BC markers, result groups) about its bbox center so the given
+   *  layer normal (part frame) points up (+Z). Null restores the true pose.
+   *  Purely visual — engine state, results and picking stay untouched. */
+  setOrientationPreview(dir: [number, number, number] | null) {
+    const objs: THREE.Object3D[] = [this.bcMarkers, this.results.voxelGroup, this.results.buildGroup];
+    if (this.mesh) objs.push(this.mesh);
+    if (this.wireframeLines) objs.push(this.wireframeLines);
+    if (!dir || !this.partBbox) {
+      for (const o of objs) {
+        o.quaternion.identity();
+        o.position.set(0, 0, 0);
+      }
+      return;
+    }
+    const n = new THREE.Vector3(dir[0], dir[1], dir[2]).normalize();
+    const q = new THREE.Quaternion().setFromUnitVectors(n, new THREE.Vector3(0, 0, 1));
+    const b = this.partBbox;
+    const c = new THREE.Vector3((b[0] + b[3]) / 2, (b[1] + b[4]) / 2, (b[2] + b[5]) / 2);
+    // Rotate about the part center: p' = q·p + (c − q·c).
+    const pos = c.clone().sub(c.clone().applyQuaternion(q));
+    for (const o of objs) {
+      o.quaternion.copy(q);
+      o.position.copy(pos);
+    }
+  }
+
   setModel(model: LoadedModel) {
     if (this.mesh) {
       this.scene.remove(this.mesh);
@@ -1708,7 +1735,7 @@ export class SceneManager {
         const uv = new Float32Array(density.length * 2);
         for (let i = 0; i < density.length; i++) {
           uv[2 * i] = Math.min(1, density[i] / 0.8);
-          uv[2 * i + 1] = 0.5;
+          uv[2 * i + 1] = 0.25; // colormap row of the 2-row LUT (see makeLut)
         }
         geo.setAttribute("uv", new THREE.BufferAttribute(uv, 2));
         mat = new THREE.MeshStandardMaterial({

@@ -187,6 +187,64 @@ assert(sff.length === nTri * 3 && sff.every((v) => Number.isFinite(v) && v > 0 &
 assert(fmin(sff) > 1 && fmin(sff) <= 10,
   `min safety factor sensible for a lightly loaded beam (${fmin(sff).toFixed(1)})`);
 
+// --- orientation sweep (DESIGN §15): single-solve pitch/roll layer-SF grid ---
+{
+  const meta = JSON.parse(model.orientation_sweep_begin([], 15)); // coarse for speed
+  assert(meta.n === 13 && meta.pixels === 169, `15° hemisphere grid is 13×13 (${meta.n})`);
+  assert(meta.cellsKept > 0 && meta.cellsKept <= meta.cellsSeen,
+    `prune keeps a sane subset (${meta.cellsKept}/${meta.cellsSeen})`);
+  assert(meta.scoredCells <= meta.cellsKept, "ring cells counted apart from scored");
+  const scored = new Float32Array(meta.pixels);
+  const all = new Float32Array(meta.pixels);
+  for (let s = 0; s < meta.pixels; s += 40) { // chunked like the worker will
+    const [sc, al] = model.orientation_sweep_rows(s, 40);
+    scored.set(sc, s);
+    all.set(al, s);
+  }
+  assert(scored.every((v) => Number.isFinite(v) && v > 0 && v <= 10) &&
+         all.every((v) => Number.isFinite(v) && v > 0 && v <= 10),
+    "sweep values finite, positive, capped");
+  // The scored value ignores the constraint ring, so per pixel it can only be
+  // the same or SAFER than the hide-nothing value.
+  assert(scored.every((v, i) => v >= all[i] - 1e-6), "scored >= all per pixel");
+  // Flip symmetry: roll −90° and +90° are the same layer plane (n vs −n).
+  for (let ip = 0; ip < meta.n; ip++) {
+    const l = all[ip * meta.n];
+    const r = all[ip * meta.n + meta.n - 1];
+    assert(Math.abs(l - r) < 1e-4, `flip symmetry at pitch row ${ip} (${l} vs ${r})`);
+  }
+  // Center pixel is n = ẑ — the same criterion the sfz field paints, but as a
+  // min over ALL cells (interior included), so it can only be <= the
+  // surface-sampled field minimum.
+  const center = all[Math.floor(meta.pixels / 2)];
+  const sfzField = model.result_field("sfz");
+  const sfzMin = fmin(sfzField);
+  assert(center <= sfzMin + 1e-3, `center pixel ${center.toFixed(3)} <= min sfz ${sfzMin.toFixed(3)}`);
+  // The preview field at n = ẑ IS the sfz field: same criterion, same surface
+  // sampling (SF is invariant to the display stress-factor choice).
+  const previewZ = model.layer_sf_field(0, 0, 1, []);
+  assert(previewZ.length === sfzField.length &&
+         previewZ.every((v, i) => Math.abs(v - sfzField[i]) < 1e-3 * Math.max(1, sfzField[i])),
+    "layer_sf_field(z) matches the sfz result field");
+  // Shear toggle: OFF = pure tension-across-layers — dropping a failure mode
+  // can only make sfz safer, never more critical.
+  model.set_layer_shear(false);
+  const sfzNoShear = model.result_field("sfz");
+  assert(sfzNoShear.every((v, i) => v >= sfzField[i] - 1e-4),
+    "shear off => sfz never more critical");
+  model.set_layer_shear(true);
+  // Physics: a cantilever bends about Y, so layers ⊥ X (roll ±90°) see the full
+  // σxx as inter-layer tension — strictly worse than printing flat (n = ẑ).
+  let edgeMin = Infinity;
+  for (let ip = 0; ip < meta.n; ip++) edgeMin = Math.min(edgeMin, all[ip * meta.n]);
+  assert(edgeMin < center, `layers ⊥ X (${edgeMin.toFixed(2)}) worse than flat (${center.toFixed(2)})`);
+  model.orientation_sweep_end();
+  let threw = false;
+  try { model.orientation_sweep_rows(0, 1); } catch { threw = true; }
+  assert(threw, "rows after end rejects");
+}
+console.log("ok: orientation sweep (begin / chunked rows / end)");
+
 // --- color 3MF export: the active field painted into discrete filament bands ---
 // Decode a whole-triangle Bambu/Orca paint_color leaf code back to its 1-based
 // filament state (mirror of the verified Rust encoder) to confirm the painted
@@ -797,6 +855,28 @@ console.log("ok: project save / load round-trip (with + without results)");
     "stash/activate round-trips for optimized::A");
   assert(Math.abs(maxU(so.activate_result("optimized::B")) - sB.maxDisplacement) < 0.05 * sB.maxDisplacement + 1e-6,
     "stash/activate round-trips for optimized::B");
+
+  // Orientation sweep across load steps (DESIGN §15 dec. 5): folding both
+  // stashes must equal the per-pixel elementwise MIN of the individual
+  // sweeps — a min over the union of cells is a min of the mins.
+  {
+    const sweepAll = (ids) => {
+      const meta = JSON.parse(so.orientation_sweep_begin(ids, 30));
+      const out = new Float32Array(meta.pixels);
+      for (let s = 0; s < meta.pixels; s += 25) out.set(so.orientation_sweep_rows(s, 25)[1], s);
+      so.orientation_sweep_end();
+      return out;
+    };
+    const a = sweepAll(["optimized::A"]);
+    const b = sweepAll(["optimized::B"]);
+    const ab = sweepAll(["optimized::A", "optimized::B"]);
+    assert(ab.every((v, i) => Math.abs(v - Math.min(a[i], b[i])) < 1e-4),
+      "multi-step sweep = elementwise min of per-step sweeps");
+    let unknown = false;
+    try { so.orientation_sweep_begin(["nope"], 30); } catch { unknown = true; }
+    assert(unknown, "sweep rejects an unknown stash id");
+  }
+  console.log("ok: orientation sweep folds load steps worst-case");
 
   // A grid change retires the kept design → clean error (no stale evaluation).
   so.set_resolution(80000);

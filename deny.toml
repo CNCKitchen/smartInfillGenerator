@@ -3,6 +3,12 @@
 # The dual-licensing (AGPL + commercial exceptions) model requires that the
 # core never contains third-party copyleft code — see CONTRIBUTING.md.
 
+# Check the full dependency graph, including the optional `step` (truck CAD
+# kernel) and `parallel` (rayon/wasm-bindgen-rayon) feature trees — the wasm
+# production build enables both, so they must pass the same license policy.
+[graph]
+all-features = true
+
 [licenses]
 # Workspace crates are AGPL-3.0-only but unpublished; don't lint our own.
 private = { ignore = true }

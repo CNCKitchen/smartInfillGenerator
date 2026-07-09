@@ -140,7 +140,7 @@ vec3 capDisp(vec3 g) {
   }
   float t = clamp((v - uLo) / max(uHi - uLo, 1e-30), 0.0, 1.0);
   if (uFlip > 0.5) t = 1.0 - t;
-  diffuseColor.rgb = texture(uLut, vec2(t, 0.5)).rgb;
+  diffuseColor.rgb = texture(uLut, vec2(t, 0.25)).rgb; // colormap row of the 2-row LUT
 }`
         );
     };

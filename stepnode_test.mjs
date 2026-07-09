@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
+//
 // Dev harness for the STEP importer. Two parts:
 //  1) BASE tessellation sweep (truck surface-deviation knob) -> writes STLs.
 //  2) END-TO-END: build a Model from the STEP bytes and from the reference STL

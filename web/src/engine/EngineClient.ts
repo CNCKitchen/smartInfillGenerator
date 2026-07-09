@@ -12,7 +12,9 @@ import type {
   EngineWorkerMessage,
   LoadedModelData,
   Op,
+  OrientationSweepResult,
   SectionVolume,
+  SweepProgress,
 } from "./EngineProtocol";
 
 interface Pending {
@@ -147,9 +149,10 @@ export class EngineClient {
     nu: number,
     density: number,
     strength: number,
-    strengthZ: number
+    strengthZ: number,
+    shearStrengthZ?: number
   ): Promise<void> {
-    return this.call({ op: "setMaterial", e0, nu, density, strength, strengthZ });
+    return this.call({ op: "setMaterial", e0, nu, density, strength, strengthZ, shearStrengthZ });
   }
 
   setGravity(on: boolean): Promise<void> {
@@ -291,6 +294,39 @@ export class EngineClient {
     state: "released" | "bonded"
   ): Promise<{ stats: { maxDisplacement: number }; displacements: Float32Array }> {
     return this.call({ op: "setBuildState", state });
+  }
+
+  /** Orientation sweep (DESIGN §15): min layer-adhesion SF per pitch/roll
+   *  pixel over the ±90° hemisphere, folding `ids` result stashes worst-case
+   *  ([] = current solution). `onProgress` fires per row chunk. */
+  orientationSweep(
+    ids: string[],
+    stepDeg: number,
+    onProgress?: (p: SweepProgress) => void
+  ): Promise<OrientationSweepResult> {
+    return this.call(
+      { op: "orientationSweep", ids, stepDeg },
+      [],
+      onProgress ? (data: unknown) => onProgress(data as SweepProgress) : undefined
+    );
+  }
+
+  /** Per-vertex layer-adhesion SF for one build direction — the heatmap
+   *  click preview recolor. Folds the same result set as the sweep.
+   *  `surface` "voxel" samples the voxel hull per cell, with constraint-ring
+   *  cells NaN (painted grey). */
+  layerSfField(
+    dir: [number, number, number],
+    ids: string[],
+    surface: "stl" | "voxel"
+  ): Promise<Float32Array> {
+    return this.call({ op: "layerSfField", dir, ids, surface });
+  }
+
+  /** Toggle the shear term of the layer criterion (sfz/sf fields, sweep,
+   *  preview — display-side derived, the solution stays valid). */
+  setLayerShear(on: boolean): Promise<void> {
+    return this.call({ op: "setLayerShear", on });
   }
 
   optimize(

@@ -29,9 +29,16 @@ export const BC_COLORS: Record<string, THREE.Color> = {
   moment: new THREE.Color(0xe8590c),
 };
 
-/** Normalize a scalar field into the uv.x channel for 1D LUT sampling:
+/** Row-center y coordinates of the two-row LUT (see makeLut): row 0 is the
+ *  colormap, row 1 a flat neutral grey for MASKED samples (NaN values —
+ *  e.g. cells excluded from the orientation score, DESIGN §15). Sampling at
+ *  the row centers never blends the rows, even with linear filtering. */
+export const LUT_ROW_MAP = 0.25;
+export const LUT_ROW_MASK = 0.75;
+
+/** Normalize a scalar field into the uv.x channel for LUT sampling:
  *  t = clamp((v - lo) / (hi - lo)), optionally flipped (safety factor: red
- *  marks the LOW values). uv.y sits at the texture's vertical center. */
+ *  marks the LOW values). Non-finite values sample the grey MASK row. */
 export function writeFieldUvs(
   uvs: Float32Array,
   values: ArrayLike<number>,
@@ -41,9 +48,15 @@ export function writeFieldUvs(
 ) {
   const inv = hi - lo > 1e-30 ? 1 / (hi - lo) : 0;
   for (let i = 0; i < values.length; i++) {
-    const t = Math.min(1, Math.max(0, (values[i] - lo) * inv));
+    const v = values[i];
+    if (!Number.isFinite(v)) {
+      uvs[2 * i] = 0.5;
+      uvs[2 * i + 1] = LUT_ROW_MASK;
+      continue;
+    }
+    const t = Math.min(1, Math.max(0, (v - lo) * inv));
     uvs[2 * i] = flip ? 1 - t : t;
-    uvs[2 * i + 1] = 0.5;
+    uvs[2 * i + 1] = LUT_ROW_MAP;
   }
 }
 
@@ -51,23 +64,29 @@ export function writeFieldUvs(
 export function writeDensityUvs(uvs: Float32Array, density: ArrayLike<number>) {
   for (let i = 0; i < density.length; i++) {
     uvs[2 * i] = Math.min(1, density[i] / 0.8);
-    uvs[2 * i + 1] = 0.5;
+    uvs[2 * i + 1] = LUT_ROW_MAP;
   }
 }
 
-/** Bake a colormap (see ./colormaps) into a 1D texture, sampled per-fragment
- * via uv.x. The same `jet`/`ramp` feed the legend bars, so they stay in sync. */
+/** Bake a colormap (see ./colormaps) into a 256×2 texture: row 0 the
+ *  colormap (sampled via uv.x at LUT_ROW_MAP), row 1 flat grey for masked
+ *  samples (LUT_ROW_MASK). The same `jet`/`ramp` feed the legend bars. */
 function makeLut(fn: (t: number) => RGB): THREE.DataTexture {
   const n = 256;
-  const data = new Uint8Array(n * 4);
+  const data = new Uint8Array(n * 2 * 4);
   for (let i = 0; i < n; i++) {
     const [r, g, b] = fn(i / (n - 1));
     data[4 * i] = Math.round(255 * r);
     data[4 * i + 1] = Math.round(255 * g);
     data[4 * i + 2] = Math.round(255 * b);
     data[4 * i + 3] = 255;
+    // Mask row: neutral grey (matches the werkbank chassis tones).
+    data[4 * (n + i)] = 138;
+    data[4 * (n + i) + 1] = 143;
+    data[4 * (n + i) + 2] = 152;
+    data[4 * (n + i) + 3] = 255;
   }
-  const tex = new THREE.DataTexture(data, n, 1, THREE.RGBAFormat);
+  const tex = new THREE.DataTexture(data, n, 2, THREE.RGBAFormat);
   tex.colorSpace = THREE.SRGBColorSpace;
   tex.minFilter = THREE.LinearFilter;
   tex.magFilter = THREE.LinearFilter;
@@ -365,7 +384,7 @@ export class ColorManager {
     this.bandCount = count;
     const tex = this.lutJet;
     const data = tex.image.data as Uint8Array;
-    const n = data.length / 4;
+    const n = tex.image.width; // quantize the colormap row ONLY (row 1 = mask grey)
     for (let i = 0; i < n; i++) {
       let t = i / (n - 1);
       if (on) {

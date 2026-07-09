@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 // Based on coi-serviceworker v0.1.7 by Guido Zuidhof
+// Copyright (c) 2021 Guido Zuidhof — MIT License
 // https://github.com/gzuidhof/coi-serviceworker
 // Enables cross-origin isolation on hosts that can't set custom headers
 // (e.g. GitHub Pages) so SharedArrayBuffer / threaded WASM works.

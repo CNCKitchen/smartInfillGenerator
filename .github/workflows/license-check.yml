@@ -1,0 +1,47 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
+#
+# Enforces the dependency license policy from CONTRIBUTING.md §2 on every PR
+# and push: the dual-licensing model (AGPL + commercial exceptions) requires
+# that no third-party copyleft code ever lands in the core.
+#  - Rust: cargo-deny against the allowlist in deny.toml (all features, so the
+#    optional step/parallel trees used by the wasm production build are covered)
+#  - npm: license-checker against the same allowlist (full tree, dev included;
+#    CC-BY-4.0 is data-only — caniuse-lite; the private root package is
+#    excluded because license-checker reports `private: true` as UNLICENSED)
+name: License check
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  rust-licenses:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: cargo deny check licenses
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses
+
+  npm-licenses:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install web dependencies
+        run: npm ci
+        working-directory: web
+      - name: npm license allowlist
+        run: >-
+          npx --yes license-checker --excludePrivatePackages
+          --onlyAllow "MIT;Apache-2.0;BSD-2-Clause;BSD-3-Clause;ISC;0BSD;Zlib;CC0-1.0;MPL-2.0;Unicode-3.0;Unlicense;CC-BY-4.0"
+          --summary
+        working-directory: web

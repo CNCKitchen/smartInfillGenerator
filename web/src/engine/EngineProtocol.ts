@@ -51,7 +51,7 @@ export interface EngineRequests {
   transform: { matrix: number[] };
   resegment: { angle: number };
   useCadFaces: Empty;
-  setMaterial: { e0: number; nu: number; density: number; strength: number; strengthZ: number };
+  setMaterial: { e0: number; nu: number; density: number; strength: number; strengthZ: number; shearStrengthZ?: number };
   setGravity: { on: boolean };
   setResolution: { cells: number };
   setVoxelSize: { h: number };
@@ -118,6 +118,15 @@ export interface EngineRequests {
   };
   exportStls: Empty;
   exportSolidStl: Empty;
+  /** Orientation sweep (DESIGN §15): fold `ids` result stashes worst-case
+   *  ([] = current solution) over the ±90° pitch/roll hemisphere. */
+  orientationSweep: { ids: string[]; stepDeg: number };
+  /** Per-vertex layer-adhesion SF for one build direction (preview recolor).
+   *  `surface` picks the sampling: STL soup, or voxel hull (per-cell crisp,
+   *  constraint-ring cells NaN → painted grey). */
+  layerSfField: { dir: [number, number, number]; ids: string[]; surface: "stl" | "voxel" };
+  /** Toggle the shear term of the layer criterion (display-side derived). */
+  setLayerShear: { on: boolean };
 }
 
 export type Op = keyof EngineRequests;
@@ -227,6 +236,30 @@ export interface EngineResponses {
   exportColorThreeMf: Uint8Array;
   exportStls: Uint8Array;
   exportSolidStl: Uint8Array;
+  orientationSweep: OrientationSweepResult;
+  layerSfField: Float32Array;
+  setLayerShear: void;
+}
+
+/** Orientation-sweep result: two n×n grids of min layer-adhesion SF (pitch
+ *  and roll both −90°..+90°, index = iPitch·n + iRoll, roll fastest).
+ *  `scored` excludes the constraint ring; `all` hides nothing. */
+export interface OrientationSweepResult {
+  n: number;
+  stepDeg: number;
+  scored: Float32Array;
+  all: Float32Array;
+  cellsSeen: number;
+  cellsKept: number;
+  scoredCells: number;
+  /** Orientation-independent material (von Mises) SF floor across the folds. */
+  materialSfMin: number;
+}
+
+/** orientationSweep: per-chunk progress (pixels done / total). */
+export interface SweepProgress {
+  done: number;
+  total: number;
 }
 
 // ---- wire envelopes ----
@@ -294,7 +327,7 @@ export interface ModalProgressMessage {
 export interface WorkerProgressMessage {
   id: number;
   progress: true;
-  data: OptProgress | BuildSimProgress | ModalProgress;
+  data: OptProgress | BuildSimProgress | ModalProgress | SweepProgress;
   density?: Float32Array;
   skelPositions?: Float32Array;
   skelIndices?: Uint32Array;

@@ -85,7 +85,10 @@ function PrintedResults() {
           <span>Min safety factor</span>
           <span>
             {p.sfGoverns === "layer"
-              ? `layer adhesion governs · σₜᶻ ${format(s.material.strengthZ, "stress")}`
+              ? `layer adhesion governs · σₜᶻ ${format(s.material.strengthZ, "stress")} · τᶻ ${format(
+                  s.material.shearStrengthZ ?? 0.6 * s.material.strengthZ,
+                  "stress"
+                )}`
               : p.sfGoverns === "material"
                 ? `material governs · σₜ ${format(s.material.strength, "stress")}`
                 : `σₜ ${format(s.material.strength, "stress")} / σₜᶻ ${format(s.material.strengthZ, "stress")}`}

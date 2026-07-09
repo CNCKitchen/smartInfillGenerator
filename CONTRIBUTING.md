@@ -49,7 +49,12 @@ it behind a process/network boundary as an optional component, buy a
 commercial license for it, or write our own. Ask first.
 
 Checking: `cargo deny check licenses` (allowlist in [deny.toml](deny.toml))
-for Rust; `npx license-checker --summary` for npm. CI runs these on PRs.
+for Rust; `npx license-checker --excludePrivatePackages --onlyAllow "..."`
+for npm (exact allowlist in the workflow). CI enforces both on every PR and
+push via [.github/workflows/license-check.yml](.github/workflows/license-check.yml).
+Note: cargo-deny does not build on the stock `windows-gnu` toolchain (same
+windows-sys/raw-dylib issue as truck) — rely on CI, or install it on a
+machine with the MSVC toolchain.
 
 ## Practicalities
 

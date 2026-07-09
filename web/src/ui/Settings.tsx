@@ -6,7 +6,13 @@ import { useShallow } from "zustand/shallow";
 import { useStore } from "../store";
 import { NumInput } from "./NumInput";
 import { UnitInput } from "./UnitInput";
-import { unitLabel } from "../units";
+import {
+  convertFromCanonical,
+  convertToCanonical,
+  unitDef,
+  unitLabel,
+  type QuantityKind,
+} from "../units";
 import type { PatternKey } from "../types";
 
 const PATTERN_LABEL: Record<PatternKey, string> = {
@@ -48,9 +54,10 @@ export function SettingsModal() {
 
         <h3>Materials</h3>
         <div className="dim small">
-          E, σₜ (in-layer tensile strength) and σₜᶻ (layer adhesion — tension across the layers,
-          typically 50–80% of σₜ) in MPa, ρ in g/cm³. The strengths drive the safety-factor
-          plots; the worst-case factor uses whichever limit governs. Tg and CTE (optional) derive
+          E, σₜ (in-layer tensile strength), σₜᶻ (layer adhesion — tension across the layers,
+          typically 50–80% of σₜ) and τᶻ (interlayer shear — sliding along the layer plane;
+          blank = 0.6·σₜᶻ until measured) in MPa, ρ in g/cm³. The strengths drive the
+          safety-factor plots; the worst-case factor uses whichever limit governs. Tg and CTE (optional) derive
           the build-sim shrink from physics and enable its temperature ladder; blank = the raw
           Shrink % path. Editing the material in use invalidates current results. Saved in this
           browser.
@@ -64,6 +71,7 @@ export function SettingsModal() {
               <th>ρ ({unitLabel("density")})</th>
               <th>σₜ ({unitLabel("stress")})</th>
               <th>σₜᶻ ({unitLabel("stress")})</th>
+              <th title="Interlayer SHEAR strength — sliding along the layer plane (τ = √(σyz²+σzx²)); the second axis of the layer-adhesion safety factor. Blank = 0.6·σₜᶻ until a measured value is entered">τᶻ ({unitLabel("stress")})</th>
               <th title="Build-sim yield stress — enables the elastic–perfectly-plastic step so the released warp responds to infill density (0 = pure-elastic, density-blind)">σy ({unitLabel("stress")})</th>
               <th title="Build-sim IN-PLANE (XY) process shrink — the dominant warp driver (inherent strain). Used only when Tg/CTE are blank">Shrink % (XY)</th>
               <th title="Build-sim THROUGH-LAYER (Z) process shrink — transverse isotropy; usually less than in-plane. Used only when Tg/CTE are blank">Shrink % (Z)</th>
@@ -138,6 +146,21 @@ export function SettingsModal() {
                     step={1}
                     onCommit={(v) =>
                       s.updateMaterial(i, { ...m, strengthZ: Math.max(1, v) })
+                    }
+                  />
+                </td>
+                <td>
+                  <OptUnitInput
+                    value={m.shearStrengthZ}
+                    kind="stress"
+                    min={1}
+                    step={1}
+                    placeholder={autoShearLabel(m.strengthZ)}
+                    onCommit={(v) =>
+                      s.updateMaterial(i, {
+                        ...m,
+                        shearStrengthZ: v == null ? undefined : Math.max(1, v),
+                      })
                     }
                   />
                 </td>
@@ -375,6 +398,50 @@ function ppm(v: number | undefined): number | undefined {
 
 /** NumInput variant for OPTIONAL fields: an empty box means "unset" and
  *  commits `undefined` (on blur, so mid-edit clearing doesn't unset). */
+/** Placeholder for a blank τᶻ field: the derived 0.6·σₜᶻ default, in the
+ *  active display unit, marked "auto" so a blank is visibly not zero. */
+function autoShearLabel(strengthZ: number): string {
+  const u = unitDef("stress");
+  return `${convertFromCanonical(0.6 * strengthZ, "stress").toFixed(u.decimals)} auto`;
+}
+
+/** OptNumInput with unit conversion on the boundary (see UnitInput): edits in
+ *  the display unit, commits canonical, blank commits undefined. */
+function OptUnitInput({
+  value,
+  kind,
+  onCommit,
+  min,
+  max,
+  step,
+  ...rest
+}: {
+  value: number | undefined;
+  kind: QuantityKind;
+  onCommit: (canonical: number | undefined) => void;
+  min?: number;
+  max?: number;
+  step?: number;
+} & Omit<
+  React.InputHTMLAttributes<HTMLInputElement>,
+  "value" | "onChange" | "type" | "min" | "max" | "step"
+>) {
+  const u = unitDef(kind);
+  const toDisp = (v: number | undefined) =>
+    v == null ? undefined : convertFromCanonical(v, kind);
+  const disp = value == null ? undefined : Number(convertFromCanonical(value, kind).toFixed(u.decimals));
+  return (
+    <OptNumInput
+      value={disp}
+      min={toDisp(min)}
+      max={toDisp(max)}
+      step={step != null ? convertFromCanonical(step, kind) : undefined}
+      onCommit={(v) => onCommit(v == null ? undefined : convertToCanonical(v, kind))}
+      {...rest}
+    />
+  );
+}
+
 function OptNumInput({
   value,
   onCommit,

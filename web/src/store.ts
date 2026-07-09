@@ -113,6 +113,12 @@ function loadSettings(): PersistedSettings {
               typeof m.strengthZ === "number" && m.strengthZ > 0
                 ? m.strengthZ
                 : Math.round(0.7 * strength),
+            // Interlayer shear (DESIGN §15): optional measured value; absent
+            // = the engine derives 0.6·strengthZ.
+            shearStrengthZ:
+              typeof m.shearStrengthZ === "number" && m.shearStrengthZ > 0
+                ? m.shearStrengthZ
+                : undefined,
             // Pre-build-sim saves: default to a ~0.5% process shrink.
             shrink: typeof m.shrink === "number" && m.shrink > 0 ? m.shrink : 0.005,
             // Pre-anisotropy saves: Z shrink ≈ half the in-plane value.
@@ -539,6 +545,11 @@ interface AppState {
    *  occupancy-scaled value — removes the curved-skin staircase stripes.
    *  Display-side only; the safety factor is unchanged. */
   materialStress: boolean;
+  /** Include the interlayer SHEAR term in the layer-adhesion criterion
+   *  (DESIGN §15 dec. 1). Off = pure tension across the layers. Affects the
+   *  sfz/sf fields, the orientation sweep and its preview — display-side
+   *  derived, the solution stays valid. */
+  layerShear: boolean;
   /** Discrete ("contour banded") result display: the color scale is quantized
    *  into fixed steps with hard edges (classic FEA contour bands) instead of a
    *  smooth gradient. Toggled by clicking the result legend bar. */
@@ -585,6 +596,21 @@ interface AppState {
   hasResult: boolean;
   optProgress: { iteration: number; maxIter: number; pass?: number; passes?: number } | null;
   optSummary: OptSummary | null;
+  /** Validate Orientation (DESIGN §15): the finished sweep — two n×n grids of
+   *  min layer-adhesion SF (scored = constraint ring excluded, all = nothing
+   *  hidden), the stash ids it folded, and the orientation-independent
+   *  material-SF floor for the readout. */
+  orientSweep: {
+    n: number;
+    stepDeg: number;
+    scored: Float32Array;
+    all: Float32Array;
+    ids: string[];
+    materialSfMin: number;
+  } | null;
+  orientProgress: { done: number; total: number } | null;
+  /** Selected heatmap pixel; non-null = display-only preview is active. */
+  orientSel: { ip: number; ir: number } | null;
   /** Retained, selectable results for the Results view's switcher. */
   results: ResultEntry[];
   /** Which retained result the Results (deformed) view is showing — a
@@ -806,6 +832,7 @@ interface AppState {
   setStrainView(on: boolean): Promise<void>;
   setStrainLayer(layer: number): Promise<void>;
   setSmoothStress(on: boolean): void;
+  setLayerShear(on: boolean): void;
   setMaterialStress(on: boolean): void;
   /** Flip between smooth and discrete (banded) result contours. */
   toggleBandedContour(): void;
@@ -855,6 +882,15 @@ interface AppState {
   fitLegend(): void;
   runCheck(): Promise<void>;
   runSolve(): Promise<void>;
+  /** Validate Orientation (DESIGN §15): sweep the ±90° pitch/roll hemisphere
+   *  of the active result kind (all load steps folded worst-case) for the
+   *  min layer-adhesion SF per orientation. */
+  runOrientationSweep(): Promise<void>;
+  /** Select a heatmap pixel: rotate the displayed part to that build
+   *  direction and recolor with its per-vertex layer SF (display-only). */
+  selectOrientation(ip: number, ir: number): Promise<void>;
+  /** Drop the orientation preview: restore pose + the active result field. */
+  clearOrientationPreview(): void;
   /** Constrained modal analysis (Verify tab): compute `modalModeCount` natural
    *  frequencies + mode shapes on the FIRST load case's supports, surfacing each
    *  mode as a switchable result-case. */
@@ -1295,6 +1331,9 @@ export interface SceneEvents {
   onSectionState?: (on: boolean) => void;
   onSectionFlip?: () => void;
   onSectionAxis?: (axis: "x" | "y" | "z") => void;
+  /** Display-only orientation preview (DESIGN §15): rotate the part so the
+   *  given layer normal (part frame) points up; null restores the true pose. */
+  onOrientationPreview?: (dir: [number, number, number] | null) => void;
 }
 
 export const sceneEvents: SceneEvents = {};
@@ -1640,6 +1679,9 @@ function markResultsStale(
   const ep = { ...get().resultEpochs };
   for (const k of keys) ep[k] += 1;
   set({ resultEpochs: ep });
+  // The orientation map was swept from the now-stale inputs — delete it
+  // outright (unlike results it has no staleness badge of its own).
+  clearOrientationSweep();
 }
 
 /** Insert a freshly-computed (single-step) result, REPLACING every prior result
@@ -1716,6 +1758,76 @@ function currentLegendRange(s: AppState): [number, number] | null {
  *  stashes it reduces over would no longer match. */
 function clearEnvelopeCache() {
   fieldServer.clearEnvelopeCache();
+  // The orientation sweep (DESIGN §15) reduces over the same stashes — every
+  // invalidation that stales the envelope stales it too.
+  clearOrientationSweep();
+}
+
+/** Drop the orientation sweep + preview (DESIGN §15): restores the true pose
+ *  and orphans a sweep still in flight via the token (its resolve is
+ *  discarded). Called on envelope invalidation AND whenever loads/inputs
+ *  change (`markResultsStale`) — the map was computed from the old inputs. */
+function clearOrientationSweep() {
+  orientToken++;
+  const s = useStore.getState();
+  if (s.orientSel) sceneEvents.onOrientationPreview?.(null);
+  if (s.orientSweep || s.orientSel || s.orientProgress) {
+    useStore.setState({ orientSweep: null, orientSel: null, orientProgress: null });
+  }
+}
+
+/** Monotone token orphaning in-flight orientation sweeps on invalidation. */
+let orientToken = 0;
+
+/** One in-flight preview-field fetch at a time; while the user drags across
+ *  the heatmap only the LATEST selection is fetched when the current request
+ *  resolves (trailing-edge coalescing — the worker never floods). */
+let orientFetchBusy = false;
+
+function orientFetchField(set: SetState, get: () => AppState) {
+  if (orientFetchBusy) return;
+  orientFetchBusy = true;
+  void (async () => {
+    try {
+      for (;;) {
+        const sel = get().orientSel;
+        const sw = get().orientSweep;
+        if (!sel || !sw) break;
+        const dir = orientDir(-90 + sel.ip * sw.stepDeg, -90 + sel.ir * sw.stepDeg);
+        const values = await engine.layerSfField(dir, sw.ids, get().resultSurface);
+        const now = get().orientSel;
+        if (!now) break;
+        if (now.ip !== sel.ip || now.ir !== sel.ir) continue; // stale — refetch newest
+        let lo = Infinity;
+        let hi = -Infinity;
+        for (const v of values) {
+          if (!Number.isFinite(v)) continue; // NaN = grey-masked ring cells
+          if (v < lo) lo = v;
+          if (v > hi) hi = v;
+        }
+        if (!Number.isFinite(lo) || lo === hi) {
+          lo = 0;
+          hi = Math.max(hi, 1);
+        }
+        sceneEvents.onScalarField?.(values, true, false, { min: lo, max: hi });
+        set({ fieldRange: { min: lo, max: hi } });
+        const after = get().orientSel;
+        if (!after || (after.ip === sel.ip && after.ir === sel.ir)) break;
+        // selection moved during the push — go around once more
+      }
+    } catch {
+      get().clearOrientationPreview(); // result vanished mid-fetch
+    } finally {
+      orientFetchBusy = false;
+    }
+  })();
+}
+
+/** Layer normal n = Rx(pitch)·Ry(roll)·ẑ — must match core orient.rs. */
+function orientDir(pitchDeg: number, rollDeg: number): [number, number, number] {
+  const p = (pitchDeg * Math.PI) / 180;
+  const r = (rollDeg * Math.PI) / 180;
+  return [Math.sin(r), -Math.sin(p) * Math.cos(r), Math.cos(p) * Math.cos(r)];
 }
 
 /** Display an envelope result: undeformed geometry (it has no single
@@ -2388,6 +2500,7 @@ export const useStore = create<AppState>((set, get) => ({
   strainLayerMax: 0,
   strainPeakMPa: 0,
   smoothStress: true,
+  layerShear: true,
   materialStress: true,
   bandedContour: false,
   bandCount: CONTOUR_BANDS,
@@ -2413,6 +2526,9 @@ export const useStore = create<AppState>((set, get) => ({
   hasResult: false,
   optProgress: null,
   optSummary: null,
+  orientSweep: null,
+  orientProgress: null,
+  orientSel: null,
   results: [],
   activeResultId: null,
   resultEpochs: { ...ZERO_EPOCHS },
@@ -2492,7 +2608,7 @@ export const useStore = create<AppState>((set, get) => ({
         }
       }
       const m = get().material;
-      await engine.setMaterial(m.e0, m.nu, m.density, m.strength, m.strengthZ);
+      await engine.setMaterial(m.e0, m.nu, m.density, m.strength, m.strengthZ, m.shearStrengthZ);
       await pushResolution(get);
       // A fresh wasm Model defaults to snap off; push the current setting.
       // (Inline, not pushSnap: the store's `model` isn't set yet.)
@@ -2502,6 +2618,7 @@ export const useStore = create<AppState>((set, get) => ({
       await engine.setCompositeSkin(get().compositeSkin);
       await engine.setSmoothStress(get().smoothStress);
       await engine.setMaterialStress(get().materialStress);
+      await engine.setLayerShear(get().layerShear);
       const freshStep = makeLoadStep("Load step 1");
       set({
         fileName: name,
@@ -3098,7 +3215,7 @@ export const useStore = create<AppState>((set, get) => ({
   setMaterial(m) {
     set({ material: m });
     markResultsStale(set, get, "material");
-    void engine.setMaterial(m.e0, m.nu, m.density, m.strength, m.strengthZ);
+    void engine.setMaterial(m.e0, m.nu, m.density, m.strength, m.strengthZ, m.shearStrengthZ);
   },
 
   updateMaterial(index, m) {
@@ -3110,7 +3227,7 @@ export const useStore = create<AppState>((set, get) => ({
     if (wasSelected) {
       set({ material: m });
       markResultsStale(set, get, "material");
-      void engine.setMaterial(m.e0, m.nu, m.density, m.strength, m.strengthZ);
+      void engine.setMaterial(m.e0, m.nu, m.density, m.strength, m.strengthZ, m.shearStrengthZ);
     }
   },
 
@@ -3408,6 +3525,23 @@ export const useStore = create<AppState>((set, get) => ({
       // active field and the dock's min-SF under the new sampling.
       session.clearAllFields();
       clearEnvelopeCache(); // reduced fields were sampled at the old setting
+      if (get().hasResult) {
+        await pushScalarField(set, get);
+        await refreshMinSf(set, get);
+      }
+    })();
+  },
+
+  setLayerShear(on) {
+    set({ layerShear: on });
+    if (!get().model) return;
+    void (async () => {
+      await engine.setLayerShear(on);
+      // Display-side derived: sfz/sf re-derive under the toggled criterion;
+      // the sweep/preview were computed with the other one — deleted via
+      // clearEnvelopeCache → clearOrientationSweep.
+      session.clearAllFields();
+      clearEnvelopeCache();
       if (get().hasResult) {
         await pushScalarField(set, get);
         await refreshMinSf(set, get);
@@ -3979,7 +4113,9 @@ export const useStore = create<AppState>((set, get) => ({
             set,
             `  min safety factor ${sf.minSf.toFixed(2)}× — ` +
               (sf.governs === "layer"
-                ? `layer adhesion governs (σₜᶻ ${m.strengthZ} MPa vs σzz tension)`
+                ? `layer adhesion governs (σₜᶻ ${m.strengthZ} / τᶻ ${
+                    m.shearStrengthZ ?? Math.round(0.6 * m.strengthZ * 10) / 10
+                  } MPa vs layer tension+shear)`
                 : `material governs (σₜ ${m.strength} MPa vs σᵥᴹ)`)
           );
         }
@@ -4204,6 +4340,105 @@ export const useStore = create<AppState>((set, get) => ({
       stopResidualPoll();
       session.endRun();
     }
+  },
+
+  async runOrientationSweep() {
+    const s = get();
+    if (s.busy || s.orientProgress) return;
+    const active = s.results.find((r) => r.id === s.activeResultId) ?? s.results[0];
+    if (!active || active.kind === "modal") {
+      set({ notice: "Run a solve first — Optimize Orientation reads its stress field." });
+      return;
+    }
+    // Fold ALL real load steps of the active kind (§15 dec. 5 — a step's
+    // delamination is fatal regardless of optimizer weight). Roster ids ARE
+    // engine stash ids.
+    const ids = s.results.filter((r) => r.kind === active.kind && !isEnvelope(r)).map((r) => r.id);
+    get().clearOrientationPreview();
+    const token = ++orientToken;
+    set({ orientProgress: { done: 0, total: 1 }, orientSweep: null, orientSel: null });
+    appendLog(
+      set,
+      `Optimize orientation — ±90° rotation X/Y sweep on ${active.kind}` +
+        (ids.length > 1 ? ` (${ids.length} load steps, worst case)` : "")
+    );
+    try {
+      const out = await engine.orientationSweep(ids, 5, (p) => {
+        if (token === orientToken) set({ orientProgress: p });
+      });
+      if (token !== orientToken) return; // invalidated mid-sweep
+      // Best orientation = the HIGHEST worst-case layer SF (each pixel is
+      // already the min over cells; we want the max of those minima).
+      let best = -Infinity;
+      let bi = 0;
+      out.scored.forEach((v, i) => {
+        if (v > best) {
+          best = v;
+          bi = i;
+        }
+      });
+      const center = out.scored[(out.scored.length - 1) / 2];
+      set({
+        orientSweep: {
+          n: out.n,
+          stepDeg: out.stepDeg,
+          scored: out.scored,
+          all: out.all,
+          ids,
+          materialSfMin: out.materialSfMin,
+        },
+        orientProgress: null,
+      });
+      appendLog(
+        set,
+        `  best rot X ${-90 + Math.floor(bi / out.n) * out.stepDeg}° / rot Y ` +
+          `${-90 + (bi % out.n) * out.stepDeg}° — min layer SF ${best.toFixed(2)}× ` +
+          `(as oriented ${center.toFixed(2)}×, material floor ${out.materialSfMin.toFixed(2)}×)`
+      );
+      // Land directly in the preview at the CURRENT orientation: undeformed
+      // part, layer-SF coloring, legend labeled accordingly.
+      void get().selectOrientation((out.n - 1) / 2, (out.n - 1) / 2);
+    } catch (e) {
+      if (token !== orientToken) return;
+      set({ orientProgress: null, error: (e as Error).message ?? String(e) });
+    }
+  },
+
+  async selectOrientation(ip, ir) {
+    const sw = get().orientSweep;
+    if (!sw) return;
+    const entering = !get().orientSel;
+    // The preview paints the LAYER SF — say so in the legend/kind selector
+    // instead of leaving the previous field's label on a SF coloring.
+    set({ orientSel: { ip, ir }, resultField: "sfz" });
+    sceneEvents.onOrientationPreview?.(orientDir(-90 + ip * sw.stepDeg, -90 + ir * sw.stepDeg));
+    if (entering) {
+      // The recolor rides the deformed-view scalar path, but an orientation
+      // preview shows the part UNDEFORMED (like the envelope): zero
+      // displacements, and NO volumetric section field — the cap and its
+      // interior extreme would keep showing the previous result's stale
+      // volume (in its own units) under the layer-SF legend.
+      if (get().viewMode !== "deformed") await get().setViewMode("deformed");
+      sceneEvents.onSectionVolume?.(null);
+      const model = get().model;
+      if (model && get().resultSurface === "stl") {
+        sceneEvents.onScalarField?.(null);
+        sceneEvents.onDisplacements?.(new Float32Array(model.triCount * 9), {
+          maxDisplacement: referenceMaxDisp(get().results),
+        });
+      }
+    }
+    orientFetchField(set, get);
+  },
+
+  clearOrientationPreview() {
+    if (!get().orientSel) return;
+    set({ orientSel: null });
+    sceneEvents.onOrientationPreview?.(null);
+    // Full restore (pose, displacements, field, legend) via re-activation.
+    const id = get().activeResultId;
+    if (id) void get().selectResult(id);
+    else void pushScalarField(set, get);
   },
 
   async runOptimize() {
@@ -4698,11 +4933,13 @@ export const useStore = create<AppState>((set, get) => ({
       session.invalidateSolution();
       // Push the saved physics + grid settings to the engine.
       const m = get().material;
-      await engine.setMaterial(m.e0, m.nu, m.density, m.strength, m.strengthZ);
+      await engine.setMaterial(m.e0, m.nu, m.density, m.strength, m.strengthZ, m.shearStrengthZ);
       await pushResolution(get);
       await engine.setSnapWall(st.snapVoxel ? st.perimeters * st.lineWidth : 0);
       await engine.setCompositeSkin(st.compositeSkin);
       await engine.setSmoothStress(st.smoothStress);
+      // Session display setting, not part of the project manifest.
+      await engine.setLayerShear(get().layerShear);
       await engine.setMaterialStress(st.materialStress);
       // Replay the saved orientation (clears the engine grid + opt; restore
       // rebuilds them), then push the loads/supports.

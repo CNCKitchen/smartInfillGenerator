@@ -166,6 +166,9 @@ printed-part datasheet values, not virgin-resin values.
 - `E₀` and `ν` define the solid stiffness (§4.1).
 - `σₜ` is the in-plane tensile allowable (drives the "material" SF, §4.7).
 - `σₜᶻ` is the **inter-layer** tensile allowable (drives the "layer adhesion" SF).
+- `τᶻ` (not tabulated — presets have no measured value yet) is the **inter-layer
+  shear** allowable, the second axis of the layer-adhesion SF (§4.7); blank
+  defaults to 0.6 · σₜᶻ.
 - Density drives mass reporting and self-weight (gravity) loads.
 
 > The library values are starting points. The engine's accuracy is ultimately
@@ -276,17 +279,22 @@ order; the skin carries full strength). Implemented in
 | SF field | Definition | Failure mode |
 |---|---|---|
 | **Material** (`sfm`) | `σₜ · rel(ρ) / σ_vM` | bulk yield/fracture against von-Mises stress |
-| **Layer adhesion** (`sfz`) | `σₜᶻ · rel(ρ) / σ_zz` for **σ_zz > 0 only** | delamination — tension across the print layers; compression cannot delaminate → SF = cap |
+| **Layer adhesion** (`sfz`) | interaction criterion `(⟨σ_zz⟩₊ / σₜᶻ·rel)² + (τ / τᶻ·rel)² = 1/SF²` with `τ = √(σ_yz² + σ_zx²)` | delamination — tension across the print layers (`⟨·⟩₊`: σ_zz > 0 only; compression cannot delaminate) **and** Mode-II sliding along the layer plane (DESIGN §15) |
 | **Worst case** (`sf`, default) | per-cell `min(sfm, sfz)` | the governing limit; the dock states which one governs |
 
 where `rel(ρ)` is the cell's relative stiffness factor (`= eps`, i.e. occupancy ×
-infill/skin blend). All SFs are **capped at 10** (`SF_CAP`) — beyond that the
-number carries no engineering meaning and would flatten the color scale.
+infill/skin blend) and `τᶻ` is the interlayer **shear** allowable — a material-card
+property; left blank it defaults to **0.6 · σₜᶻ** (uncalibrated placeholder until
+measured shear-adhesion data is entered). With τ ignored the criterion reduces to
+the pre-§15 pure-tension form `σₜᶻ·rel / σ_zz`. All SFs are **capped at 10**
+(`SF_CAP`) — beyond that the number carries no engineering meaning and would
+flatten the color scale.
 
 > **Advisory only.** Strength anisotropy is modeled this way, but stiffness
-> anisotropy and **shear-mode** delamination (Mode-II, in-plane shear across
-> layers) are **not** modeled. None of these is a certified safety factor. Treat
-> them as *screening* readouts — they tell you where to look, not whether to fly.
+> anisotropy is **not**, and the tension–shear interaction exponent (quadratic)
+> plus the 0.6 default are engineering estimates pending calibration. None of
+> these is a certified safety factor. Treat them as *screening* readouts — they
+> tell you where to look, not whether to fly.
 
 ### 4.8 Stiffness anisotropy (status)
 
