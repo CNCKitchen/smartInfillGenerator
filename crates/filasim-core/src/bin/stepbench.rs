@@ -21,6 +21,35 @@ struct Stats {
     ang_p5: f64,    // 5th-percentile minimum-angle (deg) — low = slivers present
     ang_median: f64,
     sliver_frac: f64, // fraction of triangles with a min angle < 15 deg
+    open_edges: usize, // directed edges without a reverse partner — 0 = closed
+    volume: f64,       // signed volume (divergence theorem) — negative/tiny = broken
+}
+
+/// Count boundary (unmatched) directed edges and signed volume. A watertight,
+/// consistently wound mesh has zero open edges and a positive volume.
+fn integrity(mesh: &TriMesh) -> (usize, f64) {
+    use std::collections::HashMap;
+    // Quantize vertices so numerically identical points merge.
+    let q = |x: f32| (x as f64 * 1e4).round() as i64;
+    let mut dir: HashMap<([i64; 3], [i64; 3]), i64> = HashMap::new();
+    let mut vol = 0.0f64;
+    for t in &mesh.tris {
+        let p = |k: usize| [t[3 * k], t[3 * k + 1], t[3 * k + 2]];
+        let key = |v: [f32; 3]| [q(v[0]), q(v[1]), q(v[2])];
+        let (a, b, c) = (p(0), p(1), p(2));
+        for (u, v) in [(a, b), (b, c), (c, a)] {
+            *dir.entry((key(u), key(v))).or_insert(0) += 1;
+            *dir.entry((key(v), key(u))).or_insert(0) -= 1;
+        }
+        vol += (a[0] as f64 * (b[1] as f64 * c[2] as f64 - b[2] as f64 * c[1] as f64)
+            - a[1] as f64 * (b[0] as f64 * c[2] as f64 - b[2] as f64 * c[0] as f64)
+            + a[2] as f64 * (b[0] as f64 * c[1] as f64 - b[1] as f64 * c[0] as f64))
+            / 6.0;
+    }
+    // Each undirected pair appears twice (u,v) and (v,u) with opposite signs; a
+    // nonzero net count means unmatched directed edges. Sum positives only.
+    let open: i64 = dir.values().filter(|&&c| c > 0).sum();
+    (open as usize, vol)
 }
 
 fn stats(mesh: &TriMesh) -> Stats {
@@ -75,6 +104,8 @@ fn stats(mesh: &TriMesh) -> Stats {
     let sliver = min_angles.iter().filter(|&&a| a < 15.0).count() as f64
         / min_angles.len().max(1) as f64;
 
+    let (open_edges, volume) = integrity(mesh);
+
     Stats {
         tris: mesh.tris.len(),
         diag,
@@ -85,12 +116,14 @@ fn stats(mesh: &TriMesh) -> Stats {
         ang_p5,
         ang_median,
         sliver_frac: sliver,
+        open_edges,
+        volume,
     }
 }
 
 fn print_row(label: &str, s: &Stats) {
     println!(
-        "{:<28} {:>8} {:>9.3} {:>7.2} {:>7.3} {:>8.2} {:>8.1} {:>9.1} {:>9.1}%",
+        "{:<28} {:>8} {:>9.3} {:>7.2} {:>7.3} {:>8.2} {:>8.1} {:>9.1} {:>9.1}% {:>7} {:>12.2}",
         label,
         s.tris,
         s.edge_mean,
@@ -100,20 +133,25 @@ fn print_row(label: &str, s: &Stats) {
         s.ang_p5,
         s.ang_median,
         s.sliver_frac * 100.0,
+        s.open_edges,
+        s.volume,
     );
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let step_path = args.get(1).cloned().unwrap_or_else(|| "hook5 v3.step".into());
+    // Optional 2nd arg: reference STL. Any further numeric args: deviation cases.
     let stl_path = args.get(2).cloned().unwrap_or_else(|| "hook5 v3.stl".into());
+    let cli_devs: Vec<f64> = args.iter().skip(2).filter_map(|a| a.parse().ok()).collect();
 
     let bytes = std::fs::read(&step_path).expect("read step file");
     println!("STEP file: {step_path} ({} KB)\n", bytes.len() / 1024);
 
     println!(
-        "{:<28} {:>8} {:>9} {:>7} {:>7} {:>8} {:>8} {:>9} {:>10}",
-        "case", "tris", "edge_mean", "CoV", "edge_min", "edge_max", "ang_p5", "ang_med", "slivers"
+        "{:<28} {:>8} {:>9} {:>7} {:>7} {:>8} {:>8} {:>9} {:>10} {:>7} {:>12}",
+        "case", "tris", "edge_mean", "CoV", "edge_min", "edge_max", "ang_p5", "ang_med",
+        "slivers", "open", "volume"
     );
 
     // Baseline (auto deviation, no subdivision) — establishes model scale.
@@ -128,21 +166,21 @@ fn main() {
 
     // Sweep the one truck knob (surface deviation). This reports the BASE
     // tessellation only; in the product, Model::new refines it like an STL.
-    let cases: &[(&str, f64)] = &[
-        ("dev=0.05 mm", 0.05),
-        ("dev=0.02 mm", 0.02),
-        ("dev=0.01 mm", 0.01),
-        ("dev=0.005 mm", 0.005),
-    ];
-    for (label, dev) in cases {
+    let devs: Vec<f64> = if cli_devs.is_empty() {
+        vec![0.05, 0.02, 0.01, 0.005]
+    } else {
+        cli_devs
+    };
+    for dev in devs {
+        let label = format!("dev={dev} mm");
         let settings = StepTessellation {
-            surface_deviation: Some(*dev),
+            surface_deviation: Some(dev),
             ..Default::default()
         };
         match import_step(&bytes, &settings) {
             Ok(imp) => {
                 let s = stats(&imp.mesh);
-                print_row(label, &s);
+                print_row(&label, &s);
                 let fname = format!("hook_truck_{}.stl", label.replace([' ', '.', '='], "_"));
                 std::fs::write(fname, imp.mesh.to_stl_binary()).ok();
             }
