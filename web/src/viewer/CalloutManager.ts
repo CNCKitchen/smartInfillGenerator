@@ -67,6 +67,19 @@ export interface InteriorExtreme {
   maxAt: [number, number, number];
 }
 
+/** A load's value label, drawn like a result callout (a dot pinned to the load
+ *  anchor + an offset value chip + a thin leader line) instead of an opaque 3D
+ *  sprite sitting on the picked spot. Projected each frame in `projectBcCallouts`. */
+export interface BcCalloutItem {
+  id: string;
+  world: THREE.Vector3;
+  text: string;
+  /** Roster colour (CSS hex) for the dot fill, chip text, and leader line. */
+  color: string;
+  /** Deactivated in the shown step → drawn dim. */
+  ghost: boolean;
+}
+
 export class CalloutManager {
   // ---- fixed value callouts (contour views) ----
   private callouts: Callout[] = [];
@@ -103,6 +116,10 @@ export class CalloutManager {
    *  it BEATS the surface extreme (higher max / lower SF min). */
   private interior: InteriorExtreme | null = null;
   private extremeScratch = new THREE.Vector3();
+
+  // ---- load value labels (setup view) drawn callout-style ----
+  private bcEls: { world: THREE.Vector3; dot: HTMLDivElement; chip: HTMLDivElement; line: SVGLineElement }[] = [];
+  private bcVisible = true;
 
   constructor(private readonly host: CalloutHost) {}
 
@@ -164,6 +181,7 @@ export class CalloutManager {
     document.removeEventListener("keydown", this.onAnnoKey);
     this.parent?.removeEventListener("pointerdown", this.onAnnoDownCapture, true);
     this.clearCallouts();
+    this.clearBcCallouts();
     this.annoSvg?.remove();
     this.annoRectEl?.remove();
     if (this.extremeEls) for (const el of Object.values(this.extremeEls)) el.remove();
@@ -387,6 +405,86 @@ export class CalloutManager {
     const fmt = this.host.probeFormat();
     if (!fmt) return;
     for (const c of this.callouts) c.chip.textContent = fmt(c.value);
+  }
+
+  // ---------- load value labels (callout-style) ----------
+
+  /** Replace the load value labels. Each becomes a small roster-coloured dot on
+   *  the load anchor + an offset value chip + a leader line — so the value never
+   *  covers the picked spot (unlike the old opaque 3D sprite). Rebuilt only when
+   *  the BC set changes; `projectBcCallouts` places them every frame. */
+  setBcCallouts(items: BcCalloutItem[]) {
+    this.clearBcCallouts();
+    if (!this.parent || !this.annoSvg) return;
+    for (const it of items) {
+      const dot = document.createElement("div");
+      dot.className = "bc-callout-dot";
+      dot.style.background = it.color;
+      const chip = document.createElement("div");
+      chip.className = "probe bc-callout-chip";
+      chip.textContent = it.text;
+      chip.style.color = it.color;
+      const line = document.createElementNS(SVG_NS, "line");
+      line.setAttribute("class", "bc-callout-line");
+      line.setAttribute("stroke", it.color);
+      if (it.ghost) {
+        dot.style.opacity = chip.style.opacity = "0.45";
+        line.style.opacity = "0.3";
+      }
+      this.annoSvg.appendChild(line);
+      this.parent.append(dot, chip);
+      this.bcEls.push({ world: it.world, dot, chip, line });
+    }
+    this.projectBcCallouts();
+  }
+
+  /** Show/hide the load labels (they belong to the setup view, like the load
+   *  glyphs — hidden in mesh/result views). */
+  setBcCalloutsVisible(on: boolean) {
+    this.bcVisible = on;
+    this.projectBcCallouts();
+  }
+
+  /** Project the load labels to screen pixels + place their DOM. Called every
+   *  frame from the render tick (the camera may have moved). Chip offset
+   *  below-right of the dot (matching the result extremes), leader line between. */
+  projectBcCallouts() {
+    if (!this.bcEls.length) return;
+    if (!this.bcVisible) {
+      for (const e of this.bcEls) e.dot.style.display = e.chip.style.display = e.line.style.display = "none";
+      return;
+    }
+    const { w, h } = this.host.viewSize();
+    const cam = this.host.camera();
+    for (const e of this.bcEls) {
+      const v = this.extremeScratch.copy(e.world).project(cam);
+      if (v.z < -1 || v.z > 1) {
+        e.dot.style.display = e.chip.style.display = e.line.style.display = "none";
+        continue;
+      }
+      const x = (v.x * 0.5 + 0.5) * w;
+      const y = (-v.y * 0.5 + 0.5) * h;
+      const ox = 15;
+      const oy = 11;
+      e.dot.style.display = e.chip.style.display = e.line.style.display = "block";
+      e.dot.style.left = `${x}px`;
+      e.dot.style.top = `${y}px`;
+      e.chip.style.left = `${x + ox}px`;
+      e.chip.style.top = `${y + oy}px`;
+      e.line.setAttribute("x1", `${x}`);
+      e.line.setAttribute("y1", `${y}`);
+      e.line.setAttribute("x2", `${x + ox}`);
+      e.line.setAttribute("y2", `${y + oy}`);
+    }
+  }
+
+  clearBcCallouts() {
+    for (const e of this.bcEls) {
+      e.dot.remove();
+      e.chip.remove();
+      e.line.remove();
+    }
+    this.bcEls.length = 0;
   }
 
   // ---------- min/max markers ----------

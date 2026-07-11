@@ -8,11 +8,22 @@
 use crate::bvh::WindingBvh;
 use crate::check::{islands, rbm_check, ConstraintDir, RbmMode};
 use crate::mesh::TriMesh;
+use crate::rigid::RigidGroup;
 use crate::solve::{boundary_nodes, NodeProblem, SolveSettings};
 use crate::voxel::VoxelGrid;
 
 /// Penalty stiffness multiplier for frictionless supports, relative to E0*h.
 const SPRING_FACTOR: f64 = 300.0;
+/// Penalty stiffness multiplier for a RIGID remote mass's patch coupling
+/// (DESIGN §16 milestone 4), relative to E0·h. This is the "penalty scaling vs
+/// the Chebyshev smoother" the milestone tunes: a rigid-mass sweep (validation
+/// `rigid_penalty_convergence_sweep`) shows the patch's achieved rigidity
+/// SATURATES by ~factor 5–10 (a stiffer penalty buys no more), while MGCG
+/// iterations grow ~√factor and with resolution because the coupling is a
+/// fine-only pass-through the coarse grid never sees. 20 sits at the knee:
+/// ~2–3× the baseline iteration count (bounded, resolution-stable to 1M cells)
+/// for a mount that is already effectively rigid.
+const RIGID_FACTOR: f64 = 20.0;
 /// Max distance (in cell sizes) from a boundary node to the SELECTION for the
 /// node to count as attached. Must sit between the stair-step deviation of a
 /// voxel surface (~0.87h worst case) and the next node ring (1.0h).
@@ -54,6 +65,48 @@ pub enum BcKind {
     /// `fᵢ = wᵢ (G⁻¹ M) × dᵢ` with `G = Σ wᵢ(|dᵢ|²I − dᵢdᵢᵀ)`. This makes
     /// `Σ dᵢ×fᵢ = M` exactly with zero net force, mesh-independently.
     Moment([f64; 3]),
+    /// Remote point mass (DESIGN §16): a component of mass `mass` (tonne) bolted
+    /// to the selected patch, its centre of gravity at the remote `point` (mm).
+    ///
+    /// **Deformable** (`rigid = false`, the default): load-only. Under the active
+    /// body acceleration `a` (see [`BodyLoad`]) it loads the patch with the
+    /// statically-equivalent force `F = m·a` PLUS the transported couple
+    /// `M = (p − c) × F` about the patch area-weighted centroid `c` (force by area
+    /// weight, couple by the `moment_forces` machinery); it adds NO stiffness.
+    ///
+    /// **Rigid** (`rigid = true`, milestone 4): the mount also STIFFENS the patch,
+    /// tying it to a 6-DOF virtual master at `point` (see [`crate::rigid`]). The
+    /// coupling enters the solver as a penalty `RigidGroup` on the finest level;
+    /// the load then distributes by the rigidity kinematics `Bᵢ G⁻¹ [m·a; 0]`
+    /// instead of area weights. The stiffness is present whenever `rigid` — even
+    /// with no acceleration — because a rigid boss stiffens its mount regardless
+    /// of load. A degenerate patch (<3 non-collinear nodes) falls back to
+    /// deformable. Zero active acceleration ⇒ zero LOAD (the stiffness stays).
+    Mass { point: [f64; 3], mass: f64, rigid: bool },
+}
+
+/// Inertial body load for [`assemble`] (DESIGN §16): a world acceleration `a`
+/// applied to the part's own distributed mass (self-weight) AND to every
+/// [`BcKind::Mass`]. `vfrac` is the per-cell MATERIAL volume fraction
+/// (occupancy × skin/infill composite; length = `grid.cell_count()`) — the same
+/// field the mass readout composites, NOT the stiffness `eps` (a 20 %-infill
+/// cell weighs 0.2× solid, not its stiffness fraction). A zero `accel` produces
+/// no forces at all, so `Some(BodyLoad { accel: [0;3], .. })` is inert.
+///
+/// An EMPTY `vfrac` selects **mass-only mode**: remote-mass forces are realised
+/// and solid cells still mark the RBM load flag, but the distributed self-weight
+/// FORCE is skipped — for the optimizer, which recomputes self-weight from the
+/// live density every SIMP iteration (DESIGN §16 dec. 4) rather than baking it
+/// in once. Analysis solves always pass a real (non-empty) vfrac.
+#[derive(Clone, Copy)]
+pub struct BodyLoad<'a> {
+    /// World acceleration, mm/s² (gravity = 9810 toward −Z).
+    pub accel: [f64; 3],
+    /// Material (bulk) density, tonne/mm³.
+    pub density: f64,
+    /// Per-cell material volume fraction (occupancy × skin/infill composite).
+    /// Empty ⇒ mass-only mode (no self-weight force; see the type docs).
+    pub vfrac: &'a [f32],
 }
 
 #[derive(Clone, Debug)]
@@ -99,7 +152,7 @@ pub fn assemble(
     mesh: &TriMesh,
     grid: &VoxelGrid,
     bcs: &[BcSpec],
-    gravity: Option<([f64; 3], f64)>, // (acceleration mm/s², density tonne/mm³)
+    body: Option<BodyLoad>, // inertial self-weight + remote-mass loads (DESIGN §16)
     settings: &SolveSettings,
 ) -> Result<Assembled, AttachError> {
     let h = grid.h;
@@ -128,27 +181,10 @@ pub fn assemble(
             return Err(AttachError::EmptySelection(bi));
         }
         let sel = bc.tris.clone();
-        // Mini-BVH over just this selection: distance to the SELECTION decides
-        // attachment (immune to nearest-triangle ties at face borders).
-        let sub_mesh = TriMesh::from_triangles(
-            sel.iter().map(|&ti| mesh.tris[ti as usize]).collect(),
-        );
-        let sub_bvh = WindingBvh::build(&sub_mesh);
-        // Selection bounding box + margin restricts the candidate nodes.
-        let (lo, hi) = sub_mesh.bounds().unwrap();
-        let margin = 2.0 * h;
-        let nodes: Vec<u32> = boundary
-            .iter()
-            .copied()
-            .filter(|&n| {
-                let p = node_pos(n);
-                (0..3).all(|d| p[d] >= lo[d] - margin && p[d] <= hi[d] + margin)
-            })
-            .filter(|&n| sub_bvh.closest_triangle(node_pos(n)).1 <= attach_d2)
-            .collect();
-        if nodes.is_empty() {
-            return Err(AttachError::NoNodesAttached(bi));
-        }
+        // Attached boundary nodes for this selection (shared sub-BVH + bbox
+        // margin). The sub-mesh/BVH are reused below for per-node normals.
+        let (nodes, sub_mesh, sub_bvh) =
+            attach_selection(mesh, grid, &boundary, bi, &sel, attach_d2, &node_pos)?;
 
         match &bc.kind {
             BcKind::Fixed => {
@@ -268,28 +304,104 @@ pub fn assemble(
                     load_nodes.push(n);
                 }
             }
+            BcKind::Mass { point, mass, rigid } => {
+                let a = body.map(|b| b.accel).unwrap_or([0.0; 3]);
+                let active = a != [0.0; 3] && *mass != 0.0;
+                // Rigid mount: try to build the condensed 6-DOF coupling first
+                // (stiffness is present whenever `rigid`, even with no accel). A
+                // degenerate patch (<3 non-collinear nodes ⇒ singular master
+                // Gram) falls back to the deformable path below.
+                let group = if *rigid {
+                    let arms: Vec<[f64; 3]> = nodes
+                        .iter()
+                        .map(|&n| {
+                            let p = node_pos(n);
+                            [p[0] - point[0], p[1] - point[1], p[2] - point[2]]
+                        })
+                        .collect();
+                    let k = RIGID_FACTOR * settings.e0 * h;
+                    RigidGroup::build(nodes.clone(), arms, k)
+                } else {
+                    None
+                };
+                if let Some(g) = group {
+                    // Rigid load: distribute the master force F = m·a (at the CG,
+                    // no moment) by the rigidity kinematics Bᵢ G⁻¹ [F; 0]. The
+                    // stiffness rides `problem.rigid`; the load is design-
+                    // independent (m fixed), so it goes in `forces` as usual.
+                    if active {
+                        let fm = [mass * a[0], mass * a[1], mass * a[2], 0.0, 0.0, 0.0];
+                        for (i, f) in g.load(fm).into_iter().enumerate() {
+                            if f != [0.0; 3] {
+                                problem.forces.push((nodes[i], f));
+                            }
+                            load_nodes.push(nodes[i]);
+                        }
+                    }
+                    problem.rigid.push(g);
+                } else {
+                    // Deformable (load-only): statically-equivalent force
+                    // F = m·a spread over the patch + transported couple
+                    // M = (p − c) × F. Inert when no acceleration is active.
+                    let fv =
+                        mass_forces(mesh, &sel, &nodes, grid, *point, *mass, a, |n| node_pos(n));
+                    for (i, &n) in nodes.iter().enumerate() {
+                        if fv[i] != [0.0; 3] {
+                            problem.forces.push((n, fv[i]));
+                        }
+                        if active {
+                            load_nodes.push(n);
+                        }
+                    }
+                }
+            }
         }
         bc_nodes.push(nodes);
     }
 
-    // Gravity: body force per solid cell, lumped to its 8 nodes.
-    if let Some((g, density)) = gravity {
-        let cell_f = [0, 1, 2].map(|d| density * g[d] * h * h * h / 8.0);
-        if cell_f.iter().any(|&v| v != 0.0) {
+    // Self-weight: inertial body force per cell, lumped to its 8 nodes and
+    // scaled by the cell's MATERIAL volume fraction (occupancy × skin/infill
+    // composite) so a graded-infill cell weighs its true share, not a solid
+    // skin (DESIGN §16 dec. 3). Body forces also count toward the RBM check's
+    // per-component load flag (dec. 11) — an unconstrained mass-bearing island
+    // under acceleration is a real failure, not a free-floating speck.
+    //
+    // MASS-ONLY mode (`body.vfrac` empty): the optimizer recomputes the
+    // design-dependent self-weight from the LIVE density every SIMP iteration
+    // (dec. 4), so it assembles the density-INDEPENDENT loads (surface tractions
+    // + remote masses) with an empty vfrac — no self-weight FORCE is added here,
+    // but every solid cell still marks the RBM load flag so the pre-solve check
+    // stays honest about a self-weight-loaded island.
+    if let Some(body) = body {
+        let a = body.accel;
+        if a.iter().any(|&v| v != 0.0) {
+            let has_vfrac = !body.vfrac.is_empty();
+            // Force on a fully-dense cell, per node (÷8 lumping).
+            let full = [0, 1, 2].map(|d| body.density * a[d] * h * h * h / 8.0);
             for cz in 0..grid.nz {
                 for cy in 0..grid.ny {
                     for cx in 0..grid.nx {
-                        if grid.scale[(cz * grid.ny + cy) * grid.nx + cx] <= 0.0 {
-                            continue;
-                        }
-                        for oz in 0..2 {
-                            for oy in 0..2 {
-                                for ox in 0..2 {
-                                    let n = ((cz + oz) * my + cy + oy) * mx + cx + ox;
-                                    problem.forces.push((n as u32, cell_f));
+                        let ci = (cz * grid.ny + cy) * grid.nx + cx;
+                        if has_vfrac {
+                            let vf = body.vfrac[ci] as f64;
+                            if vf <= 0.0 {
+                                continue;
+                            }
+                            let cell_f = [full[0] * vf, full[1] * vf, full[2] * vf];
+                            for oz in 0..2 {
+                                for oy in 0..2 {
+                                    for ox in 0..2 {
+                                        let n = ((cz + oz) * my + cy + oy) * mx + cx + ox;
+                                        problem.forces.push((n as u32, cell_f));
+                                    }
                                 }
                             }
+                        } else if grid.scale[ci] <= 0.0 {
+                            continue; // mass-only mode: skip void, load solid cells
                         }
+                        // One representative node marks this cell's component as
+                        // loaded (the base corner; any of the 8 resolves).
+                        load_nodes.push(((cz * my + cy) * mx + cx) as u32);
                     }
                 }
             }
@@ -297,6 +409,100 @@ pub fn assemble(
     }
 
     Ok(Assembled { problem, bc_nodes, constraints, load_nodes })
+}
+
+/// Boundary nodes attached to one triangle selection: build a mini-BVH over just
+/// the selection (distance to the SELECTION decides attachment, immune to
+/// nearest-triangle ties at face borders), prune candidates to the selection
+/// bbox + a 2·h margin, and keep the boundary nodes within `attach_d2` of it.
+/// Shared by [`assemble`] and [`point_mass_lumping`] so a remote mass's MODAL
+/// inertia footprint is EXACTLY the patch its static force loads. Returns the
+/// attached nodes plus the sub-mesh/BVH (the caller reuses them for per-node
+/// surface normals).
+fn attach_selection(
+    mesh: &TriMesh,
+    grid: &VoxelGrid,
+    boundary: &[u32],
+    bi: usize,
+    sel: &[u32],
+    attach_d2: f64,
+    node_pos: &impl Fn(u32) -> [f64; 3],
+) -> Result<(Vec<u32>, TriMesh, WindingBvh), AttachError> {
+    let sub_mesh =
+        TriMesh::from_triangles(sel.iter().map(|&ti| mesh.tris[ti as usize]).collect());
+    let sub_bvh = WindingBvh::build(&sub_mesh);
+    let (lo, hi) = sub_mesh.bounds().unwrap();
+    let margin = 2.0 * grid.h;
+    let nodes: Vec<u32> = boundary
+        .iter()
+        .copied()
+        .filter(|&n| {
+            let p = node_pos(n);
+            (0..3).all(|d| p[d] >= lo[d] - margin && p[d] <= hi[d] + margin)
+        })
+        .filter(|&n| sub_bvh.closest_triangle(node_pos(n)).1 <= attach_d2)
+        .collect();
+    if nodes.is_empty() {
+        return Err(AttachError::NoNodesAttached(bi));
+    }
+    Ok((nodes, sub_mesh, sub_bvh))
+}
+
+/// Per-node lumped mass (tonne) contributed by every [`BcKind::Mass`] in `bcs`
+/// for MODAL analysis (DESIGN §16). A remote point mass adds inertia to the
+/// eigenproblem `K v = λ M v` that the static force path (which only realises
+/// `F = m·a`) never sees — so a heavy payload correctly drags the natural
+/// frequencies down. Each mass `m` is distributed over its attachment patch by
+/// the SAME area weights the static force uses: node `i` gets `m · wᵢ/Σw`, on
+/// all three translational DOFs. The voxel HEX8 mesh has no rotational DOFs and
+/// no rigid link to the remote CG, so the offset's **rotatory** inertia is not
+/// representable; only the resultant translational mass is lumped — consistent
+/// with the static distributed-force resultant, and the honest limit of a
+/// translational-DOF model (documented in the theory manual). Node indices are
+/// finest-grid nodes (the modal solver's DOF layout); a node may repeat across
+/// mass BCs, so the caller sums. Empty when there are no mass BCs.
+pub fn point_mass_lumping(mesh: &TriMesh, grid: &VoxelGrid, bcs: &[BcSpec]) -> Vec<(u32, f64)> {
+    let h = grid.h;
+    let (mx, my) = (grid.nx + 1, grid.ny + 1);
+    let node_pos = |n: u32| -> [f64; 3] {
+        let n = n as usize;
+        let x = n % mx;
+        let y = (n / mx) % my;
+        let z = n / (mx * my);
+        [
+            grid.origin[0] + x as f64 * h,
+            grid.origin[1] + y as f64 * h,
+            grid.origin[2] + z as f64 * h,
+        ]
+    };
+    let boundary = boundary_nodes(grid);
+    let attach_d2 = (ATTACH_DIST_CELLS * h) * (ATTACH_DIST_CELLS * h);
+    let mut out = Vec::new();
+    for (bi, bc) in bcs.iter().enumerate() {
+        let mass = match &bc.kind {
+            BcKind::Mass { mass, .. } => *mass,
+            _ => continue,
+        };
+        if mass == 0.0 || bc.tris.is_empty() {
+            continue;
+        }
+        // Same attachment footprint the static force uses; a mass whose patch
+        // grabs no nodes simply contributes nothing (no hard error here).
+        let Ok((nodes, _, _)) =
+            attach_selection(mesh, grid, &boundary, bi, &bc.tris, attach_d2, &node_pos)
+        else {
+            continue;
+        };
+        let w = area_weights(mesh, &bc.tris, &nodes, grid);
+        let wsum: f64 = w.iter().sum();
+        if wsum <= 0.0 {
+            continue;
+        }
+        for (i, &n) in nodes.iter().enumerate() {
+            out.push((n, mass * w[i] / wsum));
+        }
+    }
+    out
 }
 
 /// Sample selected triangles on a sub-cell lattice; route each sample's area
@@ -619,6 +825,65 @@ fn moment_forces<F: Fn(u32) -> [f64; 3]>(
     for i in 0..nodes.len() {
         let cr = cross3(x, dd[i]);
         out[i] = [w[i] * cr[0], w[i] * cr[1], w[i] * cr[2]];
+    }
+    out
+}
+
+/// Remote point mass as a deformable patch load (DESIGN §16): the force
+/// `F = m·a` distributed by area weight PLUS the couple `M = (p − c) × F`
+/// transported by [`moment_forces`], both about the patch area-weighted
+/// centroid `c`. The area-weighted force split contributes zero moment about
+/// `c`, so the superposition is statically equivalent to `F` acting at the
+/// remote point `p` — exact resultant, zero spurious moment, mesh-independent.
+/// Returns the zero field when the force vanishes.
+#[allow(clippy::too_many_arguments)]
+fn mass_forces<F: Fn(u32) -> [f64; 3]>(
+    mesh: &TriMesh,
+    sel: &[u32],
+    nodes: &[u32],
+    grid: &VoxelGrid,
+    point: [f64; 3],
+    mass: f64,
+    accel: [f64; 3],
+    node_pos: F,
+) -> Vec<[f64; 3]> {
+    let mut out = vec![[0f64; 3]; nodes.len()];
+    let force = [mass * accel[0], mass * accel[1], mass * accel[2]];
+    if force == [0.0; 3] {
+        return out;
+    }
+    let w = area_weights(mesh, sel, nodes, grid);
+    let wsum: f64 = w.iter().sum();
+    if wsum <= 0.0 {
+        return out;
+    }
+    // Patch area-weighted centroid — the point the couple transports about, and
+    // the point the distributed force produces no net moment about.
+    let mut c = [0f64; 3];
+    for (i, &n) in nodes.iter().enumerate() {
+        let p = node_pos(n);
+        for d in 0..3 {
+            c[d] += w[i] * p[d];
+        }
+    }
+    for d in 0..3 {
+        c[d] /= wsum;
+    }
+    // Distributed statically-equivalent force (Voronoi share of F).
+    for (i, o) in out.iter_mut().enumerate() {
+        let s = w[i] / wsum;
+        for d in 0..3 {
+            o[d] += s * force[d];
+        }
+    }
+    // Transported couple M = (p − c) × F, realised with zero net force.
+    let arm = [point[0] - c[0], point[1] - c[1], point[2] - c[2]];
+    let moment = cross3(arm, force);
+    let cpl = moment_forces(mesh, sel, nodes, grid, moment, &node_pos);
+    for (o, m) in out.iter_mut().zip(&cpl) {
+        for d in 0..3 {
+            o[d] += m[d];
+        }
     }
     out
 }

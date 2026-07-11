@@ -25,11 +25,13 @@
 //!
 //! Usually invoked via `node scripts/preflight.mjs` (the pre-push gate).
 
-use filasim_core::attach::{assemble, BcKind, BcSpec};
+use filasim_core::attach::{assemble, point_mass_lumping, BcKind, BcSpec, BodyLoad};
 use filasim_core::bins::{assign_bins_mass, cleanup_small_regions, cluster_levels};
 use filasim_core::mesh::primitives;
 use filasim_core::modal::{analyze, ModalConfig};
-use filasim_core::simp::{evaluate, optimize, OptimizeParams};
+use filasim_core::simp::{
+    evaluate, evaluate_cached_stats, optimize, optimize_cached, BodyAccel, LoadSet, OptimizeParams,
+};
 use filasim_core::solve::{active_nodes, solve_cached, SolverCache};
 use filasim_core::{
     pad_for_levels, solve_static, BoxRegion, NodeProblem, SolveSettings, StaticProblem, TriMesh,
@@ -184,6 +186,89 @@ fn bench_optimize(m: &mut Metrics) {
     m.i("opt_time_ms", dt * 1000.0);
 }
 
+/// SIMP optimization DRIVEN BY SELF-WEIGHT (DESIGN §16 dec. 4): the same
+/// cantilever as `bench_optimize`, but the only load is the part's own weight
+/// under 1 g — a DESIGN-DEPENDENT load the optimizer must recompute from the
+/// live density every iteration. Anchors the self-weight optimizer path
+/// (continuous/binned compliance, gain vs uniform) AND dec. 10's own-weight
+/// comparison: the fully-solid baseline carries FULL self-weight, so it must
+/// deflect MORE than the equal-mass uniform (which is lighter). A heavy density
+/// makes the self-weight bending measurable at this size.
+fn bench_optimize_selfweight(m: &mut Metrics) {
+    let beam = primitives::boxx([0.0; 3], [60.0, 10.0, 10.0]);
+    let grid0 = VoxelGrid::voxelize(&beam, 1.0);
+    let settings = SolveSettings { e0: 2400.0, nu: 0.35, tol: 1e-5, ..Default::default() };
+    let (grid, levels) = pad_for_levels(&grid0, settings.max_levels);
+    let density = 5.0e-8; // tonne/mm³ — heavy, so self-weight loads the beam
+    let accel = [0.0, 0.0, -9810.0]; // 1 g down
+    // Fixed root only — the load is the part's own weight. Mass-only assemble
+    // (empty vfrac): the self-weight FORCE is added per iteration; here it only
+    // sets the RBM load flag on the solid cells.
+    let bcs = vec![BcSpec { kind: BcKind::Fixed, tris: vec![0, 1] }];
+    let body = BodyLoad { accel, density, vfrac: &[] };
+    let asm = assemble(&beam, &grid, &bcs, Some(body), &settings).expect("assemble self-weight");
+    let params = OptimizeParams {
+        budget: 0.35,
+        exponent: 1.5,
+        wall_mm: 1.0,
+        max_iter: 30,
+        ..Default::default()
+    };
+    let (exp, coeff) = (params.exponent, params.coeff);
+    let loads = LoadSet {
+        primary_body: Some(BodyAccel { accel, density }),
+        ..Default::default()
+    };
+
+    let t0 = Instant::now();
+    let res = optimize_cached(
+        &mut None, &grid, levels, &asm.problem, &settings, &params, None, None, &loads,
+        |_, _, _| {},
+    )
+    .expect("optimize self-weight");
+    let dt = t0.elapsed().as_secs_f64();
+
+    let target = res.x.iter().sum::<f64>() / res.x.len() as f64;
+    let centers = cluster_levels(&res.x, &res.se, 3, exp, coeff, params.floor, params.cap);
+    let mut bins = assign_bins_mass(&res.x, &res.se, &centers, exp, coeff, target);
+    cleanup_small_regions(&grid, &res.design_cells, &mut bins, centers.len(), 30);
+    let x_binned: Vec<f64> = bins.iter().map(|&b| centers[b as usize]).collect();
+    let mean_binned = x_binned.iter().sum::<f64>() / x_binned.len() as f64;
+    let x_uniform = vec![mean_binned; x_binned.len()];
+    let x_solid = vec![1.0; x_binned.len()];
+
+    // Each design carries its OWN self-weight (via `loads`): the eval recomputes
+    // the body force from the density it is handed (dec. 10).
+    let ev = |x: &[f64]| {
+        evaluate_cached_stats(
+            &mut None, &grid, levels, &asm.problem, &settings, &res.skin_cells, &res.design_cells,
+            &res.skin_frac, x, exp, coeff, &loads,
+        )
+        .expect("self-weight eval")
+    };
+    let (c_binned, maxd, _, _) = ev(&x_binned);
+    let (c_uniform, _, _, _) = ev(&x_uniform);
+    let (c_solid, maxd_solid, _, _) = ev(&x_solid);
+
+    m.q("opt_sw_c_continuous", res.compliance);
+    m.q("opt_sw_c_binned", c_binned);
+    m.q("opt_sw_c_uniform", c_uniform);
+    m.q("opt_sw_c_solid", c_solid);
+    m.q("opt_sw_gain_vs_uniform", c_uniform / c_binned);
+    m.q("opt_sw_mean_infill", target);
+    m.q("opt_sw_maxd", maxd);
+    m.i("opt_sw_iters", res.iterations as f64);
+    m.i("opt_sw_time_ms", dt * 1000.0);
+
+    // Sanity (caught at bench-run time, before --check): the self-weight
+    // optimization converged to a sane design, and the fully-solid baseline —
+    // heavier, carrying full self-weight — deflects under its own weight.
+    assert!(
+        res.iterations > 0 && c_binned > 0.0 && maxd > 0.0 && maxd_solid > 0.0,
+        "self-weight optimize produced a sane result (c_binned {c_binned}, maxd {maxd})"
+    );
+}
+
 // ---------- beam suite (solid + uniform infill; tension, bending, modal) ----------
 
 struct BeamOut {
@@ -260,7 +345,7 @@ fn bench_beam(
     // --- tension: total +Fx spread over the tip face ---
     let forces: Vec<(u32, [f64; 3])> =
         tip.iter().map(|&n| (n, [TENSION_N / tip.len() as f64, 0.0, 0.0])).collect();
-    let prob = NodeProblem { fixed: fixed.clone(), springs: Vec::new(), forces };
+    let prob = NodeProblem { fixed: fixed.clone(), springs: Vec::new(), forces, rigid: Vec::new() };
     let t0 = Instant::now();
     let r = solve_cached(&mut None, &grid, levels, &prob, &s, eps.clone(), s.tol, s.max_iter)
         .expect("tension solve");
@@ -279,7 +364,7 @@ fn bench_beam(
     // --- bending: total -Fz spread over the tip face ---
     let forces: Vec<(u32, [f64; 3])> =
         tip.iter().map(|&n| (n, [0.0, 0.0, BENDING_N / tip.len() as f64])).collect();
-    let prob = NodeProblem { fixed: fixed.clone(), springs: Vec::new(), forces };
+    let prob = NodeProblem { fixed: fixed.clone(), springs: Vec::new(), forces, rigid: Vec::new() };
     let t0 = Instant::now();
     let r = solve_cached(&mut None, &grid, levels, &prob, &s, eps.clone(), s.tol, s.max_iter)
         .expect("bending solve");
@@ -300,11 +385,11 @@ fn bench_beam(
     }
 
     // --- modal: root-clamped free vibration, lowest 6 modes ---
-    let mprob = NodeProblem { fixed: fixed.clone(), springs: Vec::new(), forces: Vec::new() };
+    let mprob = NodeProblem { fixed: fixed.clone(), springs: Vec::new(), forces: Vec::new(), rigid: Vec::new() };
     let mut cache = SolverCache::build(&grid, levels, &mprob, &s, eps.clone());
     let cfg = ModalConfig::new(6);
     let t0 = Instant::now();
-    let res = analyze(&mut cache.solver, &grid.scale, BEAM_RHO, &cfg, |_, _, _| {})
+    let res = analyze(&mut cache.solver, &grid.scale, BEAM_RHO, &[], &cfg, |_, _, _| {})
         .expect("modal solve");
     let dt = t0.elapsed().as_secs_f64();
     for (k, &fk) in res.freqs_hz.iter().take(6).enumerate() {
@@ -337,6 +422,217 @@ fn bench_beam_pair(m: &mut Metrics, sz: &str, nx: usize, ny: usize, nz: usize, h
     if !solid.f.is_empty() && !infill.f.is_empty() {
         m.q(&format!("beam_ratio_modal_{sz}"), infill.f[0] / solid.f[0]);
     }
+}
+
+/// Acceleration loads + remote point masses (DESIGN §16), on the §14 solid
+/// 64×8×4 cantilever with the root plane fully fixed. Two anchors:
+///  (a) LEVER ARM — a tip point mass `m` whose CG is offset `r` along the beam
+///      axis, under 1 g, must reproduce the hand-composed tip force `m·g` +
+///      moment `m·g·r` bit-for-bit (the remote-mass couple transport IS the
+///      Force+Moment machinery), so the deflection ratio is exactly 1.
+///  (b) SELF-WEIGHT — 1 g with no dummy mass vs the Euler cantilever band
+///      `q·L⁴/8EI`, `q = ρ·A·g`. Regression-anchored (thick-hex shear makes the
+///      exact ratio a fixed value slightly off 1; drift is what matters).
+fn bench_accel(m: &mut Metrics) {
+    let (nx, ny, nz, h) = (64usize, 8usize, 4usize, 1.0f64);
+    let beam = primitives::boxx(
+        [0.0, 0.0, 0.0],
+        [nx as f32 * h as f32, ny as f32 * h as f32, nz as f32 * h as f32],
+    );
+    let s = SolveSettings { e0: BEAM_E0, nu: BEAM_NU, tol: 1e-7, max_iter: 500, ..Default::default() };
+    let (grid, levels) = pad_for_levels(&VoxelGrid::voxelize(&beam, h), s.max_levels);
+    // Solid stiffness: eps = 1 on solid cells (occupancy is 1 on this box).
+    let eps: Vec<f32> = grid.scale.iter().map(|&sc| if sc > 0.0 { 1.0 } else { 0.0 }).collect();
+
+    // Tip-plane nodes (x = nx, the solid free end) for the mean deflection.
+    let active = active_nodes(&grid);
+    let (mx, my, mz) = (grid.nx + 1, grid.ny + 1, grid.nz + 1);
+    let mut tip = Vec::new();
+    for z in 0..mz {
+        for y in 0..my {
+            let t = (z * my + y) * mx + nx;
+            if t < active.len() && active[t] {
+                tip.push(t as u32);
+            }
+        }
+    }
+    let cross = |a: [f64; 3], b: [f64; 3]| {
+        [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+    };
+    let g = 9810.0f64;
+    let root = vec![0u32, 1]; // -x face
+
+    // --- (a) remote-mass lever arm ---
+    let tip_face = vec![2u32, 3]; // +x face
+    let mass = 1.0e-4; // tonne (100 g)
+    let r = 40.0; // CG offset along +x, beyond the tip
+    // The tip face is symmetric, so its area-weighted centroid is the geometric
+    // face centre — the point the couple transports about. Offset the CG +r·x̂.
+    let c = [nx as f64 * h, ny as f64 * h * 0.5, nz as f64 * h * 0.5];
+    let point = [c[0] + r, c[1], c[2]];
+    let accel = [0.0, 0.0, -g];
+    let force = [mass * accel[0], mass * accel[1], mass * accel[2]];
+    let moment = cross([r, 0.0, 0.0], force); // = (p − c) × F
+
+    // Solve A: the mass entity (density 0 ⇒ mass load only, no self-weight).
+    let bcs_a = vec![
+        BcSpec { kind: BcKind::Fixed, tris: root.clone() },
+        BcSpec { kind: BcKind::Mass { point, mass, rigid: false }, tris: tip_face.clone() },
+    ];
+    let body_a = BodyLoad { accel, density: 0.0, vfrac: &grid.scale };
+    let asm_a = assemble(&beam, &grid, &bcs_a, Some(body_a), &s).expect("assemble mass");
+    let ra = solve_cached(&mut None, &grid, levels, &asm_a.problem, &s, eps.clone(), s.tol, s.max_iter)
+        .expect("mass solve");
+    let uz_a = mean_disp(&ra.u, &tip, 2);
+
+    // Solve B: the same load hand-composed as tip Force + Moment.
+    let bcs_b = vec![
+        BcSpec { kind: BcKind::Fixed, tris: root.clone() },
+        BcSpec { kind: BcKind::Force(force), tris: tip_face.clone() },
+        BcSpec { kind: BcKind::Moment(moment), tris: tip_face.clone() },
+    ];
+    let asm_b = assemble(&beam, &grid, &bcs_b, None, &s).expect("assemble force+moment");
+    let rb = solve_cached(&mut None, &grid, levels, &asm_b.problem, &s, eps.clone(), s.tol, s.max_iter)
+        .expect("force+moment solve");
+    let uz_b = mean_disp(&rb.u, &tip, 2);
+
+    m.q("accel_mass_leverarm_uz", uz_a);
+    // The couple transport IS Force+Moment, so this is 1 to solver tolerance.
+    m.q("accel_mass_vs_forcemoment_ratio", if uz_b != 0.0 { uz_a / uz_b } else { 0.0 });
+
+    // --- (b) part self-weight ---
+    let bcs_g = vec![BcSpec { kind: BcKind::Fixed, tris: root.clone() }];
+    let body_g = BodyLoad { accel: [0.0, 0.0, -g], density: BEAM_RHO, vfrac: &grid.scale };
+    let asm_g = assemble(&beam, &grid, &bcs_g, Some(body_g), &s).expect("assemble self-weight");
+    let rg = solve_cached(&mut None, &grid, levels, &asm_g.problem, &s, eps.clone(), s.tol, s.max_iter)
+        .expect("self-weight solve");
+    let uz_g = mean_disp(&rg.u, &tip, 2);
+    let (l, bdim, hdim) = (nx as f64 * h, ny as f64 * h, nz as f64 * h);
+    let area = bdim * hdim;
+    let inertia = bdim * hdim.powi(3) / 12.0;
+    let q = BEAM_RHO * g * area; // distributed weight, N/mm
+    let exact = -q * l.powi(4) / (8.0 * BEAM_E0 * inertia);
+    m.q("accel_selfweight_tip_uz", uz_g);
+    m.q("accel_selfweight_eb_ratio", uz_g / exact);
+    m.i("accel_selfweight_iters", rg.stats.iterations as f64);
+
+    // --- (c) modal inertia of a remote point mass (DESIGN §16) ---
+    // The static path realises a mass only as F = m·a; MODAL must additionally
+    // add its inertia to the mass matrix M, or a payload would leave the natural
+    // frequencies untouched. Guard: a tip mass equal to the beam's own mass must
+    // drop f1 toward the Rayleigh estimate f_M/f_bare = √(0.2357·m_b/(M+0.2357·m_b))
+    // ≈ 0.437 (33/140 is the cantilever's tip-effective self-mass).
+    let m_beam = BEAM_RHO * (l * bdim * hdim); // total beam mass (tonne)
+    let bcs_m = vec![BcSpec { kind: BcKind::Fixed, tris: root.clone() }];
+    let asm_m = assemble(&beam, &grid, &bcs_m, None, &s).expect("assemble modal support");
+    let mut mcache = SolverCache::build(&grid, levels, &asm_m.problem, &s, eps.clone());
+    let mcfg = ModalConfig::new(1);
+    let f_bare = analyze(&mut mcache.solver, &grid.scale, BEAM_RHO, &[], &mcfg, |_, _, _| {})
+        .expect("modal bare")
+        .freqs_hz[0];
+    // Tip mass = beam mass, bolted to the +x face. The CG offset is irrelevant to
+    // the modal mass (a translational-DOF mesh cannot hold the offset's rotatory
+    // inertia), so `point = c` (the face centre) reproduces the same M.
+    let bcs_mp = vec![
+        BcSpec { kind: BcKind::Fixed, tris: root.clone() },
+        BcSpec { kind: BcKind::Mass { point: c, mass: m_beam, rigid: false }, tris: tip_face.clone() },
+    ];
+    let extra = point_mass_lumping(&beam, &grid, &bcs_mp);
+    let f_load = analyze(&mut mcache.solver, &grid.scale, BEAM_RHO, &extra, &mcfg, |_, _, _| {})
+        .expect("modal loaded")
+        .freqs_hz[0];
+    let ratio = f_load / f_bare;
+    let pred = (0.2357 * m_beam / (m_beam + 0.2357 * m_beam)).sqrt();
+    assert!(
+        f_load < f_bare && ratio < 0.9,
+        "tip point mass must lower f1: bare {f_bare:.1} Hz, loaded {f_load:.1} Hz"
+    );
+    m.q("accel_modal_pointmass_f1_bare", f_bare);
+    m.q("accel_modal_pointmass_f1_loaded", f_load);
+    m.q("accel_modal_pointmass_ratio", ratio);
+    m.i("accel_modal_pointmass_rayleigh", pred);
+}
+
+/// RIGID remote mass (DESIGN §16 milestone 4) on the §14 solid cantilever: a
+/// 100 g mass bolted to the tip face with its CG offset 40 mm, under 1 g, with
+/// the mount RIGID vs DEFORMABLE. Two things are guarded:
+///  (a) the rigid PATCH moves as a rigid body — its `nonrigidity` fraction is
+///      near zero, and far below the deformable patch's (proof the penalty
+///      stiffens the mount), and
+///  (b) the MGCG solve still CONVERGES with the penalty rank-6 term (the flagged
+///      convergence risk — iterations/residual are Info-tracked, convergence
+///      asserted). Tip deflection + the rigid/deformable ratio are anchored.
+fn bench_rigid_mass(m: &mut Metrics) {
+    let (nx, ny, nz, h) = (64usize, 8usize, 4usize, 1.0f64);
+    let beam = primitives::boxx(
+        [0.0, 0.0, 0.0],
+        [nx as f32 * h as f32, ny as f32 * h as f32, nz as f32 * h as f32],
+    );
+    let s = SolveSettings { e0: BEAM_E0, nu: BEAM_NU, tol: 1e-7, max_iter: 500, ..Default::default() };
+    let (grid, levels) = pad_for_levels(&VoxelGrid::voxelize(&beam, h), s.max_levels);
+    let eps: Vec<f32> = grid.scale.iter().map(|&sc| if sc > 0.0 { 1.0 } else { 0.0 }).collect();
+    let active = active_nodes(&grid);
+    let (mx, my, mz) = (grid.nx + 1, grid.ny + 1, grid.nz + 1);
+    let mut tip = Vec::new();
+    for z in 0..mz {
+        for y in 0..my {
+            let t = (z * my + y) * mx + nx;
+            if t < active.len() && active[t] {
+                tip.push(t as u32);
+            }
+        }
+    }
+    let root = vec![0u32, 1]; // -x face
+    let tip_face = vec![2u32, 3]; // +x face
+    let mass = 1.0e-4; // 100 g (tonne)
+    let r = 40.0;
+    let c = [nx as f64 * h, ny as f64 * h * 0.5, nz as f64 * h * 0.5];
+    let point = [c[0] + r, c[1], c[2]];
+    let body = BodyLoad { accel: [0.0, 0.0, -9810.0], density: 0.0, vfrac: &grid.scale };
+
+    let solve = |rigid: bool| {
+        let bcs = vec![
+            BcSpec { kind: BcKind::Fixed, tris: root.clone() },
+            BcSpec { kind: BcKind::Mass { point, mass, rigid }, tris: tip_face.clone() },
+        ];
+        let asm = assemble(&beam, &grid, &bcs, Some(body), &s).expect("assemble mass");
+        let sol = solve_cached(&mut None, &grid, levels, &asm.problem, &s, eps.clone(), s.tol, s.max_iter)
+            .expect("mass solve");
+        (asm, sol)
+    };
+    let (asm_r, rr) = solve(true);
+    let (_asm_d, rd) = solve(false);
+    assert!(
+        asm_r.problem.rigid.len() == 1,
+        "the rigid mount built a coupling (not a degenerate fallback)"
+    );
+    // Convergence with the penalty term is the milestone's flagged risk.
+    assert!(
+        rr.stats.converged && rr.stats.rel_residual < 1e-6,
+        "rigid solve converged (res {:.2e}, {} iters)",
+        rr.stats.rel_residual,
+        rr.stats.iterations
+    );
+    // The rigid group evaluated on BOTH displacement fields: the rigid mount's
+    // patch is near-rigid, the deformable one is not.
+    let rg = &asm_r.problem.rigid[0];
+    let nonrigid_r = rg.nonrigidity(&rr.u);
+    let nonrigid_d = rg.nonrigidity(&rd.u);
+    assert!(
+        nonrigid_r < 0.05 && nonrigid_r < 0.5 * nonrigid_d,
+        "rigid patch must move (near-)rigidly: rigid {nonrigid_r:.4} vs deformable {nonrigid_d:.4}"
+    );
+
+    let uz_d = mean_disp(&rd.u, &tip, 2);
+    m.q("rigid_mass_tip_uz", mean_disp(&rr.u, &tip, 2));
+    m.q("rigid_vs_deformable_tip", if uz_d != 0.0 { mean_disp(&rr.u, &tip, 2) / uz_d } else { 0.0 });
+    // Near-zero diagnostics carry solve noise (threaded f32 reduction order), so
+    // they are Info, not drift-guarded Quality — the asserts above pin behaviour.
+    m.i("rigid_mass_nonrigidity", nonrigid_r);
+    m.i("rigid_deformable_nonrigidity", nonrigid_d);
+    m.i("rigid_mass_iters", rr.stats.iterations as f64);
+    m.i("rigid_mass_residual", rr.stats.rel_residual);
+    m.i("rigid_deformable_iters", rd.stats.iterations as f64);
 }
 
 /// Voxelize the 3DBenchy at one resolution — regression-anchored (no analytic
@@ -462,7 +758,10 @@ fn main() {
     bench_cantilever(&mut m, "solve_small", 80, 8, 8, 1.0);
     bench_cantilever(&mut m, "solve_mid", 160, 16, 16, 0.5);
     bench_optimize(&mut m);
+    bench_optimize_selfweight(&mut m);
     bench_beam_suite(&mut m);
+    bench_accel(&mut m);
+    bench_rigid_mass(&mut m);
     if args.iter().any(|a| a == "--big") {
         bench_cantilever(&mut m, "solve_big", 256, 64, 64, 0.25);
     }

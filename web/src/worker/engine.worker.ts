@@ -139,9 +139,6 @@ self.onmessage = async (ev: MessageEvent<EngineWorkerRequest>) => {
       case "setMaterial":
         requireModel().set_material(msg.e0, msg.nu, msg.density, msg.strength, msg.strengthZ, msg.shearStrengthZ);
         break;
-      case "setGravity":
-        requireModel().set_gravity(msg.on);
-        break;
       case "setResolution":
         requireModel().set_resolution(msg.cells);
         break;
@@ -176,6 +173,11 @@ self.onmessage = async (ev: MessageEvent<EngineWorkerRequest>) => {
       case "setBcs": {
         const m = requireModel();
         m.clear_bcs();
+        // Every active acceleration entity sums into ONE world vector for the
+        // engine's body-load parameter (DESIGN §16 dec. 5); masses become
+        // remote-mass BCs (grams → tonne). Both are always reset — an accel or
+        // mass that vanished from this step must not linger from the last.
+        const accel: [number, number, number] = [0, 0, 0];
         for (const bc of msg.bcs) {
           if (bc.kind === "fixed") m.add_fixed(bc.tris);
           else if (bc.kind === "frictionless") m.add_frictionless(bc.tris);
@@ -194,8 +196,26 @@ self.onmessage = async (ev: MessageEvent<EngineWorkerRequest>) => {
           } else if (bc.kind === "moment") {
             const mm = bc.moment ?? [0, 0, 0];
             m.add_moment(bc.tris, mm[0], mm[1], mm[2]);
+          } else if (bc.kind === "mass") {
+            const p = bc.point ?? [0, 0, 0];
+            // grams → tonne (consistent mm–N–MPa system: N = tonne·mm/s²).
+            // DESIGN §16 milestone 4: a rigid mount also stiffens the patch.
+            m.add_mass(
+              bc.tris,
+              p[0] ?? 0,
+              p[1] ?? 0,
+              p[2] ?? 0,
+              (bc.massGrams ?? 0) * 1e-6,
+              bc.behavior === "rigid"
+            );
+          } else if (bc.kind === "accel") {
+            const a = bc.accel ?? [0, 0, 0];
+            accel[0] += a[0] ?? 0;
+            accel[1] += a[1] ?? 0;
+            accel[2] += a[2] ?? 0;
           }
         }
+        m.set_accel(accel[0], accel[1], accel[2]);
         break;
       }
       case "fitCylinder": {

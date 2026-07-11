@@ -886,4 +886,204 @@ console.log("ok: project save / load round-trip (with + without results)");
 }
 console.log("ok: per-step optimized evaluation (solve_optimized across load steps)");
 
+// ---- acceleration loads + remote point masses (DESIGN §16) ----
+{
+  const accBeam = boxStl([0, 0, 0], [40, 6, 6]);
+  const tipMeanUz = (model) => {
+    const pos = model.positions();
+    const d = model.vertex_displacements();
+    let uz = 0, n = 0;
+    for (let v = 0; v < pos.length / 3; v++)
+      if (Math.abs(pos[3 * v] - 40) < 1e-3) { uz += d[3 * v + 2]; n++; }
+    return n ? uz / n : 0;
+  };
+  const massT = 1e-4; // 100 g in tonne
+  const g0 = 9810; // 1 g in mm/s²
+  const F = massT * g0; // 0.981 N
+  const r = 80; // CG offset in +x, beyond the 40 mm tip
+
+  // (a) LEVER ARM: a tip mass whose CG is offset r beyond the tip ≡ the
+  //     hand-composed tip force F + transported moment r·F. Material density 0
+  //     isolates the mass (no self-weight), so the two solves must match.
+  const gm = new Model(accBeam, "massbeam");
+  const gsel = patchSelector(gm);
+  gm.set_material(2000, 0.3, 0, 50, 35);
+  gm.set_resolution(50000);
+  gm.add_fixed(gsel(0, "min"));
+  gm.add_mass(gsel(0, "max"), 40 + r, 3, 3, massT);
+  gm.set_accel(0, 0, -g0);
+  assert(JSON.parse(gm.check()).ok, "remote-mass cantilever passes the check");
+  JSON.parse(gm.solve());
+  const uzMass = tipMeanUz(gm);
+  gm.clear_bcs();
+  gm.set_accel(0, 0, 0); // isolate the explicit loads (no self-weight)
+  gm.add_fixed(gsel(0, "min"));
+  gm.add_force(gsel(0, "max"), 0, 0, -F);
+  gm.add_moment(gsel(0, "max"), 0, r * F, 0);
+  JSON.parse(gm.solve());
+  const uzFM = tipMeanUz(gm);
+  assert(Math.abs(uzFM) > 0.02, `force + moment gives a measurable tip deflection (${uzFM.toFixed(4)} mm)`);
+  assert(Math.abs(uzMass - uzFM) < 0.03 * Math.abs(uzFM) + 1e-6,
+    `remote mass ≡ tip force + transported couple (${uzMass.toFixed(4)} vs ${uzFM.toFixed(4)} mm)`);
+
+  // Lever-arm SANITY: the offset mass bends the tip far more than the same
+  // weight smeared over the face (CG at the patch centre ≈ a pure force).
+  gm.clear_bcs();
+  gm.set_accel(0, 0, -g0);
+  gm.add_fixed(gsel(0, "min"));
+  gm.add_mass(gsel(0, "max"), 40, 3, 3, massT);
+  JSON.parse(gm.solve());
+  const uzCentered = tipMeanUz(gm);
+  assert(Math.abs(uzMass) > 1.8 * Math.abs(uzCentered),
+    `offset CG bends more than a centred mass (${uzMass.toFixed(4)} vs ${uzCentered.toFixed(4)} mm)`);
+  gm.free();
+  console.log("ok: remote point mass (lever-arm couple transport)");
+
+  // (b) SELF-WEIGHT: 1 g on the bare beam (real density) sags it down; no accel
+  //     leaves it at rest. Confirms set_accel drives the per-cell body force.
+  const gb = new Model(accBeam, "gravitybeam");
+  const bsel2 = patchSelector(gb);
+  gb.set_material(2000, 0.3, 1.24, 50, 35);
+  gb.set_resolution(50000);
+  gb.add_fixed(bsel2(0, "min"));
+  gb.set_accel(0, 0, 0);
+  const rest = JSON.parse(gb.solve());
+  assert(rest.maxDisplacement < 1e-6, "no acceleration + no load → beam at rest");
+  gb.set_accel(0, 0, -g0);
+  const grav = JSON.parse(gb.solve());
+  assert(grav.maxDisplacement > 1e-5,
+    `self-weight under 1 g deflects the beam (${grav.maxDisplacement.toExponential(2)} mm)`);
+  assert(tipMeanUz(gb) < 0, "the beam sags downward under gravity");
+  gb.free();
+  console.log("ok: acceleration self-weight (per-cell body force)");
+
+  // (c) SCHEMA ROUND-TRIP: accel + mass entities survive the .filasim manifest
+  //     (persistence is strictly additive — the container echoes it verbatim).
+  {
+    const pm = new Model(accBeam, "schemabeam");
+    const manifest = JSON.stringify({
+      app: "filaSim", fileName: "beam.stl", transform: [1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0],
+      bcs: [
+        { kind: "accel", tris: [], accel: [0, 0, -9810], accelMode: "direction", accelDir: [0, 0, -1], accelMag: 9810 },
+        { kind: "mass", tris: [1, 2, 3], massGrams: 100, point: [40, 3, 3], behavior: "deformable" },
+      ],
+    });
+    const proj = pm.export_project(accBeam, "model.stl", manifest, false);
+    assert(project_manifest(proj) === manifest, "accel/mass manifest round-trips through the project zip");
+    const back = JSON.parse(project_manifest(proj));
+    assert(back.bcs[0].kind === "accel" && back.bcs[0].accel[2] === -9810,
+      "accel entity (vector + mode) survives save/load");
+    assert(back.bcs[1].kind === "mass" && back.bcs[1].massGrams === 100 &&
+      back.bcs[1].behavior === "deformable" && back.bcs[1].point[0] === 40,
+      "mass entity (grams + CG + behavior) survives save/load");
+    pm.free();
+  }
+  console.log("ok: accel/mass schema round-trip (additive persistence)");
+
+  // (d) MODAL INERTIA: a remote point mass adds its inertia to the modal mass
+  //     matrix (DESIGN §16), so a heavy tip payload drags the natural
+  //     frequencies DOWN. Without the wiring, f1 would be unchanged — this
+  //     guards the whole store→worker→wasm→core modal-mass path end to end.
+  {
+    const md = new Model(accBeam, "modalmass");
+    const dsel = patchSelector(md);
+    md.set_material(2000, 0.3, 1.24, 50, 35);
+    md.set_resolution(20000);
+    md.add_fixed(dsel(0, "min"));
+    const modalOpts = JSON.stringify({ numModes: 1, solid: true, free: false });
+    const bare = JSON.parse(md.modal_analysis(modalOpts, () => {}));
+    const f1Bare = bare.modes[0].freqHz;
+    assert(f1Bare > 0 && Number.isFinite(f1Bare),
+      `bare cantilever has a positive f1 (${f1Bare.toFixed(1)} Hz)`);
+    // Bolt a 20 g mass (≈10× the 1.8 g beam) to the free tip. The CG offset is
+    // irrelevant to the modal mass — a translational-DOF mesh can't hold the
+    // offset's rotatory inertia — so any point reproduces the same M.
+    md.add_mass(dsel(0, "max"), 40, 3, 3, 2e-5); // 20 g in tonne
+    const loaded = JSON.parse(md.modal_analysis(modalOpts, () => {}));
+    const f1Load = loaded.modes[0].freqHz;
+    assert(f1Load > 0 && Number.isFinite(f1Load),
+      `loaded cantilever still solves (${f1Load.toFixed(1)} Hz)`);
+    assert(f1Load < 0.7 * f1Bare,
+      `tip mass drags f1 down (${f1Bare.toFixed(1)} → ${f1Load.toFixed(1)} Hz, ` +
+      `×${(f1Load / f1Bare).toFixed(3)})`);
+    md.free();
+    console.log("ok: modal analysis accounts for remote point-mass inertia");
+  }
+
+  // (e) SELF-WEIGHT-DRIVEN OPTIMIZATION (DESIGN §16 dec. 4/10): the optimizer now
+  //     includes acceleration steps — a part optimized under its OWN weight (1 g,
+  //     no external load) must converge, flag the run as self-weight, and expose
+  //     each design's own-weight baselines (dec. 10). Exercises the full
+  //     store→worker→wasm→core self-weight optimizer path.
+  {
+    const sw = new Model(boxStl([0, 0, 0], [60, 12, 12]), "selfweightbeam");
+    const swsel = patchSelector(sw);
+    sw.set_material(2400, 0.35, 1.24, 50, 35); // real PLA density → real self-weight
+    sw.set_resolution(20000);
+    sw.add_fixed(swsel(0, "min"));
+    sw.set_accel(0, 0, -9810); // 1 g down — the ONLY load is the part's own weight
+    assert(JSON.parse(sw.check()).ok, "self-weight cantilever passes the check (accel loads it)");
+    const swSummary = JSON.parse(
+      sw.optimize(
+        JSON.stringify({
+          budgetPct: 35, exponent: 1.5, coeff: 1.0, perimeters: 2, lineWidth: 0.45,
+          smoothIters: 4, nBins: 3, floorPct: 10, capPct: 70, levelsPct: null,
+          binary: false, solidPattern: null, goal: "budget",
+        }),
+        () => {}
+      )
+    );
+    assert(swSummary.selfWeight === true, "summary flags a self-weight optimization (dec. 10 note)");
+    assert(typeof swSummary.converged === "boolean" && swSummary.massGrams > 0,
+      "self-weight optimize produced a design");
+    assert(swSummary.meanInfill > 0.2 && swSummary.meanInfill < 0.5,
+      `self-weight optimize respects the budget (${(swSummary.meanInfill * 100).toFixed(1)}%)`);
+    // dec. 10: each baseline carries its OWN weight — the uniform + fully-solid
+    // reference solves both run under their true self-weight and deflect.
+    assert(swSummary.uniformMaxDisp > 0 && swSummary.solidMaxDisp > 0,
+      "own-weight baselines solve (each design carries its true self-weight)");
+    sw.free();
+    console.log("ok: self-weight-driven optimization (DESIGN §16 dec. 4/10)");
+  }
+
+  // (f) RIGID remote-mass mount (DESIGN §16 milestone 4): a rigid boss stiffens
+  //     its mounting patch by tying it to a 6-DOF master at the CG — a NEW solver
+  //     term (penalty rank-6 coupling). The headline risk is convergence: the
+  //     MGCG must still converge with the stiff penalty. Both rigid and
+  //     deformable mounts must solve; the rigid stress field must be finite/sane.
+  {
+    const rm = new Model(accBeam, "rigidbeam");
+    const rsel = patchSelector(rm);
+    rm.set_material(2000, 0.3, 0, 50, 35); // density 0 → isolate the mass load
+    rm.set_resolution(50000);
+    const face = rsel(0, "max"); // +x tip face
+    const solveMount = (rigid) => {
+      rm.clear_bcs();
+      rm.add_fixed(rsel(0, "min"));
+      rm.add_mass(face, 80, 3, 3, 1e-4, rigid); // 100 g, CG offset 40 mm beyond tip
+      rm.set_accel(0, 0, -9810); // 1 g down
+      assert(JSON.parse(rm.check()).ok, `${rigid ? "rigid" : "deformable"} mount passes the check`);
+      return JSON.parse(rm.solve());
+    };
+    const rstats = solveMount(true);
+    assert(
+      rstats.converged && rstats.maxDisplacement > 0 && Number.isFinite(rstats.maxDisplacement),
+      `rigid mount solve CONVERGES with the penalty term (${rstats.iterations} iters, ` +
+        `max|u| ${rstats.maxDisplacement.toFixed(4)} mm)`
+    );
+    const rvm = rm.result_field("vm");
+    assert(rvm.every((v) => Number.isFinite(v)) && fmax(rvm) > 0, "rigid mount stress field is finite + nonzero");
+    const dstats = solveMount(false);
+    assert(dstats.converged && dstats.maxDisplacement > 0, "deformable mount also solves");
+    // Far-field tip deflection is Saint-Venant close (the rigid stiffening is a
+    // LOCAL patch effect); both must deflect downward under the offset weight.
+    assert(rstats.maxDisplacement > 0 && dstats.maxDisplacement > 0,
+      "both mounts deflect under the offset weight");
+    // Toggling the mount rebuilds the solver hierarchy (rigid changes the
+    // operator, not just the RHS), so the two solves are genuinely different runs.
+    rm.free();
+    console.log("ok: rigid remote-mass mount solves — penalty converges (DESIGN §16 M4)");
+  }
+}
+
 console.log("\nALL SMOKE TESTS PASSED");

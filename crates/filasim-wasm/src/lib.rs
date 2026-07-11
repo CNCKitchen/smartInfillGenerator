@@ -7,8 +7,8 @@
 //! voxel grid, boundary conditions, and the last solution. Bulk data crosses
 //! the boundary as typed arrays; small results as JSON strings.
 
-use filasim_core::attach::{assemble, check_problem, BcKind, BcSpec};
-use filasim_core::bins::{extract_iso, extract_region, taubin_smooth, RegionMesh};
+use filasim_core::attach::{assemble, check_problem, BcKind, BcSpec, BodyLoad};
+use filasim_core::bins::{extract_iso, extract_region_smooth, taubin_smooth, RegionMesh};
 use filasim_core::mesh::TriMesh;
 use filasim_core::pipeline::{smooth_regions, solid_keep_bins};
 use filasim_core::segment::{body_count, segment, Segmentation};
@@ -31,8 +31,6 @@ extern "C" {
 /// must await it before constructing a Model. Plain builds don't have it.
 #[cfg(feature = "parallel")]
 pub use wasm_bindgen_rayon::init_thread_pool;
-
-const GRAVITY_MM_S2: [f64; 3] = [0.0, 0.0, -9810.0];
 
 /// Display cap for the safety-factor fields (`sf`/`sfm`/`sfz`). Above ~10 the
 /// exact number carries no engineering meaning, and a huge cap flattens the
@@ -630,10 +628,12 @@ pub struct Model {
     cad_face_of_orig: Option<Vec<u32>>,
     bcs: Vec<BcSpec>,
     /// Registered MULTI-LOAD optimization cases (DESIGN §13): each a snapshot of
-    /// `bcs` + its weight. Empty ⇒ single-load optimize (the byte-identical
-    /// path). The first case is the primary; the rest are weighted extras. The
-    /// front end rebuilds this (clear + add per included step) before optimizing.
-    load_cases: Vec<(Vec<BcSpec>, f64)>,
+    /// `bcs` + its weight + the step's summed acceleration (DESIGN §16 dec. 4 —
+    /// the self-weight the optimizer recomputes per iteration). Empty ⇒
+    /// single-load optimize (the byte-identical path). The first case is the
+    /// primary; the rest are weighted extras. The front end rebuilds this
+    /// (clear + add per included step) before optimizing.
+    load_cases: Vec<(Vec<BcSpec>, f64, [f64; 3])>,
     settings: SolveSettings,
     /// tonne/mm³
     density: f64,
@@ -653,7 +653,11 @@ pub struct Model {
     /// tension-across-layers criterion in one place. Display-side derived —
     /// toggling never invalidates the solution.
     layer_shear_on: bool,
-    gravity_on: bool,
+    /// Active world acceleration for self-weight + remote masses (mm/s²; DESIGN
+    /// §16). The worker sums each load step's active accel entities into this
+    /// before a solve; `[0,0,0]` = no inertial load (accel-free byte-identical
+    /// path). Replaces the old hard-coded `gravity_on` 1g-down toggle.
+    accel: [f64; 3],
     target_cells: u32,
     /// Custom mode: pin the cell size to this exact value (mm) instead of
     /// sizing it from the part volume + target cell count. None = auto (preset).
@@ -977,7 +981,7 @@ impl Model {
             strength_z: 35.0,  // PLA layer adhesion, MPa
             shear_strength_z: None, // derived 0.6·strength_z until measured
             layer_shear_on: true,
-            gravity_on: false,
+            accel: [0.0; 3],
             target_cells: 300_000,
             fixed_h: None,
             snap_wall: 0.0,
@@ -1153,8 +1157,12 @@ impl Model {
         self.layer_shear_on = on;
     }
 
-    pub fn set_gravity(&mut self, on: bool) {
-        self.gravity_on = on;
+    /// Set the active world acceleration (mm/s²) for self-weight + remote masses
+    /// (DESIGN §16). The worker resolves each load step's active acceleration
+    /// entities to ONE summed vector and sets it here before solving; `[0,0,0]`
+    /// clears the inertial load. Invalidates the cached solution/design.
+    pub fn set_accel(&mut self, ax: f64, ay: f64, az: f64) {
+        self.accel = [ax, ay, az];
         self.solution = None;
         self.opt = None;
     }
@@ -1239,10 +1247,13 @@ impl Model {
         self.load_cases.clear();
     }
 
-    /// Snapshot the CURRENT `bcs` as a weighted load case for the multi-load
-    /// optimizer. Call after `set_bcs`/`add_*` have populated this step's BCs.
+    /// Snapshot the CURRENT `bcs` (+ the active acceleration `set_bcs` resolved
+    /// for this step) as a weighted load case for the multi-load optimizer. Call
+    /// after `set_bcs`/`add_*` have populated this step's BCs. The accel snapshot
+    /// lets the optimizer recompute each case's design-dependent self-weight
+    /// (DESIGN §16 dec. 4).
     pub fn add_load_case(&mut self, weight: f64) {
-        self.load_cases.push((self.bcs.clone(), weight.max(0.0)));
+        self.load_cases.push((self.bcs.clone(), weight.max(0.0), self.accel));
     }
 
     pub fn add_fixed(&mut self, tris: &[u32]) {
@@ -1309,6 +1320,22 @@ impl Model {
     /// Moment (N·mm): deformable distributed couple over the selection.
     pub fn add_moment(&mut self, tris: &[u32], mx: f64, my: f64, mz: f64) {
         self.bcs.push(BcSpec { kind: BcKind::Moment([mx, my, mz]), tris: tris.to_vec() });
+        self.solution = None;
+        self.opt = None;
+    }
+
+    /// Remote point mass (DESIGN §16): a component of `mass` TONNE with its CG at
+    /// world `(px,py,pz)` mm, bolted to the selected patch. `rigid` picks the
+    /// mount: DEFORMABLE (false) loads the patch with F = m·a + the transported
+    /// couple (p − c) × F, adding no stiffness; RIGID (true, milestone 4) also
+    /// stiffens the patch by tying it to a 6-DOF master at the CG (the load then
+    /// distributes by the rigidity kinematics). Inert (load-wise) with no accel;
+    /// the rigid stiffness is present regardless.
+    pub fn add_mass(&mut self, tris: &[u32], px: f64, py: f64, pz: f64, mass: f64, rigid: bool) {
+        self.bcs.push(BcSpec {
+            kind: BcKind::Mass { point: [px, py, pz], mass, rigid },
+            tris: tris.to_vec(),
+        });
         self.solution = None;
         self.opt = None;
     }
@@ -1411,9 +1438,35 @@ impl Model {
         .to_string())
     }
 
-    fn gravity_arg(&self) -> Option<([f64; 3], f64)> {
-        if self.gravity_on {
-            Some((GRAVITY_MM_S2, self.density))
+    /// Assemble the inertial body load for a solve whose per-cell material
+    /// volume fraction is `vfrac` (DESIGN §16 dec. 3). `None` when no
+    /// acceleration is active, so the accel-free path stays byte-identical.
+    fn body_arg<'a>(&self, vfrac: &'a [f32]) -> Option<BodyLoad<'a>> {
+        if self.accel != [0.0; 3] {
+            Some(BodyLoad { accel: self.accel, density: self.density, vfrac })
+        } else {
+            None
+        }
+    }
+
+    /// MASS-ONLY body load for the OPTIMIZER (DESIGN §16 dec. 4): an empty vfrac
+    /// realizes remote point masses (F = m·a, design-independent) and marks solid
+    /// cells for the RBM check, but skips the distributed self-weight FORCE — the
+    /// optimizer recomputes that from the live density each SIMP iteration.
+    /// `None` when no acceleration is active (byte-identical no-body path).
+    fn mass_only_body(accel: [f64; 3], density: f64) -> Option<BodyLoad<'static>> {
+        if accel != [0.0; 3] {
+            Some(BodyLoad { accel, density, vfrac: &[] })
+        } else {
+            None
+        }
+    }
+
+    /// The optimizer's per-case design-dependent self-weight descriptor
+    /// (recomputed every SIMP iteration). `None` when no acceleration is active.
+    fn opt_body_accel(accel: [f64; 3], density: f64) -> Option<filasim_core::simp::BodyAccel> {
+        if accel != [0.0; 3] {
+            Some(filasim_core::simp::BodyAccel { accel, density })
         } else {
             None
         }
@@ -1423,7 +1476,9 @@ impl Model {
     pub fn check(&mut self) -> Result<String, JsValue> {
         self.ensure_grid()?;
         let (grid, _) = self.grid.as_ref().unwrap();
-        let asm = assemble(&self.mesh, grid, &self.bcs, self.gravity_arg(), &self.settings)
+        // Occupancy is enough for the RBM has-loads flag — any solid cell under
+        // an active accel carries self-weight (dec. 11); the magnitude is moot.
+        let asm = assemble(&self.mesh, grid, &self.bcs, self.body_arg(&grid.scale), &self.settings)
             .map_err(err)?;
         let report = check_problem(grid, &asm);
         let comps: Vec<serde_json::Value> = report
@@ -1453,7 +1508,9 @@ impl Model {
     pub fn solve(&mut self) -> Result<String, JsValue> {
         self.ensure_grid()?;
         let (grid, levels) = self.grid.as_ref().unwrap();
-        let asm = assemble(&self.mesh, grid, &self.bcs, self.gravity_arg(), &self.settings)
+        // Plain solid solve: eps = grid occupancy, so self-weight uses the same
+        // occupancy field for its per-cell material volume fraction.
+        let asm = assemble(&self.mesh, grid, &self.bcs, self.body_arg(&grid.scale), &self.settings)
             .map_err(err)?;
         let report = check_problem(grid, &asm);
         if !report.ok {
@@ -1777,12 +1834,6 @@ impl Model {
         let opts: PrintedOpts = serde_json::from_str(opts_json).map_err(err)?;
         self.ensure_grid()?;
         let (grid, levels) = self.grid.as_ref().unwrap();
-        let asm = assemble(&self.mesh, grid, &self.bcs, self.gravity_arg(), &self.settings)
-            .map_err(err)?;
-        let report = check_problem(grid, &asm);
-        if !report.ok {
-            return Err(err("model is under-constrained — run check() for details"));
-        }
         let eval_exp = opts.exponent.clamp(1.0, 3.5);
         let eval_coeff = opts.coeff.clamp(0.05, 2.0);
         let (_, wall_mm) = resolve_wall(opts.perimeters, opts.line_width);
@@ -1795,6 +1846,16 @@ impl Model {
             filasim_core::simp::classify_cells(grid, wall_mm, tb_mm, tb_mm, self.composite_skin);
         let (skin, design, skin_frac) = (split.skin, split.design, split.skin_frac);
         let x = vec![infill; design.len()];
+        // Self-weight (DESIGN §16 dec. 3) needs the MATERIAL volume fraction of
+        // each cell — built here, BEFORE assembly, so the body force rides the
+        // RHS. Distinct from the E(ρ) stiffness `eps` built just below.
+        let vfrac = filasim_core::simp::build_vfrac(grid, &design, &skin_frac, &x);
+        let asm = assemble(&self.mesh, grid, &self.bcs, self.body_arg(&vfrac), &self.settings)
+            .map_err(err)?;
+        let report = check_problem(grid, &asm);
+        if !report.ok {
+            return Err(err("model is under-constrained — run check() for details"));
+        }
         let eps =
             filasim_core::simp::build_eps(grid, &skin, &design, &skin_frac, &x, eval_exp, eval_coeff);
         let (sol, _compliance) = filasim_core::simp::solve_with_eps_cached(
@@ -1852,8 +1913,12 @@ impl Model {
     /// Constrained undamped modal analysis (`filasim_core::modal`): the lowest
     /// `num_modes` natural frequencies + mode shapes of the part as supported by
     /// the CURRENT `bcs` (the store sets these to the first load case before the
-    /// call). Force-free — loads are ignored; only supports constrain the
-    /// eigenproblem. Each mode shape is stashed as a result keyed `modal::mode-i`
+    /// call). Force-free — applied forces/pressures are ignored; only supports
+    /// constrain the eigenproblem. Remote point masses (DESIGN §16) DO count:
+    /// each adds its translational inertia to the mass matrix on its attachment
+    /// patch, so a heavy payload lowers the frequencies (the offset's rotatory
+    /// inertia is not representable on a translational-DOF mesh — see
+    /// `point_mass_lumping`). Each mode shape is stashed as a result keyed `modal::mode-i`
     /// (mass-normalized, then rescaled to unit peak for display), and mode 0 is
     /// left live. JSON: `{ converged, outerIters, modes: [{id, freqHz}] }`. The
     /// store builds one `ResultEntry` per mode from this and switches modes via
@@ -1873,9 +1938,14 @@ impl Model {
         // and the transient solver hierarchy inside the grid borrow; everything
         // else needed to assemble the mode Solutions is captured owned so the
         // borrow ends before we mutate the result roster.
-        let (mut cache, eps, vfrac, mx, my, mz, h, origin, active) = {
+        let (mut cache, eps, vfrac, extra_mass, mx, my, mz, h, origin, active) = {
             let (grid, levels) = self.grid.as_ref().unwrap();
             let mut asm = assemble(&self.mesh, grid, &self.bcs, None, &self.settings).map_err(err)?;
+            // Remote point masses add inertia to the eigenproblem M (DESIGN §16):
+            // the static force path only realises F = m·a, so without this a
+            // payload would leave the natural frequencies untouched. Resolved to
+            // per-node lumped masses on the SAME patch the static force loads.
+            let extra_mass = filasim_core::attach::point_mass_lumping(&self.mesh, grid, &self.bcs);
             let report = check_problem(grid, &asm);
             // Constrained modal needs supports; free-free deliberately runs
             // WITHOUT them (the rigid-body modes are lifted + dropped below).
@@ -1932,6 +2002,7 @@ impl Model {
                 cache,
                 eps,
                 vfrac,
+                extra_mass,
                 grid.nx + 1,
                 grid.ny + 1,
                 grid.nz + 1,
@@ -1953,8 +2024,15 @@ impl Model {
                 &arr,
             );
         };
-        let res = filasim_core::modal::analyze(&mut cache.solver, &vfrac, self.density, &cfg, progress)
-            .map_err(err)?;
+        let res = filasim_core::modal::analyze(
+            &mut cache.solver,
+            &vfrac,
+            self.density,
+            &extra_mass,
+            &cfg,
+            progress,
+        )
+        .map_err(err)?;
 
         // Free-free: drop the lowest modes (the lifted rigid-body modes), keeping
         // the flexible ones the user asked for.
@@ -2032,7 +2110,29 @@ impl Model {
         if eps.len() != grid.cell_count() {
             return Err(err("the optimized design predates the current grid — re-run Optimize"));
         }
-        let asm = assemble(&self.mesh, grid, &self.bcs, self.gravity_arg(), &self.settings)
+        // Self-weight for the optimized design uses ITS OWN per-cell mass field
+        // (dec. 3), composed from the binned density — not the stiffness eps.
+        // Built only when an acceleration is active; falls back to occupancy if
+        // the stored design and current grid ever disagree.
+        let vfrac: Vec<f32> = if self.accel != [0.0; 3] {
+            match &self.opt {
+                Some(opt) => {
+                    let split = filasim_core::simp::classify_cells(
+                        grid, opt.wall_mm, opt.tb_mm, opt.tb_mm, self.composite_skin,
+                    );
+                    let x: Vec<f64> = opt.x_binned.iter().map(|&v| v as f64).collect();
+                    if split.design.len() == x.len() {
+                        filasim_core::simp::build_vfrac(grid, &split.design, &split.skin_frac, &x)
+                    } else {
+                        grid.scale.clone()
+                    }
+                }
+                None => grid.scale.clone(),
+            }
+        } else {
+            Vec::new()
+        };
+        let asm = assemble(&self.mesh, grid, &self.bcs, self.body_arg(&vfrac), &self.settings)
             .map_err(err)?;
         let report = check_problem(grid, &asm);
         if !report.ok {
@@ -2194,7 +2294,7 @@ impl Model {
                 let inside = |ci: usize| -> bool {
                     bin_of_cell.get(&(ci as u32)).is_some_and(|&b| b as usize >= level)
                 };
-                let mut r = filasim_core::bins::extract_region(grid, &inside, 0.4);
+                let mut r = filasim_core::bins::extract_region_smooth(grid, &inside, 0.4);
                 if r.indices.is_empty() {
                     continue;
                 }
@@ -2206,7 +2306,11 @@ impl Model {
             );
             (regions_raw, eps)
         };
-        let regions = filasim_core::pipeline::smooth_regions(&regions_raw, smooth_iters as usize);
+        let regions = filasim_core::pipeline::smooth_regions(
+            &regions_raw,
+            smooth_iters as usize,
+            self.grid.as_ref().unwrap().0.h,
+        );
         self.solution = None;
         self.solution_eps = Some(eps);
         // A restored design is evaluable under every load step too (DESIGN §13).
@@ -2402,24 +2506,52 @@ impl Model {
         let (grid, levels) = self.grid.as_ref().unwrap();
         let primary_bcs: &[BcSpec] =
             if self.load_cases.is_empty() { &self.bcs } else { &self.load_cases[0].0 };
-        let asm = assemble(&self.mesh, grid, primary_bcs, self.gravity_arg(), &self.settings)
-            .map_err(err)?;
+        // DESIGN §16 dec. 4: acceleration steps ARE optimized now. Each case's
+        // summed accel drives a MASS-ONLY assemble — remote masses (F = m·a) and
+        // the RBM load flag are realized, but the distributed self-weight FORCE
+        // is left out (empty vfrac) and recomputed from the LIVE density every
+        // SIMP iteration via `LoadSet::{primary,extra}_body`. No accel ⇒
+        // `mass_only_body` is None ⇒ the plain surface-load assembly, byte-
+        // identical to the pre-accel path.
+        let primary_accel =
+            if self.load_cases.is_empty() { self.accel } else { self.load_cases[0].2 };
+        let asm = assemble(
+            &self.mesh,
+            grid,
+            primary_bcs,
+            Self::mass_only_body(primary_accel, self.density),
+            &self.settings,
+        )
+        .map_err(err)?;
         let report = check_problem(grid, &asm);
         if !report.ok {
             return Err(err("model is under-constrained — fix the setup first (run Check)"));
         }
-        let mut load_set = filasim_core::simp::LoadSet::default();
+        let mut load_set = filasim_core::simp::LoadSet {
+            primary_body: Self::opt_body_accel(primary_accel, self.density),
+            ..Default::default()
+        };
         if !self.load_cases.is_empty() {
             load_set.primary_weight = self.load_cases[0].1;
-            for (case_bcs, w) in &self.load_cases[1..] {
-                let a = assemble(&self.mesh, grid, case_bcs, self.gravity_arg(), &self.settings)
-                    .map_err(err)?;
+            for (case_bcs, w, case_accel) in &self.load_cases[1..] {
+                let a = assemble(
+                    &self.mesh,
+                    grid,
+                    case_bcs,
+                    Self::mass_only_body(*case_accel, self.density),
+                    &self.settings,
+                )
+                .map_err(err)?;
                 if !check_problem(grid, &a).ok {
                     return Err(err("a load case is under-constrained — fix the setup first (run Check)"));
                 }
                 load_set.extra.push((a.problem, *w));
+                load_set.extra_body.push(Self::opt_body_accel(*case_accel, self.density));
             }
         }
+        // DESIGN §16 dec. 10: a self-weight-loaded optimization compares designs
+        // that each carry their OWN true weight — surfaced with a fine-print note.
+        let has_self_weight = load_set.has_self_weight();
 
         let params = OptimizeParams {
             // Budget = target mean INFILL density of the interior — the
@@ -2583,6 +2715,10 @@ impl Model {
             "uniformMaxDisp": oc.max_disp_uniform,
             "solidMaxDisp": oc.max_disp_solid,
             "hasBaselines": !solid,
+            // DESIGN §16 dec. 10: with acceleration active every design carries
+            // its OWN self-weight (the fully-solid baseline is heavier and sags
+            // more) — the comparison card shows a fine-print note.
+            "selfWeight": has_self_weight,
             "binary": opts.binary,
             "solid": solid,
             "goal": if goal_match { "match" } else { "budget" },
@@ -2698,11 +2834,12 @@ impl Model {
         Ok(summary)
     }
 
-    /// Re-apply Taubin smoothing to the extracted regions (live preview of
-    /// the smoothing slider). Affects display AND subsequent exports.
+    /// Re-apply constrained smoothing to the extracted regions (live preview
+    /// of the smoothing slider). Affects display AND subsequent exports.
     pub fn resmooth_regions(&mut self, iters: u32) -> Result<(), JsValue> {
+        let h = self.grid.as_ref().ok_or_else(|| err("no grid"))?.0.h;
         let opt = self.opt.as_mut().ok_or_else(|| err("no optimization result"))?;
-        opt.regions = smooth_regions(&opt.regions_raw, (iters as usize).min(60));
+        opt.regions = smooth_regions(&opt.regions_raw, (iters as usize).min(60), h);
         Ok(())
     }
 
@@ -2720,10 +2857,11 @@ impl Model {
         let t = threshold.clamp(0.05, 0.95);
         let n = grid.cell_count();
         // Build a BINARY keep indicator, then extract its watertight surface —
-        // the same robust path the run uses (`extract_region` on a set, iso 0.4).
+        // the same robust path the run uses (`extract_region_smooth` on a set,
+        // iso 0.4, one indicator blur pass so no vertex knots/needle spikes).
         // Extracting the CONTINUOUS field at an arbitrary level instead produces
         // sliver/degenerate triangles wherever the level grazes the flat
-        // boundary nodes (≈0.5), which Taubin then tears into holes/spikes.
+        // boundary nodes (≈0.5), which smoothing then tears into holes/spikes.
         let mut inside = vec![false; n];
         if opt.solid {
             for &c in &opt.anchor_cells {
@@ -2745,10 +2883,10 @@ impl Model {
                 }
             }
         }
-        let mut r = extract_region(grid, &|ci| inside[ci], 0.4);
+        let mut r = extract_region_smooth(grid, &|ci| inside[ci], 0.4);
         r.density = 1.0; // solid body / dense modifier
         opt.regions_raw = vec![r];
-        opt.regions = smooth_regions(&opt.regions_raw, (smooth_iters as usize).min(60));
+        opt.regions = smooth_regions(&opt.regions_raw, (smooth_iters as usize).min(60), grid.h);
         opt.iso_threshold = t;
         Ok(())
     }
@@ -3031,7 +3169,9 @@ impl Model {
     fn constraint_ring(&self) -> Result<Vec<bool>, JsValue> {
         use filasim_core::orient;
         let (grid, _) = self.grid.as_ref().ok_or_else(|| err("no grid"))?;
-        let asm = assemble(&self.mesh, grid, &self.bcs, self.gravity_arg(), &self.settings)
+        // Purely geometric — only the per-BC node lists are read, which don't
+        // depend on any body load, so skip it entirely.
+        let asm = assemble(&self.mesh, grid, &self.bcs, None, &self.settings)
             .map_err(err)?;
         let constraint_nodes: Vec<&[u32]> = self
             .bcs

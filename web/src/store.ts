@@ -332,7 +332,8 @@ function bcFingerprint(bcs: Bc[]): string {
     .map((b) => {
       let triSum = 0;
       for (let i = 0; i < b.tris.length; i++) triSum = (triSum + b.tris[i]) >>> 0;
-      return [b.kind, b.tris.length, triSum, b.axes?.join(""), b.force?.join(","), b.pressure, b.stiffness].join(",");
+      return [b.kind, b.tris.length, triSum, b.axes?.join(""), b.force?.join(","), b.pressure, b.stiffness,
+        b.accel?.join(","), b.massGrams, b.point?.join(","), b.behavior].join(",");
     })
     .join("|");
 }
@@ -746,6 +747,13 @@ interface AppState {
         | "momentMag"
         | "cyl"
         | "cylError"
+        | "accel"
+        | "accelMode"
+        | "accelDir"
+        | "accelMag"
+        | "massGrams"
+        | "point"
+        | "behavior"
       >
     >
   ): void;
@@ -767,6 +775,22 @@ interface AppState {
   flipMomentDir(id: string): void;
   /** Snap a moment's axis to the selection's average surface normal. */
   resetMomentDirToNormal(id: string): void;
+  /** Switch an acceleration between component and direction definition. */
+  setAccelMode(id: string, mode: ForceMode): void;
+  /** Set the magnitude (mm/s²) of a direction-mode acceleration. */
+  setAccelMag(id: string, mag: number): void;
+  /** Set the (un-normalized) direction of an acceleration; keeps |a|. */
+  setAccelDir(id: string, dir: [number, number, number]): void;
+  /** Reverse an acceleration's direction. */
+  flipAccelDir(id: string): void;
+  /** Apply the "1 g ↓" preset (9810 mm/s² toward −Z), direction mode. */
+  setAccelOneGDown(id: string): void;
+  /** Set a point mass's value (grams). */
+  setMassGrams(id: string, grams: number): void;
+  /** Set a point mass's CG position (mm); the DRO owns the point after this. */
+  setMassPoint(id: string, point: [number, number, number]): void;
+  /** Snap a point mass's CG back to the selected patch's area-weighted centroid. */
+  resetMassPointToCentroid(id: string): void;
   /** Scene → store: the pick-direction tool clicked a triangle (its normal). */
   applyPickedDir(normal: [number, number, number]): void;
   // load steps (FEA load cases) — see DESIGN §13. The data layer; the table UI
@@ -791,6 +815,8 @@ interface AppState {
   setStepMoment(stepId: string, bcId: string, moment: [number, number, number]): void;
   /** Aim a step's moment axis along the selection's average normal (|M| kept). */
   aimStepMomentAlongNormal(stepId: string, bcId: string): void;
+  /** Set a step's per-BC acceleration vector (accel BCs). */
+  setStepAccel(stepId: string, bcId: string, accel: [number, number, number]): void;
   /** Include/exclude a step from the multi-load optimizer. */
   setStepIncludeOptimize(stepId: string, include: boolean): void;
   /** Set a step's weight in the weighted-sum optimizer objective. */
@@ -973,7 +999,13 @@ const BC_KIND_NAME: Record<BcKind, string> = {
   pressure: "Pressure",
   bearing: "Bearing",
   moment: "Moment",
+  accel: "Acceleration",
+  mass: "Mass",
 };
+
+/** One g in canonical acceleration units (mm/s²) — the "1 g ↓" preset and the
+ *  addBc default (DESIGN §16 dec. 2). Matches the engine's rounded convention. */
+export const ONE_G_MMS2 = 9810;
 
 /** Fresh load step with no overrides (every BC active at its base value). */
 function makeLoadStep(name: string): LoadStep {
@@ -988,6 +1020,7 @@ function cloneOverrides(ov: Record<string, LoadStepOverride>): Record<string, Lo
       ...v,
       force: v.force ? ([...v.force] as [number, number, number]) : undefined,
       moment: v.moment ? ([...v.moment] as [number, number, number]) : undefined,
+      accel: v.accel ? ([...v.accel] as [number, number, number]) : undefined,
     };
   }
   return out;
@@ -1148,20 +1181,40 @@ async function transformModel(set: SetState, get: () => AppState, r: number[]) {
   ];
   try {
     let out = await engine.transform([...r, ...t]);
+    // Remote-mass CG points are physical components bolted on, so they move WITH
+    // the part (DESIGN §16 dec. 8) — unlike load DIRECTIONS (force/accel), which
+    // stay world-fixed. BC tri selections are index-based and survive on their
+    // own; only these coordinate points need the same transform applied here.
+    // (Accel vectors are deliberately left untouched.)
+    const xformPoint = (p: [number, number, number]): [number, number, number] => [
+      r[0] * p[0] + r[1] * p[1] + r[2] * p[2] + t[0],
+      r[3] * p[0] + r[4] * p[1] + r[5] * p[2] + t[1],
+      r[6] * p[0] + r[7] * p[1] + r[8] * p[2] + t[2],
+    ];
     // Seat on the plate (z-min → 0) and re-center the XY footprint over the
     // plate origin, so a rotate / place-on-face never drifts the part off the
     // build grid.
     const cx = (out.bbox[0] + out.bbox[3]) / 2;
     const cy = (out.bbox[1] + out.bbox[4]) / 2;
     const dz = out.bbox[2];
+    let seat: [number, number, number] = [0, 0, 0];
     if (Math.abs(cx) > 1e-6 || Math.abs(cy) > 1e-6 || Math.abs(dz) > 1e-6) {
       out = await engine.transform([1, 0, 0, 0, 1, 0, 0, 0, 1, -cx, -cy, -dz]);
+      seat = [-cx, -cy, -dz];
     }
+    const movePoint = (p: [number, number, number]): [number, number, number] => {
+      const q = xformPoint(p);
+      return [q[0] + seat[0], q[1] + seat[1], q[2] + seat[2]];
+    };
     const bbox = out.bbox as LoadedModel["bbox"];
-    set({ model: { ...get().model!, positions: out.positions, bbox } });
+    const bcs = get().bcs.map((b) =>
+      b.kind === "mass" && b.point ? { ...b, point: movePoint(b.point) } : b
+    );
+    set({ model: { ...get().model!, positions: out.positions, bbox }, bcs });
     invalidateResults(set, get);
     invalidateGrid(set, get);
     sceneEvents.onModelTransformed?.(out.positions, bbox);
+    pushBcGlyphs(get); // re-place the mass sphere/spider at the moved CG
     // The symmetry plane keeps its world position; re-center it on the
     // moved part so it doesn't strand outside.
     if (get().symOn) get().centerSymmetry();
@@ -1352,7 +1405,12 @@ export function effectiveBcs(bcs: Bc[], step: LoadStep | undefined): Bc[] {
       continue;
     }
     if (ov.active === false) continue; // deactivated in this step
-    if (ov.force === undefined && ov.pressure === undefined && ov.moment === undefined) {
+    if (
+      ov.force === undefined &&
+      ov.pressure === undefined &&
+      ov.moment === undefined &&
+      ov.accel === undefined
+    ) {
       out.push(b);
       continue;
     }
@@ -1361,6 +1419,7 @@ export function effectiveBcs(bcs: Bc[], step: LoadStep | undefined): Bc[] {
       force: ov.force ?? b.force,
       pressure: ov.pressure ?? b.pressure,
       moment: ov.moment ?? b.moment,
+      accel: ov.accel ?? b.accel,
     });
   }
   return out;
@@ -1369,6 +1428,13 @@ export function effectiveBcs(bcs: Bc[], step: LoadStep | undefined): Bc[] {
 /** The load step currently being edited / solved. */
 function activeStep(s: AppState): LoadStep | undefined {
   return s.loadSteps.find((ls) => ls.id === s.activeLoadStepId);
+}
+
+/** Does a step carry an ACTIVE acceleration entity? Self-weight then makes it a
+ *  design-dependent load, so it is excluded from the optimizer in milestone 2
+ *  (DESIGN §16 build item 2 INTERIM — the optimizer gains accel in milestone 3). */
+export function stepHasAccel(bcs: Bc[], step: LoadStep | undefined): boolean {
+  return effectiveBcs(bcs, step).some((b) => b.kind === "accel");
 }
 
 /** BCs as the active step sees them, for the 3D glyphs + surface tint: per-step
@@ -1386,6 +1452,7 @@ function sceneBcs(bcs: Bc[], step: LoadStep | undefined): Bc[] {
       force: ov.force ?? b.force,
       pressure: ov.pressure ?? b.pressure,
       moment: ov.moment ?? b.moment,
+      accel: ov.accel ?? b.accel,
     };
   });
 }
@@ -1455,6 +1522,43 @@ function selectionNormal(
   return [nx / len, ny / len, nz / len];
 }
 
+/** Area-weighted centroid of a triangle selection (mm) — the point a remote
+ *  mass's couple transports about, and where a mass CG initializes (DESIGN §16
+ *  dec. 7). `positions` is the triangle soup (9 floats/tri). Null when empty. */
+export function selectionCentroid(
+  positions: Float32Array | undefined,
+  tris: Uint32Array
+): [number, number, number] | null {
+  if (!positions || tris.length === 0) return null;
+  let cx = 0;
+  let cy = 0;
+  let cz = 0;
+  let wsum = 0;
+  for (const t of tris) {
+    const o = 9 * t;
+    // Triangle centroid + (twice) area weight.
+    const e1x = positions[o + 3] - positions[o];
+    const e1y = positions[o + 4] - positions[o + 1];
+    const e1z = positions[o + 5] - positions[o + 2];
+    const e2x = positions[o + 6] - positions[o];
+    const e2y = positions[o + 7] - positions[o + 1];
+    const e2z = positions[o + 8] - positions[o + 2];
+    const ax = e1y * e2z - e1z * e2y;
+    const ay = e1z * e2x - e1x * e2z;
+    const az = e1x * e2y - e1y * e2x;
+    const w = Math.hypot(ax, ay, az); // 2·area
+    const gx = (positions[o] + positions[o + 3] + positions[o + 6]) / 3;
+    const gy = (positions[o + 1] + positions[o + 4] + positions[o + 7]) / 3;
+    const gz = (positions[o + 2] + positions[o + 5] + positions[o + 8]) / 3;
+    cx += w * gx;
+    cy += w * gy;
+    cz += w * gz;
+    wsum += w;
+  }
+  if (wsum < 1e-12) return null;
+  return [cx / wsum, cy / wsum, cz / wsum];
+}
+
 /** Resolved load vector of a force BC for the solver: the direction × the
  *  magnitude in "direction" mode, the components verbatim otherwise. */
 function resolveForce(bc: Bc): [number, number, number] {
@@ -1463,6 +1567,16 @@ function resolveForce(bc: Bc): [number, number, number] {
     return [bc.forceDir[0] * m, bc.forceDir[1] * m, bc.forceDir[2] * m];
   }
   return bc.force ?? [0, 0, 0];
+}
+
+/** Resolved acceleration vector (mm/s²) of an accel BC: direction × magnitude
+ *  in "direction" mode, components verbatim otherwise (mirrors resolveForce). */
+function resolveAccel(bc: Bc): [number, number, number] {
+  if (bc.accelMode === "direction" && bc.accelDir) {
+    const m = bc.accelMag ?? 0;
+    return [bc.accelDir[0] * m, bc.accelDir[1] * m, bc.accelDir[2] * m];
+  }
+  return bc.accel ?? [0, 0, 0];
 }
 
 /** Magnitude a force should carry when switching into direction mode: the
@@ -2761,13 +2875,16 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   async rotateModel(axis) {
-    // +90° about the world axis, applied about the part's bbox center.
+    // +5° about the world axis, applied about the part's bbox center.
+    const rad = (5 * Math.PI) / 180;
+    const c = Math.cos(rad);
+    const sn = Math.sin(rad);
     const R: Record<"x" | "y" | "z", number[]> = {
-      x: [1, 0, 0, 0, 0, -1, 0, 1, 0],
-      y: [0, 0, 1, 0, 1, 0, -1, 0, 0],
-      z: [0, -1, 0, 1, 0, 0, 0, 0, 1],
+      x: [1, 0, 0, 0, c, -sn, 0, sn, c],
+      y: [c, 0, sn, 0, 1, 0, -sn, 0, c],
+      z: [c, -sn, 0, sn, c, 0, 0, 0, 1],
     };
-    appendLog(set, `Rotate +90° about ${axis.toUpperCase()} — results reset`);
+    appendLog(set, `Rotate +5° about ${axis.toUpperCase()} — results reset`);
     await transformModel(set, get, R[axis]);
   },
 
@@ -2877,6 +2994,18 @@ export const useStore = create<AppState>((set, get) => ({
       momentMode: kind === "moment" ? "components" : undefined,
       momentDir: kind === "moment" ? [0, 0, 1] : undefined,
       momentMag: kind === "moment" ? 100 : undefined,
+      // Acceleration: selection-less; default 1 g straight down (−Z), direction
+      // mode with the "1 g ↓" preset already applied (DESIGN §16 dec. 2).
+      accel: kind === "accel" ? [0, 0, -ONE_G_MMS2] : undefined,
+      accelMode: kind === "accel" ? "direction" : undefined,
+      accelDir: kind === "accel" ? [0, 0, -1] : undefined,
+      accelMag: kind === "accel" ? ONE_G_MMS2 : undefined,
+      // Point mass: a 100 g component; its CG snaps to the selected patch's
+      // area-weighted centroid on first selection (updateBcTris). Deformable
+      // (load-only) by default — the schema carries "rigid" for a later milestone.
+      massGrams: kind === "mass" ? 100 : undefined,
+      point: kind === "mass" ? [0, 0, 0] : undefined,
+      behavior: kind === "mass" ? "deformable" : undefined,
     };
     set({ bcs: [...get().bcs, bc], activeBcId: bc.id, tool: "select" });
     markResultsStale(set, get, "loads");
@@ -2949,6 +3078,13 @@ export const useStore = create<AppState>((set, get) => ({
             next.forceDir = n;
             next.force = resolveForce(next);
           }
+        }
+        // A point mass initializes its CG at the patch centroid on FIRST
+        // selection (zero lever arm, predictable). Later re-selections leave the
+        // user's CG alone — "reset to centroid" in the panel re-snaps it.
+        if (b.kind === "mass" && prevTris.length === 0 && tris.length > 0) {
+          const c = selectionCentroid(positions, tris);
+          if (c) next.point = c;
         }
         return next;
       }),
@@ -3082,6 +3218,80 @@ export const useStore = create<AppState>((set, get) => ({
     get().setMomentDir(id, n);
   },
 
+  // ---- acceleration (kind "accel") — mirrors the force dual-mode helpers ----
+  setAccelMode(id, mode) {
+    const bc = get().bcs.find((b) => b.id === id);
+    if (!bc) return;
+    if (mode === "components") {
+      get().updateBcParams(id, { accelMode: "components", accel: resolveAccel(bc) });
+      return;
+    }
+    // Direction mode: keep the current vector's direction + magnitude.
+    const cur = resolveAccel(bc);
+    const mag = bc.accelMag ?? Math.hypot(cur[0], cur[1], cur[2]) ?? 0;
+    const dir = bc.accelDir ?? (mag > 0 ? [cur[0] / mag, cur[1] / mag, cur[2] / mag] : [0, 0, -1]);
+    const next: Bc = { ...bc, accelMode: "direction", accelDir: dir as [number, number, number], accelMag: mag };
+    get().updateBcParams(id, { accelMode: "direction", accelDir: next.accelDir, accelMag: mag, accel: resolveAccel(next) });
+  },
+
+  setAccelMag(id, mag) {
+    const bc = get().bcs.find((b) => b.id === id);
+    if (!bc) return;
+    const next: Bc = { ...bc, accelMag: mag };
+    get().updateBcParams(id, { accelMag: mag, accel: resolveAccel(next) });
+  },
+
+  setAccelDir(id, dir) {
+    const bc = get().bcs.find((b) => b.id === id);
+    if (!bc) return;
+    const len = Math.hypot(dir[0], dir[1], dir[2]);
+    if (len < 1e-12) return;
+    const unit: [number, number, number] = [dir[0] / len, dir[1] / len, dir[2] / len];
+    const mag = bc.accelMag ?? Math.hypot(...(bc.accel ?? [0, 0, 0])) ?? 0;
+    const next: Bc = { ...bc, accelMode: "direction", accelDir: unit, accelMag: mag };
+    get().updateBcParams(id, { accelMode: "direction", accelDir: unit, accelMag: mag, accel: resolveAccel(next) });
+  },
+
+  flipAccelDir(id) {
+    const bc = get().bcs.find((b) => b.id === id);
+    if (!bc) return;
+    if (bc.accelMode === "direction") {
+      const d = bc.accelDir ?? [0, 0, -1];
+      const flipped: [number, number, number] = [-d[0], -d[1], -d[2]];
+      const next: Bc = { ...bc, accelDir: flipped };
+      get().updateBcParams(id, { accelDir: flipped, accel: resolveAccel(next) });
+    } else {
+      const a = bc.accel ?? [0, 0, 0];
+      get().updateBcParams(id, { accel: [-a[0], -a[1], -a[2]] });
+    }
+  },
+
+  setAccelOneGDown(id) {
+    get().updateBcParams(id, {
+      accelMode: "direction",
+      accelDir: [0, 0, -1],
+      accelMag: ONE_G_MMS2,
+      accel: [0, 0, -ONE_G_MMS2],
+    });
+  },
+
+  // ---- point mass (kind "mass") ----
+  setMassGrams(id, grams) {
+    get().updateBcParams(id, { massGrams: Math.max(0, grams) });
+  },
+
+  setMassPoint(id, point) {
+    get().updateBcParams(id, { point });
+  },
+
+  resetMassPointToCentroid(id) {
+    const bc = get().bcs.find((b) => b.id === id);
+    if (!bc) return;
+    const c = selectionCentroid(get().model?.positions, bc.tris);
+    if (!c) return;
+    get().updateBcParams(id, { point: c });
+  },
+
   applyPickedDir(normal) {
     const id = get().activeBcId;
     if (!id) return;
@@ -3200,6 +3410,11 @@ export const useStore = create<AppState>((set, get) => ({
       get().loadSteps.find((s) => s.id === stepId)?.overrides[bcId]?.moment ?? bc.moment ?? [0, 0, 0];
     const mag = Math.hypot(cur[0], cur[1], cur[2]) || bc.momentMag || 100;
     get().setStepMoment(stepId, bcId, [n[0] * mag, n[1] * mag, n[2] * mag]);
+  },
+
+  setStepAccel(stepId, bcId, accel) {
+    set({ loadSteps: patchStepOverride(get().loadSteps, stepId, bcId, { accel }) });
+    syncIfActiveStep(set, get, stepId);
   },
 
   setStepIncludeOptimize(stepId, include) {
@@ -4223,6 +4438,15 @@ export const useStore = create<AppState>((set, get) => ({
         }
       }
       await prebuildMeshView(set, get);
+      // Remote point masses on the first step add their inertia to the modal
+      // mass matrix (DESIGN §16) — call it out so the shifted frequencies are
+      // explained. Applied forces are still ignored (the eigenproblem is force-free).
+      const modalMasses = effectiveBcs(st0.bcs, firstStep).filter((b) => b.kind === "mass");
+      const modalMassG = modalMasses.reduce((sum, b) => sum + (b.massGrams ?? 0), 0);
+      const massNote = modalMasses.length
+        ? ` · ${modalMasses.length} attached mass${modalMasses.length === 1 ? "" : "es"} ` +
+          `(${modalMassG < 10 ? modalMassG.toFixed(1) : modalMassG.toFixed(0)} g) add inertia`
+        : "";
       appendLog(
         set,
         `Modal analysis — ${st0.modalModeCount} mode${st0.modalModeCount === 1 ? "" : "s"}, ` +
@@ -4231,6 +4455,7 @@ export const useStore = create<AppState>((set, get) => ({
             ? " — free-free (unconstrained, rigid-body modes dropped), undamped"
             : (steps.length > 1 ? ` (supports from "${firstStep.name}")` : "") +
               " — constrained, undamped") +
+          massNote +
           " …"
       );
       // Live MGCG convergence trace (the nerd convergence plot) while the many
@@ -4461,7 +4686,15 @@ export const useStore = create<AppState>((set, get) => ({
       // A single-step project — or one included step — keeps the single-load
       // path (active / sole step's BCs), byte-identical to before.
       await engine.clearLoadCases();
+      // DESIGN §16 dec. 4: acceleration/gravity steps ARE optimized now — the
+      // engine recomputes each case's design-dependent self-weight from the live
+      // density every SIMP iteration (the worker snapshots the step's summed
+      // accel into the load case). No accel ⇒ that path is inert (byte-identical).
       const included = st.loadSteps.filter((s) => s.includeInOptimize);
+      // Any included acceleration step makes this a self-weight optimization, so
+      // every design (optimized / uniform / solid) carries its OWN true weight in
+      // the comparison (dec. 10) — noted once below.
+      const selfWeight = included.some((s) => stepHasAccel(st.bcs, s));
       const multiLoad = st.loadSteps.length > 1 && included.length >= 2;
       if (multiLoad) {
         for (const step of included) {
@@ -4485,6 +4718,13 @@ export const useStore = create<AppState>((set, get) => ({
         return;
       } else {
         await pushBcs(get); // single step: the active (sole) step's BCs
+      }
+      if (selfWeight) {
+        appendLog(
+          set,
+          "Self-weight is active — the optimizer recomputes each design's body load every " +
+            "iteration (DESIGN §16); the comparison shows each design carrying its own true weight."
+        );
       }
       await logGridInfo(set);
       // Cache the voxel hull NOW (worker still free) so the Mesh view is

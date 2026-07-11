@@ -11,6 +11,9 @@ import {
   resultStale,
   symLabel,
   useStore,
+  effectiveBcs,
+  selectionCentroid,
+  ONE_G_MMS2,
   COLOR_STEPS_MIN,
   COLOR_STEPS_MAX,
 } from "../store";
@@ -70,13 +73,23 @@ function SurfacePatchControl() {
       setSegAngle: s.setSegAngle,
     }))
   );
+  // Drag the slider live off a local draft; only resegment (expensive) once
+  // the user releases, so mid-drag doesn't flash "Re-segmenting…" every pixel.
+  const [draft, setDraft] = useState<number | null>(null);
   if (!s.model) return null;
   const cad = s.model.hasCadFaces;
+  const shown = draft ?? s.segAngle;
+  const commit = () => {
+    if (draft !== null) {
+      if (draft !== s.segAngle) void s.setSegAngle(draft);
+      setDraft(null);
+    }
+  };
   return (
     <>
       <div className="g-label">
         <span>Surface detection</span>
-        {s.segSource === "angle" && <b>{s.segAngle}°</b>}
+        {s.segSource === "angle" && <b>{shown}°</b>}
       </div>
       {cad && (
         <div className="toolrow">
@@ -100,10 +113,13 @@ function SurfacePatchControl() {
         <>
           <input
             type="range"
-            min={5}
+            min={0}
             max={80}
-            value={s.segAngle}
-            onChange={(e) => void s.setSegAngle(Number(e.target.value))}
+            value={shown}
+            onChange={(e) => setDraft(Number(e.target.value))}
+            onPointerUp={commit}
+            onKeyUp={commit}
+            onBlur={commit}
           />
           <div className="dim small">
             Splits the skin into pickable surfaces — lower the angle if patches merge, raise it if
@@ -144,7 +160,13 @@ export function StepPanel() {
       const st = useStore.getState();
       if (st.tool === "orbit") return;
       const el = e.target as HTMLElement | null;
-      if (!el || el.closest("[data-bcsection]") || el.closest(".viewer")) return;
+      if (
+        !el ||
+        el.closest("[data-bcsection]") ||
+        el.closest("[data-keeptool]") ||
+        el.closest(".viewer")
+      )
+        return;
       setTimeout(() => useStore.getState().setTool("orbit"), 0);
     };
     const onKey = (e: KeyboardEvent) => {
@@ -251,13 +273,13 @@ function StepModel() {
               >
                 ⤓ Place on face
               </button>
-              <button onClick={() => void s.rotateModel("x")} title="Rotate +90° about X">
+              <button onClick={() => void s.rotateModel("x")} title="Rotate +5° about X">
                 ⟳X
               </button>
-              <button onClick={() => void s.rotateModel("y")} title="Rotate +90° about Y">
+              <button onClick={() => void s.rotateModel("y")} title="Rotate +5° about Y">
                 ⟳Y
               </button>
-              <button onClick={() => void s.rotateModel("z")} title="Rotate +90° about Z">
+              <button onClick={() => void s.rotateModel("z")} title="Rotate +5° about Z">
                 ⟳Z
               </button>
             </div>
@@ -267,7 +289,7 @@ function StepModel() {
                 : "Layer-adhesion safety treats Z as the layer direction. Loads keep their world directions; results reset on reorientation."}
             </div>
           </div>
-          <div className="group">
+          <div className="group" data-keeptool>
             <SurfacePatchControl />
           </div>
           <div className="group">
@@ -367,7 +389,14 @@ function StepBcs() {
           <HelpTip help={BC_HELP.pressure}>
             <button onClick={() => s.addBc("pressure")}>+ Pressure</button>
           </HelpTip>
+          <HelpTip help={BC_HELP.accel}>
+            <button onClick={() => s.addBc("accel")}>+ Acceleration</button>
+          </HelpTip>
+          <HelpTip help={BC_HELP.mass}>
+            <button onClick={() => s.addBc("mass")}>+ Point mass</button>
+          </HelpTip>
         </div>
+        <AttachedMassNote />
       </div>
 
       {s.bcs.length > 0 && (
@@ -537,7 +566,11 @@ function BcRow({ bc }: { bc: Bc }) {
           title="Rename this condition"
         />
         {off && <span className="bcoff">off</span>}
-        <span className="dim">{bc.tris.length ? `${bc.tris.length} tris` : "select…"}</span>
+        {bc.kind === "accel" ? (
+          <span className="dim">whole part</span>
+        ) : (
+          <span className="dim">{bc.tris.length ? `${bc.tris.length} tris` : "select…"}</span>
+        )}
         <button
           className="x"
           onClick={(e) => {
@@ -551,6 +584,8 @@ function BcRow({ bc }: { bc: Bc }) {
       {bc.kind === "force" && <ForceEditor bc={bc} step={step} />}
       {bc.kind === "bearing" && <BearingEditor bc={bc} step={step} />}
       {bc.kind === "moment" && <MomentEditor bc={bc} step={step} />}
+      {bc.kind === "accel" && <AccelEditor bc={bc} step={step} />}
+      {bc.kind === "mass" && <MassEditor bc={bc} step={step} />}
       {bc.kind === "displacement" && <DisplacementEditor bc={bc} />}
       {bc.kind === "pressure" && (
         <div className="bcparams" onClick={(e) => e.stopPropagation()}>
@@ -1066,6 +1101,249 @@ function BaseMomentEditor({ bc }: { bc: Bc }) {
         Applied as a distributed force couple about the selection's centroid (the voxel mesh has no
         rotational DOFs).
       </div>
+    </div>
+  );
+}
+
+/** Informational line under the Loads group: total attached (dummy) mass —
+ *  external components, EXCLUDED from the printed-part mass (DESIGN §16 dec. 10)
+ *  — plus a soft, non-blocking advisory when a mass has no acceleration to feel
+ *  (dec. 11: "added the motor, forgot gravity"). */
+function AttachedMassNote() {
+  const s = useStore(useShallow((s) => ({ bcs: s.bcs, loadSteps: s.loadSteps })));
+  const masses = s.bcs.filter((b) => b.kind === "mass");
+  if (masses.length === 0) return null;
+  const totalG = masses.reduce((a, b) => a + (b.massGrams ?? 0), 0);
+  const multi = s.loadSteps.length > 1;
+  const anyActiveAccel = s.loadSteps.some((ls) =>
+    effectiveBcs(s.bcs, multi ? ls : undefined).some((b) => b.kind === "accel")
+  );
+  return (
+    <div className="dim small" style={{ marginTop: 6 }}>
+      Attached masses: {format(totalG, "mass")} — external components, excluded from the printed
+      part mass.
+      {!anyActiveAccel && (
+        <div style={{ color: "#c07a0a", marginTop: 2 }}>
+          ⚠ No acceleration is active — add an Acceleration (e.g. gravity) or the masses load nothing.
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Acceleration editor (DESIGN §16): a selection-less world acceleration every
+ *  mass feels as F = m·a. Dual-mode like force (components OR direction + |a|),
+ *  shown in g by default, with a one-click "1 g ↓" preset. `step` set ⇒ edits
+ *  that load step's vector; otherwise the base BC. */
+function AccelEditor({ bc, step }: { bc: Bc; step?: LoadStep }) {
+  return step ? <StepAccelEditor bc={bc} step={step} /> : <BaseAccelEditor bc={bc} />;
+}
+
+const ACCEL_CONVENTION = "Every mass feels F = m·a along this vector — gravity is 1 g down.";
+
+function BaseAccelEditor({ bc }: { bc: Bc }) {
+  const s = useStore(
+    useShallow((s) => ({
+      setAccelMode: s.setAccelMode,
+      setAccelMag: s.setAccelMag,
+      setAccelDir: s.setAccelDir,
+      flipAccelDir: s.flipAccelDir,
+      setAccelOneGDown: s.setAccelOneGDown,
+      updateBcParams: s.updateBcParams,
+    }))
+  );
+  const mode = bc.accelMode ?? "direction";
+  const a = bc.accel ?? [0, 0, 0];
+  const dir = bc.accelDir ?? [0, 0, -1];
+  return (
+    <div className="forceedit" onClick={(e) => e.stopPropagation()}>
+      <ForceModeToggle mode={mode} onMode={(m) => s.setAccelMode(bc.id, m)} />
+      {mode === "components" ? (
+        <VectorInput
+          values={a}
+          label="a"
+          kind="acceleration"
+          step={1}
+          onChange={(na) => s.updateBcParams(bc.id, { accel: na })}
+        />
+      ) : (
+        <>
+          <div className="forcerow">
+            <span className="flabel">|a|</span>
+            <UnitInput
+              className="fnum"
+              value={bc.accelMag ?? 0}
+              kind="acceleration"
+              step={1}
+              onCommit={(v) => s.setAccelMag(bc.id, v)}
+            />
+            <span className="funit">{unitLabel("acceleration")}</span>
+          </div>
+          <VectorInput
+            values={[r4(dir[0]), r4(dir[1]), r4(dir[2])]}
+            label="d"
+            step={0.1}
+            onChange={(d) => s.setAccelDir(bc.id, d)}
+          />
+          <div className="toolrow">
+            <button onClick={() => s.setAccelOneGDown(bc.id)} title="1 g straight down (−Z)">
+              ↓ 1 g down
+            </button>
+            <button onClick={() => s.flipAccelDir(bc.id)} title="Reverse the acceleration direction">
+              ⇄ Flip
+            </button>
+          </div>
+        </>
+      )}
+      <div className="dim small">{ACCEL_CONVENTION}</div>
+    </div>
+  );
+}
+
+/** Per-step acceleration editor — edits the active load step's vector. */
+function StepAccelEditor({ bc, step }: { bc: Bc; step: LoadStep }) {
+  const s = useStore(useShallow((s) => ({ setStepAccel: s.setStepAccel })));
+  const [mode, setMode] = useState<ForceMode>(bc.accelMode ?? "direction");
+  const a = step.overrides[bc.id]?.accel ?? bc.accel ?? [0, 0, 0];
+  const setVec = (v: [number, number, number]) => s.setStepAccel(step.id, bc.id, v);
+  const mag = Math.hypot(a[0], a[1], a[2]);
+  const dir: [number, number, number] =
+    mag > 1e-9 ? [a[0] / mag, a[1] / mag, a[2] / mag] : bc.accelDir ?? [0, 0, -1];
+  const round = (x: number) => Math.round(x * 1000) / 1000;
+  return (
+    <div className="forceedit" onClick={(e) => e.stopPropagation()}>
+      <ForceModeToggle mode={mode} onMode={setMode} />
+      {mode === "components" ? (
+        <VectorInput values={a} label="a" kind="acceleration" step={1} onChange={setVec} />
+      ) : (
+        <>
+          <div className="forcerow">
+            <span className="flabel">|a|</span>
+            <UnitInput
+              className="fnum"
+              value={mag}
+              kind="acceleration"
+              step={1}
+              onCommit={(v) => setVec([dir[0] * v, dir[1] * v, dir[2] * v])}
+            />
+            <span className="funit">{unitLabel("acceleration")}</span>
+          </div>
+          <VectorInput
+            values={[round(dir[0]), round(dir[1]), round(dir[2])]}
+            label="d"
+            step={0.1}
+            onChange={(d) => {
+              const len = Math.hypot(d[0], d[1], d[2]) || 1;
+              setVec([(d[0] / len) * mag, (d[1] / len) * mag, (d[2] / len) * mag]);
+            }}
+          />
+          <div className="toolrow">
+            <button onClick={() => setVec([0, 0, -ONE_G_MMS2])} title="1 g straight down (−Z)">
+              ↓ 1 g down
+            </button>
+            <button onClick={() => setVec([-a[0], -a[1], -a[2]])} title="Reverse the acceleration direction">
+              ⇄ Flip
+            </button>
+          </div>
+        </>
+      )}
+      <div className="dim small">This step's acceleration. {ACCEL_CONVENTION}</div>
+    </div>
+  );
+}
+
+/** Point-mass editor (DESIGN §16): the component mass + its CG position (XYZ
+ *  DRO, initialized at the patch centroid), with a live F = m·a and transported
+ *  couple |M| readout for the shown step so the lever arm is visible pre-solve.
+ *  The rigid-coupling toggle is present but disabled — a later milestone. */
+function MassEditor({ bc, step }: { bc: Bc; step?: LoadStep }) {
+  const s = useStore(
+    useShallow((s) => ({
+      setMassGrams: s.setMassGrams,
+      setMassPoint: s.setMassPoint,
+      resetMassPointToCentroid: s.resetMassPointToCentroid,
+      bcs: s.bcs,
+      positions: s.model?.positions,
+    }))
+  );
+  const point = bc.point ?? [0, 0, 0];
+  const massG = bc.massGrams ?? 0;
+  // Summed active acceleration for the shown step (world mm/s²) — resolves the
+  // per-step overrides + drops deactivated entities via effectiveBcs.
+  const a: [number, number, number] = [0, 0, 0];
+  for (const b of effectiveBcs(s.bcs, step)) {
+    if (b.kind === "accel" && b.accel) {
+      a[0] += b.accel[0];
+      a[1] += b.accel[1];
+      a[2] += b.accel[2];
+    }
+  }
+  const aMag = Math.hypot(a[0], a[1], a[2]);
+  // F = m·a (N): mass in tonne × accel in mm/s². Transported couple |M| = |(p−c)×F|.
+  const mT = massG * 1e-6;
+  const F: [number, number, number] = [mT * a[0], mT * a[1], mT * a[2]];
+  const Fmag = mT * aMag;
+  const c = selectionCentroid(s.positions, bc.tris) ?? point;
+  const arm: [number, number, number] = [point[0] - c[0], point[1] - c[1], point[2] - c[2]];
+  const Mmag = Math.hypot(
+    arm[1] * F[2] - arm[2] * F[1],
+    arm[2] * F[0] - arm[0] * F[2],
+    arm[0] * F[1] - arm[1] * F[0]
+  );
+  const noSel = bc.tris.length === 0;
+  return (
+    <div className="forceedit" onClick={(e) => e.stopPropagation()}>
+      <div className="forcerow">
+        <span className="flabel">m</span>
+        <UnitInput
+          className="fnum"
+          value={massG}
+          kind="mass"
+          step={1}
+          onCommit={(v) => s.setMassGrams(bc.id, v)}
+        />
+        <span className="funit">{unitLabel("mass")}</span>
+      </div>
+      {noSel ? (
+        <div className="dim small">
+          Select the mounting surface — the CG starts at its centre, then offset it to the
+          component's true centre of gravity below.
+        </div>
+      ) : (
+        <>
+          <div className="dim small" style={{ marginTop: 4 }}>
+            Centre of gravity ({unitLabel("length")})
+          </div>
+          <VectorInput values={point} label="" kind="length" step={1} onChange={(p) => s.setMassPoint(bc.id, p)} />
+          <div className="toolrow">
+            <button onClick={() => s.resetMassPointToCentroid(bc.id)} title="Snap the CG back to the patch centre">
+              ◎ CG at patch centre
+            </button>
+          </div>
+          <div className="dim small">
+            {aMag < 1e-9 ? (
+              "Add an Acceleration (e.g. gravity) — a mass loads nothing without one."
+            ) : (
+              <>
+                Under the shown load: |F| = {format(Fmag, "force")}, transported |M| ={" "}
+                {format(Mmag, "moment")}.
+              </>
+            )}
+          </div>
+        </>
+      )}
+      {/* Coupling behavior (DESIGN §16): the RIGID mount (engine-complete, see
+          crates/filasim-core/src/rigid.rs) is HIDDEN for now — its penalty term
+          costs ~3× the MGCG iterations of a normal solve, not worth exposing yet.
+          Masses stay deformable (load-only). Re-enable by rendering the toggle:
+            <div className="seg" title="How the mass couples to the mounting patch">
+              <button className={bc.behavior === "rigid" ? "" : "on"}
+                onClick={() => s.updateBcParams(bc.id, { behavior: "deformable" })}>
+                Deformable (load only)</button>
+              <button className={bc.behavior === "rigid" ? "on" : ""}
+                onClick={() => s.updateBcParams(bc.id, { behavior: "rigid" })}>
+                Rigid (stiffens face)</button>
+            </div> */}
     </div>
   );
 }

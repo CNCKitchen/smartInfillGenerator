@@ -13,7 +13,8 @@
 //!   and the slicer's modifier order (low -> high density) resolves them,
 //! - isosurfacing via marching tetrahedra on a node lattice with a void
 //!   margin: closed, crack-free, watertight by construction,
-//! - Taubin smoothing (no shrink) takes the staircase off.
+//! - constrained Laplacian smoothing (sub-voxel displacement clamp) takes the
+//!   staircase off; Taubin remains for the smooth-field preview meshes.
 
 use crate::voxel::VoxelGrid;
 use std::collections::HashMap;
@@ -361,6 +362,72 @@ pub fn extract_region(grid: &VoxelGrid, inside: &dyn Fn(usize) -> bool, iso: f64
     extract_iso(grid, &|ci| if inside(ci) { 1.0 } else { 0.0 }, iso)
 }
 
+/// One 7-point blur pass over a per-cell field: center weight 2, each face
+/// neighbor 1, normalized by 8 (outside the grid counts as 0 = void).
+fn blur_cells(grid: &VoxelGrid, f: &[f32]) -> Vec<f32> {
+    let (nx, ny, nz) = (grid.nx, grid.ny, grid.nz);
+    let mut out = vec![0f32; f.len()];
+    for cz in 0..nz {
+        for cy in 0..ny {
+            for cx in 0..nx {
+                let ci = (cz * ny + cy) * nx + cx;
+                let mut acc = 2.0 * f[ci];
+                if cx > 0 {
+                    acc += f[ci - 1];
+                }
+                if cx + 1 < nx {
+                    acc += f[ci + 1];
+                }
+                if cy > 0 {
+                    acc += f[ci - nx];
+                }
+                if cy + 1 < ny {
+                    acc += f[ci + nx];
+                }
+                if cz > 0 {
+                    acc += f[ci - nx * ny];
+                }
+                if cz + 1 < nz {
+                    acc += f[ci + nx * ny];
+                }
+                out[ci] = acc / 8.0;
+            }
+        }
+    }
+    out
+}
+
+/// [`extract_region`] on a BLURRED indicator — the production export path.
+///
+/// The raw binary indicator quantizes the lattice node values to eighths,
+/// which does two ugly things to the marching-tets mesh: it grows tent/needle
+/// spikes at single-voxel corners, and — worse — it clusters isosurface
+/// vertices into KNOTS near lattice nodes (many crossing edges interpolate to
+/// t ≈ 0.9 around the same node). A knot vertex's neighbors are mostly the
+/// other knot vertices at the same spot, so its uniform-weight Laplacian is
+/// ≈ 0 and NO amount of mesh smoothing moves it — these were the immovable
+/// pimples on exported parts. One cell-blur pass makes the field continuous:
+/// vertices spread evenly along lattice edges (no knots), and single-voxel
+/// junk drops below the iso before it is ever meshed (an isolated cell peaks
+/// at 0.25, a proud bump cell at 0.375 < 0.4), while straight members ≥ 2
+/// cells keep their node values above the iso and survive — same thin-feature
+/// floor as the unblurred node averaging already had.
+pub fn extract_region_smooth(
+    grid: &VoxelGrid,
+    inside: &dyn Fn(usize) -> bool,
+    iso: f64,
+) -> RegionMesh {
+    let n = grid.cell_count();
+    let mut f = vec![0f32; n];
+    for (ci, v) in f.iter_mut().enumerate() {
+        if inside(ci) {
+            *v = 1.0;
+        }
+    }
+    let f = blur_cells(grid, &f);
+    extract_iso(grid, &|ci| f[ci] as f64, iso)
+}
+
 /// Isosurface of an arbitrary per-cell scalar at `iso`. Node lattice with a
 /// one-cell void margin; node value = mean of the 8 adjacent cell values.
 /// For smooth fields (e.g. filtered densities) this yields the true smooth
@@ -573,13 +640,8 @@ fn marching_tets(
     (positions, indices)
 }
 
-/// Taubin lambda/mu smoothing (volume-preserving-ish), in place.
-pub fn taubin_smooth(positions: &mut [f32], indices: &[u32], passes: usize) {
-    let nv = positions.len() / 3;
-    if nv == 0 {
-        return;
-    }
-    // Vertex adjacency.
+/// Undirected vertex adjacency of a triangle mesh (deduplicated).
+fn vertex_neighbors(nv: usize, indices: &[u32]) -> Vec<Vec<u32>> {
     let mut neighbors: Vec<Vec<u32>> = vec![Vec::new(); nv];
     let add = |a: u32, b: u32, neighbors: &mut Vec<Vec<u32>>| {
         if !neighbors[a as usize].contains(&b) {
@@ -594,13 +656,22 @@ pub fn taubin_smooth(positions: &mut [f32], indices: &[u32], passes: usize) {
         add(t[2], t[0], &mut neighbors);
         add(t[0], t[2], &mut neighbors);
     }
+    neighbors
+}
+
+/// Taubin lambda/mu smoothing (volume-preserving-ish), in place.
+pub fn taubin_smooth(positions: &mut [f32], indices: &[u32], passes: usize) {
+    let nv = positions.len() / 3;
+    if nv == 0 {
+        return;
+    }
+    let neighbors = vertex_neighbors(nv, indices);
     let mut tmp = vec![0f32; positions.len()];
     // Taubin λ/μ pair (volume-preserving, no net shrink). The textbook
     // 0.5/−0.53 is deliberately STABLE: a more aggressive pair (closer to the
     // instability edge) folds thin marching-tets features into spikes/holes on
-    // irregular meshes. Smoothing STRENGTH comes from the pass count
-    // (`SMOOTH_PASS_MULT` in the wasm layer) on a clean watertight base mesh,
-    // not from pushing λ/μ.
+    // irregular meshes. Used for the SMOOTH-field preview meshes (few passes,
+    // no staircase to fight); export regions use `constrained_smooth`.
     for pass in 0..passes * 2 {
         let factor = if pass % 2 == 0 { 0.5f32 } else { -0.53f32 };
         for v in 0..nv {
@@ -621,6 +692,64 @@ pub fn taubin_smooth(positions: &mut [f32], indices: &[u32], passes: usize) {
                 c[d] /= nb.len() as f32;
                 tmp[3 * v + d] = positions[3 * v + d] + factor * (c[d] - positions[3 * v + d]);
             }
+        }
+        positions.copy_from_slice(&tmp);
+    }
+}
+
+/// Constrained Laplacian smoothing, in place: `passes` sweeps of λ = 0.5
+/// neighborhood averaging, with every vertex clamped to a ball of radius
+/// `max_move` around its ORIGINAL position (SurfaceNets-style, cf. Whitaker's
+/// constrained level-set smoothing / VTK `vtkSurfaceNets3D`).
+///
+/// This is the staircase killer for BINARY voxel extractions. Taubin is a
+/// band-pass filter: it rounds the voxel-pitch fuzz but PRESERVES the broad
+/// terraces a binary indicator leaves on shallow slopes (wide treads are
+/// low-frequency along the surface — inside Taubin's pass band at any pass
+/// count; the aggressive-λ/μ attempt in 2026-06 confirmed the ceiling). Plain
+/// diffusion DOES melt them — it converges to the minimal-area surface — and
+/// the displacement clamp supplies the anti-shrink guarantee Taubin's μ step
+/// existed for: terraces (amplitude ≤ h/2 ≤ max_move) flatten completely,
+/// while real geometry — thin members, sharp edges, small holes — can never
+/// drift more than `max_move` from the extracted surface.
+pub fn constrained_smooth(positions: &mut [f32], indices: &[u32], passes: usize, max_move: f32) {
+    let nv = positions.len() / 3;
+    if nv == 0 || passes == 0 {
+        return;
+    }
+    let neighbors = vertex_neighbors(nv, indices);
+    let orig = positions.to_vec();
+    let mut tmp = vec![0f32; positions.len()];
+    let r2 = max_move * max_move;
+    for _ in 0..passes {
+        for v in 0..nv {
+            let nb = &neighbors[v];
+            if nb.is_empty() {
+                tmp[3 * v..3 * v + 3].copy_from_slice(&positions[3 * v..3 * v + 3]);
+                continue;
+            }
+            let mut c = [0f32; 3];
+            for &u in nb {
+                c[0] += positions[3 * u as usize];
+                c[1] += positions[3 * u as usize + 1];
+                c[2] += positions[3 * u as usize + 2];
+            }
+            let inv = 1.0 / nb.len() as f32;
+            let mut p = [0f32; 3];
+            for d in 0..3 {
+                p[d] = positions[3 * v + d] + 0.5 * (c[d] * inv - positions[3 * v + d]);
+            }
+            // Project back onto the constraint ball around the original vertex.
+            let dv =
+                [p[0] - orig[3 * v], p[1] - orig[3 * v + 1], p[2] - orig[3 * v + 2]];
+            let d2 = dv[0] * dv[0] + dv[1] * dv[1] + dv[2] * dv[2];
+            if d2 > r2 {
+                let s = max_move / d2.sqrt();
+                for d in 0..3 {
+                    p[d] = orig[3 * v + d] + dv[d] * s;
+                }
+            }
+            tmp[3 * v..3 * v + 3].copy_from_slice(&p);
         }
         positions.copy_from_slice(&tmp);
     }

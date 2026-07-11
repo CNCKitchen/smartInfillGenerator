@@ -50,9 +50,12 @@ export function StepRail() {
         b.kind === "displacement") &&
       b.tris.length > 0
   );
-  const hasLoad = s.bcs.some(
-    (b) => !SUPPORT_KINDS.includes(b.kind) && b.tris.length > 0
-  );
+  const hasLoad = s.bcs.some((b) => {
+    if (SUPPORT_KINDS.includes(b.kind)) return false;
+    // Acceleration is selection-less (DESIGN §16) — it's a load with no surface.
+    if (b.kind === "accel") return true;
+    return b.tris.length > 0;
+  });
   const done: Record<number, boolean> = buildsim
     ? {
         1: !!s.model,

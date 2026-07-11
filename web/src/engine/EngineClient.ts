@@ -155,10 +155,6 @@ export class EngineClient {
     return this.call({ op: "setMaterial", e0, nu, density, strength, strengthZ, shearStrengthZ });
   }
 
-  setGravity(on: boolean): Promise<void> {
-    return this.call({ op: "setGravity", on });
-  }
-
   setResolution(cells: number): Promise<void> {
     return this.call({ op: "setResolution", cells });
   }
@@ -208,6 +204,10 @@ export class EngineClient {
       axes: bc.axes,
       disp: bc.disp,
       moment: bc.moment,
+      accel: bc.accel,
+      massGrams: bc.massGrams,
+      point: bc.point,
+      behavior: bc.behavior,
     }));
     return this.call(
       { op: "setBcs", bcs: payload },
@@ -748,6 +748,10 @@ export interface OptSummary {
   solidMaxDisp?: number;
   /** Infill modes expose the uniform + solid baselines as selectable results. */
   hasBaselines?: boolean;
+  /** DESIGN §16 dec. 10: an acceleration/gravity step was active, so each design
+   *  (optimized / uniform / solid) carries its OWN self-weight in the comparison —
+   *  the fully-solid baseline is heavier and sags more. Drives a fine-print note. */
+  selfWeight?: boolean;
   /** True when the run was binary (hollow/solid) mode. */
   binary: boolean;
   /** True when the run was solid topology (material-removal) mode. */

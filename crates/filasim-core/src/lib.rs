@@ -25,6 +25,7 @@ pub mod orient;
 pub mod par;
 pub mod pipeline;
 pub mod progress;
+pub mod rigid;
 pub mod segment;
 pub mod selfsupport;
 pub mod simp;

@@ -268,6 +268,12 @@ function OptResults() {
           budget (or the number of levels) to get differentiated zones.
         </div>
       )}
+      {o.selfWeight && (
+        <div className="dim small selfweightnote">
+          Self-weight active: each design carries its own true weight, so the fully-solid baseline
+          is heavier and deflects more than a weightless comparison would show (DESIGN §16).
+        </div>
+      )}
     </aside>
   );
 }

@@ -28,6 +28,7 @@ export type QuantityKind =
   | "stress"
   | "modulus"
   | "mass"
+  | "acceleration"
   | "density"
   | "strain"
   | "angle"
@@ -200,6 +201,20 @@ export const QUANTITIES: Record<QuantityKind, QuantitySpec> = {
       { id: "slinch", label: "slinch", toCanonical: G_PER_SLINCH, decimals: 6 },
     ],
   },
+  acceleration: {
+    kind: "acceleration",
+    label: "Acceleration",
+    // Canonical mm/s² — the SI-mm consistent accel (N = tonne·mm/s²). Default
+    // display is g (DESIGN §16 dec. 2): 1 g₀ = 9810 mm/s² (the engine's rounded
+    // convention, matching the regbench/self-weight anchors).
+    canonical: "mms2",
+    units: [
+      { id: "g", label: "g", toCanonical: 9810, decimals: 3 },
+      { id: "ms2", label: "m/s²", toCanonical: 1000, decimals: 2 },
+      { id: "mms2", label: "mm/s²", toCanonical: 1, decimals: 0 },
+      { id: "ins2", label: "in/s²", toCanonical: IN, decimals: 1 },
+    ],
+  },
   density: {
     kind: "density",
     label: "Density",
@@ -274,6 +289,7 @@ export const PRESETS: Record<string, PresetDef> = {
       stress: "MPa",
       modulus: "GPa",
       mass: "g",
+      acceleration: "g",
       density: "gcm3",
       strain: "pct",
       angle: "deg",
@@ -294,6 +310,7 @@ export const PRESETS: Record<string, PresetDef> = {
       stress: "psi",
       modulus: "ksi",
       mass: "lb",
+      acceleration: "g",
       density: "lbin3",
       strain: "pct",
       angle: "deg",
@@ -314,6 +331,7 @@ export const PRESETS: Record<string, PresetDef> = {
       stress: "MPa",
       modulus: "MPa",
       mass: "t",
+      acceleration: "mms2",
       density: "tmm3",
       strain: "raw",
       angle: "rad",
@@ -334,6 +352,7 @@ export const PRESETS: Record<string, PresetDef> = {
       stress: "psi",
       modulus: "psi",
       mass: "slinch",
+      acceleration: "ins2",
       density: "slinchin3",
       strain: "raw",
       angle: "rad",

@@ -10,6 +10,7 @@
 
 use crate::fem::ke_hex;
 use crate::mg::{Level, MgSolver};
+use crate::rigid::RigidGroup;
 use crate::voxel::VoxelGrid;
 
 pub use crate::eps::grid_eps;
@@ -188,6 +189,10 @@ pub struct NodeProblem {
     pub springs: Vec<(u32, [f64; 3], f64)>,
     /// Per-node force vectors (N); duplicates accumulate.
     pub forces: Vec<(u32, [f64; 3])>,
+    /// Rigid remote-mass couplings (DESIGN §16 milestone 4) — an extra stiffness
+    /// term realized on the finest solver level. Empty ⇒ the byte-identical
+    /// no-rigid path (every rigid loop below is skipped).
+    pub rigid: Vec<RigidGroup>,
 }
 
 #[derive(Clone)]
@@ -364,6 +369,7 @@ pub struct SolverCache {
     levels: usize,
     fixed: Vec<u32>,
     springs: Vec<(u32, [f64; 3], f64)>,
+    rigid: Vec<RigidGroup>,
     pub solver: MgSolver,
     /// Displacement of the last solve through this cache.
     pub last_u: Vec<f64>,
@@ -375,7 +381,9 @@ impl SolverCache {
     /// Used by the multi-load optimizer to group load cases by constraint
     /// signature (one multigrid hierarchy per group).
     pub fn same_constraints(&self, problem: &NodeProblem) -> bool {
-        self.fixed == problem.fixed && self.springs == problem.springs
+        self.fixed == problem.fixed
+            && self.springs == problem.springs
+            && self.rigid == problem.rigid
     }
 
     /// Cold-build a hierarchy for `problem` (constraints + grid + eps). Public so
@@ -397,7 +405,17 @@ impl SolverCache {
             }
         }
         let ke64 = ke_hex(s.e0, s.nu, grid.h);
-        let finest = Level::new(nx, ny, nz, grid.h, eps, ke64, &fixed, problem.springs.clone());
+        let finest = Level::new(
+            nx,
+            ny,
+            nz,
+            grid.h,
+            eps,
+            ke64,
+            &fixed,
+            problem.springs.clone(),
+            problem.rigid.clone(),
+        );
         let solver = MgSolver::new(finest, levels);
         Self {
             nx,
@@ -409,6 +427,7 @@ impl SolverCache {
             levels,
             fixed: problem.fixed.clone(),
             springs: problem.springs.clone(),
+            rigid: problem.rigid.clone(),
             solver,
             last_u: vec![0f64; ndof],
         }
@@ -431,6 +450,7 @@ impl SolverCache {
             && self.levels == levels
             && self.fixed == problem.fixed
             && self.springs == problem.springs
+            && self.rigid == problem.rigid
             && self.solver.eps_exact().len() == eps.len()
             && self.solver.eps_exact().iter().zip(eps).all(|(a, b)| (*a > 0.0) == (*b > 0.0))
     }
@@ -532,6 +552,27 @@ pub fn solve_cached(
     max_iter: usize,
 ) -> Result<CachedSolve, SolveError> {
     solve_slot(slot, grid, levels, problem, s, eps, &[], tol, max_iter)
+}
+
+/// `solve_cached` plus one or more EXTRA right-hand-side vectors added to the
+/// force RHS before the constrained-DOF zeroing (DESIGN §16 dec. 4): the
+/// optimizer injects the design-dependent self-weight here, recomputed from the
+/// live density, on top of the density-independent `problem.forces`. Each
+/// `extra_rhs[i]` must be `ndof` long. The returned compliance `b·u` includes
+/// the extra RHS, so a self-weight-loaded case reports its true compliance.
+#[allow(clippy::too_many_arguments)]
+pub fn solve_cached_rhs(
+    slot: &mut Option<SolverCache>,
+    grid: &VoxelGrid,
+    levels: usize,
+    problem: &NodeProblem,
+    s: &SolveSettings,
+    eps: Vec<f32>,
+    extra_rhs: &[&[f64]],
+    tol: f64,
+    max_iter: usize,
+) -> Result<CachedSolve, SolveError> {
+    solve_slot(slot, grid, levels, problem, s, eps, extra_rhs, tol, max_iter)
 }
 
 #[allow(clippy::too_many_arguments)]

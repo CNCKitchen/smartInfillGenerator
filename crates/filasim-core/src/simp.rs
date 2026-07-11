@@ -17,10 +17,10 @@ use crate::eps::EMIN_REL;
 use crate::fem::ke_hex;
 use crate::mg::Level;
 use crate::selfsupport::SelfSupportFilter;
-use crate::solve::{solve_cached, NodeProblem, SolverCache, SolveSettings};
+use crate::solve::{solve_cached, solve_cached_rhs, NodeProblem, SolverCache, SolveSettings};
 use crate::voxel::VoxelGrid;
 
-pub use crate::eps::build_eps;
+pub use crate::eps::{build_eps, build_vfrac};
 
 #[derive(Clone, Copy, Debug)]
 pub struct OptimizeParams {
@@ -144,12 +144,33 @@ pub struct OptimizeResult {
 /// aggregates the per-cell strain energy as `se = Σ(wᵢ/Σw)·seᵢ` over all cases
 /// (primary + extra). An EMPTY `extra` is the single-load case and takes the
 /// byte-identical original path (the guards below are all `if !extra.is_empty()`).
+/// Self-weight body acceleration for one load case (DESIGN §16 dec. 4). The
+/// case's distributed self-weight is a **design-dependent** load — a lighter
+/// design carries a lighter body force — so the optimizer recomputes it from the
+/// live density every SIMP iteration instead of baking it into the RHS. Remote
+/// point masses (F = m·a) are design-INDEPENDENT and stay in `problem.forces`;
+/// only the part's own self-weight lives here.
+#[derive(Clone, Copy, Debug)]
+pub struct BodyAccel {
+    /// World acceleration, mm/s² (the summed active accel of the case's step).
+    pub accel: [f64; 3],
+    /// Material (bulk) density, tonne/mm³.
+    pub density: f64,
+}
+
 #[derive(Default)]
 pub struct LoadSet {
     /// (problem, weight) for every case BEYOND the primary.
     pub extra: Vec<(crate::solve::NodeProblem, f64)>,
     /// Weight of the primary `problem`. Ignored when `extra` is empty.
     pub primary_weight: f64,
+    /// Self-weight body accel for the PRIMARY case (DESIGN §16). `None` = no
+    /// active acceleration ⇒ the byte-identical no-self-weight path.
+    pub primary_body: Option<BodyAccel>,
+    /// Self-weight body accel per EXTRA case. Either empty (all extras have no
+    /// self-weight) or the same length as `extra`; entry `j` pairs with
+    /// `extra[j]`. `Some` only where that case carries an active acceleration.
+    pub extra_body: Vec<Option<BodyAccel>>,
 }
 
 impl LoadSet {
@@ -157,6 +178,60 @@ impl LoadSet {
     fn total(&self) -> f64 {
         self.primary_weight + self.extra.iter().map(|(_, w)| *w).sum::<f64>()
     }
+
+    /// Self-weight accel for extra case `j` (None when no body list, or that
+    /// case has no active acceleration).
+    fn extra_body(&self, j: usize) -> Option<BodyAccel> {
+        self.extra_body.get(j).copied().flatten()
+    }
+
+    /// True when ANY case (primary or extra) carries a design-dependent
+    /// self-weight — the gate for the per-iteration body-force recompute. False
+    /// ⇒ every body path below is skipped and the optimizer stays byte-identical.
+    pub fn has_self_weight(&self) -> bool {
+        self.primary_body.is_some() || self.extra_body.iter().any(|b| b.is_some())
+    }
+}
+
+/// Self-weight body-force RHS (DESIGN §16 dec. 4): the per-cell inertial load
+/// `ρ · vfrac_e · a · h³` lumped ⅛ to each cell's 8 nodes, for the CURRENT
+/// design density (`vfrac` from [`build_vfrac`]). Recomputed each SIMP iteration
+/// so a lighter design carries a lighter self-weight. Length = ndof, NOT
+/// constrained-zeroed (the caller zeros the full RHS). Matches the `assemble`
+/// self-weight lumping exactly, so the optimizer's load agrees with the
+/// verification solve. Remote masses are design-independent and NOT here.
+fn self_weight_rhs(grid: &VoxelGrid, body: BodyAccel, vfrac: &[f32]) -> Vec<f64> {
+    let (nx, ny, nz) = (grid.nx, grid.ny, grid.nz);
+    let (mx, my) = (nx + 1, ny + 1);
+    let h = grid.h;
+    let mut b = vec![0f64; 3 * (nx + 1) * (ny + 1) * (nz + 1)];
+    let a = body.accel;
+    if a.iter().all(|&v| v == 0.0) {
+        return b;
+    }
+    let full = [0, 1, 2].map(|d| body.density * a[d] * h * h * h / 8.0);
+    for cz in 0..nz {
+        for cy in 0..ny {
+            for cx in 0..nx {
+                let vf = vfrac[(cz * ny + cy) * nx + cx] as f64;
+                if vf <= 0.0 {
+                    continue;
+                }
+                let cell_f = [full[0] * vf, full[1] * vf, full[2] * vf];
+                for oz in 0..2 {
+                    for oy in 0..2 {
+                        for ox in 0..2 {
+                            let n = ((cz + oz) * my + cy + oy) * mx + cx + ox;
+                            for d in 0..3 {
+                                b[3 * n + d] += cell_f[d];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    b
 }
 
 #[derive(Debug)]
@@ -846,7 +921,14 @@ pub fn optimize_cached(
     let mut extra_bb: Vec<Vec<f64>> = Vec::new();
     let mut extra_u: Vec<Vec<f64>> = Vec::new();
     let mut extra_w: Vec<f64> = Vec::new();
-    for (p, wj) in &loads.extra {
+    // For SELF-WEIGHT extras only (DESIGN §16 dec. 4): the density-INDEPENDENT
+    // RHS (surface + remote masses, constrained-zeroed) is kept so the per-
+    // iteration self-weight can be re-added onto a clean base, plus that case's
+    // constrained DOF indices to re-zero after. Empty placeholders for no-body
+    // cases (their `extra_bb` is built once and never touched — byte-identical).
+    let mut extra_base: Vec<Vec<f64>> = Vec::new();
+    let mut extra_cons_idx: Vec<Vec<u32>> = Vec::new();
+    for (j, (p, wj)) in loads.extra.iter().enumerate() {
         let group = if cache.same_constraints(p) {
             None
         } else if let Some(i) = extra_caches.iter().position(|c| c.same_constraints(p)) {
@@ -857,7 +939,9 @@ pub fn optimize_cached(
             extra_caches.push(SolverCache::build(grid, levels, p, settings, eps_j));
             Some(extra_caches.len() - 1)
         };
+        let has_body = loads.extra_body(j).is_some();
         let mut bbj = build_rhs(grid, p);
+        let mut cons_idx: Vec<u32> = Vec::new();
         {
             let constrained = match group {
                 None => &cache.solver.levels[0].constrained,
@@ -866,9 +950,14 @@ pub fn optimize_cached(
             for (idx, c) in constrained.iter().enumerate() {
                 if *c {
                     bbj[idx] = 0.0;
+                    if has_body {
+                        cons_idx.push(idx as u32);
+                    }
                 }
             }
         }
+        extra_base.push(if has_body { bbj.clone() } else { Vec::new() });
+        extra_cons_idx.push(cons_idx);
         extra_group.push(group);
         extra_bb.push(bbj);
         extra_u.push(vec![0f64; ndof]);
@@ -901,15 +990,46 @@ pub fn optimize_cached(
         // keep creeping toward the true solution for tens of iterations and
         // the design never becomes stationary.
         let (tol_i, cap_i) = if last_mean_change < 0.012 { (2e-4, 60) } else { (5e-4, 15) };
-        let r = match solve_cached(slot, grid, levels, problem, settings, eps, tol_i, cap_i) {
-            Err(crate::solve::SolveError::Cancelled) => return Err(OptimizeError::Cancelled),
-            r => r?,
+        // DESIGN §16 dec. 4: recompute the design-dependent self-weight from THIS
+        // iteration's live density and inject it on top of the density-
+        // independent RHS. `vfrac` is empty (and the whole body path skipped)
+        // unless a case carries acceleration — so the no-accel path is unchanged.
+        let vfrac = if loads.has_self_weight() {
+            build_vfrac(grid, &design_cells, &skin_frac, &x_phys)
+        } else {
+            Vec::new()
+        };
+        let r = if let Some(body) = loads.primary_body {
+            let sw = self_weight_rhs(grid, body, &vfrac);
+            match solve_cached_rhs(slot, grid, levels, problem, settings, eps, &[&sw], tol_i, cap_i) {
+                Err(crate::solve::SolveError::Cancelled) => return Err(OptimizeError::Cancelled),
+                r => r?,
+            }
+        } else {
+            match solve_cached(slot, grid, levels, problem, settings, eps, tol_i, cap_i) {
+                Err(crate::solve::SolveError::Cancelled) => return Err(OptimizeError::Cancelled),
+                r => r?,
+            }
         };
         let inner = r.stats;
         u = r.u;
         // Multi-load: solve every extra case on its group's hierarchy (same
         // inner schedule), each warm-started from its own running displacement.
         for j in 0..extra_bb.len() {
+            // Self-weight extras (dec. 4): rebuild the RHS = density-independent
+            // base + this iteration's self-weight, re-zeroed on constrained DOFs.
+            // No-body extras keep their once-built RHS untouched (byte-identical).
+            if let Some(body) = loads.extra_body(j) {
+                let sw = self_weight_rhs(grid, body, &vfrac);
+                let base = &extra_base[j];
+                let bb = &mut extra_bb[j];
+                for idx in 0..ndof {
+                    bb[idx] = base[idx] + sw[idx];
+                }
+                for &ci in &extra_cons_idx[j] {
+                    bb[ci as usize] = 0.0;
+                }
+            }
             match extra_group[j] {
                 None => {
                     slot.as_mut()
@@ -1167,12 +1287,28 @@ pub fn evaluate_cached_stats(
     loads: &LoadSet,
 ) -> Result<(f64, f64, Vec<f64>, crate::mg::SolveStats), crate::solve::SolveError> {
     let eps = build_eps(grid, skin, design_cells, skin_frac, x, exponent, coeff);
+    // DESIGN §16 dec. 4/10: each design carries its OWN true self-weight —
+    // recomputed from the density `x` being evaluated, so the fully-solid
+    // baseline is heavier (and deflects more under its weight) than the
+    // optimized design or the equal-mass uniform. Empty (and the whole body
+    // path skipped) unless a case carries acceleration → the no-accel
+    // verification/reference solves stay byte-identical.
+    let vfrac = if loads.has_self_weight() {
+        build_vfrac(grid, design_cells, skin_frac, x)
+    } else {
+        Vec::new()
+    };
     // Hitting the cap is acceptable here: the verification/baseline solves
     // only feed the comparison card, and the warm-started iterate at the cap
     // is accurate to ~1e-4 — aborting a finished optimization over the last
     // decimals would be far worse UX. But the caller should still SEE that it
     // capped (it no longer assumes converged=true).
-    let r = solve_cached(slot, grid, levels, problem, settings, eps, settings.tol, 2000)?;
+    let r = if let Some(body) = loads.primary_body {
+        let sw = self_weight_rhs(grid, body, &vfrac);
+        solve_cached_rhs(slot, grid, levels, problem, settings, eps, &[&sw], settings.tol, 2000)?
+    } else {
+        solve_cached(slot, grid, levels, problem, settings, eps, settings.tol, 2000)?
+    };
     let mut max2 = 0f64;
     for n in 0..r.u.len() / 3 {
         let m = r.u[3 * n] * r.u[3 * n]
@@ -1188,9 +1324,14 @@ pub fn evaluate_cached_stats(
     if !loads.extra.is_empty() {
         let inv = 1.0 / loads.total();
         compliance *= loads.primary_weight * inv;
-        for (p, wj) in &loads.extra {
+        for (j, (p, wj)) in loads.extra.iter().enumerate() {
             let eps_j = build_eps(grid, skin, design_cells, skin_frac, x, exponent, coeff);
-            let rj = solve_cached(&mut None, grid, levels, p, settings, eps_j, settings.tol, 2000)?;
+            let rj = if let Some(body) = loads.extra_body(j) {
+                let sw = self_weight_rhs(grid, body, &vfrac);
+                solve_cached_rhs(&mut None, grid, levels, p, settings, eps_j, &[&sw], settings.tol, 2000)?
+            } else {
+                solve_cached(&mut None, grid, levels, p, settings, eps_j, settings.tol, 2000)?
+            };
             compliance += (wj * inv) * rj.compliance;
         }
     }
@@ -1365,7 +1506,7 @@ mod tests {
                 fixed_bool[3 * nn as usize + d] = true;
             }
         }
-        let level = Level::new(nx, ny, nz, h, eps, ke64, &fixed_bool, Vec::new());
+        let level = Level::new(nx, ny, nz, h, eps, ke64, &fixed_bool, Vec::new(), Vec::new());
         let mut se = vec![0f64; design.len()];
         cell_strain_energy(&level, &ke64, &u, &design, &mut se);
         let k = (0..se.len()).max_by(|&a, &b| se[a].total_cmp(&se[b])).unwrap();

@@ -240,7 +240,43 @@ Reference points:
   kPB ≈ 0.11) to 0.63/−0.65 (kPB ≈ 0.048 — a tighter band removes more), and `smooth_regions`
   runs `SMOOTH_PASS_MULT` (= 4) Taubin passes per slider unit, so the 0–40 slider tops out
   at 160 passes — enough to fully melt the voxel staircase while staying volume-preserving
-  (no net shrink).
+  (no net shrink). *(Superseded 2026-07: λ/μ reverted to 0.5/−0.53, then Taubin replaced
+  entirely for regions — see below.)*
+- **Constrained region smoothing (2026-07):** the slider's Taubin filter could never melt
+  the terraces a BINARY voxel extraction leaves on shallow slopes — wide treads are
+  low-frequency *along the surface*, inside Taubin's pass band at any pass count (the
+  aggressive-λ/μ experiment above found the ceiling). `smooth_regions` now runs
+  **constrained Laplacian** smoothing (SurfaceNets-style, `bins::constrained_smooth`):
+  pure λ = 0.5 diffusion — which converges to the minimal-area surface, flattening
+  terraces completely — with every vertex clamped to a ball of radius
+  `SMOOTH_CLAMP_H` (= 0.6)·h. The clamp replaces Taubin's μ step as the
+  anti-shrink/anti-collapse guarantee: staircase amplitude is ≤ h/2 < 0.6·h so it can
+  flatten fully, while thin members, holes, and sharp edges can never drift more than
+  sub-voxel — the export's dimensional error stays below one cell by construction.
+  `smooth_regions` runs THREE stages: (1) a short Taubin pre-pass (2 + slider/4 passes)
+  that melts the needle/tent spikes marching tets grows at single-voxel corners — the
+  constraint centers are captured from these DE-SPIKED positions, because clamping around
+  the raw positions gives every spike a protected ball around its own tip and it survives
+  the whole pipeline 0.6·h tall (first-print feedback 2026-07-09); (2) the constrained
+  diffusion; (3) a 2-pass Taubin polish for the C0 kinks where the clamp bound. Slider
+  mapping unchanged (0–40 units × `SMOOTH_PASS_MULT` = 4 passes; diffusion reach at max
+  ≈ √(0.5·160) ≈ 9 cells). Taubin (stable λ/μ) remains for the smooth-field preview
+  meshes (live skeleton, density cutaway) which have no staircase to fight.
+- **Blurred-indicator extraction (2026-07, `extract_region_smooth`):** mesh smoothing
+  alone still left immovable pimples (second print feedback 2026-07-09). Root cause is in
+  the EXTRACTION, not the smoother: a binary indicator quantizes the lattice node values
+  to eighths, so at iso 0.4 many crossing edges around one node interpolate to t ≈ 0.9 —
+  clusters of near-coincident vertices ("knots") whose uniform-weight Laplacian is ≈ 0.
+  NO umbrella-operator smoother (ours, Meshmixer's shape-preserving, Blender's Smooth)
+  can move a vertex whose neighbors all sit on top of it. Fix at the source: all export
+  regions extract via `extract_region_smooth` — ONE 7-point cell-blur pass (center 2,
+  faces 1, /8) over the indicator before marching tets. Node values become continuous:
+  vertices spread evenly (no knots), and single-voxel junk drops below the iso before it
+  is ever meshed (isolated cell peaks at 0.25, proud bump cell at 0.375 < 0.4) while
+  members ≥ 2 cells survive — the same thin-feature floor the unblurred node averaging
+  already imposed (a 1-cell beam never exported: raw node values 2/8 = 0.25 < 0.4).
+  Nesting of graded modifier regions is preserved (blur is monotone). Flat-face dilation
+  is nearly unchanged (0.23·h vs 0.20·h outward at iso 0.4).
 - **Self-supporting AM filter (2026-06, `selfsupport.rs`):** a Langelaar-style
   layer-by-layer projection inserted between the density filter and `build_eps`, so the
   printed field (hence the exported shape) overhangs at most the chosen angle from the
@@ -768,4 +804,72 @@ thereby DONE for the voxel surface; the smoothed STL surface stays unmasked by d
 recovery would smear NaN). Deferred to (4): GREYED mask cells in the viewport (needs a viewer feature; the panel's
 scored-vs-all numbers carry the honesty meanwhile) and plate seating in the preview pose.
 **(4)** Apply flow ← NEXT — transform + auto re-solve + re-sweep + predicted-vs-actual readout,
-greyed mask cells, preview plate seating.
+greyed mask cells, preview plate seating. **Apply must rotate ALL load directions WITH the part**
+(forces, moments, acceleration vectors — §16 dec. 8), deliberately breaking the Model-step
+"loads keep world directions" convention for this one flow: the sweep scored the service load
+case as attached to the part, so keeping loads world-fixed on Apply would re-solve a different
+problem than the pixel the user clicked. (Mass points and BC selections transform with the part
+in every flow; only load *directions* differ between the two conventions.)
+
+## 16. Acceleration loads & remote point masses (interview 2026-07-09)
+
+**Problem.** Every load today is a surface traction; there is no inertial loading. Printed
+parts routinely carry components (motors, batteries, cameras) whose *mass* — not a contact
+force — is what loads the structure under gravity, shock or maneuver ("survives a 6g crash").
+Smearing a component's weight over its mounting face loses the lever arm: a motor hanging
+40 mm off a bracket loads it in bending, not compression. This section adds an
+**acceleration** load type plus **dummy masses** — a mass value at a remote CG point,
+attached to a selected surface, whose force AND transported couple load the patch
+(a "remote point mass").
+
+**Existing machinery (found 2026-07-09).** (a) `assemble()` already takes
+`gravity: Option<(accel mm/s², density)>` and lumps a uniform body force per occupied cell
+(attach.rs:275) — plumbed through wasm `set_gravity` / EngineClient but never called by any
+UI, and its **uniform density is wrong for graded infill** (a 20 % cell weighs like solid
+skin). (b) The moment BC already realises an exact-resultant deformable couple on a patch
+with no MPCs/rotational DOFs (attach.rs:565) — precisely the transport mechanism a remote
+mass needs. (c) Units are consistent mm–N–MPa, so mass × acceleration = N falls out clean
+(density g/cm³ → ×1e-9 tonne/mm³, mass g → ×1e-6 tonne, 1 g₀ = 9810 mm/s²).
+
+| # | Topic | Decision |
+|---|-------|----------|
+| 1 | Mass coupling behavior | Per-mass **`behavior: "deformable" \| "rigid"`, in the schema from day one; default deformable; deformable ships first, rigid is its own later milestone.** Deformable = load-only: statically equivalent force `F = m·a` + transported couple `M = (p − c) × F` (p = mass point, c = patch area-weighted centroid) distributed over the patch — reuses the force + `moment_forces` machinery verbatim, adds NO stiffness (patch stays as compliant as the bare part; conservative for displacements, Saint-Venant caveat within the first cells, same tier as bearing/moment). Rigid = penalty spider from patch nodes to a 6-DOF virtual master at the mass point, master statically condensed out (free 6×6 block): operator gains per-node 3×3 diagonal blocks (elastic-foundation character) + one **rank-6 coupling term** per rigid mass — the one genuinely new solver capability; must thread through SIMD/threaded matvec, MG preconditioner (pass-through), RBM check, optimizer solves; penalty scaling vs the Chebyshev smoother is the convergence risk to retire. UI copy states it honestly: "Deformable (load only) / Rigid (stiffens the mounting face)". |
+| 2 | Sign convention | **Field convention ONLY: "every mass feels F = m·a along the entered vector."** Gravity = 1g pointing −Z, weight pulls down; "5g sideways shock" = enter 5g sideways. The ANSYS frame/d'Alembert convention (enter frame acceleration, force opposite) is NOT offered — anyone thinking in frames can negate a vector. Input = direction + magnitude (force load's dual-mode pattern), displayed in **g by default** (new "acceleration" quantity kind in units.ts, g / m/s² selectable), one-click **"1g ↓" preset**, convention stated in one panel line. |
+| 3 | Part self-weight | **Always on whenever an acceleration is active** — no checkbox. Body force scaled per-cell by the volume-fraction field: `f_cell = ρ_mat · volfrac_e · a · h³` lumped to the 8 nodes, in all three model states (uniform: skin 1 / interior infill ratio / boundary occupancy-weighted; optimized: per-cell ρ; printed: homogenized) — the same field the mass readouts already composite. The dormant uniform-density hook is upgraded, not reused as-is. |
+| 4 | Optimizer treatment | Self-weight makes acceleration steps **design-dependent loads** (lighter design ⇒ smaller load). Chosen: **track the load, skip the extra gradient term** — recompute the body force from the current density field every SIMP iteration (cheap next to a solve), keep the standard compliance sensitivity, drop `2uᵀ(∂f/∂ρ)`. Gradient slightly inconsistent, biased toward KEEPING mass in self-weight-loaded regions (the safe direction); the classic low-density parasitic pathology is blocked because E(ρ) is physical (exp 1.5–2.0) and ρ is floored at min printable infill. Verification solve is exact regardless. Full design-dependent sensitivity + sign-guarded OC = follow-up ONLY if a self-weight-dominated regbench case ever oscillates. Blocking accel steps from optimization was rejected — a drone arm optimized ignoring its motor masses under 6g is the headline use case. |
+| 5 | Data model | **Acceleration is a load ENTITY in the shared `bcs` list** — kind `"accel"`, the first selection-less BC (`tris` becomes kind-dependent; every `bc.tris`-touching path gets a kind guard). Named ("Gravity", "Cornering 3g"), a row in the steps table, per-step override `{active, accel vector}` exactly like forces; **multiple accel entities sum vectorially** when active in the same step ("crash" = Gravity + "6g lateral"). Masses: kind `"mass"` with `{tris, massGrams, point, behavior}`; per-step override = `active` only (a component's mass isn't a per-step quantity; a per-step value override stays available as a future additive field). Rides ALL existing rails: naming, roster, per-step toggles, optimizer include/weight. |
+| 6 | Engine API | New `BcKind::Mass { point, mass }` in filasim-core so the couple transport happens where the patch centroid is actually known; the worker resolves each step's active accelerations to ONE summed vector for the existing `assemble()` gravity/accel parameter. Envelope pseudo-step and per-step optimized results work unchanged (per-step results roster, §13). |
+| 7 | Mass placement UI | **Numeric XYZ DRO fields; the point initializes at the area-weighted CG of the selected surface** (zero lever arm — neutral, predictable; users have component CGs from CAD). Viewport: filled sphere at the point + spider lines to the patch + name/mass label, so the lever arm is always visible. Panel: **live readout of resolved \|F\| = m·\|a\| and transported \|M\|** for the shown step — makes the lever arm visible pre-solve and catches unit slips instantly. 3-axis drag gizmo = fast follow (not gating); click-to-place rejected (a mid-air point has no raycast depth). |
+| 8 | Frames | **Mass points transform WITH the part** on every reorientation (they are physical components bolted on — like the index-based selections). **Acceleration vectors stay world-fixed on Model-step rotations**, same documented rule as force loads ("all load directions stay world-fixed; re-check after reorienting") — one convention, no per-kind exception. The Validate-Orientation **Apply flow is the deliberate exception** and rotates all load directions with the part (§15 build item 4). |
+| 9 | Rotational effects | **Linear acceleration only in v1.** Centrifugal (ω) / angular acceleration (α) loads — impellers, prop adapters — are reserved as a future selection-less load kind `"rotation"` (axis point + direction, ω, α); the position-dependent body force is a modest extension of the same per-cell loop, and every mass already has a coordinate for the `m·ω×(ω×r)` term. Nothing in this design blocks it; it brings its own questions (axis UI, RPM units, stress stiffening) to its own interview. |
+| 10 | Mass metrics | **Dummy masses are EXCLUDED from every part-mass metric** — mass card, "−N % mass" claims, optimizer mass budget all mean *printed part mass*; external components aren't design mass. Setup panel shows an informational "attached masses: N g" line so nobody wonders. **Comparison card: each design carries its own true weight** (the solid baseline is heavier and carries a bigger self-weight load — the honest comparison of the two printable artifacts); fine-print note when accel steps exist. |
+| 11 | Preflight & RBM | **Soft advisory warning** (never a blocker) when a mass has no step with any active acceleration — almost always "added the motor, forgot gravity". The RBM/mechanism check must **count body forces as loads per component** (the dormant gravity path never fed `load_nodes`/`hasLoads`): with self-weight on, every component with mass carries load, and an unconstrained island under acceleration is an RBM failure the check must catch. |
+| 12 | Accel visualization | A selection-less load has no geometry anchor: draw **one labeled arrow at the part's bbox centroid** in the entity's roster color, visible when that entity is active in the displayed step — same visual language as surface loads, body-anchored. |
+| 13 | Persistence | **STAY at PROJECT_SCHEMA = 1, strictly additive** (load-steps precedent, §13 dec. 11): new kinds `accel`/`mass` + fields (`massGrams`, `point`, `behavior`, override `accel`) are optional; old projects load unchanged, projects without the new kinds round-trip byte-identical. |
+
+**V1 exclusions.** Rigid behavior (schema-ready, ships as its own milestone), rotational
+loads (dec. 9), the drag gizmo (dec. 7), per-step mass value override (dec. 5), frame/
+d'Alembert input convention (dec. 2), modeling the mounted component's stiffness (that is
+"model the bracket as geometry", not a solver feature).
+
+**Build order** (each milestone shippable, each gated by regbench + the wasm smoke test;
+no-accel paths must stay **byte-identical**): **(1) engine** — `BcKind::Mass` (deformable:
+force + transported couple about the patch centroid), per-cell volume-fraction self-weight
+(replaces the uniform-density hook), per-step accel resolve, RBM/`hasLoads` body-force
+awareness; regbench additions: *lever-arm analytic* (tip mass m at offset r on the §14
+cantilever ≡ hand-composed tip force mg + moment mgr — must match to solver tolerance) and
+*self-weight cantilever* (1g, no dummy mass, vs q·L⁴/8EI band); theory-manual section on
+inertial loads. **(2) data model + UI end-to-end (deformable ships here)** — store kinds +
+kind-guard sweep on `tris` paths, steps-table rows, panel (g-unit accel entity + 1g preset;
+mass DRO fields + CG init + |F|/|M| readout), viewport (sphere/spider/label, centroid accel
+arrow), preflight warning, additive persistence, attached-masses line. INTERIM: accel-carrying
+steps are excluded from optimizer include with an advisory note (§13 precedent: "optimize is
+still single-load until milestone 4"). **(3) optimizer** — dec. 4 (track load per iteration,
+standard sensitivity), remove the interim exclusion, comparison-card own-weight semantics +
+fine print; optimizer regbench case. **(4) rigid behavior** — penalty spider + rank-6
+condensed operator term, convergence validation vs the Chebyshev smoother at 1M cells,
+`behavior` toggle UI enabled.
+
+**Deferred.** Per-step mass value override (additive when needed — "full vs empty tank").
+Rotational load kind (dec. 9). Drag gizmo for the mass point. Full design-dependent
+sensitivity + sign-guarded OC (dec. 4 contingency).

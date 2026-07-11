@@ -27,6 +27,10 @@ export const BC_COLORS: Record<string, THREE.Color> = {
   pressure: new THREE.Color(0xc97b10),
   bearing: new THREE.Color(0xb5179e),
   moment: new THREE.Color(0xe8590c),
+  accel: new THREE.Color(0xb08900),
+  // Saturated teal — the former slate-gray (0x495057) barely contrasted against
+  // the gray part, so a mass patch's surface tint + sphere read as a muddy blob.
+  mass: new THREE.Color(0x0f766e),
 };
 
 /** Row-center y coordinates of the two-row LUT (see makeLut): row 0 is the

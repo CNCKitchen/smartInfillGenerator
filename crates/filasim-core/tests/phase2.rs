@@ -5,7 +5,7 @@
 //! rigid-body-mode checks, triangle-selection BC attachment, frictionless
 //! penalty springs, gravity.
 
-use filasim_core::attach::{assemble, check_problem, BcKind, BcSpec};
+use filasim_core::attach::{assemble, check_problem, BcKind, BcSpec, BodyLoad};
 use filasim_core::bvh::WindingBvh;
 use filasim_core::check::{islands, rbm_check, ConstraintDir};
 use filasim_core::mesh::{primitives, TriMesh};
@@ -293,7 +293,8 @@ fn gravity_self_weight_cantilever() {
     let density = 1.24e-9; // PLA, tonne/mm^3
     let gvec = [0.0, 0.0, -9810.0]; // mm/s^2
     let bcs = vec![BcSpec { kind: BcKind::Fixed, tris: face_tris(0) }];
-    let asm = assemble(&beam, &grid, &bcs, Some((gvec, density)), &settings).unwrap();
+    let body = BodyLoad { accel: gvec, density, vfrac: &grid.scale };
+    let asm = assemble(&beam, &grid, &bcs, Some(body), &settings).unwrap();
     let sol = solve_nodes(&grid, levels, &asm.problem, &settings).expect("solve");
     let tip = sol
         .mean_displacement(&BoxRegion::new([39.5, -1.0, -1.0], [40.5, 7.0, 7.0]))

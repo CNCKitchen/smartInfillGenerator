@@ -42,6 +42,13 @@ export interface BcPayload {
   axes?: boolean[];
   disp?: number[];
   moment?: number[];
+  // Inertial loads (DESIGN §16). `accel` is the resolved world acceleration
+  // vector (mm/s²); the worker SUMS every active accel entity into one vector
+  // for `set_accel`. Masses carry their value + CG + coupling.
+  accel?: number[];
+  massGrams?: number;
+  point?: number[];
+  behavior?: string;
 }
 
 /** Request payloads — the fields that travel WITH `{ id, op }`. */
@@ -52,7 +59,6 @@ export interface EngineRequests {
   resegment: { angle: number };
   useCadFaces: Empty;
   setMaterial: { e0: number; nu: number; density: number; strength: number; strengthZ: number; shearStrengthZ?: number };
-  setGravity: { on: boolean };
   setResolution: { cells: number };
   setVoxelSize: { h: number };
   setBcs: { bcs: BcPayload[] };
@@ -179,7 +185,6 @@ export interface EngineResponses {
   resegment: PatchUpdate;
   useCadFaces: PatchUpdate;
   setMaterial: void;
-  setGravity: void;
   setResolution: void;
   setVoxelSize: void;
   setBcs: void;

@@ -18,6 +18,7 @@
 use crate::eps::average_coarse_eps;
 use crate::fem::{invert3, ke_diag_blocks, NODE_OFFSETS};
 use crate::par::{self, UnsafeSlice};
+use crate::rigid::RigidGroup;
 
 pub const NU1: usize = 3;
 pub const NU2: usize = 3;
@@ -80,6 +81,12 @@ pub struct Level {
     dinv: Vec<f32>,
     /// Penalty springs (node, unit direction, stiffness N/mm) — frictionless supports.
     springs: Vec<(u32, [f64; 3], f64)>,
+    /// Rigid remote-mass couplings (DESIGN §16 milestone 4). A penalty rank-6
+    /// term per group; the matvec applies it as a post-pass after the hex
+    /// scatter (like `springs`), the exact diagonal folds into `build_dinv`.
+    /// FINEST LEVEL ONLY — coarsening drops it (MG pass-through), so the coarse
+    /// correction ignores the rigid constraint and the fine smoother handles it.
+    rigid: Vec<RigidGroup>,
     /// Largest eigenvalue estimate of Dinv*K (power iteration), the Chebyshev
     /// smoothing interval's upper end. Refreshed on every eps update.
     lmax: f32,
@@ -117,6 +124,7 @@ impl Level {
         ke64: [[f64; 24]; 24],
         fixed: &[bool],
         springs: Vec<(u32, [f64; 3], f64)>,
+        rigid: Vec<RigidGroup>,
     ) -> Self {
         assert_eq!(eps.len(), nx * ny * nz);
         let (mx, my, mz) = (nx + 1, ny + 1, nz + 1);
@@ -145,6 +153,7 @@ impl Level {
             constrained: vec![false; ndof],
             dinv: Vec::new(),
             springs,
+            rigid,
             lmax: 1.0,
             eigvec: Vec::new(),
             pi_t: Vec::new(),
@@ -241,7 +250,10 @@ impl Level {
                 (((z * my + y) * mx + x) as u32, dir, k)
             })
             .collect();
-        Self::new(nx, ny, nz, self.h * 2.0, eps, ke64, &fixed, springs)
+        // Rigid couplings are NOT coarsened (DESIGN §16: MG pass-through) — the
+        // fine-level smoother handles the stiff local constraint, the coarse
+        // grids reduce only the smooth global error.
+        Self::new(nx, ny, nz, self.h * 2.0, eps, ke64, &fixed, springs, Vec::new())
     }
 
     /// Cut the active cells into z-slabs balanced by active-cell count (cuts
@@ -324,6 +336,21 @@ impl Level {
             for r in 0..3 {
                 for c in 0..3 {
                     e[r][c] += k * dir[r] * dir[c];
+                }
+            }
+        }
+        // Rigid remote masses: the exact per-node diagonal block
+        // k(I − Bᵢ G⁻¹ Bᵢᵀ) folds into the same block-Jacobi diagonal (the
+        // off-diagonal rank-6 coupling is left to Chebyshev/CG, as with any
+        // incomplete smoother). Empty (skipped) when no rigid group is present.
+        for g in &self.rigid {
+            for (i, &n) in g.nodes.iter().enumerate() {
+                let e = spring_blocks.entry(n).or_insert([[0.0; 3]; 3]);
+                let blk = g.diag_block(i);
+                for r in 0..3 {
+                    for c in 0..3 {
+                        e[r][c] += blk[r][c];
+                    }
                 }
             }
         }
@@ -485,6 +512,10 @@ impl Level {
                 y[3 * n + d] += (s * dir[d]) as f32;
             }
         }
+        // Rigid remote masses: rank-6 post-pass, empty (skipped) for no-rigid.
+        for g in &self.rigid {
+            g.accumulate_f32(x, y);
+        }
         par::mask_zero(y, &self.constrained);
     }
 
@@ -573,6 +604,10 @@ impl Level {
             for d in 0..3 {
                 y[3 * n + d] += s * dir[d];
             }
+        }
+        // Rigid remote masses: rank-6 post-pass, empty (skipped) for no-rigid.
+        for g in &self.rigid {
+            g.accumulate_f64(x, y);
         }
         // Mask constrained DOFs.
         #[cfg(feature = "parallel")]

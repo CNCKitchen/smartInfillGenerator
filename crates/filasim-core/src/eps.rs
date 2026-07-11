@@ -57,6 +57,31 @@ pub fn build_eps(
     eps
 }
 
+/// Per-cell MATERIAL VOLUME FRACTION (the mass field): occupancy × (solid skin
+/// band + interior at its infill DENSITY). The mass analog of [`build_eps`] —
+/// LINEAR in the density `x` (mass ∝ material volume) where `build_eps` applies
+/// the `E/E0 = coeff·x^exponent` stiffness law. Feed this to the self-weight
+/// body force (DESIGN §16 dec. 3) so a 20 %-infill cell weighs 0.2× solid, not
+/// its (much smaller) stiffness fraction. Skin and cut boundary cells keep
+/// their occupancy; void cells stay 0. Matches the mass-readout compositing
+/// (`solve_printed`, modal lumped mass) exactly.
+pub fn build_vfrac(
+    grid: &VoxelGrid,
+    design_cells: &[u32],
+    skin_frac: &[f32],
+    x: &[f64],
+) -> Vec<f32> {
+    // Skin/solid = occupancy, void = 0 (both already in grid.scale); only the
+    // design cells blend wall band (solid) with interior infill density.
+    let mut vf = grid.scale.clone();
+    for (k, &c) in design_cells.iter().enumerate() {
+        let occ = grid.scale[c as usize] as f64;
+        let f = skin_frac[k] as f64;
+        vf[c as usize] = (occ * (f + (1.0 - f) * x[k])) as f32;
+    }
+    vf
+}
+
 /// Buildsim's eps: a caller-supplied as-printed field when it matches the
 /// (padded) grid, else the solid-hull occupancy map. The length check is the
 /// safety net — a stale override can never desync the grid. Deliberately a

@@ -8,8 +8,9 @@
 use filasim_core::attach::{assemble, check_problem, BcKind, BcSpec};
 use filasim_core::bins::{
     assign_bins, assign_bins_mass, cleanup_small_regions, cluster_densities, cluster_levels,
-    extract_region, taubin_smooth, RegionMesh,
+    constrained_smooth, extract_region, extract_region_smooth, taubin_smooth, RegionMesh,
 };
+use filasim_core::pipeline::SMOOTH_PASS_MULT;
 use filasim_core::mesh::primitives;
 use filasim_core::simp::{build_mirror_pairs, classify_cells, evaluate, optimize, OptimizeParams};
 use filasim_core::solve::SolveSettings;
@@ -140,11 +141,19 @@ fn extracted_regions_are_watertight_and_oriented() {
     for (i, &c) in f.design.iter().enumerate() {
         bin_of_cell.insert(c, bins[i]);
     }
-    for level in 1..centers.len() {
+    // Both the raw and the production (blurred-indicator) extraction must be
+    // watertight and oriented.
+    let extractors: [&dyn Fn(&dyn Fn(usize) -> bool) -> RegionMesh; 2] = [
+        &|inside| extract_region(&f.grid, inside, 0.4),
+        &|inside| extract_region_smooth(&f.grid, inside, 0.4),
+    ];
+    for (level, extract) in
+        (1..centers.len()).flat_map(|l| extractors.iter().map(move |e| (l, e)))
+    {
         let inside = |ci: usize| -> bool {
             bin_of_cell.get(&(ci as u32)).map_or(false, |&b| b as usize >= level)
         };
-        let mut region = extract_region(&f.grid, &inside, 0.4);
+        let mut region = extract(&inside);
         if region.indices.is_empty() {
             continue; // a level can be empty after cleanup; fine
         }
@@ -173,6 +182,128 @@ fn extracted_regions_are_watertight_and_oriented() {
         );
         assert!(region.positions.iter().all(|v| v.is_finite()));
     }
+}
+
+#[test]
+fn constrained_smoothing_flattens_shallow_terraces() {
+    // Shallow-slope half-space — the worst case for mesh smoothing: the voxel
+    // staircase has wide treads (low-frequency along the surface), which a
+    // Taubin band-pass preserves at ANY pass count. The constrained Laplacian
+    // must flatten it while keeping every vertex within the sub-voxel clamp.
+    let boxm = primitives::boxx([0.0; 3], [40.0, 10.0, 12.0]);
+    let grid = VoxelGrid::voxelize(&boxm, 1.0);
+    let (s, z0) = (0.18f64, 4.5f64);
+    let inside = |ci: usize| -> bool {
+        let (nx, ny) = (grid.nx, grid.ny);
+        let cx = ci % nx;
+        let cz = ci / (nx * ny);
+        let x = grid.origin[0] + (cx as f64 + 0.5) * grid.h;
+        let z = grid.origin[2] + (cz as f64 + 0.5) * grid.h;
+        z < z0 + s * x
+    };
+    let mut r = extract_region(&grid, &inside, 0.4);
+    let orig = r.positions.clone();
+
+    // Signed distance to the analytic slope plane (a constant offset from the
+    // iso-0.4 dilation is fine — roughness is measured as the std deviation).
+    let norm = (1.0 + s * s).sqrt();
+    let plane_dist = |p: &[f32], v: usize| -> f64 {
+        (p[3 * v + 2] as f64 - z0 - s * p[3 * v] as f64) / norm
+    };
+    // Vertices on the sloped top, away from the domain borders.
+    let nv = r.positions.len() / 3;
+    let sel: Vec<usize> = (0..nv)
+        .filter(|&v| {
+            let (x, y) = (orig[3 * v] as f64, orig[3 * v + 1] as f64);
+            x > 6.0 && x < 34.0 && y > 2.0 && y < 8.0 && plane_dist(&orig, v).abs() < 1.0
+        })
+        .collect();
+    assert!(sel.len() > 100, "need a meaningful top-surface sample, got {}", sel.len());
+    let roughness = |p: &[f32]| -> f64 {
+        let mean = sel.iter().map(|&v| plane_dist(p, v)).sum::<f64>() / sel.len() as f64;
+        (sel.iter().map(|&v| (plane_dist(p, v) - mean).powi(2)).sum::<f64>()
+            / sel.len() as f64)
+            .sqrt()
+    };
+    let rough_before = roughness(&orig);
+
+    // Slider max: 40 units × SMOOTH_PASS_MULT passes, clamp 0.6·h.
+    constrained_smooth(&mut r.positions, &r.indices, 40 * SMOOTH_PASS_MULT, 0.6);
+    let rough_after = roughness(&r.positions);
+    assert!(
+        rough_after < 0.35 * rough_before,
+        "terraces should melt: roughness {rough_before:.4} -> {rough_after:.4}"
+    );
+
+    // The clamp: no vertex drifts more than max_move from where it was extracted.
+    for v in 0..nv {
+        let d2: f64 = (0..3)
+            .map(|d| (r.positions[3 * v + d] - orig[3 * v + d]) as f64)
+            .map(|d| d * d)
+            .sum();
+        assert!(d2.sqrt() <= 0.6 + 1e-4, "vertex {v} moved {:.4} > clamp", d2.sqrt());
+    }
+    assert!(r.positions.iter().all(|v| v.is_finite()));
+}
+
+#[test]
+fn region_smoothing_melts_single_voxel_needles() {
+    // A lone voxel proud of a flat face extracts as a tent spike. The clamp of
+    // the constrained smoother is anchored at a Taubin-de-spiked reference —
+    // anchored at the RAW positions instead, the spike tip gets a protected
+    // ball around itself and survives the full pipeline as a needle.
+    let boxm = primitives::boxx([0.0; 3], [40.0, 10.0, 10.0]);
+    let grid = VoxelGrid::voxelize(&boxm, 1.0);
+    let (nx, ny) = (grid.nx, grid.ny);
+    let bump = (5 * ny + 5) * nx + 20; // cell (20, 5, 5) on the z < 5 slab top
+    let inside = |ci: usize| -> bool { ci / (nx * ny) < 5 || ci == bump };
+    let raw = extract_region(&grid, &inside, 0.4);
+
+    // Top-surface reference far from the bump, and the apex near it.
+    let top_mean = |p: &[f32]| -> f64 {
+        let (mut acc, mut n) = (0.0, 0usize);
+        for v in 0..p.len() / 3 {
+            let (x, y, z) = (p[3 * v] as f64, p[3 * v + 1] as f64, p[3 * v + 2] as f64);
+            if z > 4.5 && (5.0..15.0).contains(&x) && (2.0..8.0).contains(&y) {
+                acc += z;
+                n += 1;
+            }
+        }
+        acc / n as f64
+    };
+    let apex = |p: &[f32]| -> f64 {
+        let mut m = f64::NEG_INFINITY;
+        for v in 0..p.len() / 3 {
+            let (x, y, z) = (p[3 * v] as f64, p[3 * v + 1] as f64, p[3 * v + 2] as f64);
+            if z > 4.5 && (x - 20.5).abs() < 2.5 && (y - 5.5).abs() < 2.5 {
+                m = m.max(z);
+            }
+        }
+        m
+    };
+    let top_before = top_mean(&raw.positions);
+    let spike_before = apex(&raw.positions) - top_before;
+    assert!(spike_before > 0.2, "raw extraction should have a spike, got {spike_before:.3}");
+
+    // The production path (blurred indicator) drops the lone voxel below the
+    // iso BEFORE meshing — what remains is a gentle sub-¼-cell bulge (smooth,
+    // so the mesh smoother can actually move it), not a knot-pinned needle.
+    let blurred = extract_region_smooth(&grid, &inside, 0.4);
+    let spike_blurred = apex(&blurred.positions) - top_mean(&blurred.positions);
+    assert!(
+        spike_blurred < spike_before + 0.02,
+        "blurred extraction must not sharpen the spike: {spike_before:.3} -> {spike_blurred:.3}"
+    );
+
+    let region =
+        RegionMesh { density: 1.0, positions: blurred.positions, indices: blurred.indices };
+    let smoothed = &filasim_core::pipeline::smooth_regions(&[region], 40, 1.0)[0];
+    let top_after = top_mean(&smoothed.positions);
+    let spike_after = apex(&smoothed.positions) - top_after;
+    assert!(spike_after < 0.15, "needle must stay gone after smoothing: {spike_after:.3}");
+    // The flat face itself must not drift.
+    let drift = (top_after - top_before).abs();
+    assert!(drift < 0.3, "far-field top face drifted {drift:.3}");
 }
 
 fn signed_volume(positions: &[f32], indices: &[u32]) -> f64 {

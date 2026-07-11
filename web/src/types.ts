@@ -9,7 +9,12 @@ export type BcKind =
   | "force"
   | "pressure"
   | "bearing"
-  | "moment";
+  | "moment"
+  // Inertial loads (DESIGN §16). "accel" is the first SELECTION-LESS BC (no
+  // `tris`) — a world acceleration every mass feels; "mass" is a remote point
+  // mass bolted to a selected patch.
+  | "accel"
+  | "mass";
 
 /** Fitted cylinder for a bearing load: axis + radius recovered from the
  *  selected surface, plus the cylindricity check. `ok=false` means the
@@ -74,6 +79,28 @@ export interface Bc {
   momentDir?: [number, number, number];
   /** Magnitude in N·mm for "direction" mode (moment only). */
   momentMag?: number;
+  // --- Acceleration (kind "accel", DESIGN §16): a selection-less world
+  //     acceleration. Every mass (self-weight + attached masses) feels F = m·a
+  //     along this vector. Dual-mode like force; canonical unit mm/s². ---
+  /** Resolved acceleration vector in mm/s² (accel only) — what the solver sums. */
+  accel?: [number, number, number];
+  /** Acceleration definition mode (accel only); defaults to "direction". */
+  accelMode?: ForceMode;
+  /** Unit direction for "direction" mode (accel only). */
+  accelDir?: [number, number, number];
+  /** Magnitude in mm/s² for "direction" mode (accel only). */
+  accelMag?: number;
+  // --- Remote point mass (kind "mass", DESIGN §16): a component of `massGrams`
+  //     with its CG at `point`, attached to the selected patch. Its inertial
+  //     force + transported couple load the patch under the active accel. ---
+  /** Component mass in grams (mass only). Canonical mass unit (g). */
+  massGrams?: number;
+  /** CG world position in mm (mass only). Transforms WITH the part on
+   *  reorientation; initialized at the selected patch's area-weighted centroid. */
+  point?: [number, number, number];
+  /** Mass coupling (mass only); default "deformable" (load-only). "rigid"
+   *  (stiffens the mounting face) is a later milestone — schema-ready now. */
+  behavior?: "deformable" | "rigid";
 }
 
 /** Per-load-step override of a single BC (see DESIGN §13). Absent fields
@@ -90,6 +117,10 @@ export interface LoadStepOverride {
   pressure?: number;
   /** Full per-step moment vector in N·mm (moment BCs); absent = inherit base. */
   moment?: [number, number, number];
+  /** Full per-step acceleration vector in mm/s² (accel BCs); absent = inherit
+   *  base. Multiple active accel entities sum vectorially in a step. Mass BCs
+   *  carry only `active` (a component's mass isn't a per-step quantity). */
+  accel?: [number, number, number];
 }
 
 /** One FEA load case. The shared `bcs` array defines geometry/selection ONCE;

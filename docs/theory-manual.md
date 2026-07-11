@@ -436,7 +436,9 @@ elimination**; loads are converted to **consistent nodal forces**.
 | **Elastic support** | σ = k·u | Winkler foundation; each node gets 3 axis springs of `k × tributary area` | bedding modulus `k` (N/mm³); area-consistent so total stiffness = k·A independent of mesh |
 | **Surface force** | total **N** | area-weighted (Voronoi) split into consistent nodal forces | defined as X/Y/Z components OR direction + magnitude; direction defaults to the patch's average normal |
 | **Pressure** | MPa | `f = −p·(Σ area-vectors)`, per-sample normals | correct on curved patches; acts along inward normal |
-| **Gravity / self-weight** | g, ρ | body force `ρ·g·h³` per solid cell, lumped ⅛ to its 8 nodes | engine supports it; UI hides by default (negligible for desktop prints) |
+| **Moment** | **M** (N·mm) | deformable distributed couple `fᵢ = wᵢ(G⁻¹M)×dᵢ` about the patch area-weighted centroid | exact resultant `Σ dᵢ×fᵢ = M`, zero net force, mesh-independent (no rotational DOFs needed) |
+| **Acceleration / self-weight** | **a** (mm/s²), ρ | per-cell body force `ρ·φₑ·a·h³` lumped ⅛ to 8 nodes; `φₑ` = material volume fraction | world-fixed vector (§7.1); self-weight ALWAYS on when an acceleration is active |
+| **Remote point mass** | m at **p** | `F = m·a` area-weighted over the patch **+** transported couple `M = (p−c)×F` via the moment operator | deformable (load-only), adds no stiffness; `c` = patch area-weighted centroid |
 
 **Penalty stiffness.** Frictionless/Displacement springs use
 `k = 300 · E₀ · h` (`SPRING_FACTOR = 300`) — stiff enough to enforce the
@@ -449,6 +451,112 @@ tributary area of each node (corner/edge/interior nodes get their proper share),
 sampled on a sub-cell lattice — so a uniform traction reproduces the exact patch
 test. Orphan samples on selections thinner than the grid are spread evenly with a
 warning path.
+
+### 7.1 Inertial loads — acceleration and remote point masses
+
+A part accelerating at **a** (mm/s²) — under gravity, shock, or a maneuver —
+carries a body force on its **own distributed mass** plus a remote force on any
+attached components. filaSim models both from a single world acceleration
+(DESIGN §16).
+
+**Sign convention (field convention).** Every mass feels **F = m·a** along the
+entered vector. Gravity is 1 g toward −Z, so the weight pulls the part *down*; a
+"5 g sideways shock" is entered as 5 g sideways. This is the *field* convention,
+not the d'Alembert / frame convention (where one enters the frame acceleration
+and the inertial force points opposite) — anyone reasoning in frames negates the
+vector. Acceleration vectors are **world-fixed**, like force loads: reorienting
+the model does not rotate them (the Validate-Orientation *Apply* flow is the one
+documented exception, §15).
+
+**Self-weight (distributed).** Each cell contributes a body force
+`ρ · φₑ · **a** · h³`, lumped equally (⅛) to its 8 corner nodes, where ρ is the
+bulk material density and **φₑ ∈ [0,1]** is the cell's **material volume
+fraction** — occupancy × (solid skin band + interior at its infill *density*).
+`φₑ` is **linear** in the infill density and is the same field the mass readout
+composites; it is deliberately *not* the stiffness factor `E/E₀ = coeff·ρ^p`, so
+a 20 %-infill cell weighs 0.20× a solid cell, not `coeff·0.20^p×`. Self-weight is
+always active whenever an acceleration is (no separate switch). Because the load
+scales with the design's own mass it is *design-dependent* in optimization; the
+optimizer re-evaluates it each iteration but omits the load-derivative
+sensitivity term (DESIGN §16 dec. 4).
+
+**Remote point mass (deformable).** A component of mass m whose centre of gravity
+sits at a remote point **p**, bolted to a selected patch, applies its inertial
+load **F = m·a** at **p** — not smeared over the mounting face, which would lose
+the lever arm. Transporting **F** from **p** to the patch is statically
+equivalent to **F** acting at the patch **area-weighted centroid c** plus a
+**couple**
+
+  **M = (p − c) × F.**
+
+The force is distributed over the patch by the same Voronoi area weights as a
+surface force; because **c** is the area-weighted centroid, that distribution
+carries **zero net moment about c**, so it contributes only the resultant force.
+The couple **M** is then realised by the **deformable distributed-couple**
+operator used for the Moment BC — `fᵢ = wᵢ (G⁻¹ M) × dᵢ`, `dᵢ = xᵢ − c`,
+`G = Σ wᵢ(|dᵢ|²I − dᵢdᵢᵀ)` — which produces an exact resultant couple with zero
+net force and no rotational DOFs. The superposition therefore reproduces **F**
+acting at **p** exactly (resultant force *and* moment), mesh-independently; the
+regression suite checks a tip mass at a lever arm against the hand-composed
+force + moment to solver tolerance (§14). "Deformable" means the mount adds **no
+stiffness** — the patch stays as compliant as the bare part (conservative for
+displacements; a Saint-Venant smearing caveat applies within the first cell rings,
+the same tier as the bearing and moment loads).
+
+**Rigid remote mass.** A `rigid` mount also *stiffens* the mounting face, modeling
+a stiff boss or metal insert. The patch is tied to a **6-DOF virtual master** at
+the CG `p`: each patch node (arm `rᵢ = xᵢ − p`) is penalty-coupled to the master
+`m = [t; θ]` by the rigid-body relation `uᵢ ≈ t + θ×rᵢ = Bᵢ m`,
+`Bᵢ = [I | −[rᵢ]×]`. The master carries no independent DOFs — minimizing the
+penalty energy `½k Σ|uᵢ − Bᵢm|²` over the free `m = G⁻¹ Σ Bⱼᵀuⱼ`
+(`G = Σ Bⱼᵀ Bⱼ`, 6×6) **statically condenses** it out, leaving
+
+  **K_rigid = k (I − B G⁻¹ Bᵀ)**   (stacked over the patch)
+
+— a per-node `k·I` diagonal (elastic-foundation character) plus ONE **rank-6
+coupling** `−k B G⁻¹ Bᵀ` per mass. This is SPD and symmetric; its rigid-body
+motions are its exact null space, so a patch moving as `t + θ×rᵢ` stores zero
+energy. The matvec is a two-pass reduce/scatter (`crate::rigid`) appended to the
+matrix-free hex `apply` — no assembled matrix, no added DOFs. The master force
+`f_master = [m·a; 0]` distributes to the patch by the **rigidity kinematics**
+`f_load,i = Bᵢ G⁻¹ f_master` (statically equivalent to `m·a` at the CG), replacing
+the deformable area-weighted split. A degenerate patch (fewer than 3 non-collinear
+nodes ⇒ singular `G`) falls back to deformable.
+
+*Solver integration.* The rigid term lives on the **finest multigrid level only**
+(the coarse grids are a **pass-through** — they never see the coupling); the
+fine-level Chebyshev/block-Jacobi smoother carries the exact per-node diagonal
+`k(I − Bᵢ G⁻¹ Bᵢᵀ)`, and the outer CG operator (`apply64`) is exact, so
+convergence is guaranteed. The penalty scale `k` is the one tuning knob: a sweep
+shows the achieved rigidity **saturates by `k ≈ 5–10 · E₀h`** while MGCG iterations
+grow ~`√k` (and mildly with mesh size, since the coarse grid can't help the
+constraint). filaSim uses `k = 20 · E₀h` — past the rigidity knee, at ~2–3× the
+baseline iteration count (bounded and resolution-stable to 10⁶ cells). UI copy
+states the trade honestly: *"Deformable (load only) / Rigid (stiffens the mounting
+face)."*
+
+**RBM bookkeeping.** Body forces and remote masses count as loads in the
+pre-solve rigid-body-mode check: with an acceleration active every component
+carrying mass is loaded, so an unconstrained island under acceleration is flagged
+as under-constrained rather than silently drifting.
+
+**Modal inertia of a remote mass.** In modal analysis the remote mass matters
+even with *no* acceleration active: it adds inertia to the generalized
+eigenproblem `K v = λ M v`, so a heavy payload lowers the natural frequencies.
+The mass m is lumped onto its attachment patch by the **same area weights** as
+the static force — node i receives `m·wᵢ/Σw` on each of its three translational
+DOFs — reusing the identical attachment footprint (`point_mass_lumping`) so the
+modal inertia sits exactly where the static force would act. This captures the
+**translational** inertia the payload adds. The CG *offset*, however, also
+implies a **rotatory** inertia about the patch, and the voxel HEX8 mesh has only
+translational DOFs (no rotational DOF, no rigid link to the remote point) — so
+that rotatory term is **not** representable, exactly as the static couple carries
+no inertia. The offset therefore shifts the static *lever arm* but not the modal
+*mass*; both are the honest limit of a translational-DOF model, consistent with
+each other. The regression suite anchors a tip mass equal to the beam's own mass
+against the Rayleigh estimate `f_M/f₀ = √(0.2357·m_b /(M + 0.2357·m_b))` (§14).
+Applied forces and pressures remain ignored by modal (the eigenproblem is
+force-free); only masses and supports enter it.
 
 ---
 
@@ -598,6 +706,20 @@ Continuous, SIMP-style **compliance minimization under a mass budget** using the
   filter** (anti-checkerboard / minimum-member-size, §10.4), optional **planar
   symmetry**, and oscillation/2-cycle damping. ~30–100 warm-started multigrid
   solves; inexact inner solves while the layout forms, tightening as it settles.
+- **Self-weight — design-dependent loads (§16 dec. 4):** when an acceleration
+  step is optimized, the part's self-weight is a load that shrinks as the design
+  gets lighter (§7.1). The optimizer **recomputes the body force from the live
+  density every SIMP iteration** (cheap next to a solve) but keeps the **standard
+  compliance sensitivity** `−uᵀ(∂K/∂ρ)u` — the load-derivative term `2uᵀ(∂f/∂ρ)`
+  is deliberately dropped. The gradient is then slightly inconsistent, but biased
+  toward *keeping* mass in self-weight-loaded regions (the safe direction), and
+  the classic low-density parasitic pathology is blocked because E(ρ) is physical
+  (`p` = 1.5–2.0) and ρ is floored at the printable minimum. The verification
+  solve is exact regardless. Remote point masses (`F = m·a`) are design-
+  *independent* and stay in the fixed RHS. Each baseline then carries its **own**
+  weight (§16 dec. 10): the fully-solid reference is heavier and sags more, so the
+  comparison is the honest one between two printable artifacts, not against a
+  weightless ideal.
 - **Goal "match uniform stiffness":** one uniform solve sets the target
   compliance, then a guarded secant on the budget (≤ 5 warm passes) lands the
   *binned* design within ~2% — reports "same stiffness as X% uniform: −N% weight".
@@ -611,10 +733,16 @@ Continuous, SIMP-style **compliance minimization under a mass budget** using the
   (SIMP `p = 3`), exact at both endpoints in verification.
 - **Verification solve** at the binned densities + walls produces the comparison
   card (stiffness retained vs solid, vs uniform, mass, max displacement).
-- **Region export:** per-bin indicator → marching-tetrahedra isosurface → Taubin
-  smoothing → small-region cleanup → slight dilation, emitted as nested
-  overlapping modifier meshes (low→high density) so the slicer resolves them with
-  no gaps (`crates/filasim-core/src/bins.rs`, `threemf.rs`).
+- **Region export:** per-bin indicator → one 7-point cell-blur pass (turns the
+  binary field continuous, so the isosurface grows no needle spikes or
+  vertex knots) → marching-tetrahedra isosurface → three-stage smoothing
+  (short Taubin pre-pass, then constrained Laplacian diffusion with every
+  vertex clamped to 0.6·h around the de-spiked reference — flattens the voxel
+  terraces completely while bounding shrinkage/thin-member drift to
+  sub-voxel — then a 2-pass Taubin polish) → small-region cleanup → slight
+  dilation, emitted as nested overlapping modifier meshes (low→high density)
+  so the slicer resolves them with no gaps
+  (`crates/filasim-core/src/bins.rs`, `threemf.rs`).
 
 ### 10.4 Minimum member size (printability length scale)
 
@@ -626,11 +754,13 @@ size blur below the bin threshold and drop out.
 
 ### 10.5 Not implemented
 
-Modal/eigenvalue analysis, inertia relief + point masses, buckling, transient/
-dynamic, thermal, contact, and nonlinear analyses are **not** in v1. Modal and
-inertia relief are requested future work (`DESIGN.md §10`) that fit the existing
-MGCG machinery (LOBPCG/Lanczos; self-equilibrated RHS with RBMs projected out)
-but are **not present today** — do not assume them.
+**Constrained modal analysis** (natural frequencies + mode shapes, §7 / the
+`modal` module) and **inertial loads** (acceleration self-weight + remote point
+masses, §7.1 / §16) ARE implemented. Still **not** in v1: free-vibration inertia
+relief, buckling/stability, transient/dynamic, thermal, contact, and nonlinear
+analyses; and the **rigid** remote-mass coupling (§16 milestone 4 — deformable
+load-only masses ship today, the stiffening rigid variant is in progress). Do not
+assume the absent ones.
 
 ---
 

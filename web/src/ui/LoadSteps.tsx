@@ -8,7 +8,7 @@
 // The Loads panel keeps the compact selector + the detailed active-step editor.
 
 import { useShallow } from "zustand/shallow";
-import { useStore } from "../store";
+import { useStore, stepHasAccel } from "../store";
 import { NumInput } from "./NumInput";
 import { UnitInput } from "./UnitInput";
 import { bcLabel, KIND_DOT, BC_QUANTITY } from "./bcmeta";
@@ -30,6 +30,7 @@ export function LoadStepsModal() {
       setStepForce: s.setStepForce,
       setStepPressure: s.setStepPressure,
       setStepMoment: s.setStepMoment,
+      setStepAccel: s.setStepAccel,
       setStepIncludeOptimize: s.setStepIncludeOptimize,
       setStepWeight: s.setStepWeight,
       unitRev: s.unitRev,
@@ -68,7 +69,10 @@ export function LoadStepsModal() {
                   </th>
                   {s.bcs.map((bc) => {
                     const span =
-                      bc.kind === "force" || bc.kind === "bearing" || bc.kind === "moment"
+                      bc.kind === "force" ||
+                      bc.kind === "bearing" ||
+                      bc.kind === "moment" ||
+                      bc.kind === "accel"
                         ? 4
                         : bc.kind === "pressure"
                           ? 2
@@ -86,7 +90,12 @@ export function LoadStepsModal() {
                 </tr>
                 <tr>
                   {s.bcs.flatMap((bc) => {
-                    if (bc.kind === "force" || bc.kind === "bearing" || bc.kind === "moment")
+                    if (
+                      bc.kind === "force" ||
+                      bc.kind === "bearing" ||
+                      bc.kind === "moment" ||
+                      bc.kind === "accel"
+                    )
                       return [
                         <th key={`${bc.id}-on`} className="lssub">
                           on
@@ -189,6 +198,28 @@ export function LoadStepsModal() {
                           )),
                         ];
                       }
+                      if (bc.kind === "accel") {
+                        const av = ls.overrides[bc.id]?.accel ?? bc.accel ?? [0, 0, 0];
+                        return [
+                          onCell,
+                          ...[0, 1, 2].map((c) => (
+                            <td key={`${bc.id}-${c}`}>
+                              <UnitInput
+                                className="gridnum"
+                                value={av[c]}
+                                kind="acceleration"
+                                step={1}
+                                disabled={!on}
+                                onCommit={(v) => {
+                                  const nv = [...av] as [number, number, number];
+                                  nv[c] = v;
+                                  s.setStepAccel(ls.id, bc.id, nv);
+                                }}
+                              />
+                            </td>
+                          )),
+                        ];
+                      }
                       if (bc.kind === "pressure") {
                         const p = ls.overrides[bc.id]?.pressure ?? bc.pressure ?? 0;
                         return [
@@ -220,35 +251,42 @@ export function LoadStepsModal() {
             <div className="dim small">
               Which load cases the optimized infill must resist, and how much each one matters. Solve
               always runs every step — this only shapes Optimize. Weights are normalized; an
-              unchecked step is ignored.
+              unchecked step is ignored. Acceleration/gravity steps optimize too — the optimizer
+              tracks each design’s own self-weight every iteration (DESIGN §16).
             </div>
             <div className="lsoptgrid">
               {(() => {
-                const wsum =
-                  s.loadSteps.filter((x) => x.includeInOptimize).reduce((a, x) => a + x.weight, 0) ||
-                  1;
-                return s.loadSteps.map((ls) => (
-                  <div key={ls.id} className={`lsoptrow${ls.includeInOptimize ? "" : " off"}`}>
-                    <label className="lsoptinc">
-                      <input
-                        type="checkbox"
-                        checked={ls.includeInOptimize}
-                        onChange={(e) => s.setStepIncludeOptimize(ls.id, e.target.checked)}
+                const optable = (ls: (typeof s.loadSteps)[number]) => ls.includeInOptimize;
+                const wsum = s.loadSteps.filter(optable).reduce((a, x) => a + x.weight, 0) || 1;
+                return s.loadSteps.map((ls) => {
+                  const inc = ls.includeInOptimize;
+                  const accelStep = stepHasAccel(s.bcs, ls);
+                  return (
+                    <div key={ls.id} className={`lsoptrow${inc ? "" : " off"}`}>
+                      <label className="lsoptinc">
+                        <input
+                          type="checkbox"
+                          checked={inc}
+                          onChange={(e) => s.setStepIncludeOptimize(ls.id, e.target.checked)}
+                        />
+                        <span title={accelStep ? "Carries a design-dependent self-weight load" : undefined}>
+                          {ls.name}
+                          {accelStep ? <span className="dim"> · self-weight</span> : null}
+                        </span>
+                      </label>
+                      <NumInput
+                        className="gridnum"
+                        value={ls.weight}
+                        step={0.1}
+                        disabled={!inc}
+                        onCommit={(v) => s.setStepWeight(ls.id, v)}
                       />
-                      <span>{ls.name}</span>
-                    </label>
-                    <NumInput
-                      className="gridnum"
-                      value={ls.weight}
-                      step={0.1}
-                      disabled={!ls.includeInOptimize}
-                      onCommit={(v) => s.setStepWeight(ls.id, v)}
-                    />
-                    <span className="lsoptpct">
-                      {ls.includeInOptimize ? `${Math.round((100 * ls.weight) / wsum)}%` : "—"}
-                    </span>
-                  </div>
-                ));
+                      <span className="lsoptpct">
+                        {inc ? `${Math.round((100 * ls.weight) / wsum)}%` : "—"}
+                      </span>
+                    </div>
+                  );
+                });
               })()}
             </div>
           </div>

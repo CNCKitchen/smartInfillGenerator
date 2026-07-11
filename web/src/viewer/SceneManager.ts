@@ -17,7 +17,7 @@ import { ramp } from "./colormaps";
 import type { OptRegion } from "../engine/EngineClient";
 import { BC_COLORS, ColorManager } from "./ColorManager";
 import { GizmoController } from "./GizmoController";
-import { CalloutManager } from "./CalloutManager";
+import { CalloutManager, type BcCalloutItem } from "./CalloutManager";
 import { ResultSurfaceManager } from "./ResultSurfaceManager";
 import { SectionFieldCap } from "./SectionFieldCap";
 import type { SectionVolume } from "../engine/EngineProtocol";
@@ -150,6 +150,10 @@ export class SceneManager {
   /** Force arrows + support glyphs (classic FEA triangles), setup view only. */
   private bcMarkers = new THREE.Group();
   private markerDisposables: { dispose(): void }[] = [];
+  // Load VALUE labels are drawn as result-style callouts (dot + offset chip +
+  // leader) via CalloutManager, not opaque 3D sprites — collected here during
+  // rebuildBcMarkers, handed off after. See pushBcCallout.
+  private pendingBcCallouts: BcCalloutItem[] = [];
   /** Loads/fixtures belong to the structural workspace — the Build Sim
    *  workspace disables them wholesale (its physics has no applied loads). */
   private bcMarkersEnabled = true;
@@ -794,10 +798,25 @@ export class SceneManager {
     for (const d of this.markerDisposables) d.dispose();
     this.markerDisposables = [];
     this.bcMarkers.clear();
-    if (!this.basePositions) return;
+    this.pendingBcCallouts = [];
+    if (!this.basePositions) {
+      this.callouts.setBcCallouts(this.pendingBcCallouts); // clear any stale labels
+      return;
+    }
     for (const bc of this.bcs) {
-      if (bc.tris.length === 0) continue;
       const inactive = this.inactiveBcs.has(bc.id);
+      // Acceleration is SELECTION-LESS (DESIGN §16 dec. 12): one labeled arrow
+      // at the part's bbox centroid, in the roster colour, shown when active in
+      // the displayed step. Handled before the tris guard.
+      if (bc.kind === "accel") {
+        if (bc.accel) this.buildAccelGlyph(bc, inactive);
+        continue;
+      }
+      if (bc.tris.length === 0) continue;
+      if (bc.kind === "mass") {
+        this.buildMassGlyph(bc, inactive);
+        continue;
+      }
       if (bc.kind === "bearing") {
         this.buildBearingGlyphs(bc, inactive);
         continue;
@@ -816,7 +835,6 @@ export class SceneManager {
         // when the arrow is viewed end-on — e.g. a -Z force from a top-down
         // camera — leaving a context-free floating dot. A shaded cylinder
         // stays readable from every angle. Deactivated in this step → ghosted.
-        const labelHex = 0xc2330e;
         const mat = new THREE.MeshStandardMaterial({
           color: 0xff5252,
           roughness: 0.45,
@@ -834,17 +852,11 @@ export class SceneManager {
         const head = new THREE.Mesh(headGeo, mat);
         head.position.y = shaftLen + len * 0.14;
         g.add(shaft, head);
-        // Value label at the tail: even with the arrow viewed dead-on (a
-        // -Z force from a top view collapses it to a disc) the annotation
-        // says what the dot is.
+        // Value label: a result-style callout pinned to the loaded patch (dot +
+        // offset chip + leader) instead of a sprite on the arrow — readable from
+        // any angle and never covering the picked spot.
         const mag = f.length();
-        const label = this.makeLabelSprite(
-          `${mag >= 9.95 ? mag.toFixed(0) : mag.toFixed(1)} N`,
-          labelHex
-        );
-        if (inactive) (label.material as THREE.SpriteMaterial).opacity = 0.3;
-        label.position.set(0, -len * 0.02, 0);
-        g.add(label);
+        this.pushBcCallout(bc, centroid, `${mag >= 9.95 ? mag.toFixed(0) : mag.toFixed(1)} N`, inactive);
         // Local +Y becomes the force direction (the head is the +Y end).
         g.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir);
         // Keep the WHOLE arrow outside the part. A pushing load (into the
@@ -864,7 +876,110 @@ export class SceneManager {
         this.buildSupportGlyphs(bc, inactive);
       }
     }
+    this.callouts.setBcCallouts(this.pendingBcCallouts);
     this.updateMarkerVisibility();
+  }
+
+  /** Acceleration glyph: a solid-shaft arrow through the part's bbox centre,
+   *  along the acceleration vector, labelled with |a| in g. Selection-less
+   *  (DESIGN §16 dec. 12); the shaded shaft+cone stays readable end-on. */
+  private buildAccelGlyph(bc: Bc, inactive = false) {
+    if (!bc.accel || !this.partBbox) return;
+    const a = new THREE.Vector3(bc.accel[0], bc.accel[1], bc.accel[2]);
+    if (a.lengthSq() === 0) return;
+    const dir = a.clone().normalize();
+    const b = this.partBbox;
+    const center = new THREE.Vector3((b[0] + b[3]) / 2, (b[1] + b[4]) / 2, (b[2] + b[5]) / 2);
+    const col = BC_COLORS.accel;
+    const len = this.bboxDiag * 0.3; // body-wide — a touch longer than a surface load
+    const mat = new THREE.MeshStandardMaterial({
+      color: col.clone(),
+      roughness: 0.5,
+      metalness: 0.05,
+      transparent: inactive,
+      opacity: inactive ? 0.25 : 1,
+    });
+    const shaftLen = len * 0.72;
+    const shaftGeo = new THREE.CylinderGeometry(len * 0.02, len * 0.02, shaftLen, 10);
+    const headGeo = new THREE.ConeGeometry(len * 0.06, len * 0.26, 14);
+    this.markerDisposables.push(mat, shaftGeo, headGeo);
+    const g = new THREE.Group();
+    const shaft = new THREE.Mesh(shaftGeo, mat);
+    shaft.position.y = shaftLen / 2;
+    const head = new THREE.Mesh(headGeo, mat);
+    head.position.y = shaftLen + len * 0.13;
+    g.add(shaft, head);
+    const gMag = a.length() / 9810; // canonical mm/s² → g (DESIGN §16 convention)
+    // Local +Y → acceleration direction; centre the shaft on the part centroid.
+    g.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir);
+    g.position.copy(center.clone().sub(dir.clone().multiplyScalar(shaftLen / 2)));
+    this.bcMarkers.add(g);
+    // Value label as a callout at the arrow's head end (out past the part).
+    const headWorld = center.clone().add(dir.clone().multiplyScalar(shaftLen / 2));
+    this.pushBcCallout(bc, headWorld, `${gMag >= 9.95 ? gMag.toFixed(0) : gMag.toFixed(1)} g`, inactive);
+  }
+
+  /** Point-mass glyph: a filled sphere at the CG + spider lines to the mounting
+   *  patch + a name/mass label, so the lever arm is always visible (DESIGN §16
+   *  dec. 7). */
+  private buildMassGlyph(bc: Bc, inactive = false) {
+    const p = this.basePositions;
+    if (!p) return;
+    const point = new THREE.Vector3(...(bc.point ?? [0, 0, 0]));
+    const col = BC_COLORS.mass;
+    const r = this.bboxDiag * 0.02;
+    const mat = new THREE.MeshStandardMaterial({
+      color: col.clone(),
+      roughness: 0.5,
+      metalness: 0.1,
+      transparent: inactive,
+      opacity: inactive ? 0.3 : 1,
+    });
+    const sphGeo = new THREE.SphereGeometry(r, 20, 14);
+    this.markerDisposables.push(mat, sphGeo);
+    const g = new THREE.Group();
+    const sphere = new THREE.Mesh(sphGeo, mat);
+    sphere.position.copy(point);
+    g.add(sphere);
+    // Spider lines: CG → patch centroid + a few points spread across the patch.
+    const centroid = this.selectionCentroid(bc.tris);
+    const targets = [centroid];
+    const n = bc.tris.length;
+    const k = Math.min(5, n);
+    for (let i = 0; i < k; i++) {
+      const t = bc.tris[Math.floor(((i + 0.5) * n) / k)];
+      const o = 9 * t;
+      targets.push(
+        new THREE.Vector3(
+          (p[o] + p[o + 3] + p[o + 6]) / 3,
+          (p[o + 1] + p[o + 4] + p[o + 7]) / 3,
+          (p[o + 2] + p[o + 5] + p[o + 8]) / 3
+        )
+      );
+    }
+    const linePts: number[] = [];
+    for (const t of targets) linePts.push(point.x, point.y, point.z, t.x, t.y, t.z);
+    if (linePts.length) {
+      const lgeo = new THREE.BufferGeometry();
+      lgeo.setAttribute("position", new THREE.Float32BufferAttribute(linePts, 3));
+      const lmat = new THREE.LineBasicMaterial({
+        color: col.clone(),
+        transparent: true,
+        opacity: inactive ? 0.2 : 0.6,
+      });
+      this.markerDisposables.push(lgeo, lmat);
+      g.add(new THREE.LineSegments(lgeo, lmat));
+    }
+    this.bcMarkers.add(g);
+    // Value label as a callout anchored at the CG sphere — the chip is offset so
+    // it no longer covers the picked patch (the old sprite sat right on it).
+    const grams = bc.massGrams ?? 0;
+    this.pushBcCallout(
+      bc,
+      point,
+      `${bc.name ?? "Mass"} · ${grams >= 99.5 ? grams.toFixed(0) : grams.toFixed(1)} g`,
+      inactive
+    );
   }
 
   private buildSupportGlyphs(bc: Bc, inactive = false) {
@@ -964,6 +1079,9 @@ export class SceneManager {
         this.bcMarkers.add(coil);
       }
     }
+    // Name callout on the support patch — supports carry no magnitude, so the
+    // chip just identifies which support it is (in its roster colour).
+    this.pushBcCallout(bc, this.selectionCentroid(bc.tris), bc.name ?? "Support", inactive);
   }
 
   /** Bearing load: a fan of arrows over the loaded half of the fitted cylinder,
@@ -1040,18 +1158,12 @@ export class SceneManager {
       }
     }
     const mag = frad.length();
-    const label = this.makeLabelSprite(
+    this.pushBcCallout(
+      bc,
+      this.selectionCentroid(bc.tris),
       `${mag >= 9.95 ? mag.toFixed(0) : mag.toFixed(1)} N`,
-      0x8e1278
+      inactive
     );
-    if (inactive) (label.material as THREE.SpriteMaterial).opacity = 0.3;
-    label.position.copy(
-      center
-        .clone()
-        .addScaledVector(axis, (amin + amax) / 2)
-        .addScaledVector(loadDir, radius + baseLen * 1.2)
-    );
-    this.bcMarkers.add(label);
   }
 
   /** Moment: a curved arrow encircling the moment axis at the selection
@@ -1108,13 +1220,12 @@ export class SceneManager {
     head.position.copy(pts[pts.length - 1]).addScaledVector(tangent, R * 0.18);
     this.bcMarkers.add(head);
     const mag = mvec.length();
-    const label = this.makeLabelSprite(
+    this.pushBcCallout(
+      bc,
+      this.selectionCentroid(bc.tris),
       `${mag >= 9.95 ? mag.toFixed(0) : mag.toFixed(1)} N·mm`,
-      0xb14708
+      inactive
     );
-    if (inactive) (label.material as THREE.SpriteMaterial).opacity = 0.3;
-    label.position.copy(center.clone().addScaledVector(axis, R * 0.9));
-    this.bcMarkers.add(label);
   }
 
   /** Workspace gate for the load/fixture display (false in Build Sim): hides
@@ -1128,6 +1239,8 @@ export class SceneManager {
 
   private updateMarkerVisibility() {
     this.bcMarkers.visible = this.bcMarkersEnabled && this.viewMode === "setup";
+    // Load value labels ride with the glyphs (setup view only).
+    this.callouts.setBcCalloutsVisible(this.bcMarkers.visible);
   }
 
   private selectionCentroid(tris: Uint32Array): THREE.Vector3 {
@@ -2351,6 +2464,7 @@ export class SceneManager {
       if (this.results.voxRes) this.results.voxRes.group.visible = false;
       if (this.wireframeLines) this.wireframeLines.visible = false;
       this.bcMarkers.visible = false;
+      this.callouts.setBcCalloutsVisible(false);
       return;
     }
     this.results.buildGroup.visible = false;
@@ -2409,28 +2523,13 @@ export class SceneManager {
 
   /** Small screen-aligned value chip (canvas-rendered text on a light pill),
    *  world-scaled to the part. Disposal goes through markerDisposables. */
-  private makeLabelSprite(text: string, color: number): THREE.Sprite {
-    const canvas = document.createElement("canvas");
-    const ctx = canvas.getContext("2d")!;
-    const font = "bold 28px 'B612 Mono', 'Barlow', system-ui, sans-serif";
-    ctx.font = font;
-    const w = Math.ceil(ctx.measureText(text).width) + 18;
-    canvas.width = w;
-    canvas.height = 40;
-    ctx.font = font;
-    ctx.fillStyle = "#fcfcfae8";
-    ctx.fillRect(0, 0, w, 40);
-    ctx.fillStyle = `#${color.toString(16).padStart(6, "0")}`;
-    ctx.textBaseline = "middle";
-    ctx.fillText(text, 9, 21);
-    const tex = new THREE.CanvasTexture(canvas);
-    const mat = new THREE.SpriteMaterial({ map: tex, depthTest: false, transparent: true });
-    this.markerDisposables.push(tex, mat);
-    const sprite = new THREE.Sprite(mat);
-    const hWorld = 0.035 * this.bboxDiag;
-    sprite.scale.set((hWorld * w) / 40, hWorld, 1);
-    sprite.renderOrder = 9;
-    return sprite;
+  /** Queue a load's value label as a result-style callout anchored at `world`
+   *  (the picked patch / CG / bbox centre) in the load's roster colour — a small
+   *  dot + an offset value chip + a leader line, so the value never covers the
+   *  picked spot. Flushed to the CalloutManager after rebuildBcMarkers. */
+  private pushBcCallout(bc: Bc, world: THREE.Vector3, text: string, ghost: boolean) {
+    const c = BC_COLORS[bc.kind] ?? new THREE.Color(0x888888);
+    this.pendingBcCallouts.push({ id: bc.id, world: world.clone(), text, color: `#${c.getHexString()}`, ghost });
   }
 
   private tick() {
@@ -2480,6 +2579,7 @@ export class SceneManager {
     // Reproject the min/max marks + fixed callouts now the camera is settled.
     this.callouts.projectExtremes();
     this.callouts.updateCallouts();
+    this.callouts.projectBcCallouts();
   }
 }
 

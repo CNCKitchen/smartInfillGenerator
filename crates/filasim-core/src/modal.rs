@@ -62,7 +62,17 @@ pub struct ModalResult {
 /// volume while stiffness follows the (possibly non-linear) `E(ρ)` law. Each
 /// cell's mass `ρ · h³ · vfrac` lumps equally onto its 8 nodes; constrained /
 /// inactive DOFs get zero (no inertia in the reduced system).
-fn lumped_mass(solver: &MgSolver, vfrac: &[f32], density: f64) -> Vec<f64> {
+///
+/// `extra_mass` carries remote point masses (DESIGN §16): `(node, tonne)` pairs
+/// added to all three translational DOFs of each node BEFORE the constrained
+/// zeroing, so a mass bolted to a support drops out (rides the fixed wall) while
+/// a mass on a free patch drags that patch's modes down. Pass `&[]` for none.
+fn lumped_mass(
+    solver: &MgSolver,
+    vfrac: &[f32],
+    density: f64,
+    extra_mass: &[(u32, f64)],
+) -> Vec<f64> {
     let lvl = &solver.levels[0];
     let (nx, ny, nz) = (lvl.nx, lvl.ny, lvl.nz);
     let (mx, my) = (lvl.mx, lvl.my);
@@ -85,6 +95,17 @@ fn lumped_mass(solver: &MgSolver, vfrac: &[f32], density: f64) -> Vec<f64> {
                     m[3 * n + 2] += node_mass;
                 }
             }
+        }
+    }
+    // Remote point masses: add each node's lumped translational share. Done
+    // before the constrained-DOF zeroing so a mass on a fixed patch (rare, but
+    // valid) contributes no free inertia — it simply rides the support.
+    for &(n, dm) in extra_mass {
+        let b = 3 * n as usize;
+        if b + 2 < m.len() {
+            m[b] += dm;
+            m[b + 1] += dm;
+            m[b + 2] += dm;
         }
     }
     for (i, &c) in lvl.constrained.iter().enumerate() {
@@ -474,9 +495,11 @@ fn m_orthonormalize_rest(xb: &[Vec<f64>], mut rest: Vec<Vec<f64>>, m: &[f64]) ->
 ///
 /// `solver` must already hold the modal stiffness (printed or solid eps).
 /// `vfrac` is the per-cell material volume fraction for the lumped mass;
-/// `density` is in consistent mass units (tonne/mm³). The returned mode shapes
-/// are M-normalized (`vᵀ M v = 1`) — their absolute magnitude is arbitrary, so
-/// the viewer normalizes per mode for display.
+/// `density` is in consistent mass units (tonne/mm³). `extra_mass` are remote
+/// point masses as `(node, tonne)` pairs (DESIGN §16) added to the lumped mass
+/// diagonal — pass `&[]` when there are none. The returned mode shapes are
+/// M-normalized (`vᵀ M v = 1`) — their absolute magnitude is arbitrary, so the
+/// viewer normalizes per mode for display.
 ///
 /// `on_progress(outer_done, max_outer, freqs_hz)` is called once per outer
 /// subspace-iteration step with the current Ritz frequency estimates — for a
@@ -485,11 +508,12 @@ pub fn analyze(
     solver: &mut MgSolver,
     vfrac: &[f32],
     density: f64,
+    extra_mass: &[(u32, f64)],
     cfg: &ModalConfig,
     mut on_progress: impl FnMut(usize, usize, &[f64]),
 ) -> Result<ModalResult, SolveError> {
     let n = solver.levels[0].ndof();
-    let m = lumped_mass(solver, vfrac, density);
+    let m = lumped_mass(solver, vfrac, density, extra_mass);
     let free_dofs = m.iter().filter(|&&mi| mi > 0.0).count();
     if free_dofs == 0 {
         return Err(SolveError::NoSolidCells);
@@ -720,11 +744,11 @@ mod tests {
                 }
             }
         }
-        let problem = NodeProblem { fixed, springs: Vec::new(), forces: Vec::new() };
+        let problem = NodeProblem { fixed, springs: Vec::new(), forces: Vec::new(), rigid: Vec::new() };
         let eps = grid_eps(&grid);
         let mut cache = SolverCache::build(&grid, levels, &problem, &s, eps);
         let cfg = ModalConfig::new(num_modes);
-        let res = analyze(&mut cache.solver, &grid.scale, density, &cfg, |_, _, _| {}).unwrap();
+        let res = analyze(&mut cache.solver, &grid.scale, density, &[], &cfg, |_, _, _| {}).unwrap();
         eprintln!(
             "[modal] {} cells, {} modes: {} outer iters, {} total inner MGCG iters (converged={})",
             grid.cell_count(),
@@ -766,6 +790,60 @@ mod tests {
         // Square section ⇒ the first two bending modes are degenerate.
         let degen = (f[1] - f[0]).abs() / f[0];
         assert!(degen < 0.10, "modes 1&2 should be near-degenerate: {f:?}");
+    }
+
+    #[test]
+    fn tip_point_mass_lowers_frequency() {
+        // A remote point mass bolted to the free tip must drag the fundamental
+        // frequency down (f ∝ 1/√M_eff). Rayleigh estimate with a tip mass M and
+        // beam mass m_b: f_M/f_bare = √( 0.2357·m_b / (M + 0.2357·m_b) ), where
+        // 33/140 ≈ 0.2357 is the cantilever's tip-effective self-mass. Choosing
+        // M = m_b predicts ≈0.437 — this guards the modal mass wiring (a broken
+        // one leaves the ratio at 1.0; a unit slip pushes it far off).
+        let (nxc, nthick, h) = (40usize, 4usize, 1.0);
+        let s = SolveSettings { e0: 2400.0, nu: 0.35, ..Default::default() };
+        let density = 1.24e-9; // PLA, tonne/mm³
+        let raw = beam(nxc, nthick, nthick, h);
+        let (grid, levels) = pad_for_levels(&raw, s.max_levels);
+        let active = active_nodes(&grid);
+        let (mx, my, mz) = (grid.nx + 1, grid.ny + 1, grid.nz + 1);
+        // Root plane (x index 0) fixed; free tip plane (x index nxc) takes the mass.
+        let (mut fixed, mut tip) = (Vec::new(), Vec::new());
+        for z in 0..mz {
+            for y in 0..my {
+                let root = (z * my + y) * mx;
+                if active[root] {
+                    fixed.push(root as u32);
+                }
+                let t = (z * my + y) * mx + nxc;
+                if t < active.len() && active[t] {
+                    tip.push(t as u32);
+                }
+            }
+        }
+        let problem = NodeProblem { fixed, springs: Vec::new(), forces: Vec::new(), rigid: Vec::new() };
+        let mut cache = SolverCache::build(&grid, levels, &problem, &s, grid_eps(&grid));
+        let cfg = ModalConfig::new(1);
+
+        let beam_mass = density * (nxc as f64 * h) * (nthick as f64 * h).powi(2);
+        let f_bare = analyze(&mut cache.solver, &grid.scale, density, &[], &cfg, |_, _, _| {})
+            .unwrap()
+            .freqs_hz[0];
+        // Tip mass M = beam mass, split equally over the tip-plane nodes.
+        let m_tip = beam_mass;
+        let per = m_tip / tip.len() as f64;
+        let extra: Vec<(u32, f64)> = tip.iter().map(|&n| (n, per)).collect();
+        let f_load = analyze(&mut cache.solver, &grid.scale, density, &extra, &cfg, |_, _, _| {})
+            .unwrap()
+            .freqs_hz[0];
+
+        assert!(f_load < f_bare, "tip mass must lower f1: bare {f_bare}, loaded {f_load}");
+        let ratio = f_load / f_bare;
+        let pred = (0.2357 * beam_mass / (m_tip + 0.2357 * beam_mass)).sqrt();
+        assert!(
+            (ratio - pred).abs() < 0.15,
+            "f1 ratio {ratio:.3} vs Rayleigh {pred:.3} out of band (bare {f_bare:.1}, loaded {f_load:.1} Hz)"
+        );
     }
 
     // Profiling harness for the real user scenario: pipe.stl, lower face fixed,
@@ -810,7 +888,7 @@ mod tests {
             }
         }
         eprintln!("fixed {} lower-face nodes", fixed.len());
-        let problem = NodeProblem { fixed, springs: Vec::new(), forces: Vec::new() };
+        let problem = NodeProblem { fixed, springs: Vec::new(), forces: Vec::new(), rigid: Vec::new() };
         let t = Instant::now();
         let mut cache = SolverCache::build(&grid, levels, &problem, &s, grid_eps(&grid));
         eprintln!("cache build: {:.2}s", t.elapsed().as_secs_f64());
@@ -838,7 +916,7 @@ mod tests {
 
         let cfg = ModalConfig::new(6);
         let t = Instant::now();
-        let res = analyze(&mut cache.solver, &grid.scale, 1.24e-9, &cfg, |_, _, _| {}).unwrap();
+        let res = analyze(&mut cache.solver, &grid.scale, 1.24e-9, &[], &cfg, |_, _, _| {}).unwrap();
         let total = t.elapsed().as_secs_f64();
         eprintln!(
             "modal: {:.2}s — {} iters, {} V-cycles, converged={}",
@@ -868,10 +946,10 @@ mod tests {
         // Weak anchors lift the 6 rigid-body modes without hard constraints.
         let k = 1e-4 * s.e0 * grid.h;
         let springs = rigid_body_anchor_springs(mx, my, mz, &active, k);
-        let problem = NodeProblem { fixed: Vec::new(), springs, forces: Vec::new() };
+        let problem = NodeProblem { fixed: Vec::new(), springs, forces: Vec::new(), rigid: Vec::new() };
         let mut cache = SolverCache::build(&grid, levels, &problem, &s, grid_eps(&grid));
         let cfg = ModalConfig::new(1 + 6); // 6 rigid-body + 1 flexible
-        let res = analyze(&mut cache.solver, &grid.scale, density, &cfg, |_, _, _| {}).unwrap();
+        let res = analyze(&mut cache.solver, &grid.scale, density, &[], &cfg, |_, _, _| {}).unwrap();
         let f = res.freqs_hz;
         // The 6 lowest are the (soft-lifted) rigid-body modes; the 7th is the
         // first flexible mode and must sit well above them.

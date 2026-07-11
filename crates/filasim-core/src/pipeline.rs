@@ -17,8 +17,8 @@
 //! the same `simp`/`bins`/solver calls the wasm method made, in the same order.
 
 use crate::bins::{
-    assign_bins_mass, cleanup_small_regions, cluster_levels, extract_region, taubin_smooth,
-    RegionMesh,
+    assign_bins_mass, cleanup_small_regions, cluster_levels, constrained_smooth,
+    extract_region_smooth, taubin_smooth, RegionMesh,
 };
 use crate::eps::build_eps;
 use crate::simp::{
@@ -28,10 +28,18 @@ use crate::simp::{
 use crate::solve::{NodeProblem, SolveSettings, SolverCache};
 use crate::voxel::VoxelGrid;
 
-/// How many Taubin passes one region-smoothing slider unit buys. The slider
-/// tops out at 40, so the max is 40·`SMOOTH_PASS_MULT` passes — enough, with
-/// the λ/μ in `taubin_smooth`, to melt the voxel staircase at the top of range.
+/// How many constrained-Laplacian passes one region-smoothing slider unit
+/// buys. The slider tops out at 40, so the max is 40·`SMOOTH_PASS_MULT`
+/// diffusion sweeps — reach ≈ √(0.5·160) ≈ 9 cells, enough to melt even wide
+/// shallow-slope terraces inside the `SMOOTH_CLAMP_H` constraint band.
 pub const SMOOTH_PASS_MULT: usize = 4;
+
+/// Displacement clamp of the region smoother, in units of the voxel pitch h.
+/// The binary-extraction staircase deviates from the ideal smooth surface by
+/// at most ~h/2, so 0.6·h lets terraces flatten completely while bounding any
+/// real-geometry drift (shrinkage, thin-member collapse, edge rounding) to
+/// sub-voxel — the dimensional error of the export stays below one cell.
+pub const SMOOTH_CLAMP_H: f64 = 0.6;
 
 /// Stiffness-match secant: at most this many warm-started passes.
 const MAX_MATCH_PASSES: usize = 5;
@@ -61,7 +69,7 @@ pub struct PipelineCfg<'a> {
     /// Manual level override (already clamped/sorted/deduped), e.g. binary
     /// {floor, 1} or user-calibrated densities; None ⇒ auto cluster.
     pub levels_pct: Option<&'a [f64]>,
-    /// Region Taubin-smoothing passes (× `SMOOTH_PASS_MULT`).
+    /// Region-smoothing slider units (× `SMOOTH_PASS_MULT` constrained passes).
     pub smooth_iters: usize,
 }
 
@@ -353,14 +361,14 @@ pub fn run_optimization(
     for level in 1..centers.len() {
         let inside =
             |ci: usize| -> bool { bin_of_cell.get(&(ci as u32)).is_some_and(|&b| b as usize >= level) };
-        let mut r = extract_region(grid, &inside, 0.4);
+        let mut r = extract_region_smooth(grid, &inside, 0.4);
         if r.indices.is_empty() {
             continue;
         }
         r.density = centers[level];
         regions_raw.push(r);
     }
-    let regions = smooth_regions(&regions_raw, cfg.smooth_iters);
+    let regions = smooth_regions(&regions_raw, cfg.smooth_iters, grid.h);
 
     Ok(OptOutcome {
         design_cells: result.design_cells,
@@ -399,9 +407,23 @@ pub fn run_optimization(
     })
 }
 
-/// Taubin-smooth copies of the raw regions (0 passes = verbatim copy). Exposed
-/// so the post-run smoothing slider can re-smooth without re-extracting.
-pub fn smooth_regions(raw: &[RegionMesh], iters: usize) -> Vec<RegionMesh> {
+/// Smoothed copies of the raw regions (0 passes = verbatim copy). Exposed so
+/// the post-run smoothing slider can re-smooth without re-extracting.
+/// Three stages (`h` = voxel pitch the regions were extracted at):
+///
+/// 1. **Outlier kill** — a short Taubin pre-pass. Marching tets on a binary
+///    indicator grows needle/tent spikes at single-voxel corners and ridges;
+///    Taubin's band-pass melts those high-frequency outliers in a few passes
+///    with no net shrink. Crucially this runs BEFORE the constraint centers
+///    are captured — otherwise every spike gets a protected ball around its
+///    own tip and survives the whole pipeline 0.6·h tall.
+/// 2. **Terrace melt** — constrained Laplacian (clamped to `SMOOTH_CLAMP_H`·h
+///    around the de-spiked reference): pure diffusion flattens the wide
+///    shallow-slope terraces a Taubin band-pass preserves at any pass count,
+///    while the clamp bounds shrinkage / thin-member drift to sub-voxel.
+/// 3. **Polish** — two stable Taubin passes to round the C0 kinks left where
+///    the clamp bound; drift is negligible at this pass count.
+pub fn smooth_regions(raw: &[RegionMesh], iters: usize, h: f64) -> Vec<RegionMesh> {
     raw.iter()
         .map(|r| {
             let mut rr = RegionMesh {
@@ -410,7 +432,14 @@ pub fn smooth_regions(raw: &[RegionMesh], iters: usize) -> Vec<RegionMesh> {
                 indices: r.indices.clone(),
             };
             if iters > 0 {
-                taubin_smooth(&mut rr.positions, &rr.indices, iters * SMOOTH_PASS_MULT);
+                taubin_smooth(&mut rr.positions, &rr.indices, 2 + iters / 4);
+                constrained_smooth(
+                    &mut rr.positions,
+                    &rr.indices,
+                    iters * SMOOTH_PASS_MULT,
+                    (SMOOTH_CLAMP_H * h) as f32,
+                );
+                taubin_smooth(&mut rr.positions, &rr.indices, 2);
             }
             rr
         })
@@ -610,7 +639,11 @@ mod tests {
         };
         // Single-load (Z only) vs multi-load (Z + Y, equal weight).
         let a = run(&LoadSet::default());
-        let b = run(&LoadSet { extra: vec![(asm_y.problem.clone(), 1.0)], primary_weight: 1.0 });
+        let b = run(&LoadSet {
+            extra: vec![(asm_y.problem.clone(), 1.0)],
+            primary_weight: 1.0,
+            ..Default::default()
+        });
 
         // (a) The second load case visibly redistributes material.
         let mean_delta = a

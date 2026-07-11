@@ -17,6 +17,8 @@ export const KIND_LABEL: Record<BcKind, string> = {
   pressure: "Pressure",
   bearing: "Bearing load",
   moment: "Moment",
+  accel: "Acceleration",
+  mass: "Point mass",
 };
 
 // Mirrors BC_COLORS in SceneManager — the dots must match the 3D glyphs.
@@ -29,9 +31,15 @@ export const KIND_DOT: Record<BcKind, string> = {
   pressure: "#c97b10",
   bearing: "#b5179e",
   moment: "#e8590c",
+  accel: "#b08900",
+  mass: "#0f766e", // teal — must match BC_COLORS.mass in ColorManager.ts
 };
 
 export const SUPPORT_KINDS: BcKind[] = ["fixed", "elastic", "frictionless", "displacement"];
+
+/** Loads applied to a triangle SELECTION (as opposed to the selection-less
+ *  "accel"). Drives the "needs a surface" attach validation + glyph anchoring. */
+export const SELECTION_LESS_KINDS: BcKind[] = ["accel"];
 
 /** Short kind label for auto-generated names + compact table columns. */
 export const KIND_SHORT: Record<BcKind, string> = {
@@ -43,6 +51,8 @@ export const KIND_SHORT: Record<BcKind, string> = {
   pressure: "Pressure",
   bearing: "Bearing",
   moment: "Moment",
+  accel: "Accel",
+  mass: "Mass",
 };
 
 /** A load's per-step unit. Canonical labels — for live display use
@@ -52,6 +62,7 @@ export const KIND_UNIT: Partial<Record<BcKind, string>> = {
   pressure: "MPa",
   bearing: "N",
   moment: "N·mm",
+  accel: "g",
 };
 
 /** The display-unit quantity kind of a load's value (force/pressure/moment).
@@ -61,6 +72,7 @@ export const BC_QUANTITY: Partial<Record<BcKind, QuantityKind>> = {
   bearing: "force",
   pressure: "pressure",
   moment: "moment",
+  accel: "acceleration",
 };
 
 /** Display name: the user's custom name, or the auto kind label. */
@@ -125,6 +137,20 @@ export const BC_HELP: Record<BcKind, HelpContent> = {
     text: [
       "A uniform pressure acting perpendicular to the selected surfaces — positive pushes onto the surface.",
       "On curved selections every spot is loaded along its own local normal, so a closed vessel under internal pressure comes out right.",
+    ],
+  },
+  accel: {
+    title: "Acceleration",
+    text: [
+      "An acceleration the whole part feels — gravity, a crash, a maneuver. Every bit of mass, plus any attached point masses, is loaded by F = m·a along this vector.",
+      "Use the 1 g ↓ preset for standing weight, or enter a direction + magnitude (e.g. 6 g sideways). No surface to select — it acts on the entire part; part self-weight turns on automatically.",
+    ],
+  },
+  mass: {
+    title: "Point mass",
+    text: [
+      "A component bolted to the selected surface — a motor, battery or camera — whose weight loads the part. Enter its mass and the position of its centre of gravity.",
+      "Under an acceleration the offset CG loads the mount in bending, not just compression (the lever arm a smeared surface load would miss). Add an Acceleration too, or the mass does nothing.",
     ],
   },
 };
