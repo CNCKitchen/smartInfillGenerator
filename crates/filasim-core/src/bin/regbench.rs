@@ -26,11 +26,15 @@
 //! Usually invoked via `node scripts/preflight.mjs` (the pre-push gate).
 
 use filasim_core::attach::{assemble, point_mass_lumping, BcKind, BcSpec, BodyLoad};
-use filasim_core::bins::{assign_bins_mass, cleanup_small_regions, cluster_levels};
+use filasim_core::bins::{
+    assign_bins_mass, cleanup_small_regions, cluster_levels, smooth_design_field,
+    smooth_passes_for_radius,
+};
 use filasim_core::mesh::primitives;
 use filasim_core::modal::{analyze, ModalConfig};
 use filasim_core::simp::{
-    evaluate, evaluate_cached_stats, optimize, optimize_cached, BodyAccel, LoadSet, OptimizeParams,
+    evaluate, evaluate_cached_stats, filter_radius_cells, optimize, optimize_cached, BodyAccel,
+    LoadSet, OptimizeParams,
 };
 use filasim_core::solve::{active_nodes, solve_cached, SolverCache};
 use filasim_core::{
@@ -156,10 +160,18 @@ fn bench_optimize(m: &mut Metrics) {
 
     let target = res.x.iter().sum::<f64>() / res.x.len() as f64;
 
-    // App binning pipeline (3 bins): floor-pinned energy-weighted levels +
-    // mass-constrained assignment + small-region cleanup.
-    let centers = cluster_levels(&res.x, &res.se, 3, exp, coeff, params.floor, params.cap);
-    let mut bins = assign_bins_mass(&res.x, &res.se, &centers, exp, coeff, target);
+    // App binning pipeline (3 bins): member-scale-smoothed strain energy,
+    // floor-pinned energy-weighted levels + mass-constrained assignment +
+    // small-region cleanup.
+    let r_cells = filter_radius_cells(params.min_member_mm, grid.h);
+    let se_s = smooth_design_field(
+        &grid,
+        &res.design_cells,
+        &res.se,
+        smooth_passes_for_radius(r_cells),
+    );
+    let centers = cluster_levels(&res.x, &se_s, 3, exp, coeff, params.floor, params.cap);
+    let mut bins = assign_bins_mass(&res.x, &se_s, &centers, exp, coeff, target);
     cleanup_small_regions(&grid, &res.design_cells, &mut bins, centers.len(), 30);
     let x_binned: Vec<f64> = bins.iter().map(|&b| centers[b as usize]).collect();
     let mean_binned = x_binned.iter().sum::<f64>() / x_binned.len() as f64;
@@ -229,8 +241,15 @@ fn bench_optimize_selfweight(m: &mut Metrics) {
     let dt = t0.elapsed().as_secs_f64();
 
     let target = res.x.iter().sum::<f64>() / res.x.len() as f64;
-    let centers = cluster_levels(&res.x, &res.se, 3, exp, coeff, params.floor, params.cap);
-    let mut bins = assign_bins_mass(&res.x, &res.se, &centers, exp, coeff, target);
+    let r_cells = filter_radius_cells(params.min_member_mm, grid.h);
+    let se_s = smooth_design_field(
+        &grid,
+        &res.design_cells,
+        &res.se,
+        smooth_passes_for_radius(r_cells),
+    );
+    let centers = cluster_levels(&res.x, &se_s, 3, exp, coeff, params.floor, params.cap);
+    let mut bins = assign_bins_mass(&res.x, &se_s, &centers, exp, coeff, target);
     cleanup_small_regions(&grid, &res.design_cells, &mut bins, centers.len(), 30);
     let x_binned: Vec<f64> = bins.iter().map(|&b| centers[b as usize]).collect();
     let mean_binned = x_binned.iter().sum::<f64>() / x_binned.len() as f64;

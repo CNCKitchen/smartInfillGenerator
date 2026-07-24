@@ -5,6 +5,7 @@ import { create } from "zustand";
 import {
   engine,
   type OptimizeOutput,
+  type OptPhase,
   type OptRegion,
   type OptSummary,
   type SlicerFlavor,
@@ -1282,6 +1283,40 @@ async function logGridInfo(set: SetState) {
   }
 }
 
+/** Busy-chip text for an optimize-pipeline phase push (the otherwise-silent
+ *  stages between/after the SIMP iterations — without these the chip freezes
+ *  on "Optimizing…" while the engine verifies, solves baselines and extracts
+ *  regions, and users read the quiet stretch as a hang). */
+function optPhaseText(p: OptPhase, solid: boolean): string {
+  const what = solid ? "shape" : "infill";
+  switch (p.phase) {
+    case "assemble":
+      return "Setting up loads & supports…";
+    case "reference":
+      return "Solving uniform reference model (stiffness target)…";
+    case "optimize_pass":
+      return (p.passes ?? 1) > 1
+        ? `Optimizing ${what} — pass ${p.pass}/${p.passes}, first iteration…`
+        : `Optimizing ${what} — first iteration…`;
+    case "binning":
+      return solid ? "Thresholding the optimized shape…" : "Grouping densities into infill levels…";
+    case "verify":
+      return "Verifying the optimized design (re-solve)…";
+    case "uniform":
+      return "Solving uniform-infill baseline for comparison…";
+    case "solid_ref":
+      return "Solving solid-material baseline for comparison…";
+    case "stress":
+      return "Recovering stress fields…";
+    case "regions":
+      return solid ? "Extracting the optimized body…" : "Extracting infill regions…";
+    case "smoothing":
+      return "Smoothing region surfaces…";
+    case "finalize":
+      return "Preparing result views…";
+  }
+}
+
 function fieldUnit(kind: string): string {
   if (kind.startsWith("sf")) return "×"; // marker labels show a plain factor
   if (kind === "peel" || kind === "peelshear") return "MPa"; // build-sim bed traction
@@ -2019,9 +2054,13 @@ async function solveAllSteps(set: SetState, get: () => AppState) {
   let displayMinSf: { minSf: number; governs: "layer" | "material" } | null = null;
   for (let i = 0; i < steps.length; i++) {
     const step = steps[i];
-    set({ busy: `Solving load step ${i + 1}/${steps.length}: ${step.name}…`, solveResiduals: [] });
+    // The residual poll doubles as a liveness ticker in the busy chip.
+    const stepBusy = `Solving load step ${i + 1}/${steps.length}: ${step.name}`;
+    set({ busy: `${stepBusy}…`, solveResiduals: [] });
     await engine.setBcs(effectiveBcs(st0.bcs, step));
-    const stop = session.startResidualPoll((r) => set({ solveResiduals: r }));
+    const stop = session.startResidualPoll((r) =>
+      set({ solveResiduals: r, busy: `${stepBusy} — iteration ${r.length}…` })
+    );
     let stats: SolveStats;
     let printedSummary: PrintedSummary | null = null;
     try {
@@ -2059,6 +2098,7 @@ async function solveAllSteps(set: SetState, get: () => AppState) {
     // non-displayed step's sf would otherwise shadow the displayed one.
     let minSf: number | null = null;
     if (printed) {
+      set({ busy: `Computing safety factors: ${step.name}…` });
       const sf = await computeMinSf(false);
       if (sf) minSf = sf.minSf;
       if (step.id === activeId) displayMinSf = sf;
@@ -2118,6 +2158,7 @@ async function solveAllSteps(set: SetState, get: () => AppState) {
     steps
   );
   session.invalidateSolution();
+  set({ busy: "Preparing result views…" });
   const disp = await engine.activateResult(activeRid);
   sceneEvents.onLegendRange?.(null, null);
   const anyUnconverged = entries.some((e) => !e.converged);
@@ -2588,7 +2629,7 @@ export const useStore = create<AppState>((set, get) => ({
   curves: initialSettings.curves,
   resolution: "preview",
   customH: 0,
-  budget: 25,
+  budget: 30,
   pattern: "gyroid",
   perimeters: 2,
   lineWidth: 0.45,
@@ -3810,6 +3851,25 @@ export const useStore = create<AppState>((set, get) => ({
   },
   setNBins(v) {
     set({ nBins: v });
+    // A pinned manual list is tied to the level count: re-spread it evenly
+    // between its current lowest and highest level (strictly increasing —
+    // rounding collisions are bumped apart).
+    const ls = get().levelSettings;
+    if (ls.mode === "manual" && ls.manual.length !== v) {
+      const lo = ls.manual[0];
+      const hi = ls.manual[ls.manual.length - 1];
+      const manual = Array.from({ length: v }, (_, i) =>
+        Math.round(lo + ((hi - lo) * i) / (v - 1))
+      );
+      for (let i = 1; i < manual.length; i++) {
+        manual[i] = Math.max(manual[i], manual[i - 1] + 1);
+      }
+      for (let i = manual.length - 1; i > 0; i--) {
+        manual[i] = Math.min(manual[i], 100 - (manual.length - 1 - i));
+        manual[i - 1] = Math.min(manual[i - 1], manual[i] - 1);
+      }
+      get().updateLevelSettings({ manual });
+    }
     markResultsStale(set, get, "opt");
   },
   setMinMemberMm(v) {
@@ -4003,10 +4063,11 @@ export const useStore = create<AppState>((set, get) => ({
 
   async runCheck() {
     if (!get().model || !session.beginRun()) return;
-    set({ busy: "Voxelizing & checking constraints…", error: null });
+    set({ busy: "Building analysis mesh…", error: null });
     try {
       await pushBcs(get);
       await logGridInfo(set);
+      set({ busy: "Checking constraints…" });
       const report = await engine.check();
       set({ check: report, busy: null });
       const bad = report.components.find((c) => !c.constrained && c.mode);
@@ -4033,13 +4094,13 @@ export const useStore = create<AppState>((set, get) => ({
   async runSolve() {
     if (!get().model || !session.beginRun()) return;
     get().maybeShowSupport();
-    set({ busy: "Solving…", error: null });
-    sceneEvents.onAnimateMode?.(null);
-    let stopResidualPoll = () => {};
     // Build sim ignores structural BCs (its only "loads" are the per-layer
     // eigenstrain + the build plate), so it skips the multi-step path and the
     // under-constraint gate, and isn't retained as a switchable structural result.
     const buildsim = get().appMode === "buildsim";
+    set({ busy: buildsim ? "Build sim — preparing…" : "Preparing solve…", error: null });
+    sceneEvents.onAnimateMode?.(null);
+    let stopResidualPoll = () => {};
     try {
       // Multiple load steps: solve them all (each manages its own residual poll
       // and result stash). Single step falls through to the byte-identical path.
@@ -4051,8 +4112,10 @@ export const useStore = create<AppState>((set, get) => ({
       // engine), so skip pushing BCs and the analysis-grid info/build here —
       // building the fine analysis grid is exactly the cost we're avoiding.
       if (!buildsim) {
+        set({ busy: "Building analysis mesh…" });
         await pushBcs(get);
         await logGridInfo(set);
+        set({ busy: "Checking constraints…" });
       }
       const report = buildsim ? null : await engine.check();
       if (report) set({ check: report });
@@ -4071,6 +4134,7 @@ export const useStore = create<AppState>((set, get) => ({
       }
       // Cache the voxel hull NOW (worker still free) so the Mesh view is
       // viewable during the blocking solve that follows.
+      if (!buildsim) set({ busy: "Preparing mesh view…" });
       await prebuildMeshView(set, get);
       const st0 = get();
       const m = st0.material;
@@ -4081,8 +4145,19 @@ export const useStore = create<AppState>((set, get) => ({
       let displacements: Float32Array;
       // Clear the old curve and stream the new one as the MGCG loop runs (the
       // engine reset its shared buffer when the solve call below was issued).
+      // The residual poll doubles as a liveness ticker: the busy chip counts
+      // the MGCG iterations so a long solve never looks stuck. (Build sim
+      // narrates per layer instead — its residual buffer restarts every layer.)
+      const solveBusy = buildsim ? null : printed ? "Solving as printed" : "Solving";
+      if (solveBusy) set({ busy: `${solveBusy}…` });
       set({ solveResiduals: [] });
-      stopResidualPoll = session.startResidualPoll((r) => set({ solveResiduals: r }));
+      stopResidualPoll = session.startResidualPoll((r) =>
+        set(
+          solveBusy
+            ? { solveResiduals: r, busy: `${solveBusy} — iteration ${r.length}…` }
+            : { solveResiduals: r }
+        )
+      );
       if (!buildsim && printed) {
         appendLog(
           set,
@@ -4163,7 +4238,7 @@ export const useStore = create<AppState>((set, get) => ({
         // so the legend reads exactly ×exag (autoScale·deformScale) and `stats` so
         // the legend even shows (it gates on viewMode==="deformed" && stats).
         set({
-          busy: "Build sim…",
+          busy: "Build sim — building coarse grid…",
           buildProgress: { done: 0, total: 0 },
           deformScale: exag,
           autoScale: 1,
@@ -4195,7 +4270,11 @@ export const useStore = create<AppState>((set, get) => ({
               : {}),
           },
           (p, positions, mags) => {
-            set({ buildProgress: { done: p.done, total: p.total } });
+            set({
+              buildProgress: { done: p.done, total: p.total },
+              // Per-layer narration; the strip shows the same numbers + %.
+              busy: p.total > 0 ? `Build sim — printing layer ${p.done}/${p.total}…` : get().busy,
+            });
             // Throttled frames carry the deformed active voxel hull + |u| — paint
             // it and keep the legend in sync with the running max.
             if (positions && positions.length > 0) {
@@ -4285,7 +4364,10 @@ export const useStore = create<AppState>((set, get) => ({
         solveTol: stats.tol ?? get().solveTol,
         hasResult: true,
         viewMode: "deformed",
-        busy: null,
+        // The tail below (section volume, voxel hull, safety factors, stash)
+        // still runs — keep the chip honest until it's done. Build sim has no
+        // tail work worth narrating.
+        busy: buildsim ? null : "Preparing result views…",
         resultField: "u",
         fieldRange: null,
         legendMin: null,
@@ -4322,6 +4404,7 @@ export const useStore = create<AppState>((set, get) => ({
         // Min safety factors for the dock — both limits, so the dock can say
         // WHICH one governs. Fields are cached: picking them in the viewer
         // afterwards is instant.
+        set({ busy: "Computing safety factors…" });
         const sf = await refreshMinSf(set, get);
         if (sf) {
           appendLog(
@@ -4379,6 +4462,7 @@ export const useStore = create<AppState>((set, get) => ({
           // stash failed — the solve still shows, it just isn't switchable
         }
       }
+      set({ busy: null });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       if (/cancelled/i.test(msg)) {
@@ -4403,7 +4487,7 @@ export const useStore = create<AppState>((set, get) => ({
   async runModal() {
     if (!get().model || !session.beginRun()) return;
     get().maybeShowSupport();
-    set({ busy: "Modal analysis…", error: null });
+    set({ busy: "Building analysis mesh…", error: null });
     sceneEvents.onAnimateMode?.(null);
     let stopResidualPoll = () => {};
     try {
@@ -4423,6 +4507,7 @@ export const useStore = create<AppState>((set, get) => ({
       // gate (an under-constrained part has rigid-body ~0 Hz modes). Free-free
       // deliberately runs WITHOUT supports, so it skips this gate.
       if (!free) {
+        set({ busy: "Checking constraints…" });
         const report = await engine.check();
         set({ check: report });
         if (!report.ok) {
@@ -4437,6 +4522,7 @@ export const useStore = create<AppState>((set, get) => ({
           return;
         }
       }
+      set({ busy: "Preparing mesh view…" });
       await prebuildMeshView(set, get);
       // Remote point masses on the first step add their inertia to the modal
       // mass matrix (DESIGN §16) — call it out so the shifted frequencies are
@@ -4459,8 +4545,9 @@ export const useStore = create<AppState>((set, get) => ({
           " …"
       );
       // Live MGCG convergence trace (the nerd convergence plot) while the many
-      // inner solves run.
-      set({ solveResiduals: [] });
+      // inner solves run. The first outer iteration carries the eigensolver
+      // setup + a cold solve, so name it before the per-iteration ticker starts.
+      set({ busy: "Modal — setting up eigensolver…", solveResiduals: [] });
       stopResidualPoll = session.startResidualPoll((r) => set({ solveResiduals: r }));
       const out = await engine.modalAnalysis(
         {
@@ -4670,8 +4757,13 @@ export const useStore = create<AppState>((set, get) => ({
     const st = get();
     if (!st.model || !session.beginRun()) return;
     get().maybeShowSupport();
+    // Base label for the live iteration ticker; the pipeline's phase pushes
+    // (assembly, verification, baselines, regions…) overwrite `busy` between
+    // and after the iterations so the chip never freezes on one message.
+    const solid = st.optMode === "solid";
+    const actLabel = solid ? "Optimizing shape" : "Optimizing infill";
     set({
-      busy: st.optMode === "solid" ? "Optimizing shape…" : "Optimizing infill…",
+      busy: `${actLabel} — preparing…`,
       error: null,
       optProgress: null,
       optSummary: null,
@@ -4726,12 +4818,14 @@ export const useStore = create<AppState>((set, get) => ({
             "iteration (DESIGN §16); the comparison shows each design carrying its own true weight."
         );
       }
+      set({ busy: "Building analysis mesh…" });
       await logGridInfo(set);
       // Cache the voxel hull NOW (worker still free) so the Mesh view is
       // viewable during the blocking optimization that follows.
+      set({ busy: "Preparing mesh view…" });
       await prebuildMeshView(set, get);
+      set({ busy: `${actLabel} — starting…` });
       const curve = st.curves[st.pattern];
-      const solid = st.optMode === "solid";
       const binary = st.optMode === "binary";
       const match = st.goal === "match" && !solid;
       const ls = st.levelSettings;
@@ -4783,7 +4877,19 @@ export const useStore = create<AppState>((set, get) => ({
           minMemberMm: st.minMemberMm ?? 2 * st.lineWidth,
         },
         (p, density, skelPositions, skelIndices, skelDensity) => {
+          // Buffer-less phase push: narrate the silent pipeline stage and bail —
+          // there is no iteration payload to chart or preview.
+          if ("phase" in p) {
+            const txt = optPhaseText(p, solid);
+            set({ busy: txt });
+            appendLog(set, `  ${txt.replace(/…$/, "")}`);
+            return;
+          }
           set((s) => ({
+            busy:
+              `${actLabel} — iteration ${p.iteration}` +
+              (p.passes > 1 ? ` (pass ${p.pass}/${p.passes})` : "") +
+              "…",
             optProgress: {
               iteration: p.iteration,
               maxIter: p.maxIter,
@@ -4825,7 +4931,7 @@ export const useStore = create<AppState>((set, get) => ({
             set({ viewMode: "density" });
             sceneEvents.onViewState?.("density", get().deformScale);
           }
-          sceneEvents.onVertexDensity?.(density);
+          sceneEvents.onVertexDensity?.(density ?? null);
           // Watch the optimized shape gain detail iteration by iteration.
           sceneEvents.onOptShape?.(skelPositions ?? null, skelIndices ?? null, skelDensity ?? null);
         }

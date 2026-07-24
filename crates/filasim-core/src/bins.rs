@@ -7,8 +7,10 @@
 //!   E(ρ) makes dense infill more efficient per gram, so load levels land
 //!   high — measured +15.2% vs uniform on the cantilever fixture, vs +13.9%
 //!   for plain density-space k-means),
-//! - assignment: anchored at the optimizer's per-cell choice, with a
-//!   bisected mass multiplier so the binned design still meets the budget,
+//! - assignment: rounding the smooth density field to the bracketing levels
+//!   at a shared threshold slid until the budget is met — regions are level
+//!   sets of the filtered field, so they inherit its smoothness and never
+//!   densify unloaded regions,
 //! - regions are NESTED indicators (bin >= k) so exported modifiers overlap
 //!   and the slicer's modifier order (low -> high density) resolves them,
 //! - isosurfacing via marching tetrahedra on a node lattice with a void
@@ -192,75 +194,315 @@ fn weighted_kmeans_1d(v: &[f64], w: &[f64], k: usize) -> Vec<f64> {
     centers
 }
 
-/// Assign each cell to a level under a mass constraint, ANCHORED at the
-/// optimizer's own choice: per cell minimize
-///   w_c · (E(l) − E(x_c))² + λ · (l − x_c)
-/// in relative-stiffness space, with the multiplier λ bisected until the
-/// mean assigned density meets `target_mean`. At λ = 0 this is plain
-/// nearest-stiffness quantization — the continuous field already encodes
-/// the optimal mass distribution (at an OC optimum all marginal values are
-/// equal, so re-ranking cells by frozen-u sensitivity only adds noise) —
-/// and λ repairs the quantization mass drift by moving the cells with the
-/// least strain energy first (w_c = se_c + ε keeps dead cells cheap to move
-/// but still anchored).
+/// Blur passes that give the repeated 7-point cell blur roughly the same
+/// standard deviation as the optimizer's conic density filter of radius `r`
+/// cells (conic std ≈ r/√10, one blur pass adds 0.25 cell² of variance per
+/// axis), so the binning repair decides at the SAME length scale that the
+/// minimum member size enforces on the density field.
+pub fn smooth_passes_for_radius(r_cells: f64) -> usize {
+    ((0.4 * r_cells * r_cells).ceil() as usize).max(1)
+}
+
+/// Masked repeated 7-point blur of a per-design-cell field. Normalized by the
+/// blurred design-cell indicator so values don't bleed toward zero at the
+/// skin/void boundary (members often hug the skin).
+///
+/// The binning step runs on BLURRED strain energy: raw per-cell energy has
+/// salt-and-pepper fine structure, which would speckle the idle-cell gate
+/// boundary and jitter the level-placement weights. Blurring at the density
+/// filter's radius keeps every energy-derived decision at the same length
+/// scale the minimum member size enforces on the density field.
+pub fn smooth_design_field(
+    grid: &VoxelGrid,
+    design_cells: &[u32],
+    f: &[f64],
+    passes: usize,
+) -> Vec<f64> {
+    if passes == 0 || design_cells.is_empty() {
+        return f.to_vec();
+    }
+    let n = grid.cell_count();
+    let mut val = vec![0f64; n];
+    let mut wgt = vec![0f64; n];
+    for (&c, &v) in design_cells.iter().zip(f) {
+        val[c as usize] = v;
+        wgt[c as usize] = 1.0;
+    }
+    for _ in 0..passes {
+        val = blur_cells_f64(grid, &val);
+        wgt = blur_cells_f64(grid, &wgt);
+    }
+    design_cells
+        .iter()
+        .zip(f)
+        .map(|(&c, &raw)| {
+            let w = wgt[c as usize];
+            if w > 1e-12 {
+                val[c as usize] / w
+            } else {
+                raw
+            }
+        })
+        .collect()
+}
+
+/// [`blur_cells`] for f64 fields (center 2, face neighbors 1, /8; outside = 0).
+fn blur_cells_f64(grid: &VoxelGrid, f: &[f64]) -> Vec<f64> {
+    let (nx, ny, nz) = (grid.nx, grid.ny, grid.nz);
+    let mut out = vec![0f64; f.len()];
+    for cz in 0..nz {
+        for cy in 0..ny {
+            for cx in 0..nx {
+                let ci = (cz * ny + cy) * nx + cx;
+                let mut acc = 2.0 * f[ci];
+                if cx > 0 {
+                    acc += f[ci - 1];
+                }
+                if cx + 1 < nx {
+                    acc += f[ci + 1];
+                }
+                if cy > 0 {
+                    acc += f[ci - nx];
+                }
+                if cy + 1 < ny {
+                    acc += f[ci + nx];
+                }
+                if cz > 0 {
+                    acc += f[ci - nx * ny];
+                }
+                if cz + 1 < nz {
+                    acc += f[ci + nx * ny];
+                }
+                out[ci] = acc / 8.0;
+            }
+        }
+    }
+    out
+}
+
+/// Assign each cell to a level under a mass constraint, by ROUNDING the
+/// smooth density field at a shared threshold.
+///
+/// Every cell is restricted to the two levels bracketing its continuous
+/// density. All cells start at round-down; cells are then promoted in
+/// descending FRACTIONAL POSITION within their bracket until the mean meets
+/// `target_mean`. Promoting by fractional position is exactly a single
+/// rounding threshold slid across the (filtered, smooth) density field, so
+/// the binned regions are LEVEL SETS of that field — the same contours the
+/// density preview shows, with no per-cell speckle possible by construction.
+/// Earlier repair variants made per-cell decisions (λ-priced with a
+/// strain-energy anchor, then greedy by frozen-u benefit-per-gram) and every
+/// one of them drew a noisy promotion boundary: dense blobs in unloaded
+/// regions at worst, member-size-violating wisps at best.
+///
+/// Structurally IDLE cells (strain energy under 1% of the mean) are pinned to
+/// their round-down level outright as a backstop: idle cells can sit a hair
+/// above the floor (unconverged tails, filter bleed near the skin), and
+/// zero benefit at nonzero mass never deserves a promotion.
+///
+/// `_exponent`/`_coeff` are kept for API stability; the stiffness law no
+/// longer affects the assignment (the threshold absorbs any systematic
+/// rounding bias, which was the law's only role here).
 pub fn assign_bins_mass(
     x: &[f64],
     se: &[f64],
     levels: &[f64],
-    exponent: f64,
-    coeff: f64,
+    _exponent: f64,
+    _coeff: f64,
     target_mean: f64,
 ) -> Vec<u8> {
     assert_eq!(x.len(), se.len());
     if levels.len() <= 1 {
         return vec![0u8; x.len()];
     }
-    let rel: Vec<f64> = levels.iter().map(|&l| coeff * l.powf(exponent)).collect();
-    let ex: Vec<f64> = x.iter().map(|&xi| coeff * xi.powf(exponent)).collect();
     let mean_se = se.iter().map(|s| s.max(0.0)).sum::<f64>() / se.len().max(1) as f64;
-    let anchor = (0.01 * mean_se).max(1e-300);
-    let w: Vec<f64> = se.iter().map(|s| s.max(0.0) + anchor).collect();
-    let assign_for = |lambda: f64| -> Vec<u8> {
-        (0..x.len())
-            .map(|i| {
-                let mut best = 0u8;
-                let mut bs = f64::INFINITY;
-                for (c, (&l, &r)) in levels.iter().zip(&rel).enumerate() {
-                    let de = r - ex[i];
-                    let s = w[i] * de * de + lambda * (l - x[i]);
-                    if s < bs {
-                        bs = s;
-                        best = c as u8;
-                    }
-                }
-                best
-            })
-            .collect()
-    };
-    let mean_of = |bins: &[u8]| -> f64 {
-        bins.iter().map(|&b| levels[b as usize]).sum::<f64>() / bins.len().max(1) as f64
-    };
-    let mut bins = assign_for(0.0);
-    if (mean_of(&bins) - target_mean).abs() <= 0.002 {
-        return bins;
-    }
-    // Mean density is monotone decreasing in λ; saturate both ends.
-    let bound = 1e4 * w.iter().cloned().fold(0.0, f64::max).max(1e-300);
-    let (mut lo, mut hi) = (-bound, bound);
-    for _ in 0..80 {
-        let lambda = 0.5 * (lo + hi);
-        bins = assign_for(lambda);
-        let m = mean_of(&bins);
-        if (m - target_mean).abs() <= 0.002 {
+    let idle = (0.01 * mean_se).max(1e-300);
+    // Per-cell candidate pair (lo, hi): nearest level at or below x_i and
+    // nearest at or above (saturating at the ends of the level list); idle
+    // cells collapse to round-down only.
+    let bracket: Vec<(usize, usize)> = x
+        .iter()
+        .zip(se)
+        .map(|(&xi, &si)| {
+            let lo = levels.iter().rposition(|&l| l <= xi + 1e-9).unwrap_or(0);
+            let hi = if si.max(0.0) < idle {
+                lo
+            } else {
+                levels
+                    .iter()
+                    .position(|&l| l >= xi - 1e-9)
+                    .unwrap_or(levels.len() - 1)
+            };
+            (lo.min(hi), hi.max(lo))
+        })
+        .collect();
+    let mut bins: Vec<u8> = bracket.iter().map(|&(lo, _)| lo as u8).collect();
+    let n = x.len().max(1) as f64;
+    // Round-down mean ≤ mean(x) pointwise, so the repair only ever ADDS mass.
+    let mut mean = bins.iter().map(|&b| levels[b as usize]).sum::<f64>() / n;
+    let mut cand: Vec<(f64, u32)> = (0..x.len())
+        .filter(|&i| bracket[i].1 > bracket[i].0)
+        .map(|i| {
+            let (lo, hi) = bracket[i];
+            let frac = (x[i] - levels[lo]) / (levels[hi] - levels[lo]).max(1e-9);
+            (frac, i as u32)
+        })
+        .collect();
+    cand.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    for &(_, i) in &cand {
+        if mean >= target_mean {
             break;
         }
-        if m > target_mean {
-            lo = lambda; // too heavy: raise the price of mass
-        } else {
-            hi = lambda;
-        }
+        let i = i as usize;
+        let (lo, hi) = bracket[i];
+        mean += (levels[hi] - levels[lo]) / n;
+        bins[i] = hi as u8;
     }
     bins
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mass repair must never promote structurally dead floor cells: when
+    /// nearest-stiffness snapping loses mass (λ < 0), the shortfall has to be
+    /// bought back inside the transition band, not from unloaded regions
+    /// (whose near-zero anchor made them the cheapest cells to promote).
+    #[test]
+    fn mass_repair_keeps_dead_floor_cells_at_the_floor() {
+        let levels = [0.1, 0.5, 1.0];
+        let mut x = Vec::new();
+        let mut se = Vec::new();
+        // Dead appendage: exactly at the floor, (almost) no strain energy —
+        // the tiny ramp mirrors real fields and lets a subset promote first.
+        for i in 0..400 {
+            x.push(0.1);
+            se.push(1e-9 * i as f64);
+        }
+        // Loaded members at the cap.
+        for _ in 0..300 {
+            x.push(1.0);
+            se.push(1.0);
+        }
+        // Transition band at 0.55: stiffness-nearest snaps DOWN to 0.5
+        // (E(0.55) is closer to E(0.5) than to E(1.0)), so the λ = 0 mean
+        // undershoots the target and the repair must ADD mass. The se ramp
+        // spreads the promotion thresholds so the bisection can dose it.
+        for i in 0..300 {
+            x.push(0.55);
+            se.push(0.2 + 0.002 * i as f64);
+        }
+        let target = x.iter().sum::<f64>() / x.len() as f64;
+        let bins = assign_bins_mass(&x, &se, &levels, 1.5, 1.0, target);
+        for (i, &b) in bins.iter().take(400).enumerate() {
+            assert_eq!(b, 0, "dead floor cell {i} promoted to level {b}");
+        }
+        // The repair still lands the mass, via the transition band.
+        let mean = bins.iter().map(|&b| levels[b as usize]).sum::<f64>() / bins.len() as f64;
+        assert!(
+            (mean - target).abs() < 0.01,
+            "binned mean {mean:.3} should track target {target:.3}"
+        );
+        assert!(
+            bins[700..].iter().any(|&b| b == 2),
+            "some transition cells should round up to carry the repaired mass"
+        );
+    }
+
+    /// Same, one level deeper: idle cells sitting a HAIR above the floor
+    /// (unconverged tails, filter bleed near the skin of unloaded regions)
+    /// bracket to {floor, next level} — the repair must not round them up
+    /// either, or a thin dense shell appears on the deadest part of the model.
+    #[test]
+    fn mass_repair_never_promotes_idle_cells_above_the_floor() {
+        let levels = [0.1, 0.5, 1.0];
+        let mut x = Vec::new();
+        let mut se = Vec::new();
+        // Idle shell: slightly above the floor, essentially no strain energy.
+        for i in 0..400 {
+            x.push(0.11 + 1e-4 * (i % 7) as f64);
+            se.push(1e-9 * i as f64);
+        }
+        // Loaded members at the cap + a transition band that snaps down.
+        for _ in 0..300 {
+            x.push(1.0);
+            se.push(1.0);
+        }
+        for i in 0..300 {
+            x.push(0.55);
+            se.push(0.2 + 0.002 * i as f64);
+        }
+        let target = x.iter().sum::<f64>() / x.len() as f64;
+        let bins = assign_bins_mass(&x, &se, &levels, 1.5, 1.0, target);
+        for (i, &b) in bins.iter().take(400).enumerate() {
+            assert_eq!(b, 0, "idle near-floor cell {i} promoted to level {b}");
+        }
+        let mean = bins.iter().map(|&b| levels[b as usize]).sum::<f64>() / bins.len() as f64;
+        assert!(
+            (mean - target).abs() < 0.01,
+            "binned mean {mean:.3} should track target {target:.3}"
+        );
+    }
+
+    /// BARELY-loaded halo cells (above the idle threshold — filter bleed
+    /// around members and appendage roots, worse at large filter radii) sit
+    /// low in their bracket, so the sliding threshold reaches on-path
+    /// transition cells long before them: the repaired mass must land in the
+    /// members, not the halo.
+    #[test]
+    fn mass_repair_prefers_loaded_cells_over_barely_loaded_halo() {
+        let levels = [0.1, 0.5, 1.0];
+        let mut x = Vec::new();
+        let mut se = Vec::new();
+        // Halo at an appendage root: just above floor, ~5% of mean energy —
+        // enough to clear any idle gate, far below the load path.
+        for i in 0..400 {
+            x.push(0.13);
+            se.push(0.02 + 1e-5 * (i % 11) as f64);
+        }
+        // Loaded members at the cap.
+        for _ in 0..300 {
+            x.push(1.0);
+            se.push(1.0);
+        }
+        // On-path transition band, snapped down at first assignment, with
+        // ample capacity to carry the whole repair.
+        for i in 0..300 {
+            x.push(0.3);
+            se.push(0.6 + 0.002 * i as f64);
+        }
+        let target = x.iter().sum::<f64>() / x.len() as f64;
+        let bins = assign_bins_mass(&x, &se, &levels, 1.5, 1.0, target);
+        for (i, &b) in bins.iter().take(400).enumerate() {
+            assert_eq!(b, 0, "halo cell {i} promoted to level {b}");
+        }
+        let mean = bins.iter().map(|&b| levels[b as usize]).sum::<f64>() / bins.len() as f64;
+        assert!(
+            (mean - target).abs() < 0.01,
+            "binned mean {mean:.3} should track target {target:.3}"
+        );
+        assert!(
+            bins[700..].iter().any(|&b| b > 0),
+            "the on-path band should carry the repaired mass"
+        );
+    }
+
+    /// Rounding bracket: a cell may only take the level directly below or
+    /// above its continuous density, saturating outside the level range.
+    #[test]
+    fn assignment_is_bracketed_to_adjacent_levels() {
+        let levels = [0.2, 0.5, 0.9];
+        let x = [0.05, 0.2, 0.35, 0.7, 0.95];
+        let se = [1.0; 5];
+        let target = x.iter().sum::<f64>() / x.len() as f64;
+        let bins = assign_bins_mass(&x, &se, &levels, 1.5, 1.0, target);
+        assert_eq!(bins[0], 0, "below all levels saturates at the bottom level");
+        assert_eq!(bins[1], 0, "exact hit stays put");
+        assert!(bins[2] <= 1, "0.35 may only take 0.2 or 0.5");
+        assert!((1..=2).contains(&bins[3]), "0.7 may only take 0.5 or 0.9");
+        assert_eq!(bins[4], 2, "above all levels saturates at the top level");
+    }
 }
 
 /// Assign each value to the nearest center; returns bin index per value.

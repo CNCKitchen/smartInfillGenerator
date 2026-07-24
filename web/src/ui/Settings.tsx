@@ -311,9 +311,9 @@ export function SettingsModal() {
 
         <h3>Density levels</h3>
         <div className="dim small">
-          The printable band and how the discrete levels are chosen. Floor = "just so it prints"
-          (also the budget slider's minimum); pin the levels manually to match densities you have
-          calibration data for.
+          The printable band the discrete levels are chosen from. Floor = "just so it prints"
+          (also the budget slider's minimum). The levels themselves — auto placement or a pinned
+          comma-separated list — are set on the Optimize step next to the level count.
         </div>
         <div className="row">
           <label className="row">
@@ -351,21 +351,6 @@ export function SettingsModal() {
             />
             <span className="dim">%</span>
           </label>
-        </div>
-        <div className="row">
-          <label className="row">
-            <span>Placement</span>
-            <select
-              value={s.levelSettings.mode}
-              onChange={(e) =>
-                s.updateLevelSettings({ mode: e.target.value as "auto" | "manual" })
-              }
-            >
-              <option value="auto">Auto (from the optimized field)</option>
-              <option value="manual">Manual list</option>
-            </select>
-          </label>
-          {s.levelSettings.mode === "manual" && <ManualLevelsInput />}
         </div>
         <div className="hint">
           Auto pins the bottom level at the floor and places the load-bearing levels high (dense
@@ -483,41 +468,3 @@ function OptNumInput({
   );
 }
 
-/** Comma-separated manual level list, parsed/validated on commit. */
-function ManualLevelsInput() {
-  const s = useStore(
-    useShallow((s) => ({
-      levelSettings: s.levelSettings,
-      updateLevelSettings: s.updateLevelSettings,
-    }))
-  );
-  const [text, setText] = useState(s.levelSettings.manual.join(", "));
-  useEffect(() => {
-    setText(s.levelSettings.manual.join(", "));
-  }, [s.levelSettings.manual]);
-  const commit = () => {
-    const vals = text
-      .split(/[,;\s]+/)
-      .map(Number)
-      .filter((v) => Number.isFinite(v) && v >= 1 && v <= 100)
-      .map(Math.round);
-    const uniq = [...new Set(vals)].sort((a, b) => a - b);
-    if (uniq.length >= 2) s.updateLevelSettings({ manual: uniq });
-    else setText(s.levelSettings.manual.join(", "));
-  };
-  return (
-    <label className="row" style={{ flex: 1 }}>
-      <span>Levels %</span>
-      <input
-        type="text"
-        value={text}
-        placeholder="10, 40, 70"
-        onChange={(e) => setText(e.target.value)}
-        onBlur={commit}
-        onKeyDown={(e) => {
-          if (e.key === "Enter") (e.target as HTMLInputElement).blur();
-        }}
-      />
-    </label>
-  );
-}

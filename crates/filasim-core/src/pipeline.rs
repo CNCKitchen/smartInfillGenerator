@@ -18,7 +18,8 @@
 
 use crate::bins::{
     assign_bins_mass, cleanup_small_regions, cluster_levels, constrained_smooth,
-    extract_region_smooth, taubin_smooth, RegionMesh,
+    extract_region_smooth, smooth_design_field, smooth_passes_for_radius, taubin_smooth,
+    RegionMesh,
 };
 use crate::eps::build_eps;
 use crate::simp::{
@@ -82,6 +83,33 @@ pub struct IterUpdate<'a> {
     pub budget: f64,
 }
 
+/// Coarse pipeline stage, reported through the `status` callback so a UI can
+/// say what the engine is doing during the long stretches that emit no
+/// per-iteration progress (the post-optimization verification, baseline solves
+/// and region extraction otherwise look like a hang).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PipelinePhase {
+    /// Tight uniform solve that sets the goal-match stiffness target.
+    ReferenceSolve,
+    /// A SIMP optimization pass is about to start (its first iteration carries
+    /// a full cold/warm solve, so this fires well before the first progress).
+    OptimizePass { pass: usize, passes: usize },
+    /// Clustering the continuous densities into printable levels.
+    Binning,
+    /// Verification solve of the binned design.
+    VerifySolve,
+    /// Equal-mass uniform baseline solve (comparison card / Results roster).
+    UniformSolve,
+    /// Fully-solid baseline solve.
+    SolidSolve,
+    /// Stress-recovery fields for the roster results.
+    StressRecovery,
+    /// Watertight region extraction (marching tets per level).
+    Regions,
+    /// Region surface smoothing.
+    Smoothing,
+}
+
 /// Everything the front end needs after a run: the binned design, the
 /// verification + reference compliances, the deformed field, watertight
 /// regions, and the volume components for mass (the caller multiplies by
@@ -141,7 +169,8 @@ pub struct OptOutcome {
 /// Run the optimization + binning + verification + reference solves + region
 /// extraction. `progress` is called once per inner SIMP iteration with the
 /// solver progress and the current secant pass; the caller marshals it (e.g.
-/// to a JS callback / live preview).
+/// to a JS callback / live preview). `status` is called once at every stage
+/// boundary so the UI can narrate the otherwise-silent stretches.
 #[allow(clippy::too_many_arguments)]
 pub fn run_optimization(
     slot: &mut Option<SolverCache>,
@@ -153,6 +182,7 @@ pub fn run_optimization(
     cfg: &PipelineCfg,
     loads: &LoadSet,
     mut progress: impl FnMut(&IterUpdate, &[f64], &[u32]),
+    mut status: impl FnMut(PipelinePhase),
 ) -> Result<OptOutcome, OptimizeError> {
     let solid = params.solid_mode;
     let (eval_exp, eval_coeff) = (cfg.eval.exp, cfg.eval.coeff);
@@ -164,6 +194,7 @@ pub fn run_optimization(
     let max_passes = if cfg.goal_match { MAX_MATCH_PASSES } else { 1 };
     let mut c_target = 0.0f64;
     if cfg.goal_match {
+        status(PipelinePhase::ReferenceSolve);
         let split = classify_cells(
             grid,
             params.wall_mm,
@@ -200,6 +231,7 @@ pub fn run_optimization(
         let params_k = OptimizeParams { budget: budget_k, ..*params };
         let pass = pass_no;
         let budget = budget_k;
+        status(PipelinePhase::OptimizePass { pass, passes: max_passes });
         let result = optimize_cached(
             slot,
             grid,
@@ -222,23 +254,37 @@ pub fn run_optimization(
         // floating islands (not connected to a frozen load/support cell) dropped.
         // Infill modes: floor-pinned, strain-energy-weighted level placement
         // (or the manual override) + a mass-true bin assignment.
+        status(PipelinePhase::Binning);
         let (centers, bins): (Vec<f64>, Vec<u8>) = if solid {
             (
                 vec![0.0, 1.0],
                 solid_keep_bins(grid, &result.skin_cells, &result.design_cells, &result.x, 0.5),
             )
         } else {
+            // Strain energy smoothed at the density-filter radius: level
+            // placement and the idle-cell gate then carry the same length
+            // scale as the minimum member size, free of per-cell speckle.
+            let r_cells = crate::simp::filter_radius_cells(params.min_member_mm, grid.h);
+            let se_s = smooth_design_field(
+                grid,
+                &result.design_cells,
+                &result.se,
+                smooth_passes_for_radius(r_cells),
+            );
             let centers: Vec<f64> = match cfg.levels_pct {
                 Some(user) if !user.is_empty() => user.to_vec(),
                 _ => cluster_levels(
-                    &result.x, &result.se, cfg.n_bins, eval_exp, eval_coeff, params.floor,
-                    params.cap,
+                    &result.x, &se_s, cfg.n_bins, eval_exp, eval_coeff, params.floor, params.cap,
                 ),
             };
             let target_mean = result.x.iter().sum::<f64>() / result.x.len().max(1) as f64;
             let mut bins =
-                assign_bins_mass(&result.x, &result.se, &centers, eval_exp, eval_coeff, target_mean);
-            let min_cells = (result.design_cells.len() / 500).max(30);
+                assign_bins_mass(&result.x, &se_s, &centers, eval_exp, eval_coeff, target_mean);
+            // Cleanup floor: whichever is larger of the relative-size floor and
+            // the volume of the smallest legitimate member (sphere of diameter
+            // 2r, ≈ 4.2·r³ cells) — regions under the member size can't print.
+            let member_cells = (4.2 * r_cells.powi(3)).ceil() as usize;
+            let min_cells = (result.design_cells.len() / 500).max(30).max(member_cells);
             cleanup_small_regions(grid, &result.design_cells, &mut bins, centers.len(), min_cells);
             (centers, bins)
         };
@@ -246,6 +292,7 @@ pub fn run_optimization(
 
         // Verification solve of the binned design (calibrated law), warm-started
         // from the optimizer's displacement; real convergence stats kept.
+        status(PipelinePhase::VerifySolve);
         let (c_b, _maxd, u_b, stats_b) = evaluate_cached_stats(
             slot, grid, levels, problem, settings, &result.skin_cells, &result.design_cells,
             &result.skin_frac, &x_binned, eval_exp, eval_coeff, loads,
@@ -309,6 +356,7 @@ pub fn run_optimization(
     // the comparison card and compliance converges faster than the residual.
     // (The cache doesn't key on tol, so warm starts survive.)
     let ref_settings = SolveSettings { tol: settings.tol.max(5e-4), ..*settings };
+    status(PipelinePhase::UniformSolve);
     let x_uniform = vec![mean_binned; x_binned.len()];
     // KEEP the reference solves' displacement fields (they used to be dropped):
     // the equal-mass uniform and fully-solid baselines are surfaced as
@@ -322,6 +370,7 @@ pub fn run_optimization(
         grid, &result.skin_cells, &result.design_cells, &result.skin_frac, &x_uniform, eval_exp,
         eval_coeff,
     );
+    status(PipelinePhase::SolidSolve);
     let x_solid = vec![1.0; x_binned.len()];
     let (c_solid, max_disp_solid, u_solid) = evaluate_cached(
         slot, grid, levels, problem, &ref_settings, &result.skin_cells, &result.design_cells,
@@ -333,6 +382,7 @@ pub fn run_optimization(
     );
 
     // ---- deformed field + stress eps ----
+    status(PipelinePhase::StressRecovery);
     let max_disp = (0..u_binned.len() / 3)
         .map(|n| {
             u_binned[3 * n] * u_binned[3 * n]
@@ -347,6 +397,7 @@ pub fn run_optimization(
     );
 
     // ---- regions (bins above base) ----
+    status(PipelinePhase::Regions);
     let mut bin_of_cell: std::collections::HashMap<u32, u8> = Default::default();
     for (i, &c) in result.design_cells.iter().enumerate() {
         bin_of_cell.insert(c, bins[i]);
@@ -368,6 +419,7 @@ pub fn run_optimization(
         r.density = centers[level];
         regions_raw.push(r);
     }
+    status(PipelinePhase::Smoothing);
     let regions = smooth_regions(&regions_raw, cfg.smooth_iters, grid.h);
 
     Ok(OptOutcome {
@@ -574,6 +626,7 @@ mod tests {
         let oc = run_optimization(
             &mut None, &grid, levels, &asm.problem, &settings, &params, &cfg, &LoadSet::default(),
             |_, _, _| {},
+            |_| {},
         )
         .expect("pipeline");
 
@@ -634,6 +687,7 @@ mod tests {
             run_optimization(
                 &mut None, &grid, levels, &asm_z.problem, &settings, &params, &cfg, loads,
                 |_, _, _| {},
+                |_| {},
             )
             .expect("pipeline")
         };

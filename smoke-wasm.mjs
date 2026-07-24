@@ -482,6 +482,7 @@ let lastDensityLen = 0;
 let skelTris = 0;
 let skelColored = false;
 let progressTelemetryOk = false;
+const phasesSeen = new Set();
 const t1 = performance.now();
 const summary = JSON.parse(
   // 35% infill budget (mean interior density); gyroid law E = 1.0*E0*rho^1.5;
@@ -491,11 +492,14 @@ const summary = JSON.parse(
     smoothIters: 8, nBins: 3, floorPct: 10, capPct: 70, levelsPct: null,
     binary: false, solidPattern: null, goal: "budget",
   }), (json, density, skelPos, skelIdx, skelDen) => {
+    const p = JSON.parse(json);
+    // Buffer-less {phase: ...} pushes narrate the silent pipeline stages
+    // (verification, baselines, regions) for the UI busy chip.
+    if (p.phase) { phasesSeen.add(p.phase); return; }
     progressCalls++;
     lastDensityLen = density.length;
     if (skelIdx && skelIdx.length) skelTris = skelIdx.length / 3;
     if (skelPos && skelDen && skelDen.length * 3 === skelPos.length) skelColored = true;
-    const p = JSON.parse(json);
     // Nerd-log telemetry: every iteration reports the inner solve + infill.
     if (p.meanInfill > 0 && p.meanInfill < 1 && Number.isFinite(p.innerRes) && p.innerIters >= 0)
       progressTelemetryOk = true;
@@ -512,6 +516,9 @@ console.log(
     `vs uniform +${(summary.gainVsUniform * 100).toFixed(1)}%, bins ${summary.bins.map((b) => b.density).join("/")}`
 );
 assert(progressCalls >= 5, `progress callback fired (${progressCalls}x)`);
+// The pipeline narrates every silent stage so the UI never looks hung.
+for (const ph of ["assemble", "optimize_pass", "binning", "verify", "uniform", "solid_ref", "regions", "smoothing", "finalize"])
+  assert(phasesSeen.has(ph), `phase push "${ph}" narrated`);
 assert(lastDensityLen === optTri * 3, "live vertex density (1 scalar per soup vertex)");
 assert(typeof summary.converged === "boolean", "summary reports convergence");
 assert(progressTelemetryOk, "progress carries meanInfill + inner-solve telemetry");
@@ -697,6 +704,7 @@ const matchSummary = JSON.parse(
     binary: false, solidPattern: null, goal: "match",
   }), (json) => {
     const p = JSON.parse(json);
+    if (p.phase) return; // phase narration — pass counting reads iteration pushes
     maxPassSeen = Math.max(maxPassSeen, p.pass);
   })
 );

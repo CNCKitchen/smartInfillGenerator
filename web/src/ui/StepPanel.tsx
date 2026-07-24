@@ -1938,6 +1938,69 @@ function StepBuildSim() {
 
 // ---------------- 5 · Optimize infill ----------------
 
+/** Inline density-level list next to the count selector. Empty = auto
+ *  placement (levels picked from the optimized field); a comma-separated
+ *  list (e.g. "10, 40, 70") pins them manually and syncs the count
+ *  selector. Changing the count re-spreads a pinned list; clearing the
+ *  box returns to auto. */
+function LevelsInline() {
+  const s = useStore(
+    useShallow((s) => ({
+      levelSettings: s.levelSettings,
+      updateLevelSettings: s.updateLevelSettings,
+      nBins: s.nBins,
+      setNBins: s.setNBins,
+      optSummary: s.optSummary,
+    }))
+  );
+  const manual = s.levelSettings.mode === "manual";
+  const shown = manual ? s.levelSettings.manual.join(", ") : "";
+  // Auto mode: once a result exists, surface the levels auto placement chose —
+  // ready to copy/tweak into a pinned list.
+  const sum = s.optSummary;
+  const placeholder =
+    !manual && sum && !sum.solid && !sum.binary && sum.bins.length
+      ? `auto: ${sum.bins.map((b) => Math.round(b.density * 100)).join(", ")}`
+      : "auto";
+  const [text, setText] = useState(shown);
+  useEffect(() => {
+    setText(shown);
+  }, [shown]);
+  const commit = () => {
+    if (text.trim() === "") {
+      if (manual) s.updateLevelSettings({ mode: "auto" });
+      else setText(shown);
+      return;
+    }
+    const vals = text
+      .split(/[,;\s]+/)
+      .map(Number)
+      .filter((v) => Number.isFinite(v) && v >= 1 && v <= 100)
+      .map(Math.round);
+    const uniq = [...new Set(vals)].sort((a, b) => a - b);
+    if (uniq.length >= 2 && uniq.length <= 8) {
+      s.updateLevelSettings({ mode: "manual", manual: uniq });
+      if (uniq.length !== s.nBins) s.setNBins(uniq.length);
+    } else {
+      setText(shown);
+    }
+  };
+  return (
+    <input
+      type="text"
+      value={text}
+      size={11}
+      placeholder={placeholder}
+      title="Density levels in % — a comma-separated list (e.g. 10, 40, 70) pins them; empty = auto placement from the optimized field"
+      onChange={(e) => setText(e.target.value)}
+      onBlur={commit}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+      }}
+    />
+  );
+}
+
 function StepOptimize() {
   const s = useStore(
     useShallow((s) => ({
@@ -2150,10 +2213,6 @@ function StepOptimize() {
           </div>
           {s.optMode === "binary" ? (
             <span className="dim small">2 levels (hollow/solid)</span>
-          ) : s.levelSettings.mode === "manual" ? (
-            <span className="dim small" title="Manual levels — change in ⚙ Settings">
-              levels {s.levelSettings.manual.join("/")}%
-            </span>
           ) : (
             <label className="row">
               <span className="dim small">Levels</span>
@@ -2161,7 +2220,9 @@ function StepOptimize() {
                 <option value={2}>2</option>
                 <option value={3}>3</option>
                 <option value={4}>4</option>
+                {s.nBins > 4 && <option value={s.nBins}>{s.nBins}</option>}
               </select>
+              <LevelsInline />
             </label>
           )}
         </div>
@@ -2500,6 +2561,8 @@ function StepExport() {
             and their infill densities already set (base infill{" "}
             {Math.round(s.optSummary.baseDensity * 100)}% on the object). Only densities are
             overridden — walls, shells, and everything else come from your own profiles.
+            {!s.optSummary.binary &&
+              " A level pinned at 100% also gets rectilinear infill on its region, so it slices truly solid."}
           </div>
         </>
       )}

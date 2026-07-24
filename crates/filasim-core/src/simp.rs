@@ -575,8 +575,10 @@ const MAX_FILTER_RADIUS_CELLS: f64 = 8.0;
 /// narrower than roughly its diameter `2r`, so `r = min_member / 2`, then to
 /// cells via the voxel size `h`, clamped to `[MIN, MAX]`. Expressing the length
 /// scale in mm (not cells) makes it mesh-independent: refining the mesh no
-/// longer shrinks the protected feature size.
-fn filter_radius_cells(min_member_mm: f64, h: f64) -> f64 {
+/// longer shrinks the protected feature size. Public because the binning
+/// repair smooths its ordering field at the same length scale (see
+/// `bins::smooth_design_field`).
+pub fn filter_radius_cells(min_member_mm: f64, h: f64) -> f64 {
     (min_member_mm / (2.0 * h)).clamp(MIN_FILTER_RADIUS_CELLS, MAX_FILTER_RADIUS_CELLS)
 }
 

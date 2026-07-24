@@ -405,12 +405,15 @@ self.onmessage = async (ev: MessageEvent<EngineWorkerRequest>) => {
         const summary = JSON.parse(
           m.optimize(
             JSON.stringify(msg.opts),
+            // Two message shapes ride this one callback: per-iteration progress
+            // (JSON + the four preview buffers) and buffer-less `{phase: …}`
+            // status pushes narrating the silent pipeline stages.
             (
               json: string,
-              density: Float32Array,
-              skelPositions: Float32Array,
-              skelIndices: Uint32Array,
-              skelDensity: Float32Array
+              density?: Float32Array,
+              skelPositions?: Float32Array,
+              skelIndices?: Uint32Array,
+              skelDensity?: Float32Array
             ) => {
               (self as unknown as Worker).postMessage(
                 {
@@ -422,7 +425,9 @@ self.onmessage = async (ev: MessageEvent<EngineWorkerRequest>) => {
                   skelIndices,
                   skelDensity,
                 } satisfies OptimizeProgressMessage,
-                [density.buffer, skelPositions.buffer, skelIndices.buffer, skelDensity.buffer]
+                density
+                  ? [density.buffer, skelPositions!.buffer, skelIndices!.buffer, skelDensity!.buffer]
+                  : []
               );
             }
           )

@@ -468,7 +468,7 @@ fn orca_3mf_roundtrips_through_own_zip_and_import() {
         region([3.0; 3], [10.0, 10.0, 7.0], 0.50),
     ];
 
-    let bytes = export_orca_3mf("bracket & arm", &part, &regions, 0.12, 3, 5, None, None);
+    let bytes = export_orca_3mf("bracket & arm", &part, &regions, 0.12, 3, 5, None, None, None);
 
     // Container structure.
     let entries = read_zip(&bytes).expect("read back own zip");
@@ -527,7 +527,7 @@ fn orca_3mf_roundtrips_through_own_zip_and_import() {
     // sparse_infill_pattern ON EACH MODIFIER, never as object-level
     // internal_solid_infill_pattern (newer Bambu Studio renamed that key's
     // "rectilinear" value to "zig-zag" and warns on every project load).
-    let bytes2 = export_orca_3mf("p", &part, &regions, 0.05, 2, 5, Some("concentric"), None);
+    let bytes2 = export_orca_3mf("p", &part, &regions, 0.05, 2, 5, Some("concentric"), None, None);
     let entries2 = read_zip(&bytes2).unwrap();
     let cfg2 = entries2
         .iter()
@@ -551,7 +551,7 @@ fn orca_3mf_roundtrips_through_own_zip_and_import() {
 
     // A supplied plate thumbnail (PNG bytes) replaces the placeholder verbatim.
     let custom_png: &[u8] = &[1, 2, 3, 4, 5];
-    let bytes_t = export_orca_3mf("p", &part, &regions, 0.05, 2, 5, None, Some(custom_png));
+    let bytes_t = export_orca_3mf("p", &part, &regions, 0.05, 2, 5, None, None, Some(custom_png));
     let entries_t = read_zip(&bytes_t).unwrap();
     let plate = entries_t
         .iter()
@@ -563,7 +563,8 @@ fn orca_3mf_roundtrips_through_own_zip_and_import() {
     // PrusaSlicer flavor: ONE object, volumes as triangle ranges in
     // Slic3r_PE_model.config (part = ModelPart, regions = ParameterModifier
     // with fill_density; fill_pattern only when a solid pattern is chosen).
-    let bytes3 = export_prusa_3mf("bracket & arm", &part, &regions, 0.12, 3, 5, Some("concentric"));
+    let bytes3 =
+        export_prusa_3mf("bracket & arm", &part, &regions, 0.12, 3, 5, Some("concentric"), None);
     let entries3 = read_zip(&bytes3).unwrap();
     let names3: Vec<&str> = entries3.iter().map(|(n, _)| n.as_str()).collect();
     assert!(names3.contains(&"Metadata/Slic3r_PE_model.config"));
@@ -607,6 +608,64 @@ fn orca_3mf_roundtrips_through_own_zip_and_import() {
     let (_, stl_bytes) = &stl_entries[0];
     let parsed = filasim_core::TriMesh::from_stl(stl_bytes).unwrap();
     assert_eq!(parsed.len(), 12);
+}
+
+#[test]
+fn dense_pattern_applies_only_to_full_density_modifiers() {
+    let part = weld(&primitives::boxx([0.0; 3], [30.0, 20.0, 10.0]));
+    let region = |lo: [f32; 3], hi: [f32; 3], density: f64| -> RegionMesh {
+        let m = weld(&primitives::boxx(lo, hi));
+        RegionMesh {
+            density,
+            positions: m.vertices.iter().flat_map(|v| v.iter().copied()).collect(),
+            indices: m.triangles.iter().flat_map(|t| t.iter().copied()).collect(),
+        }
+    };
+    // Graded result whose top level is pinned at 100%.
+    let regions = vec![
+        region([2.0; 3], [20.0, 15.0, 8.0], 0.40),
+        region([3.0; 3], [10.0, 10.0, 7.0], 1.0),
+    ];
+
+    let bytes =
+        export_orca_3mf("p", &part, &regions, 0.10, 3, 5, None, Some("rectilinear"), None);
+    let entries = read_zip(&bytes).unwrap();
+    let cfg = entries
+        .iter()
+        .find(|(n, _)| n == "Metadata/model_settings.config")
+        .map(|(_, d)| String::from_utf8_lossy(d).into_owned())
+        .unwrap();
+    // Only the 100% modifier gets the pattern — not the object, not the 40% one.
+    assert_eq!(cfg.matches("sparse_infill_pattern").count(), 1, "pattern on the dense modifier only");
+    assert!(cfg.contains("sparse_infill_pattern\" value=\"rectilinear\""));
+    let object_level = &cfg[..cfg.find("<part").unwrap()];
+    assert!(!object_level.contains("sparse_infill_pattern"), "object keeps the profile pattern");
+    let dense_part = &cfg[cfg.find("infill 100%").unwrap()..];
+    assert!(dense_part.contains("sparse_infill_pattern\" value=\"rectilinear\""));
+
+    // A blanket solid_pattern (binary mode) still wins everywhere.
+    let bytes2 = export_orca_3mf(
+        "p", &part, &regions, 0.10, 3, 5, Some("concentric"), Some("rectilinear"), None,
+    );
+    let entries2 = read_zip(&bytes2).unwrap();
+    let cfg2 = entries2
+        .iter()
+        .find(|(n, _)| n == "Metadata/model_settings.config")
+        .map(|(_, d)| String::from_utf8_lossy(d).into_owned())
+        .unwrap();
+    assert_eq!(cfg2.matches("sparse_infill_pattern").count(), 3, "object + both modifiers");
+    assert!(!cfg2.contains("value=\"rectilinear\""), "solid_pattern overrides dense_pattern");
+
+    // PrusaSlicer flavor: same rule on fill_pattern.
+    let bytes3 = export_prusa_3mf("p", &part, &regions, 0.10, 3, 5, None, Some("rectilinear"));
+    let entries3 = read_zip(&bytes3).unwrap();
+    let cfg3 = entries3
+        .iter()
+        .find(|(n, _)| n == "Metadata/Slic3r_PE_model.config")
+        .map(|(_, d)| String::from_utf8_lossy(d).into_owned())
+        .unwrap();
+    assert_eq!(cfg3.matches("fill_pattern").count(), 1, "pattern on the dense volume only");
+    assert!(cfg3.contains("fill_pattern\" value=\"rectilinear\""));
 }
 
 #[test]

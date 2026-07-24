@@ -95,6 +95,10 @@ fn region_to_indexed(r: &RegionMesh) -> IndexedMesh {
 /// newer Bambu Studio renamed that key's "rectilinear" value to "zig-zag"
 /// and pops a "values have been replaced" dialog on every load, while
 /// "rectilinear"/"concentric" remain valid sparse-pattern values everywhere.
+/// `dense_pattern` applies only to modifiers at 100% density when no blanket
+/// `solid_pattern` is set — graded mode's fully-dense level slices as solid,
+/// and gyroid & friends fill poorly at 100%, so that region alone gets a
+/// solid-capable pattern while the rest keep the profile default.
 /// Modifiers otherwise override ONLY the infill density — walls/shells
 /// inherit from the part (a modifier wall key strips/changes perimeters
 /// wherever it touches the surface). Regions must be sorted ascending by
@@ -124,6 +128,7 @@ pub fn export_orca_3mf(
     wall_loops: u32,
     top_bottom_layers: u32,
     solid_pattern: Option<&str>,
+    dense_pattern: Option<&str>,
     thumbnail: Option<&[u8]>,
 ) -> Vec<u8> {
     let n_objects = 1 + regions.len();
@@ -226,7 +231,7 @@ pub fn export_orca_3mf(
         cfg.push_str(&format!(
             "      <metadata key=\"sparse_infill_density\" value=\"{pct}%\"/>\n"
         ));
-        if let Some(p) = solid_pattern {
+        if let Some(p) = solid_pattern.or(if pct >= 100 { dense_pattern } else { None }) {
             cfg.push_str(&format!(
                 "      <metadata key=\"sparse_infill_pattern\" value=\"{}\"/>\n",
                 xml_escape(p)
@@ -941,7 +946,9 @@ pub fn export_color_3mf(
 /// Metadata/Slic3r_PE_model.config (`ModelPart` / `ParameterModifier`).
 /// Object-level config carries `fill_density` (base) and `perimeters`;
 /// modifiers override `fill_density` (+ `fill_pattern` in binary mode —
-/// "rectilinear"/"concentric" are valid PrusaSlicer values). Geometry is
+/// "rectilinear"/"concentric" are valid PrusaSlicer values). `dense_pattern`
+/// applies only to 100%-density modifiers when no blanket `solid_pattern` is
+/// set (graded mode's fully-dense level — see export_orca_3mf). Geometry is
 /// centered on the bbox like PrusaSlicer's own exports, with the build item
 /// placing it at bed center, bottom on the plate. No print profile is
 /// embedded: the user's printer/filament/print presets stay active.
@@ -953,6 +960,7 @@ pub fn export_prusa_3mf(
     perimeters: u32,
     top_bottom_layers: u32,
     solid_pattern: Option<&str>,
+    dense_pattern: Option<&str>,
 ) -> Vec<u8> {
     // ---- concatenate part + regions into one mesh, tracking tri ranges ----
     let mut vertices: Vec<[f32; 3]> = part.vertices.clone();
@@ -1050,7 +1058,7 @@ pub fn export_prusa_3mf(
             cfg.push_str(&format!(
                 "   <metadata type=\"volume\" key=\"fill_density\" value=\"{pct}%\"/>\n"
             ));
-            if let Some(p) = solid_pattern {
+            if let Some(p) = solid_pattern.or(if pct >= 100 { dense_pattern } else { None }) {
                 cfg.push_str(&format!(
                     "   <metadata type=\"volume\" key=\"fill_pattern\" value=\"{}\"/>\n",
                     xml_escape(p)

@@ -873,3 +873,50 @@ condensed operator term, convergence validation vs the Chebyshev smoother at 1M 
 **Deferred.** Per-step mass value override (additive when needed — "full vs empty tank").
 Rotational load kind (dec. 9). Drag gizmo for the mass point. Full design-dependent
 sensitivity + sign-guarded OC (dec. 4 contingency).
+
+## 17. Strength-driven optimization — SF-target goal (interview 2026-07-24)
+
+**Problem.** Both existing goals are stiffness-driven: "budget" (min compliance at a fixed
+mean density) and "match" (least material to match uniform stiffness). Users who ask "will
+it break?" want a strength goal — "use as little material as possible such that the safety
+factor is at least N". Two hard sub-problems drove this interview: (a) elastic stress at
+re-entrant corners ("notches") is mesh-divergent, so a raw max-stress criterion chases
+artifacts and recedes under refinement; (b) the target can be unreachable even at full fill
+(the optimizer's "full" is the cap, 0.70 by default, and skin cells are not designable), so
+infeasibility is routine product behavior, not an error path.
+
+**Existing machinery (found 2026-07-24).** Per-cell SF fields already exist for display:
+`sfm` (von Mises vs in-plane strength), `sfz` (layer-adhesion tension+shear interaction,
+§15), `sf` = min of both, SF_CAP 10 (filasim-wasm/src/lib.rs:3014-3060); graded allowables
+scale by the same Gibson-Ashby factor as stiffness so the display factor cancels. Stress is
+per-cell at hex centers (stress.rs) with optional ZZ-style nodal recovery for smoothing.
+The "match" goal already implements a guarded secant on budget with the criterion evaluated
+on the verified binned design (pipeline.rs:196-335). Design variables are interior densities
+in [floor 0.10, cap 0.70]; skin is always-solid and not designable. The literature's
+stress-constrained hazards (singularity of vanishing elements, thousands of local
+constraints needing adjoint + p-norm aggregation, Le et al. 2010) mostly do NOT apply:
+graded mode is a bounded sizing problem, not 0/1 topology.
+
+| # | Topic | Decision |
+|---|-------|----------|
+| 1 | Goal shape | **Third goal alongside budget/match: minimize material s.t. SF_crit ≥ target** (default target 2.0, user-editable). Not a constraint bolted onto the existing goals (muddier UX, harder problem) and not max-SF-at-budget (users have a load and want a margin). |
+| 2 | SF measure | **Per-project toggle: material / layer adhesion / both; default = both** (`sf` field) — "optimizer says SF 2.0" must match what the SF display shows, and layer adhesion is the failure mode FDM parts actually die from. |
+| 3 | Algorithm | **Staged. M1 = outer guarded secant on budget reusing the match machinery**: inner layout stays stiffness-driven OC (unchanged), SF_crit is evaluated on the **verified binned design** after each pass, budget walks to the smallest value with SF_crit ≥ target. Tolerance band sits ABOVE target only (never accept below — unlike match's symmetric ±2%); bisection fallback guards non-monotonic blips. **M2 (only if M1 measurably over-spends)**: local redistribution — inflate per-cell floors where SF is violated, `floor ← floor·(target/SF)^(1/n)` (Gibson-Ashby strength exponent), re-run layout. Textbook stress-constrained SIMP (p-norm aggregate, adjoint solves, MMA) rejected as machinery the bounded-density problem doesn't need. |
+| 4 | Criterion (the notch answer) | **SF_crit = volume-weighted percentile-trimmed global min over all solid cells**: the SF value such that cells totaling ≤ 0.2% of SOLID VOLUME lie below it, evaluated on the **nodal-recovered (smoothed) stress**. Volume weighting (not cell count) keeps the number stable across Preview→Fine; smoothing kills single-cell staircase spikes; the trim fraction lives in code (tunable against test parts), NOT in the UI. Known residual risk: a real hotspot smaller than the trim volume (small load pad, thin rib) can hide in the tail — the dec. 6 binding-region view is the safety net. |
+| 5 | Load steps | **SF enforced on the envelope over included steps** — every included step must meet the target (matches the §13 dec. 9 envelope pseudo-step). Per-step weight sliders keep their existing meaning (inner stiffness layout only); safety is worst-case, never weighted. |
+| 6 | Infeasibility (the 100%-fill answer) | **Pre-flight solve with all designable cells at cap, before any optimization.** If SF_crit(cap) < target: skip the loop, deliver the all-at-cap design, banner "Target SF N not reachable — best achievable is X", plus a diagnosis of the binding region — skin-limited ("infill can't fix this: reorient / thicker walls / stronger material") vs interior-at-cap ("raise the cap") — with a one-click view of the binding cells. When feasible, the same solve is the secant's upper bracket, so it is never wasted. |
+| 7 | Mode scope | **All three modes (graded/binary/solid) at launch.** Graded and binary need nothing special (SF is evaluated on the binned design either way). Solid mode masks ersatz-void cells (density < ~2× the 1e-3 void) out of the percentile so meaningless void stress cannot pollute the criterion. |
+| 8 | Honesty framing | Same advisory stance as §3's SF display: strengths come from preset/measured values and Gibson-Ashby scaling — the goal is a design aid, not a certified safety factor. Copy must say so where the target is entered. |
+
+**Build order** (each milestone shippable, gated by regbench `--check` + the wasm smoke
+test; budget/match paths must stay **byte-identical**): **(1) criterion + pre-flight** —
+SF_crit reduction (volume-weighted trimmed percentile on recovered stress, per-step +
+envelope, solid-mode void mask), all-at-cap pre-flight solve + binding-region
+classification; regbench case: SF_crit on the §14 cantilever, drift-guarded. **(2) M1 outer
+loop** — goal plumbing (store goal kind, SF measure toggle, target input), secant-on-budget
+against SF_crit, infeasible-path UX (banner + binding-cell view + delivered cap design).
+**(3) M2 local redistribution** — only if a benchmark part shows M1 leaving clear material
+on the table where layer-adhesion hotspots miss compliance hotspots.
+
+**Deferred.** Per-step SF targets (survival vs service margins — additive later if asked).
+M2 until M1 proves wasteful. Exposing the trim fraction. Textbook adjoint/p-norm machinery.

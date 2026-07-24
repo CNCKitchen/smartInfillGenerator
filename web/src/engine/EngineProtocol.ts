@@ -21,6 +21,7 @@ import type {
   ModalProgress,
   OptimizeOptions,
   OptimizeOutput,
+  OptPhase,
   OptProgress,
   OptRegion,
   PrintedOptions,
@@ -298,15 +299,16 @@ export interface BuildSimProgress {
   maxU: number;
 }
 
-/** optimize: per-iteration stats + evolving density/skeleton buffers. */
+/** optimize: per-iteration stats + evolving density/skeleton buffers, OR a
+ *  buffer-less `{phase: …}` status push narrating a silent pipeline stage. */
 export interface OptimizeProgressMessage {
   id: number;
   progress: true;
-  data: OptProgress;
-  density: Float32Array;
-  skelPositions: Float32Array;
-  skelIndices: Uint32Array;
-  skelDensity: Float32Array;
+  data: OptProgress | OptPhase;
+  density?: Float32Array;
+  skelPositions?: Float32Array;
+  skelIndices?: Uint32Array;
+  skelDensity?: Float32Array;
 }
 
 /** buildSim: per-layer progress + (on throttled frames) the deformed
@@ -332,7 +334,7 @@ export interface ModalProgressMessage {
 export interface WorkerProgressMessage {
   id: number;
   progress: true;
-  data: OptProgress | BuildSimProgress | ModalProgress | SweepProgress;
+  data: OptProgress | OptPhase | BuildSimProgress | ModalProgress | SweepProgress;
   density?: Float32Array;
   skelPositions?: Float32Array;
   skelIndices?: Uint32Array;

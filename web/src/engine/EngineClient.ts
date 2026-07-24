@@ -329,11 +329,16 @@ export class EngineClient {
     return this.call({ op: "setLayerShear", on });
   }
 
+  /** Run the optimization pipeline. `onProgress` receives BOTH message kinds:
+   *  per-iteration `OptProgress` (with the live density/skeleton buffers) and
+   *  buffer-less `OptPhase` pushes narrating the silent stages (assembly,
+   *  verification, baseline solves, region extraction) — discriminate with
+   *  `"phase" in p`. */
   optimize(
     opts: OptimizeOptions,
     onProgress: (
-      p: OptProgress,
-      density: Float32Array,
+      p: OptProgress | OptPhase,
+      density?: Float32Array,
       skelPositions?: Float32Array,
       skelIndices?: Uint32Array,
       skelDensity?: Float32Array
@@ -692,6 +697,26 @@ export interface OptimizeOptions {
    *  density-filter radius; 0 = off (numerical floor only). Resolved from the
    *  store's auto/override before the call. */
   minMemberMm: number;
+}
+
+/** Buffer-less status push from the optimize pipeline: which silent stage is
+ *  running. Keys mirror the wasm adapter's phase map (filasim-wasm optimize). */
+export interface OptPhase {
+  phase:
+    | "assemble"
+    | "reference"
+    | "optimize_pass"
+    | "binning"
+    | "verify"
+    | "uniform"
+    | "solid_ref"
+    | "stress"
+    | "regions"
+    | "smoothing"
+    | "finalize";
+  /** Secant pass context (optimize_pass only). */
+  pass?: number;
+  passes?: number;
 }
 
 export interface OptProgress {

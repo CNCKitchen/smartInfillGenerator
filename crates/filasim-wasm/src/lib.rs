@@ -2473,6 +2473,14 @@ impl Model {
     ) -> Result<String, JsValue> {
         self.ensure_grid()?;
         let opts: OptimizeOpts = serde_json::from_str(opts_json).map_err(err)?;
+        // Phase pushes ride the SAME JS progress callback, as a single
+        // `{"phase": ...}` JSON argument with no buffers — the worker forwards
+        // them so the busy chip can narrate the otherwise-silent stages
+        // (assembly, verification, baselines, region extraction).
+        let emit_phase = |v: serde_json::Value| {
+            let _ = progress.call1(&JsValue::NULL, &JsValue::from_str(&v.to_string()));
+        };
+        emit_phase(serde_json::json!({"phase": "assemble"}));
         let solid = opts.solid;
         // Calibrated pattern law: every stiffness EVALUATION uses this. In SOLID
         // topology mode the kept material is plain solid plastic, so the eval
@@ -2675,8 +2683,27 @@ impl Model {
                 );
                 let _ = progress.apply(&JsValue::NULL, &args);
             },
+            |phase| {
+                use filasim_core::pipeline::PipelinePhase as P;
+                emit_phase(match phase {
+                    P::ReferenceSolve => serde_json::json!({"phase": "reference"}),
+                    P::OptimizePass { pass, passes } => {
+                        serde_json::json!({"phase": "optimize_pass", "pass": pass, "passes": passes})
+                    }
+                    P::Binning => serde_json::json!({"phase": "binning"}),
+                    P::VerifySolve => serde_json::json!({"phase": "verify"}),
+                    P::UniformSolve => serde_json::json!({"phase": "uniform"}),
+                    P::SolidSolve => serde_json::json!({"phase": "solid_ref"}),
+                    P::StressRecovery => serde_json::json!({"phase": "stress"}),
+                    P::Regions => serde_json::json!({"phase": "regions"}),
+                    P::Smoothing => serde_json::json!({"phase": "smoothing"}),
+                });
+            },
         )
         .map_err(err)?;
+        // Everything after the pipeline (summary, stress eps, baseline stashes,
+        // and the worker's region/vertex-buffer collection once this returns).
+        emit_phase(serde_json::json!({"phase": "finalize"}));
 
         // ---- mass + summary (gram conversion needs the material density) ----
         let cell_vol = grid.h * grid.h * grid.h;
@@ -3458,6 +3485,9 @@ impl Model {
         let name = if self.name.is_empty() { "part" } else { &self.name };
         let pattern = opt.solid_pattern.as_deref();
         let thumb = if thumbnail.is_empty() { None } else { Some(thumbnail) };
+        // A graded level pinned at 100% slices as solid, and gyroid & friends
+        // fill poorly at full density — that modifier alone gets rectilinear
+        // (the other levels keep the profile's own sparse pattern).
         Ok(match slicer {
             "prusa" => filasim_core::threemf::export_prusa_3mf(
                 name,
@@ -3467,6 +3497,7 @@ impl Model {
                 opt.perimeters,
                 opt.top_bottom_layers,
                 pattern,
+                Some("rectilinear"),
             ),
             s => export_orca_3mf(
                 name,
@@ -3476,6 +3507,7 @@ impl Model {
                 opt.perimeters,
                 opt.top_bottom_layers,
                 pattern.map(|p| if s == "bambu" && p == "rectilinear" { "zig-zag" } else { p }),
+                Some(if s == "bambu" { "zig-zag" } else { "rectilinear" }),
                 thumb,
             ),
         })

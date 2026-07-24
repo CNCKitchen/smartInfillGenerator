@@ -30,7 +30,13 @@ export function StatusStrip() {
     }))
   );
   const lamp = s.error ? "lamp err" : s.busy ? "lamp busy" : "lamp";
-  const state = s.busy ? s.busy.replace(/…$/, "").toUpperCase() : s.error ? "ERROR" : "READY";
+  // The busy chip narrates details ("… — iteration 12"); the strip's state
+  // lamp keeps just the stage name before the "—" so it doesn't tick.
+  const state = s.busy
+    ? s.busy.replace(/…$/, "").split(" — ")[0].toUpperCase()
+    : s.error
+      ? "ERROR"
+      : "READY";
   const v = s.voxelInfo;
   const p = s.optProgress;
   const bp = s.buildProgress;

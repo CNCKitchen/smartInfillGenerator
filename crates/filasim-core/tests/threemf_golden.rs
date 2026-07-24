@@ -89,13 +89,15 @@ fn assert_golden(flavor: &str, snapshot: &str) {
 fn orca_3mf_matches_golden() {
     let (part, regions) = fixture_inputs();
     // solid_pattern set so the modifier + object-level pattern keys are covered.
-    let zip = export_orca_3mf("bracket & arm", &part, &regions, 0.12, 3, 5, Some("concentric"), None);
+    let zip =
+        export_orca_3mf("bracket & arm", &part, &regions, 0.12, 3, 5, Some("concentric"), None, None);
     assert_golden("orca", &xml_snapshot(&zip));
 }
 
 #[test]
 fn prusa_3mf_matches_golden() {
     let (part, regions) = fixture_inputs();
-    let zip = export_prusa_3mf("bracket & arm", &part, &regions, 0.12, 3, 5, Some("concentric"));
+    let zip =
+        export_prusa_3mf("bracket & arm", &part, &regions, 0.12, 3, 5, Some("concentric"), None);
     assert_golden("prusa", &xml_snapshot(&zip));
 }
