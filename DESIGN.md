@@ -1090,14 +1090,21 @@ PROJECT_SCHEMA=1 (absent fields = M1/STL behavior):
   (shown only when the file has colors, default on).
 - **Viewport (meshstep-viewer parity, works for STL and STEP alike)**:
   camera-following key light (offset up-right in view space per frame, static cool fill
-  + hemi keep a world anchor); optional crease-aware (30°) smooth shading — corner
-  normals average area-weighted face normals within the crease over a welded-vertex CSR
-  adjacency, rebuilt per model, re-applied per pose (rigid transforms preserve both weld
-  and crease grouping); feature-edge overlay derived from PATCH borders (CAD face
-  borders on STEP, dihedral borders on STL) + open/non-manifold edges, stored as
-  corner-index pairs so pose changes just re-read coordinates. "Edges" (default on) +
-  "Smooth" (default off) chips beside Wireframe; edges show on the opaque setup surface,
-  follow section clipping, and join the orientation-preview rotation.
+  + hemi keep a world anchor); optional smooth shading; feature-edge overlay. "Edges"
+  (default on) + "Smooth" (default off) chips beside Wireframe; edges show on the opaque
+  setup surface, follow section clipping, and join the orientation-preview rotation.
+  **Edge derivation (fixed same day — first cut hallucinated edges):** the working mesh
+  is deliberately NON-CONFORMING (T-junction refinement), so any edge detection on it
+  paints "open edge" noise across flat faces. STEP models therefore get their border
+  segments computed in the IMPORT WORKER from meshStep's conforming welded mesh (exact
+  CAD face borders, 0 false positives — verified 0 open edges on real models), kept in
+  `stepInfo.featureEdges` (import frame) and re-pushed through `toWorld` on every pose
+  change; STL/3MF derive edges only across properly-shared (n=2) triangle pairs with a
+  dihedral angle above the `edgeAngle` setting (default 30°, chip-inline input, shown
+  for STL only). **Smooth-shading creases match the edges** (same-day follow-up): STEP
+  corners average only within their CAD face (tangent neighbors converge to identical
+  border normals, so fillets shade seamlessly while true edges stay hard — the same
+  behavior as meshStep's analytic vertexNormals); STL creases use the same `edgeAngle`.
 - **M4 named-body picker: DEFERRED** — it is an analysis feature (engine-side body
   filtering to solve one body of a multi-body file), not presentation; revisit when a
   real multi-body workflow demands it. meshStep's `vertexNormals`/`structure` payloads

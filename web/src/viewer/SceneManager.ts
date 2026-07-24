@@ -142,11 +142,19 @@ export class SceneManager {
   /** CSR triangle list per welded vertex (smooth-shading adjacency). */
   private vertTriOffsets: Uint32Array | null = null;
   private vertTriList: Uint32Array | null = null;
-  /** Optional smooth shading: crease-aware (30°) vertex-normal averaging. */
+  /** Optional smooth shading: within CAD faces (STEP) or crease-aware by the
+   *  edge angle (STL/3MF) — hard edges match the feature-edge overlay. */
   private smoothShadingOn = false;
-  /** Feature-edge overlay (patch borders = CAD face borders on STEP, crease
-   *  borders on STL/3MF) + open/non-manifold edges. */
+  /** Feature-edge overlay. STEP models push EXACT CAD border segments (from
+   *  meshStep's conforming mesh — the display refinement is non-conforming,
+   *  so deriving edges here would hallucinate T-junction edges); STL/3MF
+   *  derive dihedral edges > `edgeAngleDeg` across properly-shared edges. */
   private featureEdgesOn = true;
+  private edgeAngleDeg = 30;
+  /** STEP only: world-space CAD border segments + per-triangle CAD face ids
+   *  (shading groups). Null ⇒ STL path (dihedral derivation). */
+  private explicitEdgeSegments: Float32Array | null = null;
+  private cadFaceIds: Uint32Array | null = null;
   private featureEdgePairs: Uint32Array | null = null;
   private featureEdgeLines: THREE.LineSegments | null = null;
 
@@ -675,8 +683,13 @@ export class SceneManager {
     this.scene.add(this.mesh);
     this.buildWireframe();
     this.buildShadingTopology();
+    // STEP topology (CAD edges + shading groups + colors) rides separately —
+    // the store pushes it after load; a plain STL must not inherit the
+    // previous model's.
+    this.explicitEdgeSegments = null;
+    this.cadFaceIds = null;
     this.applyShading();
-    this.colorMgr.setBaseColors(null); // CAD colors (if any) are pushed after load
+    this.colorMgr.setBaseColors(null);
 
     this.setPatchIds(model.patchIds);
     this.bcs = [];
@@ -788,7 +801,7 @@ export class SceneManager {
       }
       list.push(t);
     }
-    this.buildFeatureEdges(); // patch borders ARE the feature edges
+    this.buildFeatureEdges(); // no-op for STEP (exact segments), dihedral for STL
     this.colorMgr.resetHover();
     this.colorMgr.repaint();
   }
@@ -905,11 +918,12 @@ export class SceneManager {
   }
 
   /** Write the normal attribute for the active shading mode. Flat = three's
-   *  face normals; smooth = crease-aware averaging (30°): each corner blends
-   *  the area-weighted normals of the adjacent triangles whose face normal is
-   *  within the crease angle of its own — hard edges stay hard, curved faces
-   *  lose the tessellation facets. Runs on the CURRENT positions, so it is
-   *  re-applied after pose changes. */
+   *  face normals; smooth = averaging within a SHADING GROUP, so hard edges
+   *  match the feature-edge overlay exactly: STEP corners blend only across
+   *  triangles of the SAME CAD face (tangent neighbors converge to the same
+   *  normal at the shared border, so fillets stay seamless while true edges
+   *  stay hard), STL corners blend across dihedral angles below the edge
+   *  angle. Runs on the CURRENT positions — re-applied after pose changes. */
   private applyShading() {
     if (!this.geometry) return;
     if (!this.smoothShadingOn || !this.weldIds || !this.vertTriOffsets || !this.vertTriList) {
@@ -918,13 +932,14 @@ export class SceneManager {
     }
     const fn = this.faceNormals();
     if (!fn) return;
-    const COS_CREASE = Math.cos((30 * Math.PI) / 180);
+    const cosCrease = Math.cos((this.edgeAngleDeg * Math.PI) / 180);
     this.geometry.computeVertexNormals(); // ensures the attribute exists/sized
     const normals = this.geometry.getAttribute("normal")!.array as Float32Array;
     const { scaled, unit } = fn;
     const weld = this.weldIds;
     const offs = this.vertTriOffsets;
     const list = this.vertTriList;
+    const byFace = this.cadFaceIds && this.cadFaceIds.length === this.triCount ? this.cadFaceIds : null;
     const nCorners = this.triCount * 3;
     for (let c = 0; c < nCorners; c++) {
       const t = (c / 3) | 0;
@@ -937,7 +952,10 @@ export class SceneManager {
       const v = weld[c];
       for (let i = offs[v]; i < offs[v + 1]; i++) {
         const u = list[i];
-        if (nx * unit[3 * u] + ny * unit[3 * u + 1] + nz * unit[3 * u + 2] > COS_CREASE) {
+        const same = byFace
+          ? byFace[u] === byFace[t]
+          : nx * unit[3 * u] + ny * unit[3 * u + 1] + nz * unit[3 * u + 2] > cosCrease;
+        if (same) {
           sx += scaled[3 * u];
           sy += scaled[3 * u + 1];
           sz += scaled[3 * u + 2];
@@ -951,28 +969,60 @@ export class SceneManager {
     this.geometry.getAttribute("normal")!.needsUpdate = true;
   }
 
-  /** Toggle crease-aware smooth shading. */
+  /** Toggle smooth shading (see applyShading for the group rules). */
   setSmoothShading(on: boolean) {
     if (this.smoothShadingOn === on) return;
     this.smoothShadingOn = on;
     this.applyShading();
   }
 
-  /** Derive the feature-edge overlay from the CURRENT patch segmentation:
-   *  an edge is a feature when its two triangles belong to different patches
-   *  (CAD face borders on STEP, crease borders on STL/3MF), or when it is
-   *  open / non-manifold. Stored as corner-index pairs so pose changes only
-   *  re-read positions (`refreshFeatureEdgePositions`). */
+  /** Feature-edge angle for STL/3MF models (dihedral threshold, degrees).
+   *  Drives BOTH the edge overlay and the smooth-shading creases so they
+   *  always agree. No-op for the overlay on STEP (exact CAD edges). */
+  setEdgeAngle(deg: number) {
+    const d = Math.min(89, Math.max(1, deg));
+    if (this.edgeAngleDeg === d) return;
+    this.edgeAngleDeg = d;
+    if (!this.explicitEdgeSegments) this.buildFeatureEdges();
+    if (this.smoothShadingOn && !this.cadFaceIds) this.applyShading();
+  }
+
+  /** STEP models: install the EXACT world-space CAD border segments (from
+   *  meshStep's conforming mesh, transformed by the store per pose) + the
+   *  per-working-triangle CAD face ids that group the smooth shading. Null
+   *  arguments revert to the STL dihedral derivation. */
+  setFeatureEdgeSegments(segments: Float32Array | null, faceOfTri: Uint32Array | null) {
+    this.explicitEdgeSegments = segments;
+    this.cadFaceIds = faceOfTri;
+    this.buildFeatureEdges();
+    if (this.smoothShadingOn) this.applyShading();
+  }
+
+  /** Derive the feature-edge overlay. STEP: the pushed exact segments.
+   *  STL/3MF: edges shared by exactly TWO triangles with a dihedral angle
+   *  above the threshold — T-junction edges of the non-conforming display
+   *  refinement have no exact partner and are deliberately skipped (counting
+   *  them as "open" painted noise all over flat faces), and coplanar
+   *  subdivision edges fail the angle test. Pair-derived edges are stored as
+   *  corner indices so pose changes only re-read positions. */
   private buildFeatureEdges() {
-    if (!this.weldIds || !this.patchIds || this.patchIds.length !== this.triCount) {
+    if (this.explicitEdgeSegments) {
       this.featureEdgePairs = null;
       this.rebuildFeatureEdgeLines();
       return;
     }
+    if (!this.weldIds) {
+      this.featureEdgePairs = null;
+      this.rebuildFeatureEdgeLines();
+      return;
+    }
+    const fn = this.faceNormals();
+    if (!fn) return;
+    const { unit } = fn;
+    const cosCrease = Math.cos((this.edgeAngleDeg * Math.PI) / 180);
     const weld = this.weldIds;
-    const pids = this.patchIds;
     // key = minVert·2^22 + maxVert (weld ids stay far below 2^22).
-    const edges = new Map<number, { ca: number; cb: number; patch: number; n: number; feat: boolean }>();
+    const edges = new Map<number, { ca: number; cb: number; tri: number; n: number; tri2: number }>();
     for (let t = 0; t < this.triCount; t++) {
       for (let e = 0; e < 3; e++) {
         const ca = 3 * t + e;
@@ -983,24 +1033,28 @@ export class SceneManager {
         const key = (va < vb ? va : vb) * 4194304 + (va < vb ? vb : va);
         const ent = edges.get(key);
         if (!ent) {
-          edges.set(key, { ca, cb, patch: pids[t], n: 1, feat: false });
+          edges.set(key, { ca, cb, tri: t, n: 1, tri2: -1 });
         } else {
           ent.n++;
-          if (pids[t] !== ent.patch) ent.feat = true;
+          ent.tri2 = t;
         }
       }
     }
     const pairs: number[] = [];
     for (const ent of edges.values()) {
-      if (ent.feat || ent.n !== 2) {
-        pairs.push(ent.ca, ent.cb);
-      }
+      if (ent.n !== 2) continue;
+      const a = ent.tri;
+      const b = ent.tri2;
+      const dot =
+        unit[3 * a] * unit[3 * b] + unit[3 * a + 1] * unit[3 * b + 1] + unit[3 * a + 2] * unit[3 * b + 2];
+      if (dot < cosCrease) pairs.push(ent.ca, ent.cb);
     }
     this.featureEdgePairs = Uint32Array.from(pairs);
     this.rebuildFeatureEdgeLines();
   }
 
-  /** (Re)create the feature-edge line object from the stored pairs. */
+  /** (Re)create the feature-edge line object from the exact segments (STEP)
+   *  or the stored corner pairs (STL). */
   private rebuildFeatureEdgeLines() {
     if (this.featureEdgeLines) {
       this.scene.remove(this.featureEdgeLines);
@@ -1008,13 +1062,19 @@ export class SceneManager {
       (this.featureEdgeLines.material as THREE.Material).dispose();
       this.featureEdgeLines = null;
     }
-    if (!this.featureEdgePairs || this.featureEdgePairs.length === 0) return;
+    const seg = this.explicitEdgeSegments;
+    if (!seg && (!this.featureEdgePairs || this.featureEdgePairs.length === 0)) return;
     const geo = new THREE.BufferGeometry();
-    geo.setAttribute(
-      "position",
-      new THREE.BufferAttribute(new Float32Array(this.featureEdgePairs.length * 3), 3)
-    );
-    this.refreshFeatureEdgePositions(geo);
+    if (seg) {
+      geo.setAttribute("position", new THREE.BufferAttribute(seg, 3));
+      geo.computeBoundingSphere();
+    } else {
+      geo.setAttribute(
+        "position",
+        new THREE.BufferAttribute(new Float32Array(this.featureEdgePairs!.length * 3), 3)
+      );
+      this.refreshFeatureEdgePositions(geo);
+    }
     const mat = new THREE.LineBasicMaterial({
       color: 0x2b3440, // ink-dark, crisper than the wireframe overlay
       transparent: true,

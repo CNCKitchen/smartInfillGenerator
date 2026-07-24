@@ -45,6 +45,9 @@ export function ViewportChips() {
       cadColors: s.cadColors,
       setCadColors: s.setCadColors,
       hasCadColors: !!s.stepInfo?.cadTriColors,
+      edgeAngle: s.edgeAngle,
+      setEdgeAngle: s.setEdgeAngle,
+      isStepModel: !!s.stepInfo,
       strainView: s.strainView,
       setStrainView: s.setStrainView,
       strainLayer: s.strainLayer,
@@ -92,10 +95,25 @@ export function ViewportChips() {
           <button
             className={s.featureEdges ? "on" : ""}
             onClick={() => s.setFeatureEdges(!s.featureEdges)}
-            title="Outline the part's feature edges (CAD face borders on STEP, crease borders on STL)"
+            title="Outline the part's feature edges (exact CAD face borders on STEP, dihedral edges on STL)"
           >
             Edges
           </button>
+          {!s.isStepModel && (s.featureEdges || s.smoothShading) && (
+            <label
+              className="edgeangle"
+              title="Dihedral angle above which an STL edge counts as a feature edge — also the smooth-shading crease"
+            >
+              <input
+                type="number"
+                min={1}
+                max={89}
+                value={s.edgeAngle}
+                onChange={(e) => s.setEdgeAngle(Number(e.target.value) || 30)}
+              />
+              °
+            </label>
+          )}
           <button
             className={s.smoothShading ? "on" : ""}
             onClick={() => s.setSmoothShading(!s.smoothShading)}

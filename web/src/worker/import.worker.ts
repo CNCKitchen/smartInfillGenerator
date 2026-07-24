@@ -136,8 +136,44 @@ self.onmessage = async (ev: MessageEvent<StepImportRequest>) => {
         faceColorIdx![d] = r.colors!.faceColor.get(entity) ?? -1;
       });
     }
+    // CAD feature edges (viewport overlay): every mesh edge whose two
+    // triangles belong to DIFFERENT CAD faces, taken from meshStep's
+    // original welded mesh — it is conforming, so adjacency is exact. The
+    // engine's display refinement is non-conforming (T-junctions), which is
+    // why the overlay must NOT be derived from the working mesh.
+    const positions = new Float32Array(r.mesh.positions); // f64 mm → f32 for GPU/wasm
+    const featureEdges = (() => {
+      const idx = r.mesh.indices;
+      const fot = r.faceOfTri;
+      // key = minV·2^26 + maxV — safe for meshes up to 67M welded vertices.
+      const edges = new Map<number, { va: number; vb: number; face: number; border: boolean }>();
+      for (let t = 0; t < fot.length; t++) {
+        for (let e = 0; e < 3; e++) {
+          const va = idx[3 * t + e];
+          const vb = idx[3 * t + ((e + 1) % 3)];
+          if (va === vb) continue;
+          const key = Math.min(va, vb) * 67108864 + Math.max(va, vb);
+          const ent = edges.get(key);
+          if (!ent) edges.set(key, { va, vb, face: fot[t], border: false });
+          else if (fot[t] !== ent.face) ent.border = true;
+        }
+      }
+      const segs: number[] = [];
+      for (const ent of edges.values()) {
+        if (!ent.border) continue;
+        segs.push(
+          positions[3 * ent.va],
+          positions[3 * ent.va + 1],
+          positions[3 * ent.va + 2],
+          positions[3 * ent.vb],
+          positions[3 * ent.vb + 1],
+          positions[3 * ent.vb + 2]
+        );
+      }
+      return Float32Array.from(segs);
+    })();
     const payload: StepMeshPayload = {
-      positions: new Float32Array(r.mesh.positions), // f64 mm → f32 for GPU/wasm
+      positions,
       indices: r.mesh.indices,
       faceOfTri: face.dense,
       solidOfTri: solid.dense,
@@ -147,6 +183,7 @@ self.onmessage = async (ev: MessageEvent<StepImportRequest>) => {
       faces,
       palette,
       faceColorIdx,
+      featureEdges,
       diagnostics: r.diagnostics,
       stats: r.stats,
       units: r.units,
@@ -161,6 +198,7 @@ self.onmessage = async (ev: MessageEvent<StepImportRequest>) => {
       payload.solidOfTri.buffer,
       payload.faceEntityIds.buffer,
       payload.solidEntityIds.buffer,
+      payload.featureEdges.buffer,
     ]);
   } catch (e) {
     post({ id, ok: false, error: e instanceof Error ? e.message : String(e) });

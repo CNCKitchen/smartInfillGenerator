@@ -53,6 +53,11 @@ export interface StepMeshPayload {
    *  into the per-face result. */
   palette: [number, number, number][] | null;
   faceColorIdx: Int32Array | null;
+  /** EXACT CAD face-border segments (xyz pairs, import frame, mm) from the
+   *  conforming meshStep mesh — the viewport feature-edge overlay. The
+   *  engine's display refinement is non-conforming (T-junctions), so edges
+   *  must come from HERE, never be re-derived from the working mesh. */
+  featureEdges: Float32Array;
   diagnostics: ImportDiagnostics;
   stats: MeshResult["stats"];
   /** Display-only unit label from the file; coordinates are always mm. */

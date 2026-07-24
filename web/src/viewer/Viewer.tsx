@@ -111,6 +111,8 @@ export function Viewer() {
     sceneEvents.onSmoothShading = (on) => scene.setSmoothShading(on);
     sceneEvents.onFeatureEdges = (on) => scene.setFeatureEdges(on);
     sceneEvents.onCadColors = (c) => scene.setCadColors(c);
+    sceneEvents.onCadEdges = (seg, faceIds) => scene.setFeatureEdgeSegments(seg, faceIds);
+    sceneEvents.onEdgeAngle = (deg) => scene.setEdgeAngle(deg);
     sceneEvents.onVoxelCutActive = (on) => scene.setVoxelCutActive(on);
     sceneEvents.onAnimateDeformed = (on) => scene.setDeformAnimate(on);
     sceneEvents.onModalAnim = (on) => scene.setModalAnim(on);

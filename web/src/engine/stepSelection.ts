@@ -202,6 +202,21 @@ export function transformPoint(m: number[], p: [number, number, number]): [numbe
   ];
 }
 
+/** Transform a packed xyz point array (e.g. edge segments) — returns a new
+ *  array, the import-frame source stays untouched for later poses. */
+export function transformPoints(m: number[], pts: Float32Array): Float32Array {
+  const out = new Float32Array(pts.length);
+  for (let i = 0; i + 2 < pts.length; i += 3) {
+    const x = pts[i];
+    const y = pts[i + 1];
+    const z = pts[i + 2];
+    out[i] = m[0] * x + m[1] * y + m[2] * z + m[9];
+    out[i + 1] = m[3] * x + m[4] * y + m[5] * z + m[10];
+    out[i + 2] = m[6] * x + m[7] * y + m[8] * z + m[11];
+  }
+  return out;
+}
+
 export function transformDir(m: number[], v: [number, number, number]): [number, number, number] {
   const out: [number, number, number] = [
     m[0] * v[0] + m[1] * v[1] + m[2] * v[2],

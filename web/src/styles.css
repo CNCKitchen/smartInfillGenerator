@@ -1371,6 +1371,26 @@ input[type="number"] {
   color: #fff;
 }
 
+/* STL edge-angle field inside the wirechip (feature edges + shading crease). */
+.wirechip .edgeangle {
+  display: flex;
+  align-items: center;
+  gap: 1px;
+  padding: 0 6px 0 3px;
+  color: var(--dim);
+}
+
+.wirechip .edgeangle input {
+  width: 34px;
+  padding: 2px 3px;
+  border: 1px solid var(--line);
+  border-radius: 2px;
+  background: #fff;
+  color: var(--ink);
+  font: inherit;
+  text-align: right;
+}
+
 /* empty state: the viewport invites the first action */
 
 .dropzone {

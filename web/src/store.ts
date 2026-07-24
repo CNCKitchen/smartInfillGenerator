@@ -27,6 +27,7 @@ import {
   selectionFaceIds,
   transformDir,
   transformPoint,
+  transformPoints,
   trisForFaceIds,
   type StepFaceInfo,
   type StepManifestInfo,
@@ -658,6 +659,9 @@ interface AppState {
   featureEdges: boolean;
   /** Show the STEP file's CAD face colors on the part (colored models only). */
   cadColors: boolean;
+  /** Dihedral threshold (degrees) for STL feature edges AND smooth-shading
+   *  creases. STEP models use exact CAD borders instead. */
+  edgeAngle: number;
   deformScale: number;
   animateDeformed: boolean;
   /** Display autoscale chosen by the viewer (deformation exaggeration base). */
@@ -708,6 +712,9 @@ interface AppState {
         toWorld: number[];
         /** Baked per-working-triangle CAD colors (linear RGB) or null. */
         cadTriColors: Float32Array | null;
+        /** Exact CAD border segments (IMPORT frame; transformed by `toWorld`
+         *  on every push — the viewport feature-edge overlay). */
+        featureEdges: Float32Array;
       })
     | null;
   /** Densities of the extracted modifier regions (for the region list). */
@@ -1003,6 +1010,7 @@ interface AppState {
   setSmoothShading(on: boolean): void;
   setFeatureEdges(on: boolean): void;
   setCadColors(on: boolean): void;
+  setEdgeAngle(deg: number): void;
   setDeformScale(s: number): void;
   setAnimateDeformed(on: boolean): void;
   /** Stop the running solve/optimization at its next solver checkpoint. */
@@ -1286,6 +1294,7 @@ async function transformModel(set: SetState, get: () => AppState, r: number[]) {
     invalidateResults(set, get);
     invalidateGrid(set, get);
     sceneEvents.onModelTransformed?.(out.positions, bbox);
+    pushCadEdges(get); // exact CAD edges follow the part into the new pose
     pushBcGlyphs(get); // re-place the mass sphere/spider at the moved CG
     // The symmetry plane keeps its world position; re-center it on the
     // moved part so it doesn't strand outside.
@@ -1357,6 +1366,17 @@ async function importStepWithProgress(
   } finally {
     set({ importingStep: false });
   }
+}
+
+/** Push the STEP viewport topology to the scene: exact CAD border segments
+ *  transformed into the CURRENT pose + the shading-group face ids. Nulls for
+ *  STL/3MF (the scene falls back to dihedral edges at the edge angle). */
+function pushCadEdges(get: () => AppState) {
+  const si = get().stepInfo;
+  sceneEvents.onCadEdges?.(
+    si && si.featureEdges.length > 0 ? transformPoints(si.toWorld, si.featureEdges) : null,
+    si ? si.cadPatchIds : null
+  );
 }
 
 /** Log the analysis grid when it (re)builds — entry of check/solve/optimize. */
@@ -1475,6 +1495,11 @@ export interface SceneEvents {
   onFeatureEdges?: (on: boolean) => void;
   /** Per-triangle CAD base colors (linear RGB, 3/tri) or null for plain grey. */
   onCadColors?: (triColors: Float32Array | null) => void;
+  /** Exact CAD topology for the viewport (STEP): world-space border segments
+   *  + per-triangle CAD face ids (shading groups). Nulls = STL dihedral. */
+  onCadEdges?: (segments: Float32Array | null, faceOfTri: Uint32Array | null) => void;
+  /** STL feature-edge / shading-crease dihedral threshold (degrees). */
+  onEdgeAngle?: (deg: number) => void;
   /** Voxel-true section active: the scene must NOT plane-clip the voxel
    *  group (the cut already lives in the geometry) and hides its cap. */
   onVoxelCutActive?: (on: boolean) => void;
@@ -2873,6 +2898,7 @@ export const useStore = create<AppState>((set, get) => ({
   smoothShading: false,
   featureEdges: true,
   cadColors: true,
+  edgeAngle: 30,
   deformScale: 1,
   animateDeformed: false,
   autoScale: 1,
@@ -2963,6 +2989,7 @@ export const useStore = create<AppState>((set, get) => ({
           faces: imp.faces,
           toWorld: IDENTITY_TRANSFORM.slice(),
           cadTriColors: cadTriangleColors(cadPatchIds, imp.faceColorIdx, imp.palette),
+          featureEdges: imp.featureEdges,
         };
       } else {
         model = await engine.load(bytes, cleanName);
@@ -3067,8 +3094,9 @@ export const useStore = create<AppState>((set, get) => ({
       sceneEvents.onVoxelMesh?.(null, null);
       sceneEvents.onOptShape?.(null, null);
       sceneEvents.onModelLoaded?.(model);
-      // CAD colors ride separately from the model payload (STEP only).
+      // CAD colors + exact CAD edges ride separately from the model payload.
       sceneEvents.onCadColors?.(get().cadColors ? (stepInfo?.cadTriColors ?? null) : null);
+      pushCadEdges(get);
       sceneEvents.onViewState?.("setup", get().deformScale);
       pushSymmetry(get); // hide a previous model's symmetry plane
       const [bx, by, bz] = [
@@ -5549,6 +5577,7 @@ export const useStore = create<AppState>((set, get) => ({
           faces: imp.faces,
           toWorld: IDENTITY_TRANSFORM.slice(),
           cadTriColors: cadTriangleColors(cadPatchIds, imp.faceColorIdx, imp.palette),
+          featureEdges: imp.featureEdges,
         };
         // Hash mismatch "cannot happen" (the bytes embed verbatim) — treat it
         // like a version change rather than trusting stale indices.
@@ -5693,6 +5722,7 @@ export const useStore = create<AppState>((set, get) => ({
       sceneEvents.onOptShape?.(null, null);
       sceneEvents.onModelLoaded?.(get().model!);
       sceneEvents.onCadColors?.(get().cadColors ? (stepInfo?.cadTriColors ?? null) : null);
+      pushCadEdges(get);
       pushBcGlyphs(get, null);
       // Phase 2: restore the design + result buffers into the engine. On a
       // stale STEP tessellation the design/results were computed on a mesh
@@ -5858,6 +5888,12 @@ export const useStore = create<AppState>((set, get) => ({
   setCadColors(on) {
     set({ cadColors: on });
     sceneEvents.onCadColors?.(on ? (get().stepInfo?.cadTriColors ?? null) : null);
+  },
+
+  setEdgeAngle(deg) {
+    const d = Math.min(89, Math.max(1, Math.round(deg)));
+    set({ edgeAngle: d });
+    sceneEvents.onEdgeAngle?.(d);
   },
 
   setDeformScale(s) {
