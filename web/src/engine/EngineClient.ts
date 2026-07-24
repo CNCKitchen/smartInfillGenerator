@@ -151,6 +151,12 @@ export class EngineClient {
     return this.call({ op: "resegment", angle });
   }
 
+  /** Original (pre-refinement) triangle soup, following the current pose —
+   *  the conforming mesh viewport edge detection runs on. */
+  originalPositions(): Promise<Float32Array> {
+    return this.call({ op: "originalPositions" });
+  }
+
   /** Switch surface patches to the STEP file's exact BREP faces. No-op (returns
    *  the current patches) for STL/3MF models. */
   useCadFaces(): Promise<{ patchIds: Uint32Array; patchCount: number }> {

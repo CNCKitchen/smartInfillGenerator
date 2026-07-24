@@ -1294,7 +1294,7 @@ async function transformModel(set: SetState, get: () => AppState, r: number[]) {
     invalidateResults(set, get);
     invalidateGrid(set, get);
     sceneEvents.onModelTransformed?.(out.positions, bbox);
-    pushCadEdges(get); // exact CAD edges follow the part into the new pose
+    void pushEdgeTopology(get); // edges follow the part into the new pose
     pushBcGlyphs(get); // re-place the mass sphere/spider at the moved CG
     // The symmetry plane keeps its world position; re-center it on the
     // moved part so it doesn't strand outside.
@@ -1368,15 +1368,31 @@ async function importStepWithProgress(
   }
 }
 
-/** Push the STEP viewport topology to the scene: exact CAD border segments
- *  transformed into the CURRENT pose + the shading-group face ids. Nulls for
- *  STL/3MF (the scene falls back to dihedral edges at the edge angle). */
-function pushCadEdges(get: () => AppState) {
+/** Push the viewport edge topology for the CURRENT pose. STEP models get
+ *  their exact CAD border segments (import frame × toWorld) + shading-group
+ *  face ids; STL/3MF get the ORIGINAL conforming soup fetched from the
+ *  engine — the display refinement is non-conforming (T-junctions), so edge
+ *  detection must never run on the working mesh. */
+async function pushEdgeTopology(get: () => AppState) {
   const si = get().stepInfo;
-  sceneEvents.onCadEdges?.(
-    si && si.featureEdges.length > 0 ? transformPoints(si.toWorld, si.featureEdges) : null,
-    si ? si.cadPatchIds : null
-  );
+  if (si) {
+    sceneEvents.onCadEdges?.(
+      si.featureEdges.length > 0 ? transformPoints(si.toWorld, si.featureEdges) : null,
+      si.cadPatchIds
+    );
+    sceneEvents.onOriginalMesh?.(null);
+    return;
+  }
+  sceneEvents.onCadEdges?.(null, null);
+  if (!get().model) {
+    sceneEvents.onOriginalMesh?.(null);
+    return;
+  }
+  try {
+    sceneEvents.onOriginalMesh?.(await engine.originalPositions());
+  } catch {
+    // model swapped mid-fetch — the next load pushes fresh topology
+  }
 }
 
 /** Log the analysis grid when it (re)builds — entry of check/solve/optimize. */
@@ -1498,6 +1514,9 @@ export interface SceneEvents {
   /** Exact CAD topology for the viewport (STEP): world-space border segments
    *  + per-triangle CAD face ids (shading groups). Nulls = STL dihedral. */
   onCadEdges?: (segments: Float32Array | null, faceOfTri: Uint32Array | null) => void;
+  /** STL/3MF: the ORIGINAL (pre-refinement, conforming) soup in the current
+   *  pose — the mesh viewport edge detection runs on. */
+  onOriginalMesh?: (positions: Float32Array | null) => void;
   /** STL feature-edge / shading-crease dihedral threshold (degrees). */
   onEdgeAngle?: (deg: number) => void;
   /** Voxel-true section active: the scene must NOT plane-clip the voxel
@@ -3096,7 +3115,7 @@ export const useStore = create<AppState>((set, get) => ({
       sceneEvents.onModelLoaded?.(model);
       // CAD colors + exact CAD edges ride separately from the model payload.
       sceneEvents.onCadColors?.(get().cadColors ? (stepInfo?.cadTriColors ?? null) : null);
-      pushCadEdges(get);
+      void pushEdgeTopology(get);
       sceneEvents.onViewState?.("setup", get().deformScale);
       pushSymmetry(get); // hide a previous model's symmetry plane
       const [bx, by, bz] = [
@@ -5722,7 +5741,7 @@ export const useStore = create<AppState>((set, get) => ({
       sceneEvents.onOptShape?.(null, null);
       sceneEvents.onModelLoaded?.(get().model!);
       sceneEvents.onCadColors?.(get().cadColors ? (stepInfo?.cadTriColors ?? null) : null);
-      pushCadEdges(get);
+      void pushEdgeTopology(get);
       pushBcGlyphs(get, null);
       // Phase 2: restore the design + result buffers into the engine. On a
       // stale STEP tessellation the design/results were computed on a mesh

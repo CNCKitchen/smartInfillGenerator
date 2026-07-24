@@ -1099,9 +1099,13 @@ PROJECT_SCHEMA=1 (absent fields = M1/STL behavior):
   segments computed in the IMPORT WORKER from meshStep's conforming welded mesh (exact
   CAD face borders, 0 false positives — verified 0 open edges on real models), kept in
   `stepInfo.featureEdges` (import frame) and re-pushed through `toWorld` on every pose
-  change; STL/3MF derive edges only across properly-shared (n=2) triangle pairs with a
-  dihedral angle above the `edgeAngle` setting (default 30°, chip-inline input, shown
-  for STL only). **Smooth-shading creases match the edges** (same-day follow-up): STEP
+  change; STL/3MF derive edges on the ORIGINAL soup (`Model::original_positions`, a new
+  wasm export — the as-imported conforming mesh, pose-followed), fetched by the store on
+  load and after every transform: properly-shared (n=2) pairs with a dihedral angle
+  above the `edgeAngle` setting (default 30°, chip-inline input, shown for STL only).
+  First STL cut ran on the working mesh and MISSED creases on T-junction borders
+  (subdivision differs across them → no exact partner) — same root cause as the STEP
+  noise, fixed the same way: never detect edges on the refined mesh. **Smooth-shading creases match the edges** (same-day follow-up): STEP
   corners average only within their CAD face (tangent neighbors converge to identical
   border normals, so fillets shade seamlessly while true edges stay hard — the same
   behavior as meshStep's analytic vertexNormals); STL creases use the same `edgeAngle`.

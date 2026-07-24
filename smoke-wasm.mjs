@@ -91,6 +91,8 @@ const nTri = model.triangle_count();
 assert(nTri > 5000 && nTri <= 160_000, `coarse STL subdivided for display (${nTri} tris)`);
 assert(model.patch_count() === 6, `6 patches segmented (got ${model.patch_count()})`);
 assert(model.positions().length === nTri * 9, "positions buffer 9 floats/tri");
+assert(model.original_positions().length === 12 * 9,
+  "original (pre-refinement, conforming) soup exposed for viewport edge detection");
 assert(model.body_count() === 1, `single box is one body (got ${model.body_count()})`);
 
 // Multi-body detection: two disconnected boxes in one STL → UI warns that the

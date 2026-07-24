@@ -991,6 +991,19 @@ impl Model {
         out
     }
 
+    /// ORIGINAL (as-imported) tessellation as a triangle soup, 9 floats per
+    /// triangle. It follows every `transform` like the working mesh, but is
+    /// NOT display-refined — the refinement is non-conforming (T-junctions),
+    /// so viewport edge detection must run on THIS mesh (a T-junction edge
+    /// has no exact partner and either paints noise or hides real creases).
+    pub fn original_positions(&self) -> Vec<f32> {
+        let mut out = Vec::with_capacity(self.mesh_orig.tris.len() * 9);
+        for t in &self.mesh_orig.tris {
+            out.extend_from_slice(t);
+        }
+        out
+    }
+
     /// Patch id per triangle.
     pub fn patch_ids(&self) -> Vec<u32> {
         self.seg.patch_of_tri.clone()

@@ -156,6 +156,11 @@ self.onmessage = async (ev: MessageEvent<EngineWorkerRequest>) => {
         reply(msg, { patchIds, patchCount: requireModel().patch_count() }, [patchIds.buffer]);
         return;
       }
+      case "originalPositions": {
+        const op = requireModel().original_positions();
+        reply(msg, op, [op.buffer]);
+        return;
+      }
       case "useCadFaces": {
         requireModel().use_cad_faces();
         const patchIds = requireModel().patch_ids();

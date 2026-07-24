@@ -155,7 +155,13 @@ export class SceneManager {
    *  (shading groups). Null ⇒ STL path (dihedral derivation). */
   private explicitEdgeSegments: Float32Array | null = null;
   private cadFaceIds: Uint32Array | null = null;
-  private featureEdgePairs: Uint32Array | null = null;
+  /** STL/3MF edge source: the ORIGINAL (pre-refinement, CONFORMING) soup,
+   *  fetched from the engine per pose by the store. The working mesh must
+   *  never be used here — its T-junctions have no exact edge partner, which
+   *  both paints phantom "open" edges and hides real creases. `stlEdgePairs`
+   *  caches the corner pairs (pose-invariant); positions refresh per pose. */
+  private stlOrigPositions: Float32Array | null = null;
+  private stlEdgePairs: Uint32Array | null = null;
   private featureEdgeLines: THREE.LineSegments | null = null;
 
   private bcs: Bc[] = [];
@@ -683,11 +689,13 @@ export class SceneManager {
     this.scene.add(this.mesh);
     this.buildWireframe();
     this.buildShadingTopology();
-    // STEP topology (CAD edges + shading groups + colors) rides separately —
-    // the store pushes it after load; a plain STL must not inherit the
-    // previous model's.
+    // Edge/shading topology (STEP CAD edges + shading groups + colors, STL
+    // original soup) rides separately — the store pushes it after load; a
+    // fresh model must not inherit the previous one's.
     this.explicitEdgeSegments = null;
     this.cadFaceIds = null;
+    this.stlOrigPositions = null;
+    this.stlEdgePairs = null;
     this.applyShading();
     this.colorMgr.setBaseColors(null);
 
@@ -784,7 +792,8 @@ export class SceneManager {
       this.rebuildCapGroups();
     }
     this.buildWireframe(); // re-derive from the moved geometry
-    this.refreshFeatureEdgePositions(); // connectivity survives, vertices moved
+    // Feature edges: the store re-pushes STEP segments / the STL orig soup
+    // in the new pose right after this call — nothing to do here.
     this.rebuildBcMarkers();
     this.colorMgr.repaint();
   }
@@ -983,6 +992,7 @@ export class SceneManager {
     const d = Math.min(89, Math.max(1, deg));
     if (this.edgeAngleDeg === d) return;
     this.edgeAngleDeg = d;
+    this.stlEdgePairs = null; // angle changed → re-derive on the orig soup
     if (!this.explicitEdgeSegments) this.buildFeatureEdges();
     if (this.smoothShadingOn && !this.cadFaceIds) this.applyShading();
   }
@@ -998,83 +1008,58 @@ export class SceneManager {
     if (this.smoothShadingOn) this.applyShading();
   }
 
-  /** Derive the feature-edge overlay. STEP: the pushed exact segments.
-   *  STL/3MF: edges shared by exactly TWO triangles with a dihedral angle
-   *  above the threshold — T-junction edges of the non-conforming display
-   *  refinement have no exact partner and are deliberately skipped (counting
-   *  them as "open" painted noise all over flat faces), and coplanar
-   *  subdivision edges fail the angle test. Pair-derived edges are stored as
-   *  corner indices so pose changes only re-read positions. */
-  private buildFeatureEdges() {
-    if (this.explicitEdgeSegments) {
-      this.featureEdgePairs = null;
-      this.rebuildFeatureEdgeLines();
-      return;
+  /** STL/3MF models: install the ORIGINAL (conforming) soup in its current
+   *  pose — the store fetches it from the engine on load and after every
+   *  transform. The cached corner pairs survive pose changes (rigid), so a
+   *  re-push only re-reads coordinates. Null clears (STEP models). */
+  setOriginalMesh(positions: Float32Array | null) {
+    if (
+      !positions ||
+      !this.stlOrigPositions ||
+      positions.length !== this.stlOrigPositions.length
+    ) {
+      this.stlEdgePairs = null; // different mesh → topology is stale
     }
-    if (!this.weldIds) {
-      this.featureEdgePairs = null;
-      this.rebuildFeatureEdgeLines();
-      return;
-    }
-    const fn = this.faceNormals();
-    if (!fn) return;
-    const { unit } = fn;
-    const cosCrease = Math.cos((this.edgeAngleDeg * Math.PI) / 180);
-    const weld = this.weldIds;
-    // key = minVert·2^22 + maxVert (weld ids stay far below 2^22).
-    const edges = new Map<number, { ca: number; cb: number; tri: number; n: number; tri2: number }>();
-    for (let t = 0; t < this.triCount; t++) {
-      for (let e = 0; e < 3; e++) {
-        const ca = 3 * t + e;
-        const cb = 3 * t + ((e + 1) % 3);
-        const va = weld[ca];
-        const vb = weld[cb];
-        if (va === vb) continue; // degenerate
-        const key = (va < vb ? va : vb) * 4194304 + (va < vb ? vb : va);
-        const ent = edges.get(key);
-        if (!ent) {
-          edges.set(key, { ca, cb, tri: t, n: 1, tri2: -1 });
-        } else {
-          ent.n++;
-          ent.tri2 = t;
-        }
-      }
-    }
-    const pairs: number[] = [];
-    for (const ent of edges.values()) {
-      if (ent.n !== 2) continue;
-      const a = ent.tri;
-      const b = ent.tri2;
-      const dot =
-        unit[3 * a] * unit[3 * b] + unit[3 * a + 1] * unit[3 * b + 1] + unit[3 * a + 2] * unit[3 * b + 2];
-      if (dot < cosCrease) pairs.push(ent.ca, ent.cb);
-    }
-    this.featureEdgePairs = Uint32Array.from(pairs);
-    this.rebuildFeatureEdgeLines();
+    this.stlOrigPositions = positions;
+    this.buildFeatureEdges();
   }
 
-  /** (Re)create the feature-edge line object from the exact segments (STEP)
-   *  or the stored corner pairs (STL). */
-  private rebuildFeatureEdgeLines() {
+  /** Rebuild the feature-edge overlay. STEP: the pushed exact segments.
+   *  STL/3MF: derived on the ORIGINAL soup — edges shared by exactly TWO
+   *  triangles with a dihedral angle above the threshold. (Never derived on
+   *  the working mesh: its T-junction refinement both hides real creases and
+   *  invents open edges.) */
+  private buildFeatureEdges() {
+    let segments = this.explicitEdgeSegments;
+    if (!segments && this.stlOrigPositions) {
+      if (!this.stlEdgePairs) {
+        this.stlEdgePairs = deriveEdgePairs(this.stlOrigPositions, this.edgeAngleDeg);
+      }
+      const pos = this.stlOrigPositions;
+      const pairs = this.stlEdgePairs;
+      segments = new Float32Array(pairs.length * 3);
+      for (let i = 0; i < pairs.length; i++) {
+        const c = pairs[i];
+        segments[3 * i] = pos[3 * c];
+        segments[3 * i + 1] = pos[3 * c + 1];
+        segments[3 * i + 2] = pos[3 * c + 2];
+      }
+    }
+    this.rebuildFeatureEdgeLines(segments);
+  }
+
+  /** (Re)create the feature-edge line object from coordinate segments. */
+  private rebuildFeatureEdgeLines(segments: Float32Array | null) {
     if (this.featureEdgeLines) {
       this.scene.remove(this.featureEdgeLines);
       this.featureEdgeLines.geometry.dispose();
       (this.featureEdgeLines.material as THREE.Material).dispose();
       this.featureEdgeLines = null;
     }
-    const seg = this.explicitEdgeSegments;
-    if (!seg && (!this.featureEdgePairs || this.featureEdgePairs.length === 0)) return;
+    if (!segments || segments.length === 0) return;
     const geo = new THREE.BufferGeometry();
-    if (seg) {
-      geo.setAttribute("position", new THREE.BufferAttribute(seg, 3));
-      geo.computeBoundingSphere();
-    } else {
-      geo.setAttribute(
-        "position",
-        new THREE.BufferAttribute(new Float32Array(this.featureEdgePairs!.length * 3), 3)
-      );
-      this.refreshFeatureEdgePositions(geo);
-    }
+    geo.setAttribute("position", new THREE.BufferAttribute(segments, 3));
+    geo.computeBoundingSphere();
     const mat = new THREE.LineBasicMaterial({
       color: 0x2b3440, // ink-dark, crisper than the wireframe overlay
       transparent: true,
@@ -1085,25 +1070,6 @@ export class SceneManager {
       this.featureEdgesOn && (this.viewMode === "setup" || this.viewMode === "mesh");
     this.scene.add(this.featureEdgeLines);
     this.refreshClipping();
-  }
-
-  /** Re-read the edge endpoint coordinates from the model's current position
-   *  buffer (pose changes move vertices, connectivity stays). */
-  private refreshFeatureEdgePositions(geo?: THREE.BufferGeometry) {
-    const target = geo ?? this.featureEdgeLines?.geometry;
-    const pos = this.geometry?.getAttribute("position")?.array as Float32Array | undefined;
-    if (!target || !pos || !this.featureEdgePairs) return;
-    const attr = target.getAttribute("position") as THREE.BufferAttribute;
-    const out = attr.array as Float32Array;
-    const pairs = this.featureEdgePairs;
-    for (let i = 0; i < pairs.length; i++) {
-      const c = pairs[i];
-      out[3 * i] = pos[3 * c];
-      out[3 * i + 1] = pos[3 * c + 1];
-      out[3 * i + 2] = pos[3 * c + 2];
-    }
-    attr.needsUpdate = true;
-    target.computeBoundingSphere();
   }
 
   /** Toggle the feature-edge overlay. */
@@ -2974,6 +2940,73 @@ export class SceneManager {
     this.callouts.updateCallouts();
     this.callouts.projectBcCallouts();
   }
+}
+
+/** Feature-edge corner pairs of a CONFORMING triangle soup: edges shared by
+ *  exactly two triangles whose dihedral angle exceeds the threshold. Corner
+ *  indices are pose-invariant — re-read coordinates after a rigid move. */
+function deriveEdgePairs(pos: Float32Array, angleDeg: number): Uint32Array {
+  const nTri = (pos.length / 9) | 0;
+  const nCorners = nTri * 3;
+  // Weld corners by quantized position.
+  const weld = new Uint32Array(nCorners);
+  const map = new Map<string, number>();
+  let nv = 0;
+  for (let c = 0; c < nCorners; c++) {
+    const key = `${Math.round(pos[3 * c] * 1e4)},${Math.round(pos[3 * c + 1] * 1e4)},${Math.round(pos[3 * c + 2] * 1e4)}`;
+    let id = map.get(key);
+    if (id === undefined) {
+      id = nv++;
+      map.set(key, id);
+    }
+    weld[c] = id;
+  }
+  // Unit face normals.
+  const unit = new Float32Array(nTri * 3);
+  for (let t = 0; t < nTri; t++) {
+    const o = 9 * t;
+    const ax = pos[o + 3] - pos[o];
+    const ay = pos[o + 4] - pos[o + 1];
+    const az = pos[o + 5] - pos[o + 2];
+    const bx = pos[o + 6] - pos[o];
+    const by = pos[o + 7] - pos[o + 1];
+    const bz = pos[o + 8] - pos[o + 2];
+    const cx = ay * bz - az * by;
+    const cy = az * bx - ax * bz;
+    const cz = ax * by - ay * bx;
+    const l = Math.hypot(cx, cy, cz) || 1;
+    unit[3 * t] = cx / l;
+    unit[3 * t + 1] = cy / l;
+    unit[3 * t + 2] = cz / l;
+  }
+  const cosCrease = Math.cos((angleDeg * Math.PI) / 180);
+  const edges = new Map<number, { ca: number; cb: number; tri: number; n: number; tri2: number }>();
+  for (let t = 0; t < nTri; t++) {
+    for (let e = 0; e < 3; e++) {
+      const ca = 3 * t + e;
+      const cb = 3 * t + ((e + 1) % 3);
+      const va = weld[ca];
+      const vb = weld[cb];
+      if (va === vb) continue; // degenerate
+      const key = (va < vb ? va : vb) * 4194304 + (va < vb ? vb : va);
+      const ent = edges.get(key);
+      if (!ent) edges.set(key, { ca, cb, tri: t, n: 1, tri2: -1 });
+      else {
+        ent.n++;
+        ent.tri2 = t;
+      }
+    }
+  }
+  const pairs: number[] = [];
+  for (const ent of edges.values()) {
+    if (ent.n !== 2) continue;
+    const a = ent.tri;
+    const b = ent.tri2;
+    const dot =
+      unit[3 * a] * unit[3 * b] + unit[3 * a + 1] * unit[3 * b + 1] + unit[3 * a + 2] * unit[3 * b + 2];
+    if (dot < cosCrease) pairs.push(ent.ca, ent.cb);
+  }
+  return Uint32Array.from(pairs);
 }
 
 function makeTextSprite(text: string, color: number): THREE.Sprite {

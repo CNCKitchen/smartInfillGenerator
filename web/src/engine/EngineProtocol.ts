@@ -70,6 +70,8 @@ export interface EngineRequests {
   transform: { matrix: number[] };
   resegment: { angle: number };
   useCadFaces: Empty;
+  /** Original (pre-refinement, pose-followed) soup — viewport edge source. */
+  originalPositions: Empty;
   setMaterial: { e0: number; nu: number; density: number; strength: number; strengthZ: number; shearStrengthZ?: number };
   setResolution: { cells: number };
   setVoxelSize: { h: number };
@@ -197,6 +199,7 @@ export interface EngineResponses {
   transform: { positions: Float32Array; bbox: number[] };
   resegment: PatchUpdate;
   useCadFaces: PatchUpdate;
+  originalPositions: Float32Array;
   setMaterial: void;
   setResolution: void;
   setVoxelSize: void;
