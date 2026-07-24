@@ -55,6 +55,17 @@ export interface BcPayload {
 /** Request payloads — the fields that travel WITH `{ id, op }`. */
 export interface EngineRequests {
   load: { bytes: ArrayBuffer; name: string };
+  /** Pre-tessellated import (STEP via the meshStep worker, DESIGN §18):
+   *  indexed mesh in mm + DENSE per-triangle CAD-face/solid ids. `bytes` are
+   *  the ORIGINAL file bytes, kept worker-side verbatim for project save. */
+  loadMesh: {
+    positions: Float32Array;
+    indices: Uint32Array;
+    faceOfTri: Uint32Array;
+    solidOfTri: Uint32Array;
+    bytes: ArrayBuffer;
+    name: string;
+  };
   /** Rigid transform: `matrix` = [r00..r22 row-major, tx, ty, tz] in mm. */
   transform: { matrix: number[] };
   resegment: { angle: number };
@@ -182,6 +193,7 @@ export interface SectionVolume {
 /** Response `data` per op (`void` = the generic `{ id, ok: true }` ack). */
 export interface EngineResponses {
   load: LoadedModelData;
+  loadMesh: LoadedModelData;
   transform: { positions: Float32Array; bbox: number[] };
   resegment: PatchUpdate;
   useCadFaces: PatchUpdate;
@@ -235,7 +247,14 @@ export interface EngineResponses {
   addLoadCase: void;
   transformMatrix: number[];
   exportProject: Uint8Array;
-  openProjectModel: { manifest: string; model: LoadedModelData };
+  /** `model` for STL/3MF projects (built in the worker). STEP projects come
+   *  back as `stepModel` instead — the embedded original bytes, which the
+   *  main thread runs through the meshStep worker and feeds to `loadMesh`
+   *  (the engine worker can't tessellate STEP; DESIGN §18). The project
+   *  stays staged for `openProjectRestore` in both shapes. */
+  openProjectModel:
+    | { manifest: string; model: LoadedModelData; stepModel?: undefined }
+    | { manifest: string; model?: undefined; stepModel: { bytes: ArrayBuffer; name: string } };
   openProjectRestore: { restoredResults: string[]; hasDesign: boolean };
   vertexDensity: Float32Array;
   exportThreeMf: Uint8Array;

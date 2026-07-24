@@ -60,6 +60,8 @@ export interface SceneCallbacks {
   onPickPatch?: (tris: Uint32Array, additive: boolean) => void;
   /** Brush stroke: triangles under the brush. */
   onBrush?: (tris: Uint32Array, erase: boolean) => void;
+  /** Wheel over the part in "brush" resized the brush — sync the panel slider. */
+  onBrushRadius?: (radius: number) => void;
   /** Place-on-face: the clicked triangle's outward normal (world). */
   onPlaceFace?: (normal: [number, number, number]) => void;
   /** Pick-direction: the clicked triangle's outward normal (world) — used to
@@ -136,8 +138,12 @@ export class SceneManager {
 
   private tool: Tool = "orbit";
   private brushRadius = 3;
-  private brushErase = false;
   private brushing = false;
+  /** Whether the current brush stroke erases (RMB) or adds (LMB). */
+  private strokeErase = false;
+  /** RMB press position in "select" — a sub-threshold click on release removes
+   *  the patch under the cursor (an RMB drag is still the OrbitControls pan). */
+  private rmbDown: { x: number; y: number } | null = null;
   private brushCursor: THREE.Mesh | null = null;
   /** Crosshair shown at the hovered surface point in the "pick direction" tool,
    *  to signal that a click here sets the force direction. */
@@ -190,7 +196,7 @@ export class SceneManager {
       camera: () => this.camera,
       domElement: () => this.renderer.domElement,
       onDraggingChanged: (dragging) => {
-        this.controls.enabled = !dragging && this.tool !== "brush";
+        this.controls.enabled = !dragging;
       },
       onChanged: () => this.onSectionChanged(),
       bboxDiag: () => this.bboxDiag,
@@ -216,7 +222,7 @@ export class SceneManager {
     camera: () => this.camera,
     domElement: () => this.renderer.domElement,
     onDraggingChanged: (dragging) => {
-      this.controls.enabled = !dragging && this.tool !== "brush";
+      this.controls.enabled = !dragging;
     },
     onChanged: () => this.onSymmetryChanged(),
     bboxDiag: () => this.bboxDiag,
@@ -349,6 +355,9 @@ export class SceneManager {
     canvas.addEventListener("pointermove", this.onPointerMove);
     canvas.addEventListener("pointerdown", this.onPointerDown);
     canvas.addEventListener("pointerup", this.onPointerUp);
+    // RMB is a selection tool (erase) — never the browser context menu.
+    // OrbitControls only suppresses it while enabled; brush mode disables them.
+    canvas.addEventListener("contextmenu", (e) => e.preventDefault());
     canvas.addEventListener("pointerleave", () => {
       this.colorMgr.setHover(null);
       if (this.probeEl) this.probeEl.style.display = "none";
@@ -526,11 +535,12 @@ export class SceneManager {
     this.lastOrbitPivot = center.clone();
   }
 
-  setTool(tool: Tool, brushRadius: number, brushErase: boolean) {
+  setTool(tool: Tool, brushRadius: number) {
     this.tool = tool;
     this.brushRadius = brushRadius;
-    this.brushErase = brushErase;
-    this.controls.enabled = tool !== "brush";
+    // Navigation stays live in every tool; in "brush" the hover gate in
+    // onPointerMove claims the pointer only while it is over the part.
+    this.controls.enabled = true;
     if (this.brushCursor) this.brushCursor.visible = tool === "brush";
     // The pick-direction preview arrow follows the pointer (shown on hover in
     // onPointerMove); just clear it when leaving the tool.
@@ -1279,7 +1289,7 @@ export class SceneManager {
 
   // ---------- picking ----------
 
-  private rayTri(ev: PointerEvent): THREE.Intersection | null {
+  private rayTri(ev: { clientX: number; clientY: number }): THREE.Intersection | null {
     if (!this.mesh) return null;
     const rect = this.renderer.domElement.getBoundingClientRect();
     this.pointer.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
@@ -1343,6 +1353,11 @@ export class SceneManager {
         this.brushCursor.visible = false;
       }
       if (this.brushing && hit) this.applyBrush(hit.point);
+      // Hover gate: over the part the pointer belongs to the brush (press
+      // paints, wheel sizes); beside it orbit/pan/zoom stay live. Only toggle
+      // while no button is held so an in-flight stroke, orbit or pan is never
+      // frozen mid-drag.
+      if (!this.brushing && ev.buttons === 0) this.controls.enabled = !hit;
     } else if (this.tool === "pickdir") {
       // Live preview: an arrow at the hovered point along that face's outward
       // normal — the force direction a click would set.
@@ -1362,13 +1377,35 @@ export class SceneManager {
   };
 
   private onPointerDown = (ev: PointerEvent) => {
-    if (ev.button !== 0 || !this.mesh) return;
+    if (!this.mesh) return;
+    // RMB removes from the active selection: paint-erase in "brush", and in
+    // "select" a sub-threshold click removes the patch on release (pointerup),
+    // so the OrbitControls right-drag pan keeps working.
+    if (ev.button === 2) {
+      if (this.tool === "brush") {
+        // Erase stroke only when the press lands on the part — beside it the
+        // right button stays the OrbitControls pan.
+        const hit = this.rayTri(ev);
+        if (hit) {
+          this.brushing = true;
+          this.strokeErase = true;
+          this.controls.enabled = false; // freeze a pan OrbitControls may have armed
+          this.applyBrush(hit.point);
+        }
+      } else if (this.tool === "select") {
+        this.rmbDown = { x: ev.clientX, y: ev.clientY };
+      }
+      return;
+    }
+    if (ev.button !== 0) return;
     // (Modifier-gated callout gestures are claimed earlier, in the capture-phase
     // onAnnoDownCapture, so they never reach OrbitControls or this handler.)
     // Arm a pivot orbit on every left-press in a navigable tool. The camera
     // only moves once the drag passes a threshold, so a plain click still
-    // selects/places without disturbing the view.
-    if (this.controls.enabled) this.beginOrbit(ev);
+    // selects/places without disturbing the view. In "brush" a press ON the
+    // part starts a paint stroke instead; beside the part it orbits.
+    const brushHit = this.tool === "brush" ? this.rayTri(ev) : null;
+    if (this.controls.enabled && !brushHit) this.beginOrbit(ev);
     if (this.tool === "select") {
       const hit = this.rayTri(ev);
       if (hit && hit.faceIndex != null && this.patchIds) {
@@ -1383,15 +1420,28 @@ export class SceneManager {
         if (this.tool === "place") this.callbacks.onPlaceFace?.([n.x, n.y, n.z]);
         else this.callbacks.onPickDir?.([n.x, n.y, n.z]);
       }
-    } else if (this.tool === "brush") {
+    } else if (this.tool === "brush" && brushHit) {
       this.brushing = true;
-      const hit = this.rayTri(ev);
-      if (hit) this.applyBrush(hit.point);
+      this.strokeErase = false;
+      this.controls.enabled = false;
+      this.applyBrush(brushHit.point);
     }
   };
 
-  private onPointerUp = () => {
+  private onPointerUp = (ev: PointerEvent) => {
     this.brushing = false;
+    if (ev.button === 2 && this.rmbDown && this.tool === "select") {
+      const moved = Math.hypot(ev.clientX - this.rmbDown.x, ev.clientY - this.rmbDown.y);
+      if (moved < 4) {
+        const hit = this.rayTri(ev);
+        if (hit && hit.faceIndex != null && this.patchIds) {
+          const patch = this.patchIds[hit.faceIndex];
+          const tris = this.patchToTris.get(patch);
+          if (tris) this.callbacks.onPickPatch?.(new Uint32Array(tris), false);
+        }
+      }
+    }
+    this.rmbDown = null;
   };
 
   private applyBrush(point: THREE.Vector3) {
@@ -1408,7 +1458,7 @@ export class SceneManager {
       const dz = cz - point.z;
       if (dx * dx + dy * dy + dz * dz <= r2) hit.push(t);
     }
-    if (hit.length) this.callbacks.onBrush?.(new Uint32Array(hit), this.brushErase);
+    if (hit.length) this.callbacks.onBrush?.(new Uint32Array(hit), this.strokeErase);
   }
 
   // ---------- navigation (orbit / move / zoom) ----------
@@ -1552,6 +1602,16 @@ export class SceneManager {
   /** Cursor-centric zoom: keep the world point under the cursor pinned while
    *  the orthographic frustum scales. */
   private onWheel = (ev: WheelEvent) => {
+    // In "brush", the wheel over the part sizes the brush sphere (zoom keeps
+    // working beside the part). Bounds match the panel slider (Ø 1–50 mm).
+    if (this.tool === "brush" && this.rayTri(ev)) {
+      ev.preventDefault();
+      const factor = ev.deltaY > 0 ? 1 / 1.1 : 1.1;
+      this.brushRadius = Math.max(0.5, Math.min(25, this.brushRadius * factor));
+      if (this.brushCursor) this.brushCursor.scale.setScalar(this.brushRadius);
+      this.callbacks.onBrushRadius?.(this.brushRadius);
+      return;
+    }
     if (!this.controls.enabled) return;
     ev.preventDefault();
     const rect = this.renderer.domElement.getBoundingClientRect();

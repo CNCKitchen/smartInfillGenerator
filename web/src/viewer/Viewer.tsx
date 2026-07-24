@@ -27,12 +27,6 @@ function subtract(a: Uint32Array, b: Uint32Array): Uint32Array {
   return Uint32Array.from(s);
 }
 
-function containsAll(a: Uint32Array, b: Uint32Array): boolean {
-  const s = new Set<number>(a as unknown as number[]);
-  for (const t of b) if (!s.has(t)) return false;
-  return true;
-}
-
 export function Viewer() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
@@ -41,7 +35,6 @@ export function Viewer() {
 
   const tool = useStore((s) => s.tool);
   const brushRadius = useStore((s) => s.brushRadius);
-  const brushErase = useStore((s) => s.brushErase);
 
   useEffect(() => {
     const scene = new SceneManager();
@@ -56,15 +49,16 @@ export function Viewer() {
         const st = useStore.getState();
         const bc = st.bcs.find((b) => b.id === st.activeBcId);
         if (!bc) return;
-        const next =
-          !additive || containsAll(bc.tris, tris) ? subtract(bc.tris, tris) : union(bc.tris, tris);
-        st.updateBcTris(bc.id, next);
+        st.updateBcTris(bc.id, additive ? union(bc.tris, tris) : subtract(bc.tris, tris));
       },
       onBrush: (tris, erase) => {
         const st = useStore.getState();
         const bc = st.bcs.find((b) => b.id === st.activeBcId);
         if (!bc) return;
         st.updateBcTris(bc.id, erase ? subtract(bc.tris, tris) : union(bc.tris, tris));
+      },
+      onBrushRadius: (r) => {
+        useStore.getState().setBrushRadius(r);
       },
       onPlaceFace: (normal) => {
         void useStore.getState().applyPlaceOnFace(normal);
@@ -152,8 +146,8 @@ export function Viewer() {
   }, []);
 
   useEffect(() => {
-    sceneRef.current?.setTool(tool, brushRadius, brushErase);
-  }, [tool, brushRadius, brushErase]);
+    sceneRef.current?.setTool(tool, brushRadius);
+  }, [tool, brushRadius]);
 
   // Loads/fixtures are structural-workspace concepts: hide their markers in
   // the Build Sim workspace (its physics has no applied loads).

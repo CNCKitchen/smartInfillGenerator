@@ -21,12 +21,13 @@ use crate::bins::{
     extract_region_smooth, smooth_design_field, smooth_passes_for_radius, taubin_smooth,
     RegionMesh,
 };
-use crate::eps::build_eps;
+use crate::eps::{build_eps, build_vfrac};
 use crate::simp::{
-    classify_cells, evaluate_cached, evaluate_cached_stats, optimize_cached, LoadSet,
-    OptimizeError, OptimizeParams, OptimizeProgress,
+    classify_cells, design_split, evaluate_cached, evaluate_cached_stats, optimize_cached,
+    step_displacement, LoadSet, OptimizeError, OptimizeParams, OptimizeProgress, OptimizeResult,
 };
 use crate::solve::{NodeProblem, SolveSettings, SolverCache};
+use crate::strength::{self, StrengthSpec};
 use crate::voxel::VoxelGrid;
 
 /// How many constrained-Laplacian passes one region-smoothing slider unit
@@ -47,6 +48,15 @@ const MAX_MATCH_PASSES: usize = 5;
 /// Match tolerance: stop when the binned compliance is within this of target.
 const MATCH_TOL: f64 = 0.02;
 
+/// Strength goal (DESIGN §17): at most this many warm-started secant passes
+/// on the budget.
+const MAX_STRENGTH_PASSES: usize = 5;
+/// Strength accept band, ABOVE the target only (§17 dec. 3): a pass is done
+/// when target ≤ SF_crit ≤ target·(1 + band). Below target is never accepted —
+/// the delivered design is the lightest FEASIBLE pass seen (the all-at-cap
+/// pre-flight guarantees one exists whenever the loop runs at all).
+const STRENGTH_BAND: f64 = 0.05;
+
 /// Calibrated stiffness law E/E0 = `coeff`·ρ^`exp` used for EVALUATION and
 /// binning (distinct from the optimizer's possibly-penalized law in
 /// `OptimizeParams`). Linear (1,1) in solid-topology mode.
@@ -56,12 +66,26 @@ pub struct EvalLaw {
     pub coeff: f64,
 }
 
+/// Strength goal (DESIGN §17): minimize material such that the trimmed-
+/// percentile safety-factor criterion SF_crit stays at or above `target` on
+/// every included load step. Mutually exclusive with `goal_match`.
+#[derive(Clone, Copy, Debug)]
+pub struct StrengthGoal {
+    /// Required minimum SF_crit (§17 dec. 1; UI default 2.0).
+    pub target: f64,
+    /// Which SF measure + solid allowables (§17 dec. 2).
+    pub spec: StrengthSpec,
+}
+
 /// Knobs that shape the pipeline beyond the per-iteration `OptimizeParams`.
 pub struct PipelineCfg<'a> {
     pub eval: EvalLaw,
     /// "match uniform stiffness" goal: walk the budget so the binned design is
     /// as stiff as a uniform `ref_frac` print, at minimum mass.
     pub goal_match: bool,
+    /// "reach safety factor" goal (§17): `Some` walks the budget so the binned
+    /// design meets the SF target at minimum mass. None = budget/match.
+    pub strength: Option<StrengthGoal>,
     /// Reference uniform infill fraction — the match target AND the mass
     /// baseline ("vs X% uniform").
     pub ref_frac: f64,
@@ -91,6 +115,12 @@ pub struct IterUpdate<'a> {
 pub enum PipelinePhase {
     /// Tight uniform solve that sets the goal-match stiffness target.
     ReferenceSolve,
+    /// Strength goal: the all-designable-at-cap pre-flight solve that decides
+    /// feasibility up front (§17 dec. 6).
+    Preflight,
+    /// Strength goal: per-step SF_crit evaluation of a binned design (extra
+    /// load steps re-solve here, so it can take a solve's worth of time).
+    SfEval,
     /// A SIMP optimization pass is about to start (its first iteration carries
     /// a full cold/warm solve, so this fires well before the first progress).
     OptimizePass { pass: usize, passes: usize },
@@ -156,6 +186,27 @@ pub struct OptOutcome {
     pub regions_raw: Vec<RegionMesh>,
     /// (budget, binned compliance) of each secant pass.
     pub pass_trace: Vec<(f64, f64)>,
+    // ---- strength goal outputs (DESIGN §17; zero/empty for budget/match) ----
+    /// Required SF_crit (0.0 when the strength goal is off).
+    pub sf_target: f64,
+    /// SF_crit of the DELIVERED binned design (min over included load steps).
+    pub sf_crit: f64,
+    /// SF_crit of the all-at-cap pre-flight — the best any layout can do.
+    pub sf_crit_cap: f64,
+    /// Pre-flight verdict: false = target unreachable even at the cap; the
+    /// delivered design IS the all-at-cap design (§17 dec. 6).
+    pub sf_feasible: bool,
+    /// Per-step SF_crit of the delivered design (primary first, then the
+    /// extra cases in `LoadSet` order) — the envelope's members.
+    pub sf_per_step: Vec<f64>,
+    /// (budget, SF_crit) of every strength evaluation, pre-flight first.
+    pub sf_trace: Vec<(f64, f64)>,
+    /// Cells (padded grid) whose smoothed envelope SF lies below the target on
+    /// the delivered design — the binding region (one-click view / diagnosis).
+    pub binding_cells: Vec<u32>,
+    /// Volume share of the binding region inside skin cells: ≳0.5 reads
+    /// "skin-limited" (infill can't fix it), else "interior-at-cap".
+    pub binding_skin_share: f64,
     // ---- volume components (occupancy-weighted); mass = (skin+wall+infill)·h³·ρ ----
     pub vol_skin: f64,
     /// Wall-band volume inside design cells (composite skin's solid share).
@@ -164,6 +215,113 @@ pub struct OptOutcome {
     pub w_sum: f64,
     /// Infill volume actually placed by the binned design.
     pub infill_vol_binned: f64,
+}
+
+/// One deliverable design: everything a secant pass (or the strength
+/// pre-flight) produces that the post-loop pipeline consumes. The strength
+/// goal keeps the lightest FEASIBLE one as its delivery fallback; budget and
+/// match construct it once at their break site (sf fields empty).
+struct Snapshot {
+    budget: f64,
+    result: OptimizeResult,
+    centers: Vec<f64>,
+    bins: Vec<u8>,
+    x_binned: Vec<f64>,
+    c_binned: f64,
+    u_binned: Vec<f64>,
+    stats: crate::mg::SolveStats,
+    /// Strength goal only: SF_crit (min over steps), per-step values, the
+    /// elementwise-min folded smoothed SF field, and the criterion mask.
+    sf_crit: f64,
+    sf_steps: Vec<f64>,
+    sf_folded: Vec<f32>,
+    sf_mask: Vec<bool>,
+}
+
+impl Snapshot {
+    /// A budget/match delivery (no strength fields).
+    #[allow(clippy::too_many_arguments)]
+    fn plain(
+        budget: f64,
+        result: OptimizeResult,
+        centers: Vec<f64>,
+        bins: Vec<u8>,
+        x_binned: Vec<f64>,
+        c_binned: f64,
+        u_binned: Vec<f64>,
+        stats: crate::mg::SolveStats,
+    ) -> Self {
+        Snapshot {
+            budget,
+            result,
+            centers,
+            bins,
+            x_binned,
+            c_binned,
+            u_binned,
+            stats,
+            sf_crit: 0.0,
+            sf_steps: Vec::new(),
+            sf_folded: Vec::new(),
+            sf_mask: Vec::new(),
+        }
+    }
+}
+
+/// SF_crit of ONE design over every included load step (DESIGN §17 dec. 4/5):
+/// per-cell SF (display math) → masked nodal smoothing → volume-weighted
+/// trimmed percentile, per step; the scalar is the min over steps (every step
+/// must meet the target). The primary step reuses `u_primary` (already solved
+/// for exactly this `x`); extra steps re-solve cold, each with its own
+/// self-weight when the case carries one. Returns
+/// (min SF_crit, per-step SF_crit, folded elementwise-min smoothed SF, mask).
+#[allow(clippy::too_many_arguments)]
+fn strength_eval(
+    grid: &VoxelGrid,
+    levels: usize,
+    settings: &SolveSettings,
+    loads: &LoadSet,
+    skin: &[u32],
+    design_cells: &[u32],
+    skin_frac: &[f32],
+    x: &[f64],
+    eval_exp: f64,
+    eval_coeff: f64,
+    solid_mode: bool,
+    spec: &StrengthSpec,
+    u_primary: &[f64],
+) -> Result<(f64, Vec<f64>, Vec<f32>, Vec<bool>), OptimizeError> {
+    let eps = build_eps(grid, skin, design_cells, skin_frac, x, eval_exp, eval_coeff);
+    let mask = strength::criterion_mask(grid, design_cells, x, solid_mode);
+    let vfrac = if loads.has_self_weight() {
+        build_vfrac(grid, design_cells, skin_frac, x)
+    } else {
+        Vec::new()
+    };
+    let mut folded: Vec<f32> = Vec::new();
+    let fold_step = |u64: &[f64], folded: &mut Vec<f32>| -> f64 {
+        let u: Vec<f32> = u64.iter().map(|&v| v as f32).collect();
+        let cells = strength::sf_cells(grid, &u, settings.e0, settings.nu, &eps, &mask, spec);
+        let sm = strength::smooth_masked(grid, &cells, &mask);
+        let crit = strength::sf_percentile(grid, &sm, &mask, strength::SF_TRIM_FRAC);
+        if folded.is_empty() {
+            *folded = sm;
+        } else {
+            for (f, v) in folded.iter_mut().zip(&sm) {
+                *f = f.min(*v);
+            }
+        }
+        crit
+    };
+    let mut per_step = vec![fold_step(u_primary, &mut folded)];
+    for (j, (p, _w)) in loads.extra.iter().enumerate() {
+        let u_j = step_displacement(
+            grid, levels, p, settings, eps.clone(), loads.extra_body(j), &vfrac,
+        )?;
+        per_step.push(fold_step(&u_j, &mut folded));
+    }
+    let crit_min = per_step.iter().copied().fold(f64::INFINITY, f64::min);
+    Ok((crit_min, per_step, folded, mask))
 }
 
 /// Run the optimization + binning + verification + reference solves + region
@@ -191,7 +349,20 @@ pub fn run_optimization(
     // "match": one tight uniform solve at ref_frac sets the target compliance;
     // a guarded secant then walks the budget until the BINNED design lands
     // within tolerance, each pass warm-started from the previous design.
-    let max_passes = if cfg.goal_match { MAX_MATCH_PASSES } else { 1 };
+    // "strength" (§17): an all-at-cap pre-flight decides feasibility, then the
+    // same secant machinery walks the budget against SF_crit instead.
+    debug_assert!(
+        !(cfg.goal_match && cfg.strength.is_some()),
+        "match and strength goals are mutually exclusive"
+    );
+    let strength_goal = cfg.strength.as_ref();
+    let max_passes = if cfg.goal_match {
+        MAX_MATCH_PASSES
+    } else if strength_goal.is_some() {
+        MAX_STRENGTH_PASSES
+    } else {
+        1
+    };
     let mut c_target = 0.0f64;
     if cfg.goal_match {
         status(PipelinePhase::ReferenceSolve);
@@ -213,21 +384,100 @@ pub fn run_optimization(
         c_target = c_ref;
     }
 
+    // ---- strength pre-flight (§17 dec. 6) ----
+    // One tight solve with EVERY designable cell at the cap — the best any
+    // layout can reach. Below target ⇒ infeasible: skip the loop entirely and
+    // deliver this cap design (with diagnosis). Feasible ⇒ it seeds the secant
+    // trace as the guaranteed-feasible upper bracket AND the delivery
+    // fallback, so the solve is never wasted.
+    let mut sf_trace: Vec<(f64, f64)> = Vec::new();
+    let mut sf_cap_crit = 0.0f64;
+    let mut sf_feasible = true;
+    let mut best_feasible: Option<Snapshot> = None;
+    if let Some(sg) = strength_goal {
+        status(PipelinePhase::Preflight);
+        let split = design_split(grid, params, problem, loads);
+        if split.design.is_empty() {
+            return Err(OptimizeError::NoInterior);
+        }
+        let x_cap = vec![params.cap; split.design.len()];
+        let (c_cap, _maxd, u_cap, stats_cap) = evaluate_cached_stats(
+            slot, grid, levels, problem, settings, &split.skin, &split.design, &split.skin_frac,
+            &x_cap, eval_exp, eval_coeff, loads,
+        )?;
+        status(PipelinePhase::SfEval);
+        let (crit, steps, folded, mask) = strength_eval(
+            grid, levels, settings, loads, &split.skin, &split.design, &split.skin_frac, &x_cap,
+            eval_exp, eval_coeff, solid, &sg.spec, &u_cap,
+        )?;
+        sf_cap_crit = crit;
+        sf_feasible = crit >= sg.target;
+        sf_trace.push((params.cap, crit));
+        // Cap delivery: one printable level at the cap (solid mode: the full
+        // part) — bins/regions/baselines flow through the normal tail.
+        let centers = if solid { vec![0.0, 1.0] } else { vec![params.floor, params.cap] };
+        let bins = vec![1u8; split.design.len()];
+        let result = OptimizeResult {
+            x: x_cap.clone(),
+            design_cells: split.design,
+            skin_cells: split.skin,
+            skin_frac: split.skin_frac,
+            effective_budget: params.cap,
+            iterations: 0,
+            converged: true,
+            compliance: c_cap,
+            u: u_cap.clone(),
+            se: vec![0.0; bins.len()],
+        };
+        best_feasible = Some(Snapshot {
+            budget: params.cap,
+            result,
+            centers,
+            bins,
+            x_binned: x_cap,
+            c_binned: c_cap,
+            u_binned: u_cap,
+            stats: stats_cap,
+            sf_crit: crit,
+            sf_steps: steps,
+            sf_folded: folded,
+            sf_mask: mask,
+        });
+    }
+
     let mut pass_no = 1usize;
     let mut budget_k = if cfg.goal_match {
         // Optimized designs match uniform stiffness at ~70–85% of the mass —
         // start the search there.
         (cfg.ref_frac * 0.8).max(params.floor)
+    } else if let Some(sg) = strength_goal {
+        // First guess from the first-order power law SF(b) ≈ SF_cap·(b/cap)^n
+        // (Gibson–Ashby: strength tracks stiffness), aimed at the middle of
+        // the accept band. Degenerate when the cap design sits AT the SF cap
+        // (flat spot) — the guarded secant/bisection recovers from that.
+        let aim = sg.target * (1.0 + 0.5 * STRENGTH_BAND);
+        (params.cap * (aim / sf_cap_crit.max(1e-9)).powf(1.0 / eval_exp.max(0.5)))
+            .clamp(params.floor, params.cap)
     } else {
         params.budget
     };
-    let (mut lo_b, mut hi_b) = (params.floor, cfg.ref_frac);
+    let (mut lo_b, mut hi_b) = if strength_goal.is_some() {
+        (params.floor, params.cap)
+    } else {
+        (params.floor, cfg.ref_frac)
+    };
     let mut warm_x: Option<Vec<f64>> = None;
     let mut warm_u: Option<Vec<f64>> = None;
     let mut pass_trace: Vec<(f64, f64)> = Vec::new();
     let mut total_iters = 0usize;
 
-    let (result, centers, bins, x_binned, c_binned, u_binned, verify_stats) = loop {
+    let delivered: Snapshot = 'deliver: {
+        // Infeasible strength target: no layout can reach it — deliver the
+        // all-at-cap design straight away (§17 dec. 6), no optimization loop.
+        if strength_goal.is_some() && !sf_feasible {
+            break 'deliver best_feasible.take().unwrap();
+        }
+        loop {
         let params_k = OptimizeParams { budget: budget_k, ..*params };
         let pass = pass_no;
         let budget = budget_k;
@@ -299,13 +549,85 @@ pub fn run_optimization(
         )?;
         pass_trace.push((budget_k, c_b));
 
+        // ---- strength goal arm (§17 dec. 3): budget secant against SF_crit ----
+        if let Some(sg) = strength_goal {
+            status(PipelinePhase::SfEval);
+            let (crit, steps, folded, mask) = strength_eval(
+                grid, levels, settings, loads, &result.skin_cells, &result.design_cells,
+                &result.skin_frac, &x_binned, eval_exp, eval_coeff, solid, &sg.spec, &u_b,
+            )?;
+            sf_trace.push((budget_k, crit));
+            let feasible_now = crit >= sg.target;
+            if feasible_now {
+                hi_b = hi_b.min(budget_k);
+            } else {
+                lo_b = lo_b.max(budget_k);
+            }
+            // Keep the lightest feasible design seen — the delivery. Below
+            // target is never delivered (the band sits ABOVE target only),
+            // and the cap pre-flight guarantees a feasible fallback exists.
+            let lighter = best_feasible.as_ref().map_or(true, |b| budget_k <= b.budget);
+            if feasible_now && lighter {
+                best_feasible = Some(Snapshot {
+                    budget: budget_k,
+                    result: result.clone(),
+                    centers: centers.clone(),
+                    bins: bins.clone(),
+                    x_binned: x_binned.clone(),
+                    c_binned: c_b,
+                    u_binned: u_b.clone(),
+                    stats: stats_b.clone(),
+                    sf_crit: crit,
+                    sf_steps: steps,
+                    sf_folded: folded,
+                    sf_mask: mask,
+                });
+            }
+            let in_band = feasible_now && crit <= sg.target * (1.0 + STRENGTH_BAND);
+            let at_floor = feasible_now && budget_k <= params.floor + 1e-9;
+            if in_band || at_floor || pass_no >= max_passes || hi_b - lo_b < 0.005 {
+                break 'deliver best_feasible.take().unwrap();
+            }
+            // Guarded secant on the last two evaluations, aimed at the band
+            // midpoint; bisection fallback inside the feasibility bracket.
+            let n = sf_trace.len();
+            let aim = sg.target * (1.0 + 0.5 * STRENGTH_BAND);
+            let (b1, c1) = sf_trace[n - 2];
+            let (b2, c2) = sf_trace[n - 1];
+            let mut next = if (c1 - c2).abs() > 1e-12 {
+                b2 + (aim - c2) * (b1 - b2) / (c1 - c2)
+            } else {
+                0.5 * (lo_b + hi_b)
+            };
+            // UNLIKE match, the lower bracket starts AT the floor without a
+            // measurement there — the floor itself may well be feasible. When
+            // the secant wants to go at/below an untested floor, TRY the floor
+            // (the lightest legal design; the `at_floor` break then ends the
+            // search) instead of bisecting above it for the remaining passes.
+            let floor_untested = lo_b <= params.floor + 1e-12
+                && sf_trace.iter().all(|&(b, _)| b > params.floor + 1e-9);
+            if next <= params.floor + 0.002 && floor_untested {
+                next = params.floor;
+            } else if !(next > lo_b + 0.002 && next < hi_b - 0.002) {
+                next = 0.5 * (lo_b + hi_b);
+            }
+            budget_k = next.clamp(params.floor, params.cap);
+            warm_x = Some(result.x.clone());
+            warm_u = Some(result.u.clone());
+            pass_no += 1;
+            continue;
+        }
         if !cfg.goal_match {
-            break (result, centers, bins, x_binned, c_b, u_b, stats_b);
+            break 'deliver Snapshot::plain(
+                budget_k, result, centers, bins, x_binned, c_b, u_b, stats_b,
+            );
         }
         // dev > 0: too compliant (needs more material); < 0: too stiff.
         let dev = c_b / c_target - 1.0;
         if dev.abs() <= MATCH_TOL || pass_no >= max_passes || hi_b - lo_b < 0.005 {
-            break (result, centers, bins, x_binned, c_b, u_b, stats_b);
+            break 'deliver Snapshot::plain(
+                budget_k, result, centers, bins, x_binned, c_b, u_b, stats_b,
+            );
         }
         if dev > 0.0 {
             lo_b = lo_b.max(budget_k);
@@ -332,6 +654,44 @@ pub fn run_optimization(
         warm_x = Some(result.x.clone());
         warm_u = Some(result.u.clone());
         pass_no += 1;
+        }
+    };
+
+    let Snapshot {
+        result,
+        centers,
+        bins,
+        x_binned,
+        c_binned,
+        u_binned,
+        stats: verify_stats,
+        sf_crit: sf_crit_out,
+        sf_steps: sf_steps_out,
+        sf_folded,
+        sf_mask,
+        budget: _,
+    } = delivered;
+
+    // ---- binding region on the DELIVERED design (§17 dec. 6) ----
+    // Cells below the SF target on the folded smoothed field. On a feasible
+    // delivery this is (at most) the trimmed tail — the safety net for
+    // hotspots smaller than the trim volume; on an infeasible one it is the
+    // diagnosis: mostly-skin ⇒ infill can't fix it, else raise the cap.
+    let (binding_cells, binding_skin_share) = if let Some(sg) = strength_goal {
+        let b = strength::binding_cells(&sf_folded, &sf_mask, sg.target);
+        let mut is_skin = vec![false; grid.cell_count()];
+        for &c in &result.skin_cells {
+            is_skin[c as usize] = true;
+        }
+        let v_all: f64 = b.iter().map(|&c| grid.scale[c as usize] as f64).sum();
+        let v_skin: f64 = b
+            .iter()
+            .filter(|&&c| is_skin[c as usize])
+            .map(|&c| grid.scale[c as usize] as f64)
+            .sum();
+        (b, if v_all > 0.0 { v_skin / v_all } else { 0.0 })
+    } else {
+        (Vec::new(), 0.0)
     };
 
     // ---- volume bookkeeping (occupancy × (1 − wall fraction)) ----
@@ -453,6 +813,14 @@ pub fn run_optimization(
         regions,
         regions_raw,
         pass_trace,
+        sf_target: strength_goal.map_or(0.0, |g| g.target),
+        sf_crit: sf_crit_out,
+        sf_crit_cap: sf_cap_crit,
+        sf_feasible,
+        sf_per_step: sf_steps_out,
+        sf_trace,
+        binding_cells,
+        binding_skin_share,
         vol_skin,
         sum_f,
         w_sum,
@@ -618,6 +986,7 @@ mod tests {
         let cfg = PipelineCfg {
             eval: EvalLaw { exp: 1.5, coeff: 1.0 },
             goal_match: false,
+            strength: None,
             ref_frac: 0.35,
             n_bins: 3,
             levels_pct: None,
@@ -646,6 +1015,121 @@ mod tests {
         );
         assert!(!oc.regions.is_empty(), "at least one region extracted");
         assert!(oc.max_disp > 0.0 && oc.max_disp < 50.0, "sane deflection {}", oc.max_disp);
+    }
+
+    /// STRENGTH goal (DESIGN §17): min material s.t. SF_crit ≥ target, on the
+    /// tip-loaded cantilever. Three behaviours anchored:
+    ///  (a) an unreachable target (beyond SF_CAP) takes the infeasible path —
+    ///      no optimization loop, the all-at-cap design delivered, best
+    ///      achievable + binding region reported;
+    ///  (b) a reachable target delivers a design AT or ABOVE the target
+    ///      (never below — the band sits above only) with LESS material than
+    ///      the cap design;
+    ///  (c) budget/match outputs stay inert (sf fields zero/empty) — the
+    ///      byte-identity of those paths is regbench's job, this guards the
+    ///      plumbing.
+    #[test]
+    fn strength_goal_feasible_and_infeasible() {
+        let beam = primitives::boxx([0.0; 3], [60.0, 10.0, 10.0]);
+        let grid0 = VoxelGrid::voxelize(&beam, 1.0);
+        let settings = SolveSettings { e0: 2400.0, nu: 0.35, tol: 1e-5, ..Default::default() };
+        let (grid, levels) = pad_for_levels(&grid0, settings.max_levels);
+        let bcs = vec![
+            BcSpec { kind: BcKind::Fixed, tris: vec![0, 1] },
+            BcSpec { kind: BcKind::Force([0.0, 0.0, -30.0]), tris: vec![2, 3] },
+        ];
+        let asm = assemble(&beam, &grid, &bcs, None, &settings).unwrap();
+        let params = OptimizeParams {
+            budget: 0.35,
+            exponent: 1.5,
+            coeff: 1.0,
+            wall_mm: 1.0,
+            max_iter: 30,
+            ..Default::default()
+        };
+        let spec = crate::strength::StrengthSpec {
+            measure: crate::strength::SfMeasure::Both,
+            strength: 50.0,
+            strength_z: 35.0,
+            shear_z: 21.0,
+        };
+        let run = |target: f64| {
+            let cfg = PipelineCfg {
+                eval: EvalLaw { exp: 1.5, coeff: 1.0 },
+                goal_match: false,
+                strength: Some(StrengthGoal { target, spec }),
+                ref_frac: 0.35,
+                n_bins: 3,
+                levels_pct: None,
+                smooth_iters: 0,
+            };
+            run_optimization(
+                &mut None, &grid, levels, &asm.problem, &settings, &params, &cfg,
+                &LoadSet::default(),
+                |_, _, _| {},
+                |_| {},
+            )
+            .expect("strength pipeline")
+        };
+
+        // (a) Unreachable: SF_CAP is 10, so 50 can never be met.
+        let inf = run(50.0);
+        assert!(!inf.sf_feasible, "target 50 must be infeasible");
+        assert!(
+            inf.sf_crit_cap > 0.0 && inf.sf_crit_cap < 50.0,
+            "best achievable reported: {}",
+            inf.sf_crit_cap
+        );
+        assert_eq!(inf.design_iters, 0, "infeasible path must skip the SIMP loop");
+        assert!(
+            (inf.mean_binned - params.cap).abs() < 1e-6,
+            "all-at-cap delivery: mean {}",
+            inf.mean_binned
+        );
+        assert!(!inf.binding_cells.is_empty(), "binding region identified");
+        assert!(
+            (0.0..=1.0).contains(&inf.binding_skin_share),
+            "sane skin share {}",
+            inf.binding_skin_share
+        );
+        assert_eq!(inf.sf_per_step.len(), 1, "single load step");
+
+        // (b) Reachable: aim well below the cap design's SF_crit.
+        let target = (inf.sf_crit_cap * 0.55).max(1.1);
+        let ok = run(target);
+        assert!(ok.sf_feasible, "target {target:.2} must be feasible");
+        assert!(
+            ok.sf_crit >= target - 1e-9,
+            "delivered design meets the target: SF_crit {} < {target:.2}",
+            ok.sf_crit
+        );
+        assert!(
+            ok.mean_binned < params.cap - 0.02,
+            "feasible delivery saves material vs cap: mean {}",
+            ok.mean_binned
+        );
+        assert!(ok.sf_trace.len() >= 2, "pre-flight + ≥1 pass traced");
+        assert!(ok.verify_converged, "verification solve converged");
+
+        // (c) Plain budget run: strength outputs stay inert.
+        let cfg = PipelineCfg {
+            eval: EvalLaw { exp: 1.5, coeff: 1.0 },
+            goal_match: false,
+            strength: None,
+            ref_frac: 0.35,
+            n_bins: 3,
+            levels_pct: None,
+            smooth_iters: 0,
+        };
+        let plain = run_optimization(
+            &mut None, &grid, levels, &asm.problem, &settings, &params, &cfg,
+            &LoadSet::default(),
+            |_, _, _| {},
+            |_| {},
+        )
+        .expect("budget pipeline");
+        assert_eq!(plain.sf_target, 0.0);
+        assert!(plain.sf_trace.is_empty() && plain.binding_cells.is_empty());
     }
 
     /// MULTI-LOAD (DESIGN §13): a cantilever loaded +Z in one case and +Y in
@@ -678,6 +1162,7 @@ mod tests {
         let cfg = PipelineCfg {
             eval: EvalLaw { exp: 1.5, coeff: 1.0 },
             goal_match: false,
+            strength: None,
             ref_frac: 0.35,
             n_bins: 3,
             levels_pct: None,

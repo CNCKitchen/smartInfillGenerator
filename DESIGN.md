@@ -533,6 +533,8 @@ panel. Fallback pattern law: conservative generic n = 2.
   truck's correct BREP + boundary polylines (the surface vertices truck emits are
   exactly on the true surface). Dev scaffolding kept: `filasim-wasm` debug exports
   `step_face_report` / `step_face_stl`, harness `stepnode_test.mjs`.
+  **SUPERSEDED 2026-07-24 by §18**: STEP tessellation moves to meshStep (JS-side);
+  the truck path gets deleted once §18 M1 is proven.
 - Self-weight: engine supports it, UI hides it (negligible for desktop plastic prints; revisit for large/heavy parts).
 
 ## 10. Future simulation types (requested 2026-06, not scheduled)
@@ -918,5 +920,128 @@ against SF_crit, infeasible-path UX (banner + binding-cell view + delivered cap 
 **(3) M2 local redistribution** — only if a benchmark part shows M1 leaving clear material
 on the table where layer-adhesion hotspots miss compliance hotspots.
 
+**Status (2026-07-24): milestones 1 + 2 SHIPPED; M2 redistribution deferred as planned.**
+Implementation notes for the record:
+- Criterion lives in `filasim-core/src/strength.rs` (`sf_cells` → `smooth_masked` →
+  `sf_percentile`, trim `SF_TRIM_FRAC = 0.002` in code). Per-cell SF is the DISPLAY math
+  (allowable and stress both scale by the cell's eps, so the factor cancels), and the
+  SMOOTHED field is the SF field itself (nodal recovery + cell re-average) — the display's
+  smooth-stress toggle recovers `sf` to nodes too, so dec. 2's "the number matches the plot"
+  holds under smoothing as well. Masked-out ersatz-void cells neither contribute nor receive.
+- The pipeline arm (`pipeline.rs`: `StrengthGoal` in `PipelineCfg`, `Preflight`/`SfEval`
+  phases) reuses the match secant with two §17 twists: the accept band sits ABOVE target
+  only (`STRENGTH_BAND` 5%), and the delivery is the lightest FEASIBLE snapshot seen — the
+  all-at-cap pre-flight seeds that snapshot, so a below-target design can never ship. One
+  extra guard vs match: when the secant asks for a budget at/below an UNTESTED floor it
+  tries the floor itself (the floor is not a formal bracket here, it may be feasible).
+- Envelope = per-step SF_crit, min over included steps (extra steps re-solve cold per pass
+  via `simp::step_displacement`, with their own self-weight when §16 accel is active).
+- Infeasible UX: `warnbanner` in the Results inspector + skin-share diagnosis
+  (`bindingSkinShare` > 0.5 ⇒ skin-limited copy) + "show the critical region" button = the
+  SF field with the legend banded in 2 at the target (red = below target).
+- regbench anchors: `strength_sfcrit_solid` / `strength_rawmin_solid` /
+  `strength_sfcrit_infill` (the infill one must equal eps × solid — the Gibson–Ashby
+  allowable wiring); smoke: infeasible path (all-at-cap, 0 iterations) + feasible path.
+  Budget/match stayed byte-identical (regbench +0.000% across the board).
+
 **Deferred.** Per-step SF targets (survival vs service margins — additive later if asked).
 M2 until M1 proves wasteful. Exposing the trim fraction. Textbook adjoint/p-norm machinery.
+
+## 18. STEP import via meshStep (plan 2026-07-24)
+
+**Problem.** STEP import has been DEACTIVATED since 2026-06 (§9): truck parses B-rep
+exactly but tessellates it badly (developable-face slivers, twisted trimmed periodic
+faces). Meanwhile meshStep (own tool, `Desktop/Coding/meshStep`, published as
+`meshstep` on npm) became a production-quality pure-TS STEP→mesh importer: watertight
+per body by construction, seam-unwrapped periodic faces (exactly truck's failure mode),
+97.2% watertight on 10k wild ABC files, zero runtime deps, AGPL-3.0-only, same owner.
+It also preserves B-rep provenance far beyond what truck's path carried: per-triangle
+CAD face + solid + instance ids, per-face analytic surface info (type/axis/radius/
+area/normal), STYLED_ITEM colors, assembly structure with part names, and opt-in
+analytic measure geometry (B-rep edges incl. adjacency).
+
+**Existing machinery (found 2026-07-24).** filasim already has a latent STEP pipeline,
+gated only by the `step` cargo feature + the `.stl,.3mf` accept list: `import_any`
+dispatches on `ISO-10303-21` (filasim-wasm lib.rs:213-228), `Model` carries
+`cad_face_of_orig`, `cad_segmentation` seeds one patch per CAD face, `use_cad_faces` /
+`has_cad_faces` exist, and the web side models `LoadedModel.hasCadFaces` +
+`segSource: "angle" | "cad"`. Everything downstream of "(mesh, face-of-tri) exists"
+already works — the only broken piece is tessellation, which is exactly what meshStep
+replaces.
+
+| # | Topic | Decision |
+|---|-------|----------|
+| 1 | Tessellator | **meshStep in JS replaces the truck path entirely.** truck's `step` feature stays off and is DELETED once M1 is proven (with its debug exports + `stepnode_test.mjs`). No Rust-side STEP parsing remains. |
+| 2 | Where it runs | **Dedicated import worker** (`import.worker.ts`), not the engine worker. `importStep` is synchronous/CPU-bound (worker is meshStep's documented pattern): `onProgress` → progress UI, `signal: AbortSignal` → cancel at work-unit boundary, `worker.terminate()` → hard-stop for pathological faces. Buffers transfer zero-copy to the engine worker. |
+| 3 | wasm boundary | **New entry `Model::new_from_mesh(positions: f32, indices: u32, face_of_tri: u32, solid_of_tri: u32)`** landing exactly where `import_any` returns today, so refinement → segmentation → voxelize → attach → solve are untouched. Float64→Float32 downcast in JS before transfer. STL/3MF paths must stay **byte-identical** (regbench `--check` + wasm smoke). |
+| 4 | Tessellation params | Defaults from meshStep's `estimateStepSize` + `autoTessellation(diag)` (≈0.01 mm deviation / 1 mm maxEdge at 100 mm parts), with `maxEdge` additionally clamped relative to expected voxel pitch h (attach radius is 0.9·h; selection + result display live on the triangles). Keep `capped_edges` as a safety cap in M1, measure, then drop for the meshStep path. `remesh` stays off (meshStep docs: it degrades the raw pipeline). |
+| 5 | Identity contract (meshstep@0.1.1, README "Identity & versioning") | Mesh layout (vertex positions/counts/triangle order) is **NOT stable across meshStep releases** — bit-identical only within a version. But `faceOfTri`/`solidOfTri`/`MeasureEdge.edgeId` are the **STEP file's own entity record numbers** (#123 of ADVANCED_FACE / EDGE_CURVE) — stable across versions for byte-identical input by construction. Rules: (a) persist entity ids + `SolidInstance.instance`, never triangle/vertex indices; (b) record the runtime `VERSION` export (trust it over the lockfile — stays correct under npm link) with any cached mesh, invalidate on mismatch; (c) hash the STEP bytes — ids are stable per FILE, not per design; a CAD re-export renumbers ⇒ "re-bind selections"; (d) tolerate the meshed-face set growing between versions (coverage improves, ids never renumber). |
+| 6 | Persistence | `.filasim` embeds the original `.step` bytes verbatim (existing §12 pattern) + manifest additions: meshStep `VERSION`, tessellation opts, STEP byte hash. **BC selections on STEP models are stored as CAD face-id sets when the selection is exactly a union of patches** (the common case under CAD segmentation); brush/sub-face selections fall back to triangle indices (valid because open re-tessellates with the pinned version + saved opts). Additive in PROJECT_SCHEMA=1. |
+| 7 | Diagnostics | meshStep `diagnostics`/`stats` map onto the existing import `notice` mechanism (dropped/unsupported faces, heuristic repairs). **Open shells (`openSolids` / `openEdges`) are a hard warning**: the winding-number inside-test (voxel.rs) is unreliable on open geometry. `diagnostics.ok` = quiet import. |
+| 8 | Dependency & license | **Exact pin `meshstep@0.1.1`** (no caret — see dec. 5's version sensitivity); `npm link` for dev. Both projects are AGPL-3.0-only with the same owner, so the copyleft is compatible; NOTE for the §2.14 license model: any filasim **commercial exception must bundle a meshstep exception** — decided here deliberately, not discovered later. Zero runtime deps (the one LGPL package in meshStep is a dev-only test harness, never shipped). |
+| 9 | Metadata exploitation (M3+) | `FaceInfo.surface` gives exact cylinder/cone axis+radius ⇒ bearing BC skips the least-squares fit on STEP input, and the axis feeds the planned rotational loads (§16 dec. 9). `meanNormal` ⇒ exact place-on-face / pickdir. `area` ⇒ true pressure↔force readouts. `colors` ⇒ CAD-colored viewer (later: paint-faces-in-CAD as BC markup — separate decision). `structure` ⇒ named body picker for multi-body. `measure.edges` (opt-in) revives the deferred edge/vertex-BC idea with EXACT B-rep edges: all edges included, B-splines as kind "other" with exact polylines + adjacent faceIds; respect `MeasureGeometry.truncated` (>250k edge instances ⇒ freeform polylines stride-decimated — selection identity still valid, but never render/snap to the decimated polyline). |
+
+**Build order** (each milestone shippable; gates: regbench `--check` byte-identical for
+STL/3MF, wasm smoke test, plus frozen STEP fixture hashes once M1 lands):
+**(1) Ship STEP import** — import worker with progress/cancel, `new_from_mesh`,
+`.step/.stp` accept lists (App.tsx/StepPanel.tsx), CAD segmentation active by default,
+size-adaptive tolerances, diagnostics→notices + open-shell hard warning; then delete
+the truck path. **(2) Persistence** — manifest fields (dec. 6), face-id BC storage +
+re-bind-on-hash-mismatch UX. **(3) Analytic BCs** — exact bearing axis/radius, exact
+place/pickdir normals, area readouts, cylindrical-patch → bearing suggestion.
+**(4) Presentation** — CAD colors, named body picker, `vertexNormals` shading.
+**(5, unscheduled)** — edge BCs via `measure.edges`, color-as-markup convention,
+planar-face seeding for §15's orientation Apply flow.
+
+**Deferred.** Assembly handling beyond "analyze one body/occurrence" (instances are
+baked; a picker is enough for now). Per-face tessellation density (meshStep has no
+override — REQUEST it from the maintainer if a real part needs it rather than
+designing around a guess). AP242 PMI (not in meshStep, none planned).
+
+**Status (2026-07-24): M1 SHIPPED.** Implementation notes:
+- `meshstep@0.1.1` exact-pinned in web/. `import.worker.ts` runs `importStep` with
+  file-derived opts (`estimateStepSize` → `autoTessellation`, normalDeviation 15°) —
+  deterministic per file so project reopen reproduces the mesh bit-identically (verified
+  on 3 real models incl. GoProHandlePod). It densifies the sparse entity ids and returns
+  the dense→entity tables (`faceEntityIds`/`solidEntityIds`) + diagnostics + VERSION in
+  `StepMeshPayload` (`StepImporter.ts`); the dec. 4 pitch-coupled maxEdge clamp was NOT
+  implemented — it would couple tessellation to session state and break reopen
+  determinism, and the auto maxEdge (~diag/100) already tracks the default pitch.
+- wasm: `Model::new` refactored into a shared `from_import` tail + new
+  `Model::from_mesh(positions, indices, face_of_tri, solid_of_tri, name)` (DENSE ids);
+  regbench +0.000% across the board (STL/3MF byte-identical).
+- Wire: `loadMesh` op (original .step bytes ride along for save); `openProjectModel`
+  returns `stepModel` bytes for STEP projects (header sniff) and the store re-tessellates
+  → `loadMesh` → `openProjectRestore` unchanged. `model.step` entry in `.filasim`.
+- UI: `.step/.stp` accepted everywhere (App/StepPanel/TopBar/drop), busy chip narrates
+  parse/tessellate%/finalize, Stop terminates the import worker (`importingStep` state);
+  cancelled imports are not errors. Diagnostics → notices (missing faces / open bodies
+  hard warning / heuristic repairs), meshStep version + face count in the nerd log.
+- Verified: regbench PASS, tsc + vite build clean (import worker = own 210 kB chunk),
+  smoke test extended (`from_mesh` validation, CAD-patch segmentation/solve, `.step`
+  project round-trip incl. design+result restore onto a `from_mesh` model), Node e2e
+  seam test on cylinderWithHole/chamferFillet/GoProHandlePod (bit-identical re-imports).
+- NOT yet done: truck-path deletion (waiting for real-world proving per dec. 1), M3+
+  metadata features. Note: GoProHandlePod tessellates to ~665k triangles at auto opts —
+  heavy but works; a coarser display budget knob may be worth it now that opts persist.
+
+**Status (2026-07-24): M2 SHIPPED.** Persistence per dec. 5/6, all additive in
+PROJECT_SCHEMA=1 (absent fields = M1/STL behavior):
+- Manifest gains `step: { meshstepVersion, opts, sha256 }` (`StepManifestInfo` in
+  `stepSelection.ts`); the import worker now hashes the original bytes (SHA-256) and
+  accepts an opts OVERRIDE — reopen replays the SAVED opts, so a re-anchored
+  `autoTessellation` in a future meshStep can't shift the mesh.
+- Per-BC `faceIds` (STEP entity record numbers) written when the selection is exactly a
+  union of CAD faces (`selectionFaceIds`); brush/partial selections stay tris-only. The
+  whole-face test runs against the LOAD-TIME CAD segmentation (`stepInfo.cadPatchIds` +
+  `faceEntityIds` kept in the store), so it's immune to the live segSource.
+- Open: same version + same opts ⇒ tris used verbatim (bit-identical mesh). Version or
+  hash mismatch ⇒ `trisForFaceIds` re-derives triangles from entity ids on the fresh
+  tessellation (unknown ids skipped — dec. 5d coverage growth); tris-only selections
+  empty out with a "re-paint N selections" notice; design/results restore is SKIPPED
+  (they were computed on a mesh that no longer exists — honest path), noticed + logged.
+  A re-save then writes the current version/opts/hash, healing the project.
+- Verified: `npm run check:step` (new harness `web/scripts/check-step-selection.mjs` —
+  whole-face detection, brush fallback, never-fabricate on stale indices, cross-version
+  entity-id rebind incl. changed dense order + grown faces), tsc + vite build clean.
+  No Rust/wasm changes (regbench/smoke unaffected).

@@ -11,9 +11,11 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "check:units": "node scripts/check-units.mjs",
+    "check:step": "node scripts/check-step-selection.mjs",
     "preview": "vite preview"
   },
   "dependencies": {
+    "meshstep": "0.1.1",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "three": "^0.180.0",

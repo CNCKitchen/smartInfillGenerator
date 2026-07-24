@@ -945,6 +945,7 @@ const PC_EPS_FLOOR: f32 = 0.20;
 /// publish to a few dozen copies even on the worst-case iteration counts.
 const PROGRESS_STRIDE: usize = 4;
 
+#[derive(Clone)]
 pub struct SolveStats {
     pub iterations: usize,
     pub rel_residual: f64,

@@ -115,6 +115,7 @@ pub struct OptimizeProgress {
     pub inner_residual: f64,
 }
 
+#[derive(Clone)]
 pub struct OptimizeResult {
     /// Physical (filtered) densities per interior design cell.
     pub x: Vec<f64>,
@@ -181,7 +182,7 @@ impl LoadSet {
 
     /// Self-weight accel for extra case `j` (None when no body list, or that
     /// case has no active acceleration).
-    fn extra_body(&self, j: usize) -> Option<BodyAccel> {
+    pub fn extra_body(&self, j: usize) -> Option<BodyAccel> {
         self.extra_body.get(j).copied().flatten()
     }
 
@@ -753,6 +754,72 @@ pub fn build_rhs(grid: &VoxelGrid, problem: &NodeProblem) -> Vec<f64> {
     b
 }
 
+/// The skin/design cell split the optimizer works on — extracted so callers
+/// that need the SAME split WITHOUT running the optimizer (the strength-goal
+/// all-at-cap pre-flight, DESIGN §17 dec. 6) cannot drift from it.
+///
+/// SOLID topology mode bypasses the skin band: the auto-frozen load/support
+/// cells become the only always-solid cells (reusing the skin path), every
+/// other solid cell is a free design cell. Infill modes keep the wall/shell
+/// skin model. Retain ON: freeze the load/support cells solid (keep regions);
+/// OFF: no frozen cells — the whole part is free to be carved. Multi-load:
+/// freeze the UNION of every case's anchors (single-load = unchanged).
+pub fn design_split(
+    grid: &VoxelGrid,
+    params: &OptimizeParams,
+    problem: &NodeProblem,
+    loads: &LoadSet,
+) -> SkinSplit {
+    if params.solid_mode {
+        let frozen = if !params.retain_bc {
+            Vec::new()
+        } else if loads.extra.is_empty() {
+            frozen_cells_from_problem(grid, problem)
+        } else {
+            let mut f = frozen_cells_from_problem(grid, problem);
+            for (p, _) in &loads.extra {
+                f.extend(frozen_cells_from_problem(grid, p));
+            }
+            f.sort_unstable();
+            f.dedup();
+            f
+        };
+        build_solid_split(grid, &frozen)
+    } else {
+        classify_cells(
+            grid,
+            params.wall_mm,
+            params.top_mm,
+            params.bottom_mm,
+            params.composite_skin,
+        )
+    }
+}
+
+/// Displacement of ONE load case under an explicit stiffness field — the
+/// per-step evaluation the strength goal's envelope needs (DESIGN §17 dec. 5:
+/// every included step must meet the SF target, so each step's own `u` is
+/// required, where `evaluate_cached_stats` only returns the primary's).
+/// `body`/`vfrac` carry the case's design-dependent self-weight (§16 dec. 4);
+/// pass `None`/`&[]` for no-accel cases. One tight cold solve.
+pub fn step_displacement(
+    grid: &VoxelGrid,
+    levels: usize,
+    problem: &NodeProblem,
+    settings: &SolveSettings,
+    eps: Vec<f32>,
+    body: Option<BodyAccel>,
+    vfrac: &[f32],
+) -> Result<Vec<f64>, crate::solve::SolveError> {
+    let r = if let Some(b) = body {
+        let sw = self_weight_rhs(grid, b, vfrac);
+        solve_cached_rhs(&mut None, grid, levels, problem, settings, eps, &[&sw], settings.tol, 2000)?
+    } else {
+        solve_cached(&mut None, grid, levels, problem, settings, eps, settings.tol, 2000)?
+    };
+    Ok(r.u)
+}
+
 /// Run the optimization. `progress` is called once per iteration.
 /// `x0`/`u0` warm-start the design and displacement fields — the
 /// stiffness-match outer loop re-runs at slightly different budgets, where
@@ -798,37 +865,7 @@ pub fn optimize_cached(
     loads: &LoadSet,
     mut progress: impl FnMut(&OptimizeProgress, &[f64], &[u32]),
 ) -> Result<OptimizeResult, OptimizeError> {
-    // SOLID topology mode bypasses the skin band: the auto-frozen load/support
-    // cells become the only always-solid cells (reusing the skin path), every
-    // other solid cell is a free design cell. Infill modes keep the wall/shell
-    // skin model.
-    let SkinSplit { skin, design: design_cells, skin_frac } = if params.solid_mode {
-        // Retain ON: freeze the load/support cells solid (keep regions). OFF:
-        // no frozen cells — the whole part is free to be carved. Multi-load:
-        // freeze the UNION of every case's anchors (single-load = unchanged).
-        let frozen = if !params.retain_bc {
-            Vec::new()
-        } else if loads.extra.is_empty() {
-            frozen_cells_from_problem(grid, problem)
-        } else {
-            let mut f = frozen_cells_from_problem(grid, problem);
-            for (p, _) in &loads.extra {
-                f.extend(frozen_cells_from_problem(grid, p));
-            }
-            f.sort_unstable();
-            f.dedup();
-            f
-        };
-        build_solid_split(grid, &frozen)
-    } else {
-        classify_cells(
-            grid,
-            params.wall_mm,
-            params.top_mm,
-            params.bottom_mm,
-            params.composite_skin,
-        )
-    };
+    let SkinSplit { skin, design: design_cells, skin_frac } = design_split(grid, params, problem, loads);
     if design_cells.is_empty() {
         return Err(OptimizeError::NoInterior);
     }

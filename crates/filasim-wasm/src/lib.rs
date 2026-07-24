@@ -326,8 +326,19 @@ struct OptimizeOpts {
     /// "budget" = stiffest design at the given mean infill (one pass);
     /// "match" = LIGHTEST design as stiff as a uniform print at budget_pct —
     /// a guarded secant on the budget, each pass warm-started, until the
-    /// BINNED design's compliance meets the uniform reference within 2%.
+    /// BINNED design's compliance meets the uniform reference within 2%;
+    /// "strength" (DESIGN §17) = LIGHTEST design whose trimmed-percentile
+    /// safety factor SF_crit meets `sf_target` on every included load step —
+    /// an all-at-cap pre-flight decides feasibility, then the same secant
+    /// machinery walks the budget against SF_crit (never accepting below).
     goal: String,
+    /// Strength goal: required SF_crit (§17 dec. 1; advisory design aid, not
+    /// a certified safety factor — strengths come from preset/measured values
+    /// and Gibson–Ashby scaling).
+    sf_target: f64,
+    /// Strength goal SF measure (§17 dec. 2): "material" (von Mises vs
+    /// in-plane strength) | "layer" (§15 adhesion interaction) | "both".
+    sf_measure: String,
     /// Planar symmetry constraint: [nx, ny, nz, c] of the plane n·p = c
     /// (world mm). None = unconstrained.
     symmetry: Option<Vec<f64>>,
@@ -360,6 +371,8 @@ impl Default for OptimizeOpts {
             overhang_deg: 45.0,
             solid_pattern: None,
             goal: "budget".into(),
+            sf_target: 2.0,
+            sf_measure: "both".into(),
             symmetry: None,
             top_bottom_layers: 5,
             layer_height: 0.2,
@@ -927,14 +940,18 @@ pub fn project_model(bytes: &[u8]) -> Result<Vec<u8>, JsValue> {
     Err(err("project file has no embedded model"))
 }
 
-#[wasm_bindgen]
 impl Model {
-    /// Parse STL (binary/ASCII), 3MF (zip magic), or STEP (`ISO-10303-21`
-    /// header, tessellated via truck); segment at 10° (fine patches pick
-    /// better; the slider re-segments live).
-    #[wasm_bindgen(constructor)]
-    pub fn new(bytes: &[u8], name: &str) -> Result<Model, JsValue> {
-        let (mesh_orig, mesh_objects, cad_face_of_orig) = import_any(bytes)?;
+    /// Shared tail of every import path: refine the tessellation, build the
+    /// default segmentation, and assemble the Model with its defaults. Called
+    /// by `new` (bytes → `import_any`) and `from_mesh` (pre-tessellated STEP
+    /// from meshStep, DESIGN §18) — keep it the ONLY place a Model is built so
+    /// both paths stay behaviorally identical.
+    fn from_import(
+        mesh_orig: TriMesh,
+        mesh_objects: usize,
+        cad_face_of_orig: Option<Vec<u32>>,
+        name: &str,
+    ) -> Model {
         // Refine the display/analysis tessellation: edges capped at ~1/60 of
         // the diagonal so deflection curves are visible on coarse meshes.
         // Dense meshes pass through unchanged (160k-triangle budget).
@@ -964,7 +981,7 @@ impl Model {
             None => remap_segmentation(&segment(&mesh_orig, 10.0), &parents),
         };
         let bodies = body_count(&mesh_orig);
-        Ok(Model {
+        Model {
             mesh,
             mesh_orig,
             parents,
@@ -1003,7 +1020,69 @@ impl Model {
             build_eps: None,
             build_eigen: [0.0; 3],
             transform_accum: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
-        })
+        }
+    }
+}
+
+#[wasm_bindgen]
+impl Model {
+    /// Parse STL (binary/ASCII), 3MF (zip magic), or STEP (`ISO-10303-21`
+    /// header, tessellated via truck); segment at 10° (fine patches pick
+    /// better; the slider re-segments live).
+    #[wasm_bindgen(constructor)]
+    pub fn new(bytes: &[u8], name: &str) -> Result<Model, JsValue> {
+        let (mesh_orig, mesh_objects, cad_face_of_orig) = import_any(bytes)?;
+        Ok(Self::from_import(mesh_orig, mesh_objects, cad_face_of_orig, name))
+    }
+
+    /// Pre-tessellated import (DESIGN §18): meshStep runs in a JS import
+    /// worker and hands over an indexed mesh (mm, welded) with per-triangle
+    /// CAD-face and solid ids. Both id arrays must be DENSE indices — the JS
+    /// side densifies the STEP entity record numbers and keeps the dense→
+    /// entity-id tables for persistence, so `cad_segmentation`'s max+1 patch
+    /// sizing stays bounded by the real face count. Refinement + segmentation
+    /// are identical to the bytes path with CAD faces present.
+    pub fn from_mesh(
+        positions: &[f32],
+        indices: &[u32],
+        face_of_tri: &[u32],
+        solid_of_tri: &[u32],
+        name: &str,
+    ) -> Result<Model, JsValue> {
+        if positions.len() % 3 != 0 {
+            return Err(err("positions length must be a multiple of 3"));
+        }
+        if indices.len() % 3 != 0 {
+            return Err(err("indices length must be a multiple of 3"));
+        }
+        let ntri = indices.len() / 3;
+        if ntri == 0 {
+            return Err(err("mesh has no triangles"));
+        }
+        if face_of_tri.len() != ntri {
+            return Err(err("face_of_tri length must equal the triangle count"));
+        }
+        if !solid_of_tri.is_empty() && solid_of_tri.len() != ntri {
+            return Err(err("solid_of_tri length must equal the triangle count"));
+        }
+        let nvert = positions.len() / 3;
+        let mut tris: Vec<[f32; 9]> = Vec::with_capacity(ntri);
+        for t in 0..ntri {
+            let mut tri = [0f32; 9];
+            for v in 0..3 {
+                let i = indices[3 * t + v] as usize;
+                if i >= nvert {
+                    return Err(err("triangle index out of range"));
+                }
+                tri[3 * v..3 * v + 3].copy_from_slice(&positions[3 * i..3 * i + 3]);
+            }
+            tris.push(tri);
+        }
+        let mesh_orig = TriMesh { tris };
+        // Distinct-solid count plays the mesh-object role (UI warns > 1 only
+        // for 3MF; the geometric `body_count` drives the multi-body warning).
+        let objects = solid_of_tri.iter().copied().max().map_or(1, |m| m as usize + 1);
+        Ok(Self::from_import(mesh_orig, objects, Some(face_of_tri.to_vec()), name))
     }
 
     /// Number of mesh objects found in the imported file (UI warns when >1).
@@ -2610,6 +2689,21 @@ impl Model {
         // serializes the outcome. The grid/mesh borrows are disjoint fields from
         // the &mut solver_cache the pipeline takes.
         let goal_match = opts.goal == "match" && !solid;
+        // Strength goal (§17): all three modes (dec. 7). Allowables are the
+        // material's solid strengths; graded knockdown happens per cell in the
+        // core (same Gibson–Ashby factor as the SF display, so "optimizer says
+        // SF 2.0" matches the plot). Target clamped inside the meaningful band
+        // (≥ SF_CAP would always be infeasible by construction).
+        let strength_goal = (opts.goal == "strength").then(|| filasim_core::pipeline::StrengthGoal {
+            target: opts.sf_target.clamp(1.0, 9.5),
+            spec: filasim_core::strength::StrengthSpec {
+                measure: filasim_core::strength::SfMeasure::parse(&opts.sf_measure)
+                    .unwrap_or(filasim_core::strength::SfMeasure::Both),
+                strength: self.strength,
+                strength_z: self.strength_z,
+                shear_z: self.shear_strength_z_eff(),
+            },
+        });
         let ref_frac = (budget_pct / 100.0).clamp(params.floor, params.cap);
         // Manual level override (binary {floor,1} or user densities): clamp,
         // sort, dedup once here; the pipeline takes the list verbatim.
@@ -2626,6 +2720,7 @@ impl Model {
         let cfg = filasim_core::pipeline::PipelineCfg {
             eval: filasim_core::pipeline::EvalLaw { exp: eval_exp, coeff: eval_coeff },
             goal_match,
+            strength: strength_goal,
             ref_frac,
             n_bins,
             levels_pct: levels_clean.as_deref(),
@@ -2687,6 +2782,8 @@ impl Model {
                 use filasim_core::pipeline::PipelinePhase as P;
                 emit_phase(match phase {
                     P::ReferenceSolve => serde_json::json!({"phase": "reference"}),
+                    P::Preflight => serde_json::json!({"phase": "preflight"}),
+                    P::SfEval => serde_json::json!({"phase": "sf_eval"}),
                     P::OptimizePass { pass, passes } => {
                         serde_json::json!({"phase": "optimize_pass", "pass": pass, "passes": passes})
                     }
@@ -2748,9 +2845,43 @@ impl Model {
             "selfWeight": has_self_weight,
             "binary": opts.binary,
             "solid": solid,
-            "goal": if goal_match { "match" } else { "budget" },
+            "goal": if goal_match {
+                "match"
+            } else if strength_goal.is_some() {
+                "strength"
+            } else {
+                "budget"
+            },
             "passes": oc.pass_trace.len(),
         });
+        if let Some(sg) = &strength_goal {
+            // Strength summary (§17): target vs achieved, the pre-flight's
+            // best-achievable ceiling, and the binding-region diagnosis the
+            // infeasibility banner narrates (dec. 6).
+            let o = summary_v.as_object_mut().unwrap();
+            o.insert("sfTarget".into(), serde_json::json!(sg.target));
+            o.insert("sfAchieved".into(), serde_json::json!(oc.sf_crit));
+            o.insert("sfBest".into(), serde_json::json!(oc.sf_crit_cap));
+            o.insert("sfFeasible".into(), serde_json::json!(oc.sf_feasible));
+            o.insert(
+                "sfMeasure".into(),
+                serde_json::json!(match sg.spec.measure {
+                    filasim_core::strength::SfMeasure::Material => "material",
+                    filasim_core::strength::SfMeasure::Layer => "layer",
+                    filasim_core::strength::SfMeasure::Both => "both",
+                }),
+            );
+            o.insert("sfPerStep".into(), serde_json::json!(oc.sf_per_step));
+            o.insert("bindingCellCount".into(), serde_json::json!(oc.binding_cells.len()));
+            o.insert("bindingSkinShare".into(), serde_json::json!(oc.binding_skin_share));
+            o.insert(
+                "sfTrace".into(),
+                serde_json::json!(oc.sf_trace
+                    .iter()
+                    .map(|&(b, sf)| serde_json::json!({"budget": b, "sf": sf}))
+                    .collect::<Vec<_>>()),
+            );
+        }
         if goal_match {
             let o = summary_v.as_object_mut().unwrap();
             o.insert("refUniformPct".into(), serde_json::json!(ref_frac * 100.0));

@@ -443,6 +443,11 @@ a.iconbtn:hover {
   color: var(--dim);
   background: none;
   white-space: nowrap;
+  /* A long label must never push the control past the panel edge — it
+     ellipsizes instead (the title attribute carries the full wording). */
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .seg button.on {

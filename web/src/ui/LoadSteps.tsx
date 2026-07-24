@@ -252,7 +252,7 @@ export function LoadStepsModal() {
               Which load cases the optimized infill must resist, and how much each one matters. Solve
               always runs every step — this only shapes Optimize. Weights are normalized; an
               unchecked step is ignored. Acceleration/gravity steps optimize too — the optimizer
-              tracks each design’s own self-weight every iteration (DESIGN §16).
+              tracks each design’s own self-weight every iteration.
             </div>
             <div className="lsoptgrid">
               {(() => {

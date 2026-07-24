@@ -721,6 +721,55 @@ assert(matchSummary.massGrams < matchSummary.massUniformRefGrams,
   "matched design is lighter than the uniform reference");
 console.log("ok: stiffness-match goal (lighter at equal stiffness)");
 
+// ---- strength goal (DESIGN §17) ----
+// Min material s.t. SF_crit ≥ target. Two runs on one model: an unreachable
+// target must take the honest infeasible path (all-at-cap delivery + best
+// achievable + binding diagnosis, NO optimization loop), a reachable one must
+// deliver AT/ABOVE the target with less material than the cap design.
+const sfModel = new Model(boxStl([0, 0, 0], [60, 12, 12]), "beam5");
+const ssel = patchSelector(sfModel);
+sfModel.set_material(2400, 0.35, 1.24, 50, 35);
+sfModel.set_resolution(25000);
+sfModel.add_fixed(ssel(0, "min"));
+sfModel.add_force(ssel(0, "max"), 0, 0, -40);
+const sfOpts = {
+  budgetPct: 35, exponent: 1.5, coeff: 1.0, perimeters: 2, lineWidth: 0.45,
+  smoothIters: 4, nBins: 3, floorPct: 10, capPct: 70, levelsPct: null,
+  binary: false, solidPattern: null, goal: "strength", sfMeasure: "both",
+};
+const t4 = performance.now();
+const sfInf = JSON.parse(
+  sfModel.optimize(JSON.stringify({ ...sfOpts, sfTarget: 9.5 }), () => {})
+);
+console.log(
+  `   strength (infeasible): best achievable SF ${sfInf.sfBest.toFixed(2)} at cap, ` +
+    `${sfInf.bindingCellCount} binding cells (skin share ${(sfInf.bindingSkinShare * 100).toFixed(0)}%)`
+);
+assert(sfInf.goal === "strength", "summary flags strength goal");
+assert(sfInf.sfFeasible === false, "SF 9.5 on this beam is (honestly) infeasible");
+assert(sfInf.sfBest > 0 && sfInf.sfBest < 9.5, `best-achievable ceiling reported (${sfInf.sfBest})`);
+assert(Math.abs(sfInf.meanInfill - 0.7) < 0.02,
+  `infeasible path delivers the all-at-cap design (mean ${(sfInf.meanInfill * 100).toFixed(1)}%)`);
+assert(sfInf.iterations === 0, "infeasible path skips the optimization loop");
+assert(sfInf.bindingCellCount > 0, "binding region identified for the diagnosis");
+const sfTargetVal = Math.max(1.2, Math.min(3, sfInf.sfBest * 0.55));
+const sfOk = JSON.parse(
+  sfModel.optimize(JSON.stringify({ ...sfOpts, sfTarget: sfTargetVal }), () => {})
+);
+console.log(
+  `   strength (feasible): target ${sfTargetVal.toFixed(2)} → SF ${sfOk.sfAchieved.toFixed(2)} at ` +
+    `mean ${(sfOk.meanInfill * 100).toFixed(1)}% in ${sfOk.passes} pass(es), ` +
+    `${((performance.now() - t4) / 1000).toFixed(1)} s total`
+);
+assert(sfOk.sfFeasible === true, "reachable target is feasible");
+assert(sfOk.sfAchieved >= sfTargetVal - 1e-9,
+  `delivered design meets the target (SF ${sfOk.sfAchieved.toFixed(2)} ≥ ${sfTargetVal.toFixed(2)})`);
+assert(sfOk.meanInfill < 0.7 - 0.02, "feasible delivery saves material vs the cap design");
+assert(Array.isArray(sfOk.sfTrace) && sfOk.sfTrace.length >= 2,
+  "pre-flight + passes traced (budget vs SF)");
+assert(sfOk.sfMeasure === "both", "SF measure echoed in the summary");
+console.log("ok: strength goal (SF target met at minimum material; honest infeasibility)");
+
 // ---- project (.filasim) save / load round-trip ----
 // Orient → optimize → export project → re-import the original file + replay the
 // transform + restore: the design (regions, density, stress eps) and the result
@@ -1093,5 +1142,107 @@ console.log("ok: per-step optimized evaluation (solve_optimized across load step
     console.log("ok: rigid remote-mass mount solves — penalty converges (DESIGN §16 M4)");
   }
 }
+
+// ---- pre-tessellated import (DESIGN §18): Model.from_mesh ----
+// STEP now tessellates in the JS meshStep worker; the engine receives an
+// INDEXED mesh + DENSE per-triangle CAD-face/solid ids via from_mesh. It must
+// land exactly where the bytes path lands (CAD-face segmentation, refinement,
+// solvable), and a .step project must round-trip the way the open path does:
+// original bytes embedded verbatim, model rebuilt via from_mesh + transform
+// replay, design restored onto it.
+{
+  // Indexed 40×6×6 box: 8 vertices, 12 triangles, one CAD "face" per side,
+  // outward winding (the winding-number voxelizer needs it).
+  const lo = [0, 0, 0], hi = [40, 6, 6];
+  const positions = new Float32Array(24);
+  for (let c = 0; c < 8; c++) {
+    positions[3 * c] = c & 1 ? hi[0] : lo[0];
+    positions[3 * c + 1] = c & 2 ? hi[1] : lo[1];
+    positions[3 * c + 2] = c & 4 ? hi[2] : lo[2];
+  }
+  const V = (x, y, z) => x + 2 * y + 4 * z;
+  const sides = [
+    [[0, 0, 0], [0, 0, 1], [0, 1, 1], [0, 1, 0]], // -x
+    [[1, 0, 0], [1, 1, 0], [1, 1, 1], [1, 0, 1]], // +x
+    [[0, 0, 0], [1, 0, 0], [1, 0, 1], [0, 0, 1]], // -y
+    [[0, 1, 0], [0, 1, 1], [1, 1, 1], [1, 1, 0]], // +y
+    [[0, 0, 0], [0, 1, 0], [1, 1, 0], [1, 0, 0]], // -z
+    [[0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1]], // +z
+  ];
+  const idx = [];
+  const fot = [];
+  sides.forEach((s, f) => {
+    const c = s.map(([x, y, z]) => V(x, y, z));
+    idx.push(c[0], c[1], c[2], c[0], c[2], c[3]);
+    fot.push(f, f);
+  });
+  const indices = Uint32Array.from(idx);
+  const faceOfTri = Uint32Array.from(fot);
+  const solidOfTri = new Uint32Array(faceOfTri.length); // one solid, dense id 0
+
+  // Malformed inputs reject instead of building a broken model.
+  let bad = false;
+  try { Model.from_mesh(positions, indices, faceOfTri.subarray(0, 3), solidOfTri, "bad"); }
+  catch { bad = true; }
+  assert(bad, "from_mesh rejects a face_of_tri length mismatch");
+
+  const fm = Model.from_mesh(positions, indices, faceOfTri, solidOfTri, "meshbeam");
+  assert(fm.has_cad_faces() === true, "from_mesh model exposes CAD faces");
+  assert(fm.patch_count() === 6, `CAD-face segmentation: one patch per side (got ${fm.patch_count()})`);
+  const fmTri = fm.triangle_count();
+  assert(fmTri > 5000 && fmTri <= 160_000, `from_mesh refines for display like the bytes path (${fmTri} tris)`);
+  assert(fm.body_count() === 1, "from_mesh box is one body");
+  assert(fm.mesh_object_count() === 1, "one solid id → one mesh object");
+  const fmBbox = Array.from(fm.bbox());
+  assert(Math.abs(fmBbox[3] - 40) < 1e-4, "from_mesh bbox hi.x = 40");
+
+  const fsel = patchSelector(fm);
+  fm.set_material(2400, 0.35, 1.24, 50, 35);
+  fm.set_resolution(20000);
+  fm.add_fixed(fsel(0, "min"));
+  fm.add_force(fsel(0, "max"), 0, 0, -5);
+  assert(JSON.parse(fm.check()).ok === true, "from_mesh cantilever passes the check");
+  const fmStats = JSON.parse(fm.solve());
+  assert(fmStats.converged && fmStats.maxDisplacement > 0.001 && fmStats.maxDisplacement < 10,
+    `from_mesh model solves (max |u| ${fmStats.maxDisplacement.toFixed(4)} mm)`);
+
+  // .step project round-trip, exactly as the web open path performs it: the
+  // original STEP text embeds verbatim under model.step; open re-tessellates
+  // (same pinned meshStep + same file-derived opts ⇒ identical arrays) and
+  // rebuilds via from_mesh + transform replay, then restores the design.
+  const stepText = "ISO-10303-21;\nHEADER;ENDSEC;\nDATA;\n/* fixture stand-in */\nENDSEC;\nEND-ISO-10303-21;\n";
+  const stepBytes = new TextEncoder().encode(stepText);
+  JSON.parse(fm.optimize(JSON.stringify({
+    budgetPct: 30, exponent: 1.5, coeff: 1.0, perimeters: 2, lineWidth: 0.45,
+    smoothIters: 4, nBins: 3, floorPct: 10, capPct: 70, levelsPct: null,
+    binary: false, solidPattern: null, goal: "budget",
+  }), () => {}));
+  fm.stash_result("optimized");
+  const fmRegions = fm.region_count();
+  const fmVd = fm.vertex_density();
+  const manifest = JSON.stringify({ app: "filaSim", fileName: "meshbeam.step", transform: Array.from(fm.transform_matrix()) });
+  const proj = fm.export_project(stepBytes, "model.step", manifest, true);
+  assert(proj[0] === 0x50 && proj[1] === 0x4b, ".step project export is a zip");
+  const embedded = project_model(proj);
+  assert(embedded.length === stepBytes.length && embedded.every((b, i) => b === stepBytes[i]),
+    "original STEP bytes embedded verbatim under model.step");
+  assert(new TextDecoder("latin1").decode(embedded.subarray(0, 32)).includes("ISO-10303-21"),
+    "embedded model sniffs as STEP (the worker's open-path dispatch)");
+
+  const q = Model.from_mesh(positions, indices, faceOfTri, solidOfTri, "meshbeam");
+  q.set_material(2400, 0.35, 1.24, 50, 35);
+  q.set_resolution(20000);
+  const qSummary = JSON.parse(q.restore_project(proj));
+  assert(qSummary.hasDesign === true, "restore onto a from_mesh model reports the design");
+  assert(qSummary.restoredResults.includes("optimized"), "optimized result restored onto from_mesh model");
+  assert(q.region_count() === fmRegions, `regions match after from_mesh reopen (${q.region_count()} vs ${fmRegions})`);
+  const qVd = q.vertex_density();
+  let vdDiff = 0;
+  for (let i = 0; i < qVd.length; i++) vdDiff = Math.max(vdDiff, Math.abs(qVd[i] - fmVd[i]));
+  assert(vdDiff < 1e-6, "vertex density identical after from_mesh reopen");
+  q.free();
+  fm.free();
+}
+console.log("ok: pre-tessellated import (from_mesh + CAD patches + .step project round-trip)");
 
 console.log("\nALL SMOKE TESTS PASSED");

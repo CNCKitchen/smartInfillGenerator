@@ -117,6 +117,32 @@ self.onmessage = async (ev: MessageEvent<EngineWorkerRequest>) => {
         reply(msg, data, [positions.buffer, patchIds.buffer]);
         return;
       }
+      case "loadMesh": {
+        model?.free();
+        model = ModelCtor.from_mesh(
+          msg.positions,
+          msg.indices,
+          msg.faceOfTri,
+          msg.solidOfTri,
+          msg.name
+        );
+        // Original STEP bytes, verbatim — project save embeds these.
+        lastModel = { bytes: new Uint8Array(msg.bytes), name: msg.name };
+        const positions = model.positions();
+        const patchIds = model.patch_ids();
+        const data = {
+          positions,
+          patchIds,
+          patchCount: model.patch_count(),
+          triCount: model.triangle_count(),
+          bbox: Array.from(model.bbox()) as LoadedModelData["bbox"],
+          meshObjects: model.mesh_object_count(),
+          bodyCount: model.body_count(),
+          hasCadFaces: model.has_cad_faces(),
+        };
+        reply(msg, data, [positions.buffer, patchIds.buffer]);
+        return;
+      }
       case "transform": {
         const m = requireModel();
         m.transform(new Float64Array(msg.matrix));
@@ -581,9 +607,22 @@ self.onmessage = async (ev: MessageEvent<EngineWorkerRequest>) => {
         let name = "project";
         try {
           const mf = JSON.parse(manifest);
-          if (mf.fileName) name = String(mf.fileName).replace(/\.(stl|3mf|filasim)$/i, "");
+          if (mf.fileName) name = String(mf.fileName).replace(/\.(stl|3mf|step|stp|filasim)$/i, "");
         } catch {
           // manifest name is cosmetic — fall back to "project"
+        }
+        // STEP-model projects: the engine can't tessellate STEP (DESIGN §18)
+        // — hand the embedded bytes back so the main thread runs meshStep and
+        // follows up with `loadMesh`. The project stays staged for restore.
+        const head = new TextDecoder("iso-8859-1").decode(
+          modelBytes.subarray(0, Math.min(256, modelBytes.length))
+        );
+        if (head.includes("ISO-10303-21")) {
+          pendingProject = projBytes;
+          // Fresh copy: a plain ArrayBuffer view (transferable, exact size).
+          const stepBytes = new Uint8Array(modelBytes).buffer;
+          reply(msg, { manifest, stepModel: { bytes: stepBytes, name } }, [stepBytes]);
+          return;
         }
         model?.free();
         model = new ModelCtor(modelBytes, name);

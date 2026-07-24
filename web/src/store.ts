@@ -11,7 +11,19 @@ import {
   type SlicerFlavor,
 } from "./engine/EngineClient";
 import { EngineSession } from "./engine/EngineSession";
-import type { SectionVolume } from "./engine/EngineProtocol";
+import type { LoadedModelData, SectionVolume } from "./engine/EngineProtocol";
+import {
+  isStepName,
+  stepImporter,
+  stepImportNotices,
+  type StepMeshPayload,
+  type StepTessOpts,
+} from "./engine/StepImporter";
+import {
+  selectionFaceIds,
+  trisForFaceIds,
+  type StepManifestInfo,
+} from "./engine/stepSelection";
 import { ENVELOPE_STEP, FieldServer, isEnvelope } from "./engine/FieldServer";
 import type {
   Bc,
@@ -175,7 +187,7 @@ function clampPct(v: number, lo: number, hi: number): number {
  *  printable band regardless of fill mode. */
 export function budgetBounds(s: {
   optMode: "graded" | "binary" | "solid";
-  goal: "budget" | "match";
+  goal: "budget" | "match" | "strength";
   levelSettings: LevelSettings;
 }): [number, number] {
   // Solid topology: the budget is the RETAINED VOLUME fraction of the design
@@ -454,7 +466,6 @@ interface AppState {
   // interaction
   tool: Tool;
   brushRadius: number;
-  brushErase: boolean;
   // bcs
   bcs: Bc[];
   activeBcId: string | null;
@@ -567,9 +578,16 @@ interface AppState {
    *  (2× line width). Drives the optimizer's density-filter radius so thin,
    *  unprintable members are smoothed away — mesh-independent. */
   minMemberMm: number | null;
-  /** Optimization goal: stiffest at a mass budget, or lightest at a
-   *  target stiffness ("as stiff as uniform X%"). */
-  goal: "budget" | "match";
+  /** Optimization goal: stiffest at a mass budget, lightest at a target
+   *  stiffness ("as stiff as uniform X%"), or lightest at a target safety
+   *  factor (DESIGN §17). */
+  goal: "budget" | "match" | "strength";
+  /** Strength goal: required safety factor SF_crit (§17 dec. 1). Advisory —
+   *  strengths come from preset/measured values and Gibson–Ashby scaling. */
+  sfTarget: number;
+  /** Strength goal: which SF the target applies to (§17 dec. 2) — in-plane
+   *  material, layer adhesion, or the worst of both (default). */
+  sfMeasure: "material" | "layer" | "both";
   /** Optimization mode: graded infill densities, binary (hollow/solid core),
    *  or solid topology (material removal — a new optimized shape). */
   optMode: "graded" | "binary" | "solid";
@@ -591,6 +609,9 @@ interface AppState {
   levelSettings: LevelSettings;
   // run state
   busy: string | null;
+  /** A meshStep STEP conversion is running (DESIGN §18) — the busy chip
+   *  offers Stop, which terminates the import worker. */
+  importingStep: boolean;
   error: string | null;
   notice: string | null;
   check: CheckReport | null;
@@ -658,6 +679,14 @@ interface AppState {
   askImportUnit: boolean;
   /** STL awaiting a unit choice (picker open); null otherwise. */
   pendingImport: { name: string; bytes: ArrayBuffer } | null;
+  /** STEP provenance of the loaded model, null for STL/3MF (DESIGN §18 M2).
+   *  `cadPatchIds` is the load-time CAD segmentation (dense face id per
+   *  working triangle) — kept apart from `model.patchIds`, which follows the
+   *  live segSource; `faceEntityIds` maps dense ids to the STEP file's own
+   *  entity record numbers (the version-stable selection identity). */
+  stepInfo:
+    | (StepManifestInfo & { cadPatchIds: Uint32Array; faceEntityIds: Uint32Array })
+    | null;
   /** Densities of the extracted modifier regions (for the region list). */
   regionInfos: { density: number }[];
   regionVisible: boolean[];
@@ -721,13 +750,15 @@ interface AppState {
   /** Scene → store: the symmetry gizmo was dragged/rotated. */
   onSymmetryPlaneMoved(normal: [number, number, number], c: number): void;
   setBrushRadius(r: number): void;
-  setBrushErase(on: boolean): void;
   addBc(kind: BcKind): void;
   removeBc(id: string): void;
   setActiveBc(id: string | null): void;
   /** Rename a condition (display only — doesn't stale results). */
   setBcName(id: string, name: string): void;
   updateBcTris(id: string, tris: Uint32Array): void;
+  /** Grow (+1) or shrink (−1) the active condition's surface selection by one
+   *  ring of elements (triangle vertex adjacency). */
+  resizeBcSelection(delta: 1 | -1): void;
   updateBcParams(
     id: string,
     params: Partial<
@@ -871,7 +902,10 @@ interface AppState {
   setNBins(v: number): void;
   /** Minimum member size in mm; null restores auto (2× line width). */
   setMinMemberMm(v: number | null): void;
-  setGoal(g: "budget" | "match"): void;
+  setGoal(g: "budget" | "match" | "strength"): void;
+  /** Strength goal: required SF_crit (clamped to a sane 1..9.5 band). */
+  setSfTarget(v: number): void;
+  setSfMeasure(m: "material" | "layer" | "both"): void;
   setOptMode(m: "graded" | "binary" | "solid"): void;
   setRetainBc(on: boolean): void;
   setSelfSupport(on: boolean): void;
@@ -1259,6 +1293,35 @@ function appendLog(set: SetState, msg: string) {
   }));
 }
 
+/** Run the meshStep import worker on STEP bytes, narrating progress through
+ *  the busy chip (which shows Stop while `importingStep`). The worker
+ *  transfers its argument, so the caller's `bytes` are passed as a copy and
+ *  stay usable for `engine.loadMesh` afterwards. Rejects with "cancelled" on
+ *  Stop. */
+async function importStepWithProgress(
+  bytes: ArrayBuffer,
+  set: SetState,
+  opts?: StepTessOpts
+): Promise<StepMeshPayload> {
+  set({ busy: "Reading CAD geometry…", importingStep: true });
+  try {
+    return await stepImporter.import(
+      bytes.slice(0),
+      (phase, done, total) => {
+        if (phase === "tessellate") {
+          const pct = total > 0 ? Math.round((100 * done) / total) : 0;
+          set({ busy: `Tessellating CAD faces… ${pct}%` });
+        } else if (phase === "finalize") {
+          set({ busy: "Finalizing mesh…" });
+        }
+      },
+      opts
+    );
+  } finally {
+    set({ importingStep: false });
+  }
+}
+
 /** Log the analysis grid when it (re)builds — entry of check/solve/optimize. */
 async function logGridInfo(set: SetState) {
   try {
@@ -1294,6 +1357,10 @@ function optPhaseText(p: OptPhase, solid: boolean): string {
       return "Setting up loads & supports…";
     case "reference":
       return "Solving uniform reference model (stiffness target)…";
+    case "preflight":
+      return "Pre-flight: solving with everything at the density cap (feasibility)…";
+    case "sf_eval":
+      return "Evaluating safety-factor criterion…";
     case "optimize_pass":
       return (p.passes ?? 1) > 1
         ? `Optimizing ${what} — pass ${p.pass}/${p.passes}, first iteration…`
@@ -1527,6 +1594,63 @@ function syncIfActiveStep(
   markResultsStale(set, get, "loads");
   void pushBcs(get);
   pushBcGlyphs(get);
+}
+
+/** Vertex-key → incident-triangle map for the triangle soup (9 floats/tri).
+ *  Coincident vertices in an imported mesh are bitwise-identical copies of the
+ *  same source vertex, so exact float keys are the right join. Cached per
+ *  positions array — rebuilding on every grow/shrink click would cost ~100 ms
+ *  on large meshes. */
+const vertTriCache = new WeakMap<Float32Array, Map<string, number[]>>();
+function vertexTriMap(positions: Float32Array): Map<string, number[]> {
+  let map = vertTriCache.get(positions);
+  if (map) return map;
+  map = new Map();
+  const triCount = positions.length / 9;
+  for (let t = 0; t < triCount; t++) {
+    for (let k = 0; k < 3; k++) {
+      const o = 9 * t + 3 * k;
+      const key = `${positions[o]}|${positions[o + 1]}|${positions[o + 2]}`;
+      const list = map.get(key);
+      if (list) list.push(t);
+      else map.set(key, [t]);
+    }
+  }
+  vertTriCache.set(positions, map);
+  return map;
+}
+
+/** Selection grown by one element ring: every triangle sharing at least one
+ *  vertex with the current selection joins it. */
+function growSelection(positions: Float32Array, tris: Uint32Array): Uint32Array {
+  const map = vertexTriMap(positions);
+  const next = new Set<number>(tris as unknown as number[]);
+  for (const t of tris) {
+    for (let k = 0; k < 3; k++) {
+      const o = 9 * t + 3 * k;
+      const near = map.get(`${positions[o]}|${positions[o + 1]}|${positions[o + 2]}`);
+      if (near) for (const n of near) next.add(n);
+    }
+  }
+  return Uint32Array.from(next).sort();
+}
+
+/** Selection shrunk by one element ring: selected triangles touching (sharing
+ *  a vertex with) any unselected triangle are dropped — the inverse of
+ *  growSelection's ring. */
+function shrinkSelection(positions: Float32Array, tris: Uint32Array): Uint32Array {
+  const map = vertexTriMap(positions);
+  const sel = new Set<number>(tris as unknown as number[]);
+  const keep: number[] = [];
+  outer: for (const t of tris) {
+    for (let k = 0; k < 3; k++) {
+      const o = 9 * t + 3 * k;
+      const near = map.get(`${positions[o]}|${positions[o + 1]}|${positions[o + 2]}`);
+      if (near) for (const n of near) if (!sel.has(n)) continue outer;
+    }
+    keep.push(t);
+  }
+  return Uint32Array.from(keep).sort();
 }
 
 /** Area-weighted average outward normal of a triangle selection (matches the
@@ -2225,7 +2349,8 @@ async function stashOptimizedSteps(
   const sm = out.summary;
   const meanPct = Math.round(sm.meanInfill * 100);
   const modeLabel = sm.solid ? "Part Topo" : sm.binary ? "binary" : "graded";
-  const goalNote = sm.goal === "match" ? " · match" : "";
+  const goalNote =
+    sm.goal === "match" ? " · match" : sm.goal === "strength" ? " · SF target" : "";
   const ep = { ...st.resultEpochs };
   const entries: ResultEntry[] = [];
   for (let i = 0; i < steps.length; i++) {
@@ -2295,7 +2420,8 @@ async function stashOptimizedSingle(set: SetState, get: () => AppState, out: Opt
   const sm = out.summary;
   const meanPct = Math.round(sm.meanInfill * 100);
   const modeLabel = sm.solid ? "Part Topo" : sm.binary ? "binary" : "graded";
-  const goalNote = sm.goal === "match" ? " · match" : "";
+  const goalNote =
+    sm.goal === "match" ? " · match" : sm.goal === "strength" ? " · SF target" : "";
   const ep = { ...cur.resultEpochs };
   const optStepId = cur.activeLoadStepId;
   const optStepName = activeStep(cur)?.name ?? "Load step";
@@ -2498,6 +2624,8 @@ function collectSettings(s: AppState) {
     nBins: s.nBins,
     minMemberMm: s.minMemberMm,
     goal: s.goal,
+    sfTarget: s.sfTarget,
+    sfMeasure: s.sfMeasure,
     optMode: s.optMode,
     retainBc: s.retainBc,
     selfSupport: s.selfSupport,
@@ -2533,7 +2661,15 @@ interface ProjectManifest {
   /** Cumulative orientation transform (12 numbers) to replay on the re-import. */
   transform: number[];
   settings: ProjectSettings;
-  bcs: (Omit<Bc, "tris"> & { tris: number[] })[];
+  /** STEP models only (DESIGN §18 M2): meshStep version + tessellation opts
+   *  + file hash of the embedded model. OPTIONAL & additive like loadSteps —
+   *  absent for STL/3MF projects and files saved before this feature. */
+  step?: StepManifestInfo | null;
+  /** `faceIds` (STEP entity record numbers) is set when the selection is
+   *  exactly a union of CAD faces — the durable identity that survives a
+   *  meshStep upgrade; `tris` stays authoritative while the version matches
+   *  (brush/partial selections have only `tris`). */
+  bcs: (Omit<Bc, "tris"> & { tris: number[]; faceIds?: number[] | null })[];
   /** FEA load steps (DESIGN §13). OPTIONAL & additive: absent in v1 files and
    *  files saved before this feature → the loader synthesizes a single step,
    *  so the schema version does NOT bump and old/new builds interoperate. */
@@ -2619,7 +2755,6 @@ export const useStore = create<AppState>((set, get) => ({
   segSource: "angle",
   tool: "orbit",
   brushRadius: 3,
-  brushErase: false,
   bcs: [],
   activeBcId: null,
   loadSteps: [initialStep],
@@ -2664,6 +2799,8 @@ export const useStore = create<AppState>((set, get) => ({
   nBins: 3,
   minMemberMm: null, // auto = 2× line width
   goal: "budget",
+  sfTarget: 2,
+  sfMeasure: "both",
   symOn: false,
   symNormal: [1, 0, 0],
   symC: 0,
@@ -2674,6 +2811,7 @@ export const useStore = create<AppState>((set, get) => ({
   solidPattern: "rectilinear",
   levelSettings: initialSettings.levels,
   busy: null,
+  importingStep: false,
   error: null,
   notice: null,
   check: null,
@@ -2706,6 +2844,7 @@ export const useStore = create<AppState>((set, get) => ({
   importUnit: initialImportPrefs.unit,
   askImportUnit: initialImportPrefs.ask,
   pendingImport: null,
+  stepInfo: null,
   regionInfos: [],
   regionVisible: [],
   densityThreshold: 0,
@@ -2741,7 +2880,43 @@ export const useStore = create<AppState>((set, get) => ({
     const useUnit = unitId ?? (isStl ? get().importUnit : "mm");
     set({ busy: "Parsing & segmenting…", error: null, notice: null });
     try {
-      let model = await engine.load(bytes, name.replace(/\.(stl|3mf|step|stp)$/i, ""));
+      const cleanName = name.replace(/\.(stl|3mf|step|stp)$/i, "");
+      let stepNotices: string[] = [];
+      let model: LoadedModelData;
+      let stepInfo: AppState["stepInfo"] = null;
+      if (isStepName(name)) {
+        // STEP tessellates in the meshStep worker (DESIGN §18); the engine
+        // gets the finished mesh + CAD-face ids, plus the ORIGINAL bytes so
+        // project save embeds the .step verbatim.
+        const imp = await importStepWithProgress(bytes, set);
+        stepNotices = stepImportNotices(imp);
+        appendLog(
+          set,
+          `STEP converted by meshStep ${imp.meshstepVersion} — ${imp.faceEntityIds.length} CAD faces, ` +
+            `${imp.stats.solids} solid${imp.stats.solids === 1 ? "" : "s"}, deviation ${imp.opts.surfaceDeviation} mm, max edge ${imp.opts.maxEdge} mm`
+        );
+        set({ busy: "Segmenting…" });
+        model = await engine.loadMesh(
+          imp.positions,
+          imp.indices,
+          imp.faceOfTri,
+          imp.solidOfTri,
+          bytes,
+          cleanName
+        );
+        // Selection identity for project save (DESIGN §18 M2). The reply's
+        // patchIds ARE the load-time CAD segmentation (STEP default) — copy
+        // them before the live segSource can diverge.
+        stepInfo = {
+          meshstepVersion: imp.meshstepVersion,
+          opts: imp.opts,
+          sha256: imp.sha256,
+          cadPatchIds: model.patchIds.slice(),
+          faceEntityIds: imp.faceEntityIds,
+        };
+      } else {
+        model = await engine.load(bytes, cleanName);
+      }
       // One-time bake to canonical mm: scale the geometry by mm-per-import-unit
       // (e.g. inch → ×25.4). After this the model is canonical; the display unit
       // never reinterprets it (units-design §8).
@@ -2778,6 +2953,7 @@ export const useStore = create<AppState>((set, get) => ({
       set({
         fileName: name,
         model,
+        stepInfo,
         // STEP arrives already segmented by its BREP faces (Model::new default),
         // so reflect that; STL/3MF use the crease-angle slider.
         segSource: model.hasCadFaces ? "cad" : "angle",
@@ -2812,6 +2988,9 @@ export const useStore = create<AppState>((set, get) => ({
         busy: null,
         notice:
           [
+            // STEP conversion health first — it decides whether the numbers
+            // downstream can be trusted at all (DESIGN §18 dec. 7).
+            ...stepNotices,
             // 3MF only: import keeps the largest mesh object (STEP keeps all
             // shells, so its shell count must not trigger this message).
             /\.3mf$/i.test(name) && model.meshObjects > 1
@@ -2854,7 +3033,9 @@ export const useStore = create<AppState>((set, get) => ({
         );
       }
     } catch (e) {
-      set({ busy: null, error: e instanceof Error ? e.message : String(e) });
+      const emsg = e instanceof Error ? e.message : String(e);
+      // A cancelled STEP conversion is the user's Stop, not an error.
+      set({ busy: null, error: /cancelled/i.test(emsg) ? null : emsg });
     }
   },
 
@@ -2997,9 +3178,6 @@ export const useStore = create<AppState>((set, get) => ({
   setBrushRadius(r) {
     set({ brushRadius: r });
   },
-  setBrushErase(on) {
-    set({ brushErase: on });
-  },
 
   addBc(kind) {
     // Auto-name "Force 1", "Force 2", … per kind so steps/tables read clearly.
@@ -3133,6 +3311,16 @@ export const useStore = create<AppState>((set, get) => ({
     markResultsStale(set, get, "loads");
     pushBcGlyphs(get);
     void pushBcs(get);
+  },
+
+  resizeBcSelection(delta) {
+    const st = get();
+    const bc = st.bcs.find((b) => b.id === st.activeBcId);
+    const positions = st.model?.positions;
+    if (!bc || !positions || bc.tris.length === 0) return;
+    const next =
+      delta > 0 ? growSelection(positions, bc.tris) : shrinkSelection(positions, bc.tris);
+    if (next.length !== bc.tris.length) st.updateBcTris(bc.id, next);
   },
 
   updateBcParams(id, params) {
@@ -3881,6 +4069,17 @@ export const useStore = create<AppState>((set, get) => ({
   setGoal(g) {
     set({ goal: g });
     get().setBudget(get().budget); // re-clamp to the goal's band
+  },
+
+  setSfTarget(v) {
+    // Keep inside the meaningful band: the SF display caps at 10, so a target
+    // at/above the cap would be infeasible by construction (§17).
+    set({ sfTarget: Math.min(9.5, Math.max(1, v)) });
+    markResultsStale(set, get, "opt");
+  },
+  setSfMeasure(m) {
+    set({ sfMeasure: m });
+    markResultsStale(set, get, "opt");
   },
 
   setOptMode(m) {
@@ -4828,6 +5027,8 @@ export const useStore = create<AppState>((set, get) => ({
       const curve = st.curves[st.pattern];
       const binary = st.optMode === "binary";
       const match = st.goal === "match" && !solid;
+      // Strength goal (DESIGN §17): available in ALL modes incl. Part Topo.
+      const strength = st.goal === "strength";
       const ls = st.levelSettings;
       const manual = !binary && !solid && ls.mode === "manual" && ls.manual.length >= 2;
       appendLog(
@@ -4841,7 +5042,10 @@ export const useStore = create<AppState>((set, get) => ({
           : `Optimize (${binary ? `binary: ${ls.binaryFloorPct}% or solid` : manual ? `manual levels ${ls.manual.join("/")}%` : "graded, auto levels"}): ` +
               (match
                 ? `match the stiffness of uniform ${st.budget}% — lightest design via budget secant`
-                : `infill budget ${st.budget}%`) +
+                : strength
+                  ? `reach safety factor ≥ ${st.sfTarget} (${st.sfMeasure === "both" ? "material & layer" : st.sfMeasure}) — ` +
+                    `all-at-cap pre-flight, then lightest design via budget secant`
+                  : `infill budget ${st.budget}%`) +
               ` (${st.pattern}: E/E₀ = ${curve.coeff}·ρ^${curve.exponent}), ` +
               `skin ${st.perimeters}×${st.lineWidth} mm — convergence when mean |Δρ| < 0.005 twice` +
               (binary ? " · optimizer SIMP-penalized p=3" : "") +
@@ -4869,7 +5073,11 @@ export const useStore = create<AppState>((set, get) => ({
           // Binary mode always pins the pattern (rectilinear/concentric) on the
           // modifiers AND the object-level general infill.
           solidPattern: binary ? st.solidPattern : null,
-          goal: solid ? "budget" : st.goal,
+          // Match has no meaning in solid mode; strength works in all three
+          // modes (§17 dec. 7).
+          goal: solid && st.goal === "match" ? "budget" : st.goal,
+          sfTarget: st.sfTarget,
+          sfMeasure: st.sfMeasure,
           symmetry: st.symOn ? [...st.symNormal, st.symC] : null,
           topBottomLayers: st.topBottomLayers,
           layerHeight: st.layerHeight,
@@ -4952,6 +5160,33 @@ export const useStore = create<AppState>((set, get) => ({
             ? `+${(out.summary.gainVsUniform * 100).toFixed(1)}% stiffer than the same material spread uniformly`
             : `+${(out.summary.gainVsUniform * 100).toFixed(1)}% stiffer than uniform ${Math.round(out.summary.meanInfill * 100)}% infill at equal weight`)
       );
+      if (out.summary.goal === "strength") {
+        const sm = out.summary;
+        if (sm.sfFeasible === false) {
+          appendLog(
+            set,
+            `  strength: target SF ${sm.sfTarget} is NOT reachable — best achievable is ` +
+              `${(sm.sfBest ?? 0).toFixed(2)} with everything at the density cap. ` +
+              ((sm.bindingSkinShare ?? 0) > 0.5
+                ? `The binding region is mostly SKIN — infill can't fix this: reorient, add walls, or pick a stronger material.`
+                : `The binding region is interior at the cap — raising the density cap may help.`)
+          );
+        } else {
+          appendLog(
+            set,
+            `  strength: SF ${(sm.sfAchieved ?? 0).toFixed(2)} ≥ target ${sm.sfTarget} at ` +
+              `mean infill ${(sm.meanInfill * 100).toFixed(1)}% (${sm.passes} passes; cap design reaches ${(sm.sfBest ?? 0).toFixed(2)})` +
+              ((sm.sfPerStep?.length ?? 0) > 1
+                ? ` · per step: ${sm.sfPerStep!.map((v) => v.toFixed(2)).join(" / ")}`
+                : "")
+          );
+        }
+        appendLog(
+          set,
+          "  note: SF targets are a design aid from preset/measured strengths and Gibson–Ashby " +
+            "scaling — not a certified safety factor."
+        );
+      }
       if (out.summary.goal === "match" && out.summary.massUniformRefGrams) {
         const saved = 1 - out.summary.massGrams / out.summary.massUniformRefGrams;
         appendLog(
@@ -5154,7 +5389,11 @@ export const useStore = create<AppState>((set, get) => ({
     set({ busy: "Saving project…", error: null, notice: null });
     try {
       const transform = await engine.transformMatrix();
-      const ext = /\.3mf$/i.test(s.fileName) ? "3mf" : "stl";
+      const ext = /\.3mf$/i.test(s.fileName)
+        ? "3mf"
+        : /\.(step|stp)$/i.test(s.fileName)
+          ? "step"
+          : "stl";
       const manifest: ProjectManifest = {
         app: "filaSim",
         schemaVersion: PROJECT_SCHEMA,
@@ -5162,7 +5401,18 @@ export const useStore = create<AppState>((set, get) => ({
         fileName: s.fileName,
         transform,
         settings: collectSettings(s),
-        bcs: s.bcs.map((b) => ({ ...b, tris: Array.from(b.tris) })),
+        step: s.stepInfo
+          ? { meshstepVersion: s.stepInfo.meshstepVersion, opts: s.stepInfo.opts, sha256: s.stepInfo.sha256 }
+          : undefined,
+        bcs: s.bcs.map((b) => ({
+          ...b,
+          tris: Array.from(b.tris),
+          // Whole-CAD-face selections additionally carry their entity ids —
+          // the identity that survives a meshStep upgrade (DESIGN §18 M2).
+          faceIds: s.stepInfo
+            ? selectionFaceIds(b.tris, s.stepInfo.cadPatchIds, s.stepInfo.faceEntityIds)
+            : undefined,
+        })),
         loadSteps: serializeLoadSteps(s.bcs, s.loadSteps),
         optSummary: s.optSummary,
         regionInfos: s.regionInfos,
@@ -5171,7 +5421,7 @@ export const useStore = create<AppState>((set, get) => ({
         activeResultId: includeResults ? s.activeResultId : null,
       };
       const bytes = await engine.exportProject(JSON.stringify(manifest), `model.${ext}`, includeResults);
-      const base = s.fileName.replace(/\.(stl|3mf)$/i, "");
+      const base = s.fileName.replace(/\.(stl|3mf|step|stp)$/i, "");
       download(bytes, `${base}.filasim`, "application/octet-stream");
       set({
         busy: null,
@@ -5188,13 +5438,49 @@ export const useStore = create<AppState>((set, get) => ({
     set({ busy: "Opening project…", error: null, notice: null });
     try {
       const bytes = await file.arrayBuffer();
-      const { manifest, model: mi } = await engine.openProjectModel(bytes);
-      const mf = JSON.parse(manifest) as ProjectManifest;
+      const opened = await engine.openProjectModel(bytes);
+      const mf = JSON.parse(opened.manifest) as ProjectManifest;
       if (mf.app !== "filaSim" || typeof mf.schemaVersion !== "number") {
         throw new Error("Not a filaSim project file.");
       }
       if (mf.schemaVersion > PROJECT_SCHEMA) {
         throw new Error("This project was saved by a newer version of filaSim — please update to open it.");
+      }
+      // STEP-model projects: the engine returned the embedded .step bytes;
+      // re-tessellate through meshStep with the SAVED opts. Same meshStep
+      // version + same opts ⇒ bit-identical mesh, so the manifest's
+      // triangle-index selections remain valid. A version CHANGE invalidates
+      // triangle indices (mesh layout is only stable within a version) but
+      // not the CAD-face entity ids — those re-bind below (DESIGN §18 M2).
+      let mi: LoadedModelData;
+      let stepInfo: AppState["stepInfo"] = null;
+      let stepStale = false;
+      if (opened.stepModel) {
+        const { bytes: stepBytes, name: stepName } = opened.stepModel;
+        const imp = await importStepWithProgress(stepBytes, set, mf.step?.opts);
+        set({ busy: "Opening project…" });
+        mi = await engine.loadMesh(
+          imp.positions,
+          imp.indices,
+          imp.faceOfTri,
+          imp.solidOfTri,
+          stepBytes,
+          stepName
+        );
+        stepInfo = {
+          meshstepVersion: imp.meshstepVersion,
+          opts: imp.opts,
+          sha256: imp.sha256,
+          cadPatchIds: mi.patchIds.slice(),
+          faceEntityIds: imp.faceEntityIds,
+        };
+        // Hash mismatch "cannot happen" (the bytes embed verbatim) — treat it
+        // like a version change rather than trusting stale indices.
+        stepStale =
+          !!mf.step &&
+          (mf.step.meshstepVersion !== imp.meshstepVersion || mf.step.sha256 !== imp.sha256);
+      } else {
+        mi = opened.model;
       }
       const st = mf.settings;
       const model: LoadedModel = {
@@ -5205,14 +5491,34 @@ export const useStore = create<AppState>((set, get) => ({
         bbox: mi.bbox as LoadedModel["bbox"],
         hasCadFaces: mi.hasCadFaces,
       };
-      // Re-id the loads/supports so they can't collide with this session's counter.
-      const bcs: Bc[] = mf.bcs.map((b) => ({ ...b, id: `bc${++bcCounter}`, tris: Uint32Array.from(b.tris) }));
+      // Re-id the loads/supports so they can't collide with this session's
+      // counter. On a stale STEP tessellation the saved triangle indices are
+      // meaningless: whole-face selections re-derive their triangles from the
+      // persisted CAD-face entity ids (stable across meshStep versions);
+      // brush/partial selections lose their geometry and must be re-painted.
+      let repaint = 0;
+      const bcs: Bc[] = mf.bcs.map((b) => {
+        const { faceIds, ...rest } = b;
+        let tris: Uint32Array;
+        if (stepStale && stepInfo) {
+          if (faceIds && faceIds.length) {
+            tris = trisForFaceIds(faceIds, stepInfo.cadPatchIds, stepInfo.faceEntityIds);
+          } else {
+            tris = new Uint32Array(0);
+            if (b.tris.length > 0) repaint++;
+          }
+        } else {
+          tris = Uint32Array.from(b.tris);
+        }
+        return { ...rest, id: `bc${++bcCounter}`, tris };
+      });
       // Load steps remap their override keys onto the re-id'd BCs (above);
       // pre-feature files synthesize a single default step.
       const loadSteps = deserializeLoadSteps(bcs, mf.loadSteps);
       set({
         fileName: mf.fileName,
         model,
+        stepInfo,
         segAngle: st.segAngle,
         segSource: st.segSource,
         material: st.material,
@@ -5242,6 +5548,9 @@ export const useStore = create<AppState>((set, get) => ({
         nBins: st.nBins,
         minMemberMm: st.minMemberMm,
         goal: st.goal,
+        // Additive fields (absent in files saved before the strength goal).
+        sfTarget: st.sfTarget ?? 2,
+        sfMeasure: st.sfMeasure ?? "both",
         optMode: st.optMode,
         retainBc: st.retainBc,
         selfSupport: st.selfSupport,
@@ -5304,8 +5613,13 @@ export const useStore = create<AppState>((set, get) => ({
       sceneEvents.onOptShape?.(null, null);
       sceneEvents.onModelLoaded?.(get().model!);
       pushBcGlyphs(get, null);
-      // Phase 2: restore the design + result buffers into the engine.
-      const restore = await engine.openProjectRestore();
+      // Phase 2: restore the design + result buffers into the engine. On a
+      // stale STEP tessellation the design/results were computed on a mesh
+      // that no longer exists — restoring them would silently mis-map, so
+      // skip and let the user re-run (the honest path).
+      const restore = stepStale
+        ? { restoredResults: [] as string[], hasDesign: false }
+        : await engine.openProjectRestore();
       // Optimized design → store + scene (Density/Regions/export).
       if (restore.hasDesign && mf.optSummary) {
         set({
@@ -5365,6 +5679,22 @@ export const useStore = create<AppState>((set, get) => ({
       }
       const landing: ViewMode = haveResults ? "deformed" : restore.hasDesign ? "density" : "setup";
       set({ busy: null, viewMode: landing });
+      if (stepStale && stepInfo) {
+        const rebound = bcs.filter((b) => b.tris.length > 0).length;
+        set({
+          notice:
+            `This project was saved with meshStep ${mf.step?.meshstepVersion}; the app now runs ${stepInfo.meshstepVersion}, so the CAD mesh was rebuilt. ` +
+            `${rebound} selection${rebound === 1 ? "" : "s"} re-bound to their CAD faces` +
+            (repaint > 0
+              ? `; ${repaint} painted selection${repaint === 1 ? "" : "s"} could not be recovered — re-paint ${repaint === 1 ? "it" : "them"}.`
+              : ".") +
+            " Saved results and the optimized design were not restored — re-run the analysis.",
+        });
+        appendLog(
+          set,
+          `meshStep ${mf.step?.meshstepVersion} → ${stepInfo.meshstepVersion}: mesh rebuilt, ${rebound} face-bound selection(s) recovered, ${repaint} lost`
+        );
+      }
       sceneEvents.onViewState?.(landing, get().deformScale);
       if (restore.hasDesign) get().setDensityThreshold(st.densityThreshold);
       if (landing === "deformed") await pushScalarField(set, get);
@@ -5378,7 +5708,9 @@ export const useStore = create<AppState>((set, get) => ({
               : "")
       );
     } catch (e) {
-      set({ busy: null, error: e instanceof Error ? e.message : String(e) });
+      const emsg = e instanceof Error ? e.message : String(e);
+      // A cancelled STEP re-tessellation is the user's Stop, not an error.
+      set({ busy: null, error: /cancelled/i.test(emsg) ? null : emsg });
     }
   },
 

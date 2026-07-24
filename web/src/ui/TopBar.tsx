@@ -68,7 +68,7 @@ export function TopBar() {
       <input
         ref={openRef}
         type="file"
-        accept=".filasim,.stl,.3mf"
+        accept=".filasim,.stl,.3mf,.step,.stp"
         hidden
         onChange={(e) => void onLoad(e.target.files?.[0] ?? undefined)}
       />

@@ -654,6 +654,85 @@ fn bench_rigid_mass(m: &mut Metrics) {
     m.i("rigid_deformable_iters", rd.stats.iterations as f64);
 }
 
+/// SF_crit criterion (DESIGN §17 dec. 4) on the §14 solid cantilever under
+/// bending: per-cell SF (material + §15 layer interaction, worst of both) →
+/// masked nodal smoothing → volume-weighted 0.2%-trimmed percentile. Two
+/// anchors, drift-guarded so the number the strength goal optimizes against
+/// cannot move silently:
+///  (a) SOLID beam — plus the untrimmed min for contrast (guards smoothing
+///      and trim separately);
+///  (b) UNIFORM 30% INFILL — same load. A uniform stiffness scale leaves the
+///      stress field unchanged (u scales by 1/eps) while the Gibson–Ashby
+///      allowable scales by eps, so SF_crit must come out ≈ eps × the solid
+///      value — this isolates the graded-allowable wiring.
+fn bench_strength(m: &mut Metrics) {
+    use filasim_core::strength::{
+        sf_cells, sf_percentile, smooth_masked, SfMeasure, StrengthSpec, SF_TRIM_FRAC,
+    };
+    let (nx, ny, nz, h) = (64usize, 8usize, 4usize, 1.0f64);
+    let s = SolveSettings { e0: BEAM_E0, nu: BEAM_NU, tol: 1e-6, max_iter: 400, ..Default::default() };
+    let (grid, levels) = pad_for_levels(&VoxelGrid::solid_box(nx, ny, nz, h), s.max_levels);
+    let active = active_nodes(&grid);
+    let (mx, my, mz) = (grid.nx + 1, grid.ny + 1, grid.nz + 1);
+    let mut fixed = Vec::new();
+    let mut tip = Vec::new();
+    for z in 0..mz {
+        for y in 0..my {
+            let root = (z * my + y) * mx;
+            if active[root] {
+                fixed.push(root as u32);
+            }
+            let t = (z * my + y) * mx + nx;
+            if active[t] {
+                tip.push(t as u32);
+            }
+        }
+    }
+    // -8 N tip bending: σ_max ≈ 3·|F| = 24 MPa ⇒ material SF ≈ 2 on the solid
+    // beam — well inside the cap, so the criterion actually discriminates.
+    let f_tip = -8.0f64;
+    let forces: Vec<(u32, [f64; 3])> =
+        tip.iter().map(|&n| (n, [0.0, 0.0, f_tip / tip.len() as f64])).collect();
+    let prob = NodeProblem { fixed, springs: Vec::new(), forces, rigid: Vec::new() };
+    let spec = StrengthSpec {
+        measure: SfMeasure::Both,
+        strength: 50.0,
+        strength_z: 35.0,
+        shear_z: 21.0,
+    };
+    let mask: Vec<bool> = grid.scale.iter().map(|&sc| sc > 0.0).collect();
+    let t0 = Instant::now();
+    let mut run = |eps_val: f32| -> (f64, f64) {
+        let eps: Vec<f32> =
+            grid.scale.iter().map(|&sc| if sc > 0.0 { eps_val } else { 0.0 }).collect();
+        let r = solve_cached(&mut None, &grid, levels, &prob, &s, eps.clone(), s.tol, s.max_iter)
+            .expect("strength solve");
+        let u: Vec<f32> = r.u.iter().map(|&v| v as f32).collect();
+        let cells = sf_cells(&grid, &u, BEAM_E0, BEAM_NU, &eps, &mask, &spec);
+        let sm = smooth_masked(&grid, &cells, &mask);
+        (sf_percentile(&grid, &sm, &mask, SF_TRIM_FRAC), sf_percentile(&grid, &sm, &mask, 0.0))
+    };
+    let (crit_solid, rawmin_solid) = run(1.0);
+    let eps_infill = (INFILL_COEFF * INFILL_X.powf(INFILL_EXP)) as f32;
+    let (crit_infill, _) = run(eps_infill);
+    let dt = t0.elapsed().as_secs_f64();
+    m.q("strength_sfcrit_solid", crit_solid);
+    m.q("strength_rawmin_solid", rawmin_solid);
+    m.q("strength_sfcrit_infill", crit_infill);
+    m.i("strength_time_ms", dt * 1000.0);
+    // Sanity at bench time: trim can only raise the number, the infill SF
+    // tracks the Gibson–Ashby allowable, and nothing sits at the cap.
+    assert!(
+        crit_solid >= rawmin_solid && crit_solid < 9.9,
+        "criterion discriminates: crit {crit_solid}, raw {rawmin_solid}"
+    );
+    let ga_ratio = crit_infill / (crit_solid * eps_infill as f64);
+    assert!(
+        (0.8..=1.25).contains(&ga_ratio),
+        "infill SF tracks the Gibson–Ashby allowable: ratio {ga_ratio}"
+    );
+}
+
 /// Voxelize the 3DBenchy at one resolution — regression-anchored (no analytic
 /// volume): cell/element counts and solid volume must not drift; time is Info.
 fn bench_voxelize_benchy(m: &mut Metrics, sz: &str, mesh: &TriMesh, h: f64) {
@@ -781,6 +860,7 @@ fn main() {
     bench_beam_suite(&mut m);
     bench_accel(&mut m);
     bench_rigid_mass(&mut m);
+    bench_strength(&mut m);
     if args.iter().any(|a| a == "--big") {
         bench_cantilever(&mut m, "solve_big", 256, 64, 64, 0.25);
     }

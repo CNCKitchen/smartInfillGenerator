@@ -137,7 +137,14 @@ function PrintedResults() {
 
 function OptResults() {
   const s = useStore(
-    useShallow((s) => ({ optSummary: s.optSummary, budget: s.budget, unitRev: s.unitRev }))
+    useShallow((s) => ({
+      optSummary: s.optSummary,
+      budget: s.budget,
+      unitRev: s.unitRev,
+      setResultField: s.setResultField,
+      setLegendRange: s.setLegendRange,
+      setBandCount: s.setBandCount,
+    }))
   );
   const o = s.optSummary!;
   const solid = o.solid;
@@ -150,15 +157,42 @@ function OptResults() {
     ? "vs material spread evenly, same weight"
     : `vs ${uniformPct} % uniform, same weight`;
   const isMatch = o.goal === "match" && o.massUniformRefGrams != null;
+  const isStrength = o.goal === "strength";
   const saved = isMatch ? 1 - o.massGrams / o.massUniformRefGrams! : 0;
   const [defl, deflUnit] = fmtDispParts(o.maxDisplacement);
+  // One-click binding view (DESIGN §17 dec. 6): the SF field of the run's
+  // measure, banded in two colors with the boundary AT the target — every
+  // red cell is below the required safety factor.
+  const showSfView = () => {
+    const field = o.sfMeasure === "material" ? "sfm" : o.sfMeasure === "layer" ? "sfz" : "sf";
+    void s.setResultField(field);
+    s.setLegendRange(0, 2 * (o.sfTarget ?? 2));
+    s.setBandCount(2);
+  };
 
   return (
     <aside className="inspector" aria-label="Results">
       <div className="i-head">
         <span>Results</span>
-        <span>{isMatch ? "match goal" : "budget goal"}</span>
+        <span>{isMatch ? "match goal" : isStrength ? "strength goal" : "budget goal"}</span>
       </div>
+
+      {/* §17 dec. 6: infeasibility is routine product behaviour, not an error —
+          deliver the all-at-cap design with the honest ceiling + a diagnosis of
+          WHERE it binds (skin ⇒ infill can't fix it; interior ⇒ raise the cap). */}
+      {isStrength && o.sfFeasible === false && (
+        <div className="warnbanner">
+          ⚠ <b>Target SF {o.sfTarget} is not reachable.</b> Even with the whole interior at the
+          density cap the safety factor reaches <b>{(o.sfBest ?? 0).toFixed(2)}</b> — that
+          all-at-cap design is what you see below.{" "}
+          {(o.bindingSkinShare ?? 0) > 0.5
+            ? "The critical region sits in the solid skin, so more infill cannot fix it: reorient the part, add perimeters/shells, or pick a stronger material."
+            : "The critical region is interior material already at the cap — raising the density cap (Levels settings) may get you further."}{" "}
+          <button className="linkbtn" onClick={showSfView}>
+            Show the critical region
+          </button>
+        </div>
+      )}
 
       {/* o.converged is the optimizer's DESIGN-stationarity signal (mean |Δρ|
           settled before the iteration cap). It does NOT yet reflect the
@@ -175,7 +209,28 @@ function OptResults() {
         </div>
       )}
 
-      {isMatch ? (
+      {isStrength ? (
+        <div className="dro hero">
+          <div className="dro-label">
+            <span>
+              {o.sfFeasible === false
+                ? `best achievable · target ≥ ${o.sfTarget}`
+                : `safety factor · target ≥ ${o.sfTarget}`}
+            </span>
+            <span>
+              {o.sfMeasure === "material"
+                ? "material (von Mises)"
+                : o.sfMeasure === "layer"
+                  ? "layer adhesion"
+                  : "material & layer adhesion"}
+            </span>
+          </div>
+          <div className="dro-window">
+            <b>{(o.sfAchieved ?? 0).toFixed(2)}</b>
+            <span>× SF</span>
+          </div>
+        </div>
+      ) : isMatch ? (
         <div className="dro hero">
           <div className="dro-label">
             <span>vs {Math.round(o.refUniformPct!)} % uniform, same stiffness</span>
@@ -225,6 +280,28 @@ function OptResults() {
       </div>
 
       <div className="divider" />
+      {isStrength && (
+        <>
+          <div className="kv">
+            <span>SF at 100 % fill (cap)</span>
+            <b>{(o.sfBest ?? 0).toFixed(2)} ×</b>
+          </div>
+          {(o.sfPerStep?.length ?? 0) > 1 && (
+            <div className="kv">
+              <span>SF per load step (worst binds)</span>
+              <b>{o.sfPerStep!.map((v) => v.toFixed(2)).join(" · ")}</b>
+            </div>
+          )}
+          <div className="kv">
+            <span>Critical region</span>
+            <b>
+              <button className="linkbtn" onClick={showSfView}>
+                show in SF view
+              </button>
+            </b>
+          </div>
+        </>
+      )}
       {isMatch && (
         <div className="kv">
           <span>vs {uniformPct} % uniform, same weight</span>
@@ -271,7 +348,13 @@ function OptResults() {
       {o.selfWeight && (
         <div className="dim small selfweightnote">
           Self-weight active: each design carries its own true weight, so the fully-solid baseline
-          is heavier and deflects more than a weightless comparison would show (DESIGN §16).
+          is heavier and deflects more than a weightless comparison would show.
+        </div>
+      )}
+      {isStrength && (
+        <div className="dim small selfweightnote">
+          SF targets are a design aid: strengths come from the material presets (or your measured
+          values) with Gibson–Ashby scaling — not a certified safety factor.
         </div>
       )}
     </aside>

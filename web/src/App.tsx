@@ -21,9 +21,11 @@ import { TitleTipLayer } from "./ui/HelpTip";
 import { Viewer } from "./viewer/Viewer";
 import { useStore } from "./store";
 import { engine } from "./engine/EngineClient";
+import { stepImporter } from "./engine/StepImporter";
 
 export function App() {
   const busy = useStore((s) => s.busy);
+  const importingStep = useStore((s) => s.importingStep);
   const error = useStore((s) => s.error);
   const notice = useStore((s) => s.notice);
   const model = useStore((s) => s.model);
@@ -45,10 +47,18 @@ export function App() {
             <div className="busychip">
               <div className="spinner" />
               {busy}
-              {engine.canCancel && (
-                <button className="stopbtn" onClick={() => useStore.getState().cancelRun()}>
+              {importingStep ? (
+                // STEP conversion: Stop terminates the meshStep worker (the
+                // sync import can't be interrupted any other way, DESIGN §18).
+                <button className="stopbtn" onClick={() => stepImporter.cancel()}>
                   ■ Stop
                 </button>
+              ) : (
+                engine.canCancel && (
+                  <button className="stopbtn" onClick={() => useStore.getState().cancelRun()}>
+                    ■ Stop
+                  </button>
+                )
               )}
             </div>
           )}
@@ -90,12 +100,12 @@ function DropZone() {
   return (
     <div className="dropzone">
       <div className="dz-card">
-        <b>Drop an STL or 3MF here</b>
+        <b>Drop an STL, 3MF, or STEP here</b>
         <div className="small">STL units are set on import — the file never leaves your browser.</div>
         <input
           ref={fileRef}
           type="file"
-          accept=".stl,.3mf"
+          accept=".stl,.3mf,.step,.stp"
           hidden
           onChange={(e) => void onFile(e.target.files?.[0])}
         />

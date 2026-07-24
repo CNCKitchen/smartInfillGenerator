@@ -45,7 +45,7 @@ const SLICER_NAMES = {
 const r4 = (x: number) => Math.round(x * 1e4) / 1e4;
 
 const HEAD: Record<number, { title: string; sub: string }> = {
-  1: { title: "Model", sub: "Drop an STL or 3MF — units are mm." },
+  1: { title: "Model", sub: "Drop an STL, 3MF, or STEP — units are mm." },
   2: { title: "Boundary conditions", sub: "Where the part is held, how it is loaded." },
   3: { title: "Properties", sub: "Material, print settings, analysis grid." },
   4: { title: "Verify setup", sub: "Check constraints, then analyze the print or the solid." },
@@ -54,7 +54,7 @@ const HEAD: Record<number, { title: string; sub: string }> = {
 };
 
 const BUILD_HEAD: Record<number, { title: string; sub: string }> = {
-  1: { title: "Model", sub: "Drop an STL or 3MF — units are mm." },
+  1: { title: "Model", sub: "Drop an STL, 3MF, or STEP — units are mm." },
   2: { title: "Material & grid", sub: "Material (incl. shrink) and the analysis grid." },
   3: { title: "Build simulation", sub: "Inherent-strain warping & bed peel, layer by layer." },
   4: { title: "View & export", sub: "Inspect the warp, hand off the predeformed mesh." },
@@ -236,12 +236,12 @@ function StepModel() {
       <input
         ref={fileRef}
         type="file"
-        accept=".stl,.3mf"
+        accept=".stl,.3mf,.step,.stp"
         hidden
         onChange={(e) => void onFile(e.target.files?.[0])}
       />
       <button className="primary" onClick={() => fileRef.current?.click()}>
-        {s.fileName ? "Replace model…" : "Open STL / 3MF…"}
+        {s.fileName ? "Replace model…" : "Open STL / 3MF / STEP…"}
       </button>
       {s.fileName ? (
         <div className="fileinfo">
@@ -336,11 +336,12 @@ function StepBcs() {
       setTool: s.setTool,
       brushRadius: s.brushRadius,
       setBrushRadius: s.setBrushRadius,
-      brushErase: s.brushErase,
-      setBrushErase: s.setBrushErase,
+      resizeBcSelection: s.resizeBcSelection,
       activeBcId: s.activeBcId,
     }))
   );
+  const activeBc = s.bcs.find((bc) => bc.id === s.activeBcId);
+  const hasSelection = !!activeBc && activeBc.kind !== "accel" && activeBc.tris.length > 0;
   const supports = s.bcs.filter((bc) => SUPPORT_KINDS.includes(bc.kind));
   const loads = s.bcs.filter((bc) => !SUPPORT_KINDS.includes(bc.kind));
   return (
@@ -418,41 +419,54 @@ function StepBcs() {
               Brush
             </button>
           </div>
+          <div className="toolrow" style={{ marginTop: 4 }}>
+            <button
+              disabled={!hasSelection}
+              onClick={() => s.resizeBcSelection(1)}
+              title="Grow the highlighted condition's selection by one row of elements"
+            >
+              ⊕ Extend
+            </button>
+            <button
+              disabled={!hasSelection}
+              onClick={() => s.resizeBcSelection(-1)}
+              title="Shrink the highlighted condition's selection by one row of elements"
+            >
+              ⊖ Shrink
+            </button>
+          </div>
           <div style={{ marginTop: 4 }}>
             <SurfacePatchControl />
           </div>
         </div>
       )}
       {s.tool === "brush" && (
-        <>
-          <div className="group">
-            <div className="g-label">
-              <span>Brush diameter</span>
-              <b>{format(s.brushRadius * 2, "length")}</b>
-            </div>
-            <input
-              type="range"
-              min={1}
-              max={50}
-              step={1}
-              value={s.brushRadius * 2}
-              onChange={(e) => s.setBrushRadius(Number(e.target.value) / 2)}
-            />
+        <div className="group">
+          <div className="g-label">
+            <span>Brush diameter</span>
+            <b>{format(s.brushRadius * 2, "length")}</b>
           </div>
-          <label className="rowcheck">
-            <input
-              type="checkbox"
-              checked={s.brushErase}
-              onChange={(e) => s.setBrushErase(e.target.checked)}
-            />
-            <span>Erase mode</span>
-          </label>
-        </>
+          <input
+            type="range"
+            min={1}
+            max={50}
+            step={1}
+            value={s.brushRadius * 2}
+            onChange={(e) => s.setBrushRadius(Number(e.target.value) / 2)}
+          />
+        </div>
       )}
-      {s.activeBcId && (s.tool === "select" || s.tool === "brush") && (
+      {s.activeBcId && s.tool === "select" && (
         <div className="hint">
-          Click surfaces to add to the highlighted condition (click again to remove, shift-click
-          always removes). Esc or clicking another step returns to orbiting.
+          Click surfaces to add to the highlighted condition — right-click removes. Esc or clicking
+          another step returns to orbiting.
+        </div>
+      )}
+      {s.activeBcId && s.tool === "brush" && (
+        <div className="hint">
+          Paint surfaces to add to the highlighted condition — paint with the right mouse button to
+          erase, scroll over the part to resize the brush. Orbit, pan and zoom stay active beside
+          the part; Esc returns to orbiting.
         </div>
       )}
       {s.activeBcId && s.tool === "pickdir" && (
@@ -537,6 +551,7 @@ function BcRow({ bc }: { bc: Bc }) {
       setActiveBc: s.setActiveBc,
       removeBc: s.removeBc,
       setBcName: s.setBcName,
+      updateBcTris: s.updateBcTris,
       updateBcParams: s.updateBcParams,
       setStepPressure: s.setStepPressure,
       loadSteps: s.loadSteps,
@@ -570,6 +585,18 @@ function BcRow({ bc }: { bc: Bc }) {
           <span className="dim">whole part</span>
         ) : (
           <span className="dim">{bc.tris.length ? `${bc.tris.length} tris` : "select…"}</span>
+        )}
+        {bc.kind !== "accel" && bc.tris.length > 0 && (
+          <button
+            className="x"
+            title="Remove all selected triangles (keeps the condition)"
+            onClick={(e) => {
+              e.stopPropagation();
+              s.updateBcTris(bc.id, new Uint32Array(0));
+            }}
+          >
+            ⌫
+          </button>
         )}
         <button
           className="x"
@@ -1938,12 +1965,13 @@ function StepBuildSim() {
 
 // ---------------- 5 · Optimize infill ----------------
 
-/** Inline density-level list next to the count selector. Empty = auto
- *  placement (levels picked from the optimized field); a comma-separated
- *  list (e.g. "10, 40, 70") pins them manually and syncs the count
- *  selector. Changing the count re-spreads a pinned list; clearing the
- *  box returns to auto. */
-function LevelsInline() {
+/** Graded density levels: count selector + the level list, as its own group.
+ *  The list is either auto-placed from the optimized field (button "auto";
+ *  after a run the box shows what auto chose) or pinned to a typed
+ *  comma-separated list. Typing a list pins it and syncs the count; changing
+ *  the count re-spreads a pinned list; the auto button (or clearing the box)
+ *  returns to auto placement. */
+function LevelsGroup() {
   const s = useStore(
     useShallow((s) => ({
       levelSettings: s.levelSettings,
@@ -1960,8 +1988,8 @@ function LevelsInline() {
   const sum = s.optSummary;
   const placeholder =
     !manual && sum && !sum.solid && !sum.binary && sum.bins.length
-      ? `auto: ${sum.bins.map((b) => Math.round(b.density * 100)).join(", ")}`
-      : "auto";
+      ? sum.bins.map((b) => Math.round(b.density * 100)).join(", ")
+      : "placed by the optimizer";
   const [text, setText] = useState(shown);
   useEffect(() => {
     setText(shown);
@@ -1986,18 +2014,50 @@ function LevelsInline() {
     }
   };
   return (
-    <input
-      type="text"
-      value={text}
-      size={11}
-      placeholder={placeholder}
-      title="Density levels in % — a comma-separated list (e.g. 10, 40, 70) pins them; empty = auto placement from the optimized field"
-      onChange={(e) => setText(e.target.value)}
-      onBlur={commit}
-      onKeyDown={(e) => {
-        if (e.key === "Enter") (e.target as HTMLInputElement).blur();
-      }}
-    />
+    <div className="group">
+      <div className="g-label">
+        <span>Density levels</span>
+        <b>{manual ? "pinned" : `auto · ${s.nBins}`}</b>
+      </div>
+      <div className="toolrow">
+        <select
+          value={s.nBins}
+          onChange={(e) => s.setNBins(Number(e.target.value))}
+          title="Number of discrete density levels"
+        >
+          <option value={2}>2 levels</option>
+          <option value={3}>3 levels</option>
+          <option value={4}>4 levels</option>
+          {s.nBins > 4 && <option value={s.nBins}>{s.nBins} levels</option>}
+        </select>
+        <input
+          type="text"
+          value={text}
+          style={{ flex: 1, minWidth: 0 }}
+          placeholder={placeholder}
+          title="Densities in % — type a comma-separated list (e.g. 10, 40, 70) to pin them"
+          onChange={(e) => setText(e.target.value)}
+          onBlur={commit}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+          }}
+        />
+        <button
+          className={manual ? "" : "on"}
+          onClick={() => {
+            if (manual) s.updateLevelSettings({ mode: "auto" });
+          }}
+          title="Place the levels automatically from the optimized field (bottom level pinned at the printability floor)"
+        >
+          auto
+        </button>
+      </div>
+      <div className="dim small">
+        {manual
+          ? "Pinned: exactly these densities are used — match them to values you have calibration data for. A level at 100% exports as solid rectilinear fill. Clear the box (or press auto) to go back."
+          : "Auto: the optimizer places the levels from the density field, bottom pinned at the printability floor. Type e.g. 10, 40, 70 to pin your own."}
+      </div>
+    </div>
   );
 }
 
@@ -2007,6 +2067,10 @@ function StepOptimize() {
       optMode: s.optMode,
       goal: s.goal,
       setGoal: s.setGoal,
+      sfTarget: s.sfTarget,
+      setSfTarget: s.setSfTarget,
+      sfMeasure: s.sfMeasure,
+      setSfMeasure: s.setSfMeasure,
       budget: s.budget,
       setBudget: s.setBudget,
       levelSettings: s.levelSettings,
@@ -2042,59 +2106,111 @@ function StepOptimize() {
   );
   return (
     <>
-      {s.optMode !== "solid" && (
-        <div className="group">
-          <div className="g-label">
-            <span>Goal</span>
-          </div>
-          <div className="seg">
-            <button
-              className={s.goal === "budget" ? "on" : ""}
-              onClick={() => s.setGoal("budget")}
-              title="Maximize stiffness at a given material budget"
-            >
-              Stiffest at budget
-            </button>
+      <div className="group">
+        <div className="g-label">
+          <span>Goal</span>
+        </div>
+        <div className="seg">
+          <button
+            className={s.goal === "budget" ? "on" : ""}
+            onClick={() => s.setGoal("budget")}
+            title="Maximize stiffness at a given material budget"
+          >
+            Stiffest
+          </button>
+          {s.optMode !== "solid" && (
             <button
               className={s.goal === "match" ? "on" : ""}
               onClick={() => s.setGoal("match")}
               title="Find the lightest design that is as stiff as a uniform print at X%"
             >
-              Match uniform stiffness
+              Match stiffness
             </button>
+          )}
+          <button
+            className={s.goal === "strength" ? "on" : ""}
+            onClick={() => s.setGoal("strength")}
+            title="Find the lightest design whose safety factor stays at or above a target"
+          >
+            Safety factor
+          </button>
+        </div>
+      </div>
+
+      {s.goal === "strength" ? (
+        <div className="group">
+          <div className="g-label">
+            <span>Target safety factor</span>
+            <b>≥ {s.sfTarget}</b>
+          </div>
+          <NumInput
+            value={s.sfTarget}
+            min={1}
+            max={9.5}
+            step={0.1}
+            onCommit={(v) => s.setSfTarget(v)}
+          />
+          <div className="seg" style={{ marginTop: 6 }}>
+            <button
+              className={s.sfMeasure === "both" ? "on" : ""}
+              onClick={() => s.setSfMeasure("both")}
+              title="Worst of material and layer-adhesion safety factor per cell — matches the SF plot"
+            >
+              Material + layers
+            </button>
+            <button
+              className={s.sfMeasure === "material" ? "on" : ""}
+              onClick={() => s.setSfMeasure("material")}
+              title="Von Mises stress vs the in-plane tensile strength"
+            >
+              Material
+            </button>
+            <button
+              className={s.sfMeasure === "layer" ? "on" : ""}
+              onClick={() => s.setSfMeasure("layer")}
+              title="Layer adhesion: tension across the layers + interlayer shear (how FDM parts usually fail)"
+            >
+              Layers
+            </button>
+          </div>
+          <div className="dim small">
+            Uses as little material as possible while the safety factor stays at or above the
+            target under every included load step. A pre-flight check reports honestly when even
+            100% fill can&apos;t reach it. Strengths come from the material presets (or your
+            measurements) with Gibson–Ashby scaling — a design aid, not a certified safety factor.
+          </div>
+        </div>
+      ) : (
+        <div className="group">
+          <div className="g-label">
+            <span>
+              {s.optMode === "solid"
+                ? "Retained volume"
+                : s.goal === "match"
+                  ? "As stiff as uniform"
+                  : "Infill budget"}
+            </span>
+            <b>{s.budget} %</b>
+          </div>
+          <input
+            type="range"
+            min={budgetBounds(s)[0]}
+            max={budgetBounds(s)[1]}
+            step={1}
+            value={s.budget}
+            onChange={(e) => s.setBudget(Number(e.target.value))}
+          />
+          <div className="dim small">
+            {s.optMode === "solid"
+              ? `Keeps ${s.budget}% of the design volume as solid material and removes the rest — the stiffest shape at that mass. Load/support regions are kept regardless.`
+              : s.goal === "match"
+                ? `Finds the LIGHTEST layout with the stiffness of a uniform ${s.budget}% print (a few warm-started passes search the needed budget).`
+                : s.optMode === "binary"
+                  ? `Mean interior density: cells are either ${s.levelSettings.binaryFloorPct}% (so it prints) or 100% solid. The optimizer runs SIMP-penalized so the design goes black/white.`
+                  : "Mean infill of the interior — same scale as your slicer's uniform infill %. Walls and shells come on top."}
           </div>
         </div>
       )}
-
-      <div className="group">
-        <div className="g-label">
-          <span>
-            {s.optMode === "solid"
-              ? "Retained volume"
-              : s.goal === "match"
-                ? "As stiff as uniform"
-                : "Infill budget"}
-          </span>
-          <b>{s.budget} %</b>
-        </div>
-        <input
-          type="range"
-          min={budgetBounds(s)[0]}
-          max={budgetBounds(s)[1]}
-          step={1}
-          value={s.budget}
-          onChange={(e) => s.setBudget(Number(e.target.value))}
-        />
-        <div className="dim small">
-          {s.optMode === "solid"
-            ? `Keeps ${s.budget}% of the design volume as solid material and removes the rest — the stiffest shape at that mass. Load/support regions are kept regardless.`
-            : s.goal === "match"
-              ? `Finds the LIGHTEST layout with the stiffness of a uniform ${s.budget}% print (a few warm-started passes search the needed budget).`
-              : s.optMode === "binary"
-                ? `Mean interior density: cells are either ${s.levelSettings.binaryFloorPct}% (so it prints) or 100% solid. The optimizer runs SIMP-penalized so the design goes black/white.`
-                : "Mean infill of the interior — same scale as your slicer's uniform infill %. Walls and shells come on top."}
-        </div>
-      </div>
 
       <div className="group">
         <div className="g-label">
@@ -2204,28 +2320,20 @@ function StepOptimize() {
           </div>
         </div>
       ) : (
-        <div className="row">
-          <div className="dim small" style={{ flex: 1 }}>
-            Skin {s.perimeters} × {format(s.lineWidth, "length")} · {s.pattern} —{" "}
-            <a className="link" onClick={() => s.setActiveStep(3)}>
-              edit in Properties
-            </a>
+        <>
+          {s.optMode === "graded" && <LevelsGroup />}
+          <div className="row">
+            <div className="dim small" style={{ flex: 1 }}>
+              Skin {s.perimeters} × {format(s.lineWidth, "length")} · {s.pattern} —{" "}
+              <a className="link" onClick={() => s.setActiveStep(3)}>
+                edit in Properties
+              </a>
+            </div>
+            {s.optMode === "binary" && (
+              <span className="dim small">2 levels (hollow/solid)</span>
+            )}
           </div>
-          {s.optMode === "binary" ? (
-            <span className="dim small">2 levels (hollow/solid)</span>
-          ) : (
-            <label className="row">
-              <span className="dim small">Levels</span>
-              <select value={s.nBins} onChange={(e) => s.setNBins(Number(e.target.value))}>
-                <option value={2}>2</option>
-                <option value={3}>3</option>
-                <option value={4}>4</option>
-                {s.nBins > 4 && <option value={s.nBins}>{s.nBins}</option>}
-              </select>
-              <LevelsInline />
-            </label>
-          )}
-        </div>
+        </>
       )}
 
       <div className="group">

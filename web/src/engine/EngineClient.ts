@@ -127,6 +127,26 @@ export class EngineClient {
     return this.call({ op: "load", bytes, name }, [bytes]);
   }
 
+  /** Pre-tessellated import (STEP via the meshStep worker, DESIGN §18):
+   *  indexed mesh + dense CAD-face/solid ids. `bytes` = the original file,
+   *  kept worker-side for project save. All buffers transfer. */
+  loadMesh(
+    positions: Float32Array,
+    indices: Uint32Array,
+    faceOfTri: Uint32Array,
+    solidOfTri: Uint32Array,
+    bytes: ArrayBuffer,
+    name: string
+  ): Promise<LoadedModelData> {
+    return this.call({ op: "loadMesh", positions, indices, faceOfTri, solidOfTri, bytes, name }, [
+      positions.buffer,
+      indices.buffer,
+      faceOfTri.buffer,
+      solidOfTri.buffer,
+      bytes,
+    ]);
+  }
+
   resegment(angle: number): Promise<{ patchIds: Uint32Array; patchCount: number }> {
     return this.call({ op: "resegment", angle });
   }
@@ -474,11 +494,11 @@ export class EngineClient {
   }
 
   /** Phase 1 of open: extract the manifest + rebuild the Model from the embedded
-   *  file. The caller then pushes settings/orientation/BCs and calls
-   *  openProjectRestore. */
-  openProjectModel(
-    bytes: ArrayBuffer
-  ): Promise<{ manifest: string; model: LoadedModelData }> {
+   *  file. STEP-model projects return `stepModel` (the embedded bytes) instead —
+   *  the caller tessellates via the meshStep worker and calls `loadMesh`, then
+   *  proceeds identically. Either way the caller then pushes settings/
+   *  orientation/BCs and calls openProjectRestore. */
+  openProjectModel(bytes: ArrayBuffer): Promise<EngineResponses["openProjectModel"]> {
     return this.call({ op: "openProjectModel", bytes }, [bytes]);
   }
 
@@ -685,8 +705,14 @@ export interface OptimizeOptions {
   /** Per-modifier sparse_infill_pattern for the export (binary mode). */
   solidPattern: string | null;
   /** "budget" = stiffest at the given mean infill; "match" = lightest design
-   *  as stiff as a uniform print at budgetPct (secant on the budget). */
-  goal: "budget" | "match";
+   *  as stiff as a uniform print at budgetPct (secant on the budget);
+   *  "strength" = lightest design whose trimmed-percentile safety factor
+   *  meets `sfTarget` on every included load step (DESIGN §17). */
+  goal: "budget" | "match" | "strength";
+  /** Strength goal: required SF_crit (advisory design aid — §17 dec. 8). */
+  sfTarget?: number;
+  /** Strength goal SF measure: material / layer adhesion / both (§17 dec. 2). */
+  sfMeasure?: "material" | "layer" | "both";
   /** Planar symmetry constraint: [nx, ny, nz, c] of the plane n·p = c
    *  (world mm). null = unconstrained. */
   symmetry: number[] | null;
@@ -705,6 +731,8 @@ export interface OptPhase {
   phase:
     | "assemble"
     | "reference"
+    | "preflight"
+    | "sf_eval"
     | "optimize_pass"
     | "binning"
     | "verify"
@@ -782,9 +810,29 @@ export interface OptSummary {
   /** True when the run was solid topology (material-removal) mode. */
   solid: boolean;
   /** Optimization goal of the run. */
-  goal: "budget" | "match";
+  goal: "budget" | "match" | "strength";
   /** Outer passes executed (1 for budget mode). */
   passes: number;
+  // ---- strength mode only (DESIGN §17) ----
+  /** Required SF_crit of the run. */
+  sfTarget?: number;
+  /** SF_crit of the delivered design (min over included load steps). */
+  sfAchieved?: number;
+  /** SF_crit of the all-at-cap pre-flight — the best any layout can do. */
+  sfBest?: number;
+  /** False = target unreachable even at the cap; the delivered design IS the
+   *  all-at-cap design and `sfBest` is the honest ceiling (§17 dec. 6). */
+  sfFeasible?: boolean;
+  /** SF measure the run enforced. */
+  sfMeasure?: "material" | "layer" | "both";
+  /** Per-step SF_crit of the delivered design (primary step first). */
+  sfPerStep?: number[];
+  /** Cells below the target on the delivered design (binding region size). */
+  bindingCellCount?: number;
+  /** Volume share of the binding region in SKIN cells: ≳0.5 reads
+   *  "skin-limited — infill can't fix this", else "interior at cap". */
+  bindingSkinShare?: number;
+  sfTrace?: { budget: number; sf: number }[];
   // ---- match mode only ----
   /** Reference uniform infill the stiffness was matched to (percent). */
   refUniformPct?: number;
