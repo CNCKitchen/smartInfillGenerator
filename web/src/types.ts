@@ -25,6 +25,9 @@ export interface CylFit {
   point: [number, number, number];
   radius: number;
   residual: number;
+  /** True when axis/point/radius come from the STEP file's analytic cylinder
+   *  (exact CAD identity) instead of a least-squares fit (DESIGN §18 M3). */
+  exact?: boolean;
 }
 
 /** How a force load is defined in the UI. "components" edits Fx/Fy/Fz

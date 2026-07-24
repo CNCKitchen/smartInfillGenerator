@@ -8,6 +8,7 @@
 //! spawns a fresh worker.
 
 import type { ImportDiagnostics, ImportProgress, MeshResult } from "meshstep";
+import type { StepFaceInfo } from "./stepSelection";
 
 /** Tessellation options — file-derived on fresh imports; passed back in
  *  verbatim on project reopen so the mesh reproduces even if the auto
@@ -41,6 +42,11 @@ export interface StepMeshPayload {
   /** Dense solid indices of open-by-design (OPEN_SHELL) bodies. Any entry ⇒
    *  the winding-number voxelization cannot be trusted — hard warning. */
   openSolids: number[];
+  /** Per-face metadata (surface class, analytic identity, area, normal),
+   *  dense-indexed like `faceEntityIds`; null when assembly instances carry
+   *  placements (part-local geometry would be ambiguous in world space) —
+   *  DESIGN §18 M3. */
+  faces: StepFaceInfo[] | null;
   diagnostics: ImportDiagnostics;
   stats: MeshResult["stats"];
   /** Display-only unit label from the file; coordinates are always mm. */

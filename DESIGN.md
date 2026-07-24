@@ -1045,3 +1045,33 @@ PROJECT_SCHEMA=1 (absent fields = M1/STL behavior):
   whole-face detection, brush fallback, never-fabricate on stale indices, cross-version
   entity-id rebind incl. changed dense order + grown faces), tsc + vite build clean.
   No Rust/wasm changes (regbench/smoke unaffected).
+
+**Status (2026-07-24): M3 SHIPPED** (analytic BCs from CAD metadata; JS-only again):
+- Import worker now emits `faces: StepFaceInfo[]` (dense-indexed: surface type, analytic
+  origin/axis/radius/semiAngle, area mm², mean normal — all IMPORT-frame), gated on every
+  assembly instance being meshed in place (`frame === null`); placed assemblies get
+  `faces: null` rather than ambiguous part-local geometry.
+- `stepInfo` gains `faces` + `toWorld`, the cumulative rigid transform since import, kept
+  in lockstep at every `engine.transform` site (loadFile auto-center, `transformModel`
+  rotate/place incl. plate seating, project-open replay) via `composeTransform` — the
+  same composition `Model::transform` accumulates. Analytic values compose through it at
+  USE time, so orientation changes never stale them.
+- **Exact bearing**: `updateBcTris` prefers `exactCylinderForSelection` over the
+  least-squares fit — non-null iff the selection is exactly a union of cylindrical faces
+  sharing one axis + radius (split-bore halves combine; parallel-offset axes, radius
+  mismatch, cones, partial faces all fall back to the fit). `CylFit.exact` marks
+  provenance; the bearing readout shows "· CAD-exact". Wasm `add_bearing` still fits
+  internally — the exact path upgrades validation + display; solver unchanged.
+- **Area readout**: pressure BCs show exact CAD face area + resultant p·A when the
+  selection is a whole-face union (`selectionCadArea`).
+- **Bearing suggestion**: a plain force whose selection is a cylindrical bore/boss gets a
+  "consider a Bearing load" hint (`CylindricalBearingHint`).
+- DELIBERATE deviation from dec. 9: place/pickdir exact-normal snapping NOT built — a
+  planar face's tessellated normal already equals the analytic normal to float precision,
+  so there is nothing to gain; snapping pickdir-on-cylinder to the AXIS would change
+  semantics (radial → axial) and is deferred as a UX question. Cone support for bearing
+  likewise deferred until a real part needs it.
+- Verified: check:step extended (exact-cylinder accept/reject matrix, split bore, area
+  sums, transform composition vs sequential application), tsc + vite build clean, e2e
+  seam test recovers the real bore's r=5.000 exactly + CAD area on cylinderWithHole.step.
+  `faces` is NOT persisted in the manifest — it's rebuilt from the re-import on open.

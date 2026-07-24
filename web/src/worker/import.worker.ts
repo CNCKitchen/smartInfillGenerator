@@ -20,6 +20,7 @@ import type {
   StepImportWorkerMessage,
   StepMeshPayload,
 } from "../engine/StepImporter";
+import type { StepFaceInfo } from "../engine/stepSelection";
 
 /** Densify sparse STEP entity record numbers into 0..n-1 indices. The engine
  *  sizes patch arrays as max-id+1 (`cad_segmentation`), so raw entity numbers
@@ -96,6 +97,33 @@ self.onmessage = async (ev: MessageEvent<StepImportRequest>) => {
     solid.table.forEach((entity, denseId) => {
       if (openSet.has(entity)) openSolids.push(denseId);
     });
+    // Per-face metadata for analytic BCs (DESIGN §18 M3), dense-indexed.
+    // Analytic identity is PART-LOCAL; only when every instance is meshed in
+    // place (frame null — single parts, in-place assemblies) does it equal
+    // world space, so gate the whole block on that.
+    const inPlace = r.instances.every((i) => !i.frame);
+    let faces: StepFaceInfo[] | null = null;
+    if (inPlace) {
+      faces = Array.from(face.table, (entity) => {
+        const f = r.faces.get(entity);
+        if (!f) {
+          // Repair-fill ids always adopt a real face; a miss should not
+          // happen, but a placeholder beats dropping the whole payload.
+          return { entityId: entity, type: "other", area: 0, meanNormal: [0, 0, 1] as [number, number, number] };
+        }
+        const s = f.surface;
+        return {
+          entityId: entity,
+          type: f.type,
+          area: f.area,
+          meanNormal: [f.meanNormal[0], f.meanNormal[1], f.meanNormal[2]] as [number, number, number],
+          origin: s.origin ? ([s.origin[0], s.origin[1], s.origin[2]] as [number, number, number]) : undefined,
+          axis: s.axis ? ([s.axis[0], s.axis[1], s.axis[2]] as [number, number, number]) : undefined,
+          radius: s.radius,
+          semiAngle: s.semiAngle,
+        };
+      });
+    }
     const payload: StepMeshPayload = {
       positions: new Float32Array(r.mesh.positions), // f64 mm → f32 for GPU/wasm
       indices: r.mesh.indices,
@@ -104,6 +132,7 @@ self.onmessage = async (ev: MessageEvent<StepImportRequest>) => {
       faceEntityIds: face.table,
       solidEntityIds: solid.table,
       openSolids,
+      faces,
       diagnostics: r.diagnostics,
       stats: r.stats,
       units: r.units,

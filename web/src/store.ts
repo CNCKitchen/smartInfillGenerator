@@ -20,8 +20,14 @@ import {
   type StepTessOpts,
 } from "./engine/StepImporter";
 import {
+  composeTransform,
+  exactCylinderForSelection,
+  IDENTITY_TRANSFORM,
   selectionFaceIds,
+  transformDir,
+  transformPoint,
   trisForFaceIds,
+  type StepFaceInfo,
   type StepManifestInfo,
 } from "./engine/stepSelection";
 import { ENVELOPE_STEP, FieldServer, isEnvelope } from "./engine/FieldServer";
@@ -679,13 +685,21 @@ interface AppState {
   askImportUnit: boolean;
   /** STL awaiting a unit choice (picker open); null otherwise. */
   pendingImport: { name: string; bytes: ArrayBuffer } | null;
-  /** STEP provenance of the loaded model, null for STL/3MF (DESIGN §18 M2).
+  /** STEP provenance of the loaded model, null for STL/3MF (DESIGN §18 M2/M3).
    *  `cadPatchIds` is the load-time CAD segmentation (dense face id per
    *  working triangle) — kept apart from `model.patchIds`, which follows the
    *  live segSource; `faceEntityIds` maps dense ids to the STEP file's own
-   *  entity record numbers (the version-stable selection identity). */
+   *  entity record numbers (the version-stable selection identity). `faces`
+   *  carries per-face analytic metadata in the IMPORT frame; `toWorld` is the
+   *  cumulative rigid transform since import (kept in lockstep with every
+   *  `engine.transform`), composing them into current world space. */
   stepInfo:
-    | (StepManifestInfo & { cadPatchIds: Uint32Array; faceEntityIds: Uint32Array })
+    | (StepManifestInfo & {
+        cadPatchIds: Uint32Array;
+        faceEntityIds: Uint32Array;
+        faces: StepFaceInfo[] | null;
+        toWorld: number[];
+      })
     | null;
   /** Densities of the extracted modifier regions (for the region list). */
   regionInfos: { density: number }[];
@@ -1245,7 +1259,18 @@ async function transformModel(set: SetState, get: () => AppState, r: number[]) {
     const bcs = get().bcs.map((b) =>
       b.kind === "mass" && b.point ? { ...b, point: movePoint(b.point) } : b
     );
-    set({ model: { ...get().model!, positions: out.positions, bbox }, bcs });
+    // Keep the STEP analytic frame in lockstep: world = seat ∘ (r,t) ∘ old.
+    const si = get().stepInfo;
+    const stepInfo = si
+      ? {
+          ...si,
+          toWorld: composeTransform(
+            [1, 0, 0, 0, 1, 0, 0, 0, 1, ...seat],
+            composeTransform([...r, ...t], si.toWorld)
+          ),
+        }
+      : si;
+    set({ model: { ...get().model!, positions: out.positions, bbox }, bcs, stepInfo });
     invalidateResults(set, get);
     invalidateGrid(set, get);
     sceneEvents.onModelTransformed?.(out.positions, bbox);
@@ -2913,6 +2938,8 @@ export const useStore = create<AppState>((set, get) => ({
           sha256: imp.sha256,
           cadPatchIds: model.patchIds.slice(),
           faceEntityIds: imp.faceEntityIds,
+          faces: imp.faces,
+          toWorld: IDENTITY_TRANSFORM.slice(),
         };
       } else {
         model = await engine.load(bytes, cleanName);
@@ -2933,8 +2960,10 @@ export const useStore = create<AppState>((set, get) => ({
         const cy = (model.bbox[1] + model.bbox[4]) / 2;
         const dz = model.bbox[2];
         if (Math.abs(cx) > 1e-6 || Math.abs(cy) > 1e-6 || Math.abs(dz) > 1e-6) {
-          const out = await engine.transform([1, 0, 0, 0, 1, 0, 0, 0, 1, -cx, -cy, -dz]);
+          const m = [1, 0, 0, 0, 1, 0, 0, 0, 1, -cx, -cy, -dz];
+          const out = await engine.transform(m);
           model = { ...model, positions: out.positions, bbox: out.bbox as LoadedModel["bbox"] };
+          if (stepInfo) stepInfo = { ...stepInfo, toWorld: composeTransform(m, stepInfo.toWorld) };
         }
       }
       const m = get().material;
@@ -3270,7 +3299,25 @@ export const useStore = create<AppState>((set, get) => ({
       if (tris.length === 0) {
         bearingPatch = { tris, cyl: null, cylError: undefined };
       } else {
-        const fit = positions ? fitCylinderFromSelection(positions, tris) : null;
+        // STEP models: a whole-CAD-face cylindrical selection carries its
+        // EXACT analytic axis/radius — use it instead of the least-squares
+        // fit (short or partial bores fit noisily). Import-frame values are
+        // composed into the current orientation via stepInfo.toWorld
+        // (DESIGN §18 M3). Anything else falls back to the fit.
+        const si = get().stepInfo;
+        const exact = si ? exactCylinderForSelection(tris, si.cadPatchIds, si.faces) : null;
+        const fit = exact
+          ? {
+              ok: true as const,
+              axis: transformDir(si!.toWorld, exact.axis),
+              point: transformPoint(si!.toWorld, exact.origin),
+              radius: exact.radius,
+              residual: 0,
+              exact: true,
+            }
+          : positions
+            ? fitCylinderFromSelection(positions, tris)
+            : null;
         if (fit?.ok) {
           bearingPatch = { tris, cyl: fit, cylError: undefined };
         } else {
@@ -5473,6 +5520,8 @@ export const useStore = create<AppState>((set, get) => ({
           sha256: imp.sha256,
           cadPatchIds: mi.patchIds.slice(),
           faceEntityIds: imp.faceEntityIds,
+          faces: imp.faces,
+          toWorld: IDENTITY_TRANSFORM.slice(),
         };
         // Hash mismatch "cannot happen" (the bytes embed verbatim) — treat it
         // like a version change rather than trusting stale indices.
@@ -5600,7 +5649,11 @@ export const useStore = create<AppState>((set, get) => ({
       // rebuilds them), then push the loads/supports.
       if (Array.isArray(mf.transform) && mf.transform.length === 12) {
         const out = await engine.transform(mf.transform);
-        set({ model: { ...get().model!, positions: out.positions, bbox: out.bbox as LoadedModel["bbox"] } });
+        const si = get().stepInfo;
+        set({
+          model: { ...get().model!, positions: out.positions, bbox: out.bbox as LoadedModel["bbox"] },
+          stepInfo: si ? { ...si, toWorld: composeTransform(mf.transform, si.toWorld) } : si,
+        });
       }
       // Push the active (first) load step's effective BCs — identical to `bcs`
       // for a single-step / pre-feature project.

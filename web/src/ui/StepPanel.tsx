@@ -4,7 +4,7 @@
 // One panel, one step: the active station's controls. Everything the old
 // all-at-once sidebar offered is still here, just shown one step at a time.
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useShallow } from "zustand/shallow";
 import {
   budgetBounds,
@@ -25,6 +25,7 @@ import { fmtDisp, fmtLen, lenUnit, rampCss } from "./fmt";
 import { BC_HELP, bcLabel, KIND_DOT, KIND_LABEL, SUPPORT_KINDS } from "./bcmeta";
 import { HelpTip } from "./HelpTip";
 import { ValidateOrientation } from "./ValidateOrientation";
+import { isCylindricalSelection, selectionCadArea } from "../engine/stepSelection";
 import {
   format,
   unitLabel,
@@ -608,26 +609,34 @@ function BcRow({ bc }: { bc: Bc }) {
           ×
         </button>
       </div>
-      {bc.kind === "force" && <ForceEditor bc={bc} step={step} />}
+      {bc.kind === "force" && (
+        <>
+          <ForceEditor bc={bc} step={step} />
+          <CylindricalBearingHint bc={bc} />
+        </>
+      )}
       {bc.kind === "bearing" && <BearingEditor bc={bc} step={step} />}
       {bc.kind === "moment" && <MomentEditor bc={bc} step={step} />}
       {bc.kind === "accel" && <AccelEditor bc={bc} step={step} />}
       {bc.kind === "mass" && <MassEditor bc={bc} step={step} />}
       {bc.kind === "displacement" && <DisplacementEditor bc={bc} />}
       {bc.kind === "pressure" && (
-        <div className="bcparams" onClick={(e) => e.stopPropagation()}>
-          <label>
-            p
-            <UnitInput
-              value={step ? step.overrides[bc.id]?.pressure ?? bc.pressure ?? 0 : bc.pressure ?? 0}
-              kind="pressure"
-              step={0.01}
-              onCommit={(v) =>
-                step ? s.setStepPressure(step.id, bc.id, v) : s.updateBcParams(bc.id, { pressure: v })
-              }
-            />
-          </label>
-          <span className="dim">{unitLabel("pressure")}</span>
+        <div onClick={(e) => e.stopPropagation()}>
+          <div className="bcparams">
+            <label>
+              p
+              <UnitInput
+                value={step ? step.overrides[bc.id]?.pressure ?? bc.pressure ?? 0 : bc.pressure ?? 0}
+                kind="pressure"
+                step={0.01}
+                onCommit={(v) =>
+                  step ? s.setStepPressure(step.id, bc.id, v) : s.updateBcParams(bc.id, { pressure: v })
+                }
+              />
+            </label>
+            <span className="dim">{unitLabel("pressure")}</span>
+          </div>
+          <PressureAreaReadout bc={bc} step={step ?? null} />
         </div>
       )}
       {bc.kind === "elastic" && (
@@ -960,10 +969,57 @@ function BearingCylStatus({ bc }: { bc: Bc }) {
     return (
       <div className="dim small">
         ⌀ {format(bc.cyl.radius * 2, "length")} · axis ({r4(a[0])}, {r4(a[1])}, {r4(a[2])})
+        {bc.cyl.exact ? (
+          <span title="Axis, center, and radius come from the STEP file's analytic cylinder — no fit noise.">
+            {" "}
+            · CAD-exact
+          </span>
+        ) : null}
       </div>
     );
   }
   return <div className="dim small">Checking cylindricity…</div>;
+}
+
+/** CAD metadata of a BC's selection on a STEP model: exact face area when the
+ *  selection is a whole-face union, and whether it is a cylindrical bore/boss
+ *  on one axis (DESIGN §18 M3). Null/false for STL/3MF or brush selections. */
+function useCadSelection(bc: Bc): { area: number | null; cylindrical: boolean } {
+  const stepInfo = useStore((s) => s.stepInfo);
+  return useMemo(() => {
+    if (!stepInfo || bc.tris.length === 0) return { area: null, cylindrical: false };
+    return {
+      area: selectionCadArea(bc.tris, stepInfo.cadPatchIds, stepInfo.faces),
+      cylindrical: isCylindricalSelection(bc.tris, stepInfo.cadPatchIds, stepInfo.faces),
+    };
+  }, [stepInfo, bc.tris]);
+}
+
+/** Nudge toward the bearing load when a plain force sits on a cylindrical
+ *  CAD bore/boss (DESIGN §18 M3 — the "this is a pin" signal). */
+function CylindricalBearingHint({ bc }: { bc: Bc }) {
+  const { cylindrical } = useCadSelection(bc);
+  if (!cylindrical) return null;
+  return (
+    <div className="dim small" onClick={(e) => e.stopPropagation()}>
+      Cylindrical CAD face — a <b>Bearing</b> load models a pin/bolt pressing on this bore more
+      realistically than a uniform force.
+    </div>
+  );
+}
+
+/** Exact CAD area + resultant of a pressure load (p·A) — only shown when the
+ *  area is exact (whole CAD faces on a STEP model). */
+function PressureAreaReadout({ bc, step }: { bc: Bc; step: LoadStep | null }) {
+  const { area } = useCadSelection(bc);
+  if (area === null) return null;
+  const p = (step ? (step.overrides[bc.id]?.pressure ?? bc.pressure) : bc.pressure) ?? 0;
+  return (
+    <div className="dim small">
+      CAD face area {format(area, "area")}
+      {p !== 0 ? <> → resultant ≈ {format(Math.abs(p) * area, "force")}</> : null}
+    </div>
+  );
 }
 
 /** Moment editor: edits the active load step's vector when multi-step, else the
