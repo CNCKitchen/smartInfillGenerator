@@ -1102,7 +1102,7 @@ PROJECT_SCHEMA=1 (absent fields = M1/STL behavior):
   change; STL/3MF derive edges on the ORIGINAL soup (`Model::original_positions`, a new
   wasm export — the as-imported conforming mesh, pose-followed), fetched by the store on
   load and after every transform: properly-shared (n=2) pairs with a dihedral angle
-  above the `edgeAngle` setting (default 30°, chip-inline input, shown for STL only).
+  above the `edgeAngle` setting (default 20°, chip-inline input, shown for STL only).
   First STL cut ran on the working mesh and MISSED creases on T-junction borders
   (subdivision differs across them → no exact partner) — same root cause as the STEP
   noise, fixed the same way: never detect edges on the refined mesh. **Smooth-shading creases match the edges** (same-day follow-up): STEP

@@ -109,7 +109,7 @@ export function ViewportChips() {
                 min={1}
                 max={89}
                 value={s.edgeAngle}
-                onChange={(e) => s.setEdgeAngle(Number(e.target.value) || 30)}
+                onChange={(e) => s.setEdgeAngle(Number(e.target.value) || 20)}
               />
               °
             </label>

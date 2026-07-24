@@ -150,7 +150,7 @@ export class SceneManager {
    *  so deriving edges here would hallucinate T-junction edges); STL/3MF
    *  derive dihedral edges > `edgeAngleDeg` across properly-shared edges. */
   private featureEdgesOn = true;
-  private edgeAngleDeg = 30;
+  private edgeAngleDeg = 20;
   /** STEP only: world-space CAD border segments + per-triangle CAD face ids
    *  (shading groups). Null ⇒ STL path (dihedral derivation). */
   private explicitEdgeSegments: Float32Array | null = null;

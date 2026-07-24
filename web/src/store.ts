@@ -2917,7 +2917,7 @@ export const useStore = create<AppState>((set, get) => ({
   smoothShading: false,
   featureEdges: true,
   cadColors: true,
-  edgeAngle: 30,
+  edgeAngle: 20,
   deformScale: 1,
   animateDeformed: false,
   autoScale: 1,
