@@ -98,6 +98,18 @@ fn signed_vm_sign(sxx: f64, syy: f64, szz: f64) -> f64 {
 /// so samplers can renormalize around them. Returns (nx+1)(ny+1)(nz+1)
 /// values, node index (z*(ny+1) + y)*(nx+1) + x.
 pub fn recover_nodal(grid: &VoxelGrid, cell_values: &[f32]) -> Vec<f32> {
+    recover_nodal_where(grid, cell_values, &|_| true)
+}
+
+/// `recover_nodal` restricted to cells with `keep(ci)`: dropped cells
+/// contribute nothing to their nodes, so a masked display surface (e.g. the
+/// Part Topo retained body) doesn't have its boundary values dragged toward
+/// the near-void SIMP-floor cells outside it.
+pub fn recover_nodal_where(
+    grid: &VoxelGrid,
+    cell_values: &[f32],
+    keep: &dyn Fn(usize) -> bool,
+) -> Vec<f32> {
     let (nx, ny, nz) = (grid.nx, grid.ny, grid.nz);
     let (mx, my, mz) = (nx + 1, ny + 1, nz + 1);
     let mut sum = vec![0f32; mx * my * mz];
@@ -106,7 +118,7 @@ pub fn recover_nodal(grid: &VoxelGrid, cell_values: &[f32]) -> Vec<f32> {
         for cy in 0..ny {
             for cx in 0..nx {
                 let ci = (cz * ny + cy) * nx + cx;
-                if grid.scale[ci] <= 0.0 {
+                if grid.scale[ci] <= 0.0 || !keep(ci) {
                     continue;
                 }
                 let v = cell_values[ci];

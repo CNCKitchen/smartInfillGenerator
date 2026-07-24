@@ -526,7 +526,7 @@ self.onmessage = async (ev: MessageEvent<EngineWorkerRequest>) => {
         return;
       }
       case "voxelResults": {
-        const arr = requireModel().voxel_results();
+        const arr = requireModel().voxel_results(msg.solidBody);
         const positions = arr[0] as Float32Array;
         const displacements = arr[1] as Float32Array;
         const edges = arr[2] as Float32Array;
@@ -540,7 +540,7 @@ self.onmessage = async (ev: MessageEvent<EngineWorkerRequest>) => {
         return;
       }
       case "voxelResultField": {
-        const values = requireModel().voxel_result_field(msg.kind);
+        const values = requireModel().voxel_result_field(msg.kind, msg.solidBody);
         reply(msg, values, [values.buffer]);
         return;
       }

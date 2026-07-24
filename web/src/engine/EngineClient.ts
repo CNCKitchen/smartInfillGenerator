@@ -447,19 +447,22 @@ export class EngineClient {
     return this.call({ op: "inherentStrainVoxels", layerMax, shrinkXy, shrinkZ });
   }
 
-  /** Voxel hull with exact nodal displacements (results-on-voxel-mesh view). */
-  voxelResults(): Promise<{
+  /** Voxel hull with exact nodal displacements (results-on-voxel-mesh view).
+   *  `solidBody` masks it to the Part Topo retained cells — results display
+   *  on the optimized shape instead of the original envelope. */
+  voxelResults(solidBody = false): Promise<{
     positions: Float32Array;
     displacements: Float32Array;
     edges: Float32Array;
     edgeDisplacements: Float32Array;
   }> {
-    return this.call({ op: "voxelResults" });
+    return this.call({ op: "voxelResults", solidBody });
   }
 
-  /** Result field per voxel-hull vertex (owning cell's value, flat per cell). */
-  voxelResultField(kind: string): Promise<Float32Array> {
-    return this.call({ op: "voxelResultField", kind });
+  /** Result field per voxel-hull vertex (owning cell's value, flat per cell).
+   *  `solidBody` must match the `voxelResults` fetch so values align. */
+  voxelResultField(kind: string, solidBody = false): Promise<Float32Array> {
+    return this.call({ op: "voxelResultField", kind, solidBody });
   }
 
   /** Snapshot the current solution under `id` for the Results-view switcher. */

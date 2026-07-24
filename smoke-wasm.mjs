@@ -326,7 +326,7 @@ assert(rootUz < 1e-3, `root stays put (${rootUz.toExponential(1)} mm)`);
 
 // Results on the voxel mesh: hull + exact nodal displacements + per-cell field.
 {
-  const vr = model.voxel_results();
+  const vr = model.voxel_results(false);
   const vpos = vr[0], vdisp = vr[1], vedges = vr[2], vedisp = vr[3];
   assert(vpos.length > 0 && vpos.length % 9 === 0, `voxel result hull (${vpos.length / 9} tris)`);
   assert(vdisp.length === vpos.length, "hull displacement per vertex");
@@ -336,7 +336,7 @@ assert(rootUz < 1e-3, `root stays put (${rootUz.toExponential(1)} mm)`);
     vmax = Math.max(vmax, Math.hypot(vdisp[i], vdisp[i + 1], vdisp[i + 2]));
   assert(Math.abs(vmax - stats.maxDisplacement) < 0.05 * stats.maxDisplacement + 1e-6,
     `voxel nodal max |u| matches solve (${vmax.toFixed(4)} vs ${stats.maxDisplacement.toFixed(4)})`);
-  const vvm = model.voxel_result_field("vm");
+  const vvm = model.voxel_result_field("vm", false);
   assert(vvm.length === vpos.length / 3, "voxel field value per hull vertex");
   assert(vvm.every((v) => Number.isFinite(v)) && fmax(vvm) > 0, "voxel von Mises sane");
   // Flat per-cell coloring: all 3 vertices of a triangle share one value.
@@ -686,6 +686,55 @@ assert(binSummary.gainVsUniform > 0.0, "binary core beats uniform infill");
   assert(raw.includes('sparse_infill_density" value="5%"'), "base density 5%");
 }
 console.log("ok: binary mode pipeline (optimize + export)");
+
+// ---- Part Topo (solid topology): validation results on the optimized shape ----
+// The masked voxel-result hull covers only the RETAINED cells (anchors +
+// connected-keep above iso_threshold), so stress/displacement display on the
+// carved body instead of the original envelope.
+{
+  const topo = new Model(boxStl([0, 0, 0], [60, 12, 12]), "topobeam");
+  const tsel = patchSelector(topo);
+  topo.set_material(2400, 0.35, 1.24, 50, 35);
+  topo.set_resolution(8000);
+  topo.add_fixed(tsel(0, "min"));
+  topo.add_force(tsel(0, "max"), 0, 0, -40);
+  const ts = JSON.parse(topo.optimize(JSON.stringify({
+    budgetPct: 40, exponent: 1.5, coeff: 1.0, perimeters: 2, lineWidth: 0.45,
+    smoothIters: 4, nBins: 2, floorPct: 5, capPct: 100, levelsPct: null,
+    binary: false, solid: true, solidPattern: null, goal: "budget",
+  }), () => {}));
+  assert(ts.solid === true, "summary flags solid topology mode");
+  const full = topo.voxel_results(false);
+  const masked = topo.voxel_results(true);
+  assert(masked[0].length > 0 && masked[0].length % 9 === 0,
+    `masked result hull (${masked[0].length / 9} tris vs full ${full[0].length / 9})`);
+  assert(masked[0].length !== full[0].length,
+    "masked hull differs from the full envelope hull (carved faces exposed)");
+  assert(masked[1].length === masked[0].length, "masked hull displacement per vertex");
+  assert(masked[2].length > 0 && masked[3].length === masked[2].length,
+    "masked edge displacements match edges");
+  // The load anchor is frozen solid, so the deflection peak survives the mask.
+  let mmax = 0;
+  for (let i = 0; i < masked[1].length; i += 3)
+    mmax = Math.max(mmax, Math.hypot(masked[1][i], masked[1][i + 1], masked[1][i + 2]));
+  assert(Math.abs(mmax - ts.maxDisplacement) < 0.05 * ts.maxDisplacement + 1e-6,
+    `masked nodal max |u| matches the verification solve (${mmax.toFixed(4)} mm)`);
+  // Field values ride the SAME mask: one value per masked-hull vertex, flat
+  // per cell (all 3 vertices of a triangle share the owning cell's value).
+  const mvm = topo.voxel_result_field("vm", true);
+  assert(mvm.length === masked[0].length / 3, "masked field value per masked hull vertex");
+  assert(mvm.every((v) => Number.isFinite(v)) && fmax(mvm) > 0, "masked von Mises sane");
+  for (let t = 0; t < 30; t++)
+    assert(mvm[3 * t] === mvm[3 * t + 1] && mvm[3 * t] === mvm[3 * t + 2],
+      "per-cell flat values on the masked hull");
+  // Moving the iso slider moves the mask: a much higher threshold keeps fewer
+  // cells, and the hull follows the stored level.
+  topo.set_iso_threshold(0.9, 4);
+  const tight = topo.voxel_results(true);
+  assert(tight[0].length !== masked[0].length,
+    `hull follows iso_threshold (${tight[0].length / 9} tris at 0.9)`);
+}
+console.log("ok: Part Topo masked result hull (fields on the optimized shape)");
 
 // ---- stiffness-match goal ----
 // Lightest design as stiff as a uniform 35% print: the secant on the budget

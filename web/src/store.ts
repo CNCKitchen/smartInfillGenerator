@@ -32,7 +32,7 @@ import {
   type StepFaceInfo,
   type StepManifestInfo,
 } from "./engine/stepSelection";
-import { ENVELOPE_STEP, FieldServer, isEnvelope } from "./engine/FieldServer";
+import { ENVELOPE_STEP, FieldServer, isEnvelope, resultIsSolidBody } from "./engine/FieldServer";
 import type {
   Bc,
   BcKind,
@@ -1147,8 +1147,11 @@ function disclaimerSkippedInit(): boolean {
 /** Owns the per-solution engine-session state (field caches, voxel-result
  *  geometry, residual poll). The `onVoxelResult` sink forwards to the scene at
  *  call time (sceneEvents is populated by the viewer on mount). */
-const session = new EngineSession((p, d, e, ed) =>
-  sceneEvents.onVoxelResult?.(p, d, e, ed)
+const session = new EngineSession(
+  (p, d, e, ed) => sceneEvents.onVoxelResult?.(p, d, e, ed),
+  // Part Topo result active → the voxel hull is fetched masked to the
+  // retained body. Read lazily at fetch time (useStore initializes later).
+  () => resultIsSolidBody(useStore.getState())
 );
 
 /** Owns the result-field display pipeline: the four fetch/compute paths
@@ -1172,6 +1175,7 @@ function pushScalarField(set: SetState, get: () => AppState): Promise<void> {
         resultSurface: s.resultSurface,
         results: s.results,
         sectionOn: s.sectionOn,
+        resultIsSolid: resultIsSolidBody(s),
       };
     },
     {
@@ -4270,6 +4274,17 @@ export const useStore = create<AppState>((set, get) => ({
             });
             sceneEvents.onRegions?.(regions);
             sceneEvents.onRegionVisibility?.(get().regionVisible);
+            // Part Topo: the masked RESULT hull is cut at this same level —
+            // refetch it (and the field painted on it) if the body is the
+            // active result. Off-screen it just invalidates; the lazy load
+            // on entering the results view picks up the new level.
+            if (resultIsSolidBody(get())) {
+              session.invalidateVoxelResult();
+              if (get().viewMode === "deformed" && get().resultSurface === "voxel") {
+                await session.loadVoxelResult();
+                await pushScalarField(set, get);
+              }
+            }
           }
         } catch {
           // grid/result vanished mid-drag: ignore
@@ -4337,7 +4352,14 @@ export const useStore = create<AppState>((set, get) => ({
       session.invalidateSolution();
       // Only the optimized result in Part Topo mode is a solid body; every
       // other result renders on the part hull.
-      sceneEvents.onResultSolid?.(e.kind === "optimized" && !!get().optSummary?.solid);
+      const solidBody = e.kind === "optimized" && !!get().optSummary?.solid;
+      sceneEvents.onResultSolid?.(solidBody);
+      // Part Topo body: the original skin doesn't exist on the carved shape,
+      // so its results always display on the (retained-cells) voxel hull.
+      if (solidBody && get().resultSurface !== "voxel") {
+        set({ resultSurface: "voxel" });
+        sceneEvents.onResultSurface?.("voxel");
+      }
       sceneEvents.onScalarField?.(null);
       // Modal mode shapes are mass-normalized (unit peak) and animate as a
       // symmetric ± swing; auto-start the animation when a mode is viewed (Q7).
@@ -5363,6 +5385,12 @@ export const useStore = create<AppState>((set, get) => ({
       // Part Topo: the body IS the result — drop the original envelope hull in
       // the result views so it doesn't moiré against the coincident body.
       sceneEvents.onResultSolid?.(out.summary.solid);
+      if (out.summary.solid && get().resultSurface !== "voxel") {
+        // The carved body has no STL skin — its results display on the
+        // retained-cells voxel hull (loaded lazily on entering results).
+        set({ resultSurface: "voxel" });
+        sceneEvents.onResultSurface?.("voxel");
+      }
       sceneEvents.onRegions?.(out.regions);
       sceneEvents.onRegionVisibility?.(vis);
       // Land in the Regions view. Part Topo / binary seed the isosurface density
@@ -5940,6 +5968,8 @@ export const useStore = create<AppState>((set, get) => ({
 
   async setResultSurface(surface) {
     if (get().resultSurface === surface) return;
+    // The Part Topo body has no STL skin to map results onto — voxels only.
+    if (surface === "stl" && resultIsSolidBody(get())) return;
     set({ resultSurface: surface });
     try {
       if (surface === "voxel") {

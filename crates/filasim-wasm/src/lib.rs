@@ -16,7 +16,9 @@ use filasim_core::simp::OptimizeParams;
 use filasim_core::solve::{
     active_nodes, pad_for_levels, solve_nodes_cached, SolveSettings, Solution, SolverCache,
 };
-use filasim_core::stress::{cell_field_eigen, material_factor, recover_nodal, FieldKind};
+use filasim_core::stress::{
+    cell_field_eigen, material_factor, recover_nodal, recover_nodal_where, FieldKind,
+};
 use filasim_core::threemf::{export_orca_3mf, export_stl_zip, import_3mf, weld};
 use filasim_core::voxel::VoxelGrid;
 use wasm_bindgen::prelude::*;
@@ -3114,15 +3116,53 @@ impl Model {
         }
     }
 
+    /// Part Topo display mask: per-cell keep of the RETAINED body (frozen
+    /// load/support anchors + connected-keep of the design cells above the
+    /// current `iso_threshold` — the exact `set_iso_threshold` membership, so
+    /// the masked result hull matches the exported body cell for cell). None
+    /// unless a solid-topology optimization result is present.
+    fn solid_topo_keep(&self) -> Option<Vec<bool>> {
+        let opt = self.opt.as_ref().filter(|o| o.solid)?;
+        let (grid, _) = self.grid.as_ref()?;
+        let mut inside = vec![false; grid.cell_count()];
+        for &c in &opt.anchor_cells {
+            inside[c as usize] = true;
+        }
+        let kept = solid_keep_bins(
+            grid,
+            &opt.anchor_cells,
+            &opt.design_cells,
+            &opt.x_cont,
+            opt.iso_threshold,
+        );
+        for (i, &c) in opt.design_cells.iter().enumerate() {
+            if kept[i] == 1 {
+                inside[c as usize] = true;
+            }
+        }
+        Some(inside)
+    }
+
     /// Voxel-hull result geometry: the analysis mesh with EXACT nodal
     /// displacements (hull vertices ARE grid nodes — no surface sampling
-    /// like the STL view). Returns [positions f32 (9/tri), displacements
+    /// like the STL view). With `solid_body` on (Part Topo result active)
+    /// the hull covers only the RETAINED cells, so the validation fields
+    /// display on the optimized shape instead of the original envelope —
+    /// silently full when no solid-topo result exists (defensive: the flag
+    /// follows UI state). Returns [positions f32 (9/tri), displacements
     /// f32 (9/tri), edges f32 (6/segment), edge displacements f32].
-    pub fn voxel_results(&self) -> Result<js_sys::Array, JsValue> {
+    pub fn voxel_results(&self, solid_body: bool) -> Result<js_sys::Array, JsValue> {
         let sol =
             self.solution.as_ref().ok_or_else(|| err("no solution — run Solve or Optimize"))?;
         let (grid, _) = self.grid.as_ref().ok_or_else(|| err("no grid"))?;
-        let (tris, edges) = grid.surface_mesh();
+        let keep = if solid_body { self.solid_topo_keep() } else { None };
+        let (tris, edges) = match &keep {
+            Some(k) => {
+                let (t, e, _) = grid.surface_mesh_where(&|ci| k[ci]);
+                (t, e)
+            }
+            None => grid.surface_mesh(),
+        };
         let tri_disp = node_displacements(&tris, grid, sol);
         let edge_disp = node_displacements(&edges, grid, sol);
         Ok(js_sys::Array::of4(
@@ -3137,13 +3177,19 @@ impl Model {
     /// triangle). Default: each triangle carries its OWNING CELL's value —
     /// crisp per-cell coloring. With smooth_stress on, every hull vertex IS
     /// a grid node, so it carries the recovered nodal value — the hull
-    /// shades smoothly instead of flat per cell. Kinds as in `result_field`.
-    pub fn voxel_result_field(&self, kind: &str) -> Result<Vec<f32>, JsValue> {
+    /// shades smoothly instead of flat per cell. `solid_body` must match the
+    /// flag `voxel_results` was fetched with — same mask, so the values line
+    /// up per triangle AND the nodal recovery ignores the carved (SIMP-floor)
+    /// cells whose near-void stresses are meaningless. Kinds as in
+    /// `result_field`.
+    pub fn voxel_result_field(&self, kind: &str, solid_body: bool) -> Result<Vec<f32>, JsValue> {
         let cells = self.cell_values(kind)?;
         let (grid, _) = self.grid.as_ref().ok_or_else(|| err("no grid"))?;
-        let (tris, _edges, cell_of_tri) = grid.surface_mesh_where(&|_| true);
+        let mask = if solid_body { self.solid_topo_keep() } else { None };
+        let keep = |ci: usize| mask.as_ref().map_or(true, |k| k[ci]);
+        let (tris, _edges, cell_of_tri) = grid.surface_mesh_where(&keep);
         if self.smooth_stress {
-            let nodal = recover_nodal(grid, &cells);
+            let nodal = recover_nodal_where(grid, &cells, &keep);
             let (mx, my, mz) = (grid.nx + 1, grid.ny + 1, grid.nz + 1);
             let (h, o) = (grid.h, grid.origin);
             let mut out = Vec::with_capacity(tris.len() / 3);

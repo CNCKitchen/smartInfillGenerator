@@ -114,8 +114,10 @@ export interface EngineRequests {
   peelField: { kind: "peel" | "peelshear" };
   peelMap: { kind: "peel" | "peelshear" };
   inherentStrainVoxels: { layerMax: number; shrinkXy: number; shrinkZ: number };
-  voxelResults: Empty;
-  voxelResultField: { kind: string };
+  /** `solidBody`: mask hull/field to the Part Topo RETAINED cells (results
+   *  on the optimized shape). Both calls must pass the same flag. */
+  voxelResults: { solidBody: boolean };
+  voxelResultField: { kind: string; solidBody: boolean };
   sectionVolume: { kind: string };
   stashResult: { resultId: string };
   activateResult: { resultId: string };

@@ -6,6 +6,7 @@
 // the section plane bottom left. Result review happens ON the result.
 
 import { useShallow } from "zustand/shallow";
+import { resultIsSolidBody } from "../engine/FieldServer";
 import { useStore, resultStale, type ViewMode, type ResultKind } from "../store";
 import { RESULT_FIELDS } from "../types";
 import { format } from "../units";
@@ -248,7 +249,12 @@ export function ViewportChips() {
               <button
                 className={s.resultSurface === "stl" ? "on" : ""}
                 onClick={() => void s.setResultSurface("stl")}
-                title="Results sampled onto the smooth part surface"
+                disabled={resultIsSolidBody(s)}
+                title={
+                  resultIsSolidBody(s)
+                    ? "The optimized Part Topo body has no smooth skin — its results show on the retained voxel mesh"
+                    : "Results sampled onto the smooth part surface"
+                }
               >
                 STL
               </button>

@@ -33,7 +33,15 @@ export class EngineSession {
   /** Is the voxel-hull geometry for the CURRENT solution in the scene? */
   private voxelLoaded = false;
 
-  constructor(private emitVoxelResult: VoxelResultEmit) {}
+  /** `solidBody` reports whether the ACTIVE result is the Part Topo optimized
+   *  body (read at fetch time): the voxel hull + its fields are then masked to
+   *  the retained cells so results display on the optimized shape. Any flip of
+   *  the flag goes through a result switch or threshold change, both of which
+   *  invalidate the hull + voxel field cache, so cached data never crosses. */
+  constructor(
+    private emitVoxelResult: VoxelResultEmit,
+    private solidBody: () => boolean = () => false
+  ) {}
 
   // ---- field caches ----
 
@@ -88,7 +96,7 @@ export class EngineSession {
   /** Fetch the voxel hull + nodal displacements once per solution. */
   async loadVoxelResult() {
     if (this.voxelLoaded) return;
-    const r = await engine.voxelResults();
+    const r = await engine.voxelResults(this.solidBody());
     this.emitVoxelResult(r.positions, r.displacements, r.edges, r.edgeDisplacements);
     this.voxelLoaded = true;
   }

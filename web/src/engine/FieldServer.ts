@@ -39,6 +39,20 @@ export function isEnvelope(e: { loadStepId: string }): boolean {
   return e.loadStepId === ENVELOPE_STEP;
 }
 
+/** The active result is the Part Topo optimized SOLID body (DESIGN §19):
+ *  its validation fields display on the retained shape (masked voxel hull),
+ *  not the original envelope. Structural so both the store's AppState and
+ *  narrower snapshots qualify. */
+export function resultIsSolidBody(s: {
+  activeResultId: string | null;
+  results: readonly { id: string; kind: string }[];
+  optSummary: { solid: boolean } | null;
+}): boolean {
+  if (!s.optSummary?.solid) return false;
+  const active = s.results.find((r) => r.id === s.activeResultId);
+  return active?.kind === "optimized";
+}
+
 /** The slice of a retained result the field pipeline needs (structural
  *  subset of the store's `ResultEntry`). */
 export interface FieldResultRef {
@@ -57,6 +71,9 @@ export interface FieldDisplayState {
   /** Section plane active: the volumetric payload for the capped section is
    *  worth fetching (displacement fields skip it entirely when off). */
   sectionOn: boolean;
+  /** Active result is the Part Topo solid body (`resultIsSolidBody`): voxel
+   *  fields are fetched masked to the retained cells. */
+  resultIsSolid: boolean;
 }
 
 /** Narrow apply surface the store hands in: state writes (`fieldRange`) and
@@ -197,7 +214,9 @@ export class FieldServer {
     const vox = s.resultSurface === "voxel";
     let values = this.session.fieldOf(kind, vox);
     if (!values) {
-      values = vox ? await engine.voxelResultField(kind) : await engine.resultField(kind);
+      values = vox
+        ? await engine.voxelResultField(kind, s.resultIsSolid)
+        : await engine.resultField(kind);
       this.session.setField(kind, vox, values);
     }
     // The volumetric payload rides along for every stress/strain/SF field: its

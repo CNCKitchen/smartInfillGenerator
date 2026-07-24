@@ -1116,3 +1116,49 @@ PROJECT_SCHEMA=1 (absent fields = M1/STL behavior):
   subdivision remapping).
 - Verified: check:step extended with color-baking cases (sRGB→linear, grey fallback,
   null on colorless), tsc + vite build clean, regbench + smoke green post-deletion.
+
+## 19. Part Topo — validation results on the optimized shape (2026-07-24)
+
+Request (Stefan): after a Part Topo (solid topology) run, the validation solve's
+fields (displacement / stress / SF) should display on the OPTIMIZED shape, not on
+the original solid model. Previously the result views painted the field on the
+original STL soup or the full-envelope voxel hull — smearing meaningless
+near-void (SIMP-floor) stresses over carved-away material.
+
+Decisions:
+1. **Masked voxel hull, not the smooth isosurface.** The result surface for a
+   Part Topo result is the analysis voxel hull restricted to the RETAINED cells —
+   exact nodal displacements, honest per-cell fields. Sampling onto the smoothed
+   marching-cubes body (interpolated through half-cut boundary cells) is a
+   possible later polish, deliberately not built now.
+2. **Mask = export membership.** `Model::solid_topo_keep()` reproduces
+   `set_iso_threshold`'s cell set exactly: frozen load/support `anchor_cells` +
+   `solid_keep_bins` connected-keep of design cells above the stored
+   `opt.iso_threshold`. The displayed hull therefore matches the exported body
+   cell for cell, and **follows the isosurface slider** (the store invalidates +
+   refetches the hull on threshold changes while the body is the active result).
+3. **Boundary values don't bleed.** With smoothed stress on, nodal recovery runs
+   masked (`recover_nodal_where`, filasim-core) so retained-surface nodes never
+   average in the carved cells' near-zero SIMP-floor stresses.
+4. **Voxels-only surface.** The carved body has no STL skin, so activating a
+   Part Topo `optimized` result forces `resultSurface: "voxel"` (post-optimize
+   and on every result switch); the STL chip is disabled with an explanatory
+   tooltip and `setResultSurface("stl")` is a no-op while the body is active.
+   Baselines (uniform/solid/as-printed) and infill-mode results are untouched —
+   they still render on the full part, either surface.
+5. **Plumbing.** `voxel_results(solid_body)` / `voxel_result_field(kind,
+   solid_body)` take the flag; the web derives it in ONE place
+   (`resultIsSolidBody` in FieldServer: active result kind `optimized` +
+   `optSummary.solid`) and threads it via the EngineSession mask provider and
+   `FieldDisplayState.resultIsSolid`. Cache safety: every flag flip goes through
+   a result switch or threshold change, both of which invalidate the voxel hull
+   + field caches.
+
+Known limitations (accepted for v1): the multi-step worst-case ENVELOPE still
+reduces + renders on the STL surface (envelope reduction is forced to "stl");
+the volumetric section-cap payload and interior-extreme markers are unmasked
+(carved cells report ~0 stress / SF at cap, which never wins an extreme, so the
+displayed ranges stay honest); the §15 orientation-sweep voxel layer view is
+unmasked. Verified: regbench PASS (+0.000% everywhere), filasim-core tests,
+tsc clean, smoke test extended (masked hull vs full, nodal max |u| matches the
+verification solve, per-cell field alignment, hull follows `set_iso_threshold`).
