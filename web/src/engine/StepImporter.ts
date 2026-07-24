@@ -47,6 +47,12 @@ export interface StepMeshPayload {
    *  placements (part-local geometry would be ambiguous in world space) —
    *  DESIGN §18 M3. */
   faces: StepFaceInfo[] | null;
+  /** STEP presentation colors (DESIGN §18 M4): distinct sRGB colors + a
+   *  palette index per DENSE face id (-1 = unstyled). Null when the file
+   *  carries no surface colors. meshStep already composes body-level styles
+   *  into the per-face result. */
+  palette: [number, number, number][] | null;
+  faceColorIdx: Int32Array | null;
   diagnostics: ImportDiagnostics;
   stats: MeshResult["stats"];
   /** Display-only unit label from the file; coordinates are always mm. */

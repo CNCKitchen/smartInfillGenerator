@@ -130,6 +130,25 @@ export class SceneManager {
   /** Triangle-mesh wireframe overlay (inspect the input mesh) + its toggle. */
   private wireframeOn = false;
   private wireframeLines: THREE.LineSegments | null = null;
+  // ---- meshstep-viewer parity (DESIGN §18 M4 / viewport) ----
+  /** Camera-following key light — orbiting never leaves the part unlit. */
+  private headlight: THREE.DirectionalLight | null = null;
+  private readonly _hlRight = new THREE.Vector3();
+  private readonly _hlUp = new THREE.Vector3();
+  /** Corner → welded-vertex id (positions quantized to 1e-4 mm). Built per
+   *  model; RIGID pose changes preserve coincidence, so it survives
+   *  orientation edits and only rebuilds on a new model. */
+  private weldIds: Uint32Array | null = null;
+  /** CSR triangle list per welded vertex (smooth-shading adjacency). */
+  private vertTriOffsets: Uint32Array | null = null;
+  private vertTriList: Uint32Array | null = null;
+  /** Optional smooth shading: crease-aware (30°) vertex-normal averaging. */
+  private smoothShadingOn = false;
+  /** Feature-edge overlay (patch borders = CAD face borders on STEP, crease
+   *  borders on STL/3MF) + open/non-manifold edges. */
+  private featureEdgesOn = true;
+  private featureEdgePairs: Uint32Array | null = null;
+  private featureEdgeLines: THREE.LineSegments | null = null;
 
   private bcs: Bc[] = [];
   private activeBcId: string | null = null;
@@ -336,10 +355,13 @@ export class SceneManager {
 
     const hemi = new THREE.HemisphereLight(0xffffff, 0xb9b6ae, 1.0);
     this.scene.add(hemi);
-    const key = new THREE.DirectionalLight(0xffffff, 1.6);
-    key.position.set(1, -1.2, 1.8);
-    this.scene.add(key);
-    const fill = new THREE.DirectionalLight(0xc8d2e0, 0.4);
+    // Key light FOLLOWS the camera (position updated per frame in tick(), a
+    // little up-right of the view axis so faces keep gradient) — orbiting can
+    // never turn the part's far side pitch-black. A weak static cool fill
+    // keeps a fixed world anchor so the shading still shifts as you orbit.
+    this.headlight = new THREE.DirectionalLight(0xffffff, 1.6);
+    this.scene.add(this.headlight, this.headlight.target);
+    const fill = new THREE.DirectionalLight(0xc8d2e0, 0.35);
     fill.position.set(-1.5, 1, -0.5);
     this.scene.add(fill);
 
@@ -412,6 +434,10 @@ export class SceneManager {
     if (this.wireframeLines) {
       this.wireframeLines.geometry.dispose();
       (this.wireframeLines.material as THREE.Material).dispose();
+    }
+    if (this.featureEdgeLines) {
+      this.featureEdgeLines.geometry.dispose();
+      (this.featureEdgeLines.material as THREE.Material).dispose();
     }
     for (const d of this.pickArrowDisposables) d.dispose();
     this.sectionField.dispose();
@@ -580,6 +606,7 @@ export class SceneManager {
     const objs: THREE.Object3D[] = [this.bcMarkers, this.results.voxelGroup, this.results.buildGroup];
     if (this.mesh) objs.push(this.mesh);
     if (this.wireframeLines) objs.push(this.wireframeLines);
+    if (this.featureEdgeLines) objs.push(this.featureEdgeLines);
     if (!dir || !this.partBbox) {
       for (const o of objs) {
         o.quaternion.identity();
@@ -647,6 +674,9 @@ export class SceneManager {
     this.mesh = new THREE.Mesh(this.geometry, material);
     this.scene.add(this.mesh);
     this.buildWireframe();
+    this.buildShadingTopology();
+    this.applyShading();
+    this.colorMgr.setBaseColors(null); // CAD colors (if any) are pushed after load
 
     this.setPatchIds(model.patchIds);
     this.bcs = [];
@@ -723,7 +753,7 @@ export class SceneManager {
     const attr = this.geometry.getAttribute("position") as THREE.BufferAttribute;
     (attr.array as Float32Array).set(positions);
     attr.needsUpdate = true;
-    this.geometry.computeVertexNormals();
+    this.applyShading(); // flat OR crease-aware smooth, from the new pose
     this.geometry.computeBoundingBox();
     this.geometry.computeBoundingSphere();
     this.basePositions = new Float32Array(positions);
@@ -741,6 +771,7 @@ export class SceneManager {
       this.rebuildCapGroups();
     }
     this.buildWireframe(); // re-derive from the moved geometry
+    this.refreshFeatureEdgePositions(); // connectivity survives, vertices moved
     this.rebuildBcMarkers();
     this.colorMgr.repaint();
   }
@@ -757,6 +788,7 @@ export class SceneManager {
       }
       list.push(t);
     }
+    this.buildFeatureEdges(); // patch borders ARE the feature edges
     this.colorMgr.resetHover();
     this.colorMgr.repaint();
   }
@@ -801,6 +833,229 @@ export class SceneManager {
     this.wireframeLines.visible =
       this.wireframeOn && (this.viewMode === "setup" || this.viewMode === "mesh");
     this.scene.add(this.wireframeLines);
+  }
+
+  // ---------- shading & feature edges (meshstep-viewer parity) ----------
+
+  /** Weld the soup corners by quantized position and build the per-vertex
+   *  triangle adjacency (CSR). One pass per MODEL — rigid pose changes keep
+   *  coincidence, so orientation edits reuse it. */
+  private buildShadingTopology() {
+    const pos = this.geometry?.getAttribute("position")?.array as Float32Array | undefined;
+    if (!pos) {
+      this.weldIds = null;
+      this.vertTriOffsets = null;
+      this.vertTriList = null;
+      return;
+    }
+    const nCorners = this.triCount * 3;
+    const weld = new Uint32Array(nCorners);
+    const map = new Map<string, number>();
+    let nVerts = 0;
+    for (let c = 0; c < nCorners; c++) {
+      const key = `${Math.round(pos[3 * c] * 1e4)},${Math.round(pos[3 * c + 1] * 1e4)},${Math.round(pos[3 * c + 2] * 1e4)}`;
+      let id = map.get(key);
+      if (id === undefined) {
+        id = nVerts++;
+        map.set(key, id);
+      }
+      weld[c] = id;
+    }
+    // CSR: triangles per welded vertex (a triangle appears once per distinct
+    // corner vertex — degenerate repeats are harmless for averaging).
+    const counts = new Uint32Array(nVerts + 1);
+    for (let c = 0; c < nCorners; c++) counts[weld[c] + 1]++;
+    for (let v = 0; v < nVerts; v++) counts[v + 1] += counts[v];
+    const list = new Uint32Array(nCorners);
+    const cursor = counts.slice(0, nVerts);
+    for (let c = 0; c < nCorners; c++) list[cursor[weld[c]]++] = c / 3;
+    this.weldIds = weld;
+    this.vertTriOffsets = counts;
+    this.vertTriList = list;
+  }
+
+  /** Per-triangle scaled face normals (cross product ≈ 2·area·n̂) + unit
+   *  copies, from the CURRENT position buffer. */
+  private faceNormals(): { scaled: Float32Array; unit: Float32Array } | null {
+    const pos = this.geometry?.getAttribute("position")?.array as Float32Array | undefined;
+    if (!pos) return null;
+    const n = this.triCount;
+    const scaled = new Float32Array(n * 3);
+    const unit = new Float32Array(n * 3);
+    for (let t = 0; t < n; t++) {
+      const o = 9 * t;
+      const ax = pos[o + 3] - pos[o];
+      const ay = pos[o + 4] - pos[o + 1];
+      const az = pos[o + 5] - pos[o + 2];
+      const bx = pos[o + 6] - pos[o];
+      const by = pos[o + 7] - pos[o + 1];
+      const bz = pos[o + 8] - pos[o + 2];
+      const cx = ay * bz - az * by;
+      const cy = az * bx - ax * bz;
+      const cz = ax * by - ay * bx;
+      scaled[3 * t] = cx;
+      scaled[3 * t + 1] = cy;
+      scaled[3 * t + 2] = cz;
+      const l = Math.hypot(cx, cy, cz) || 1;
+      unit[3 * t] = cx / l;
+      unit[3 * t + 1] = cy / l;
+      unit[3 * t + 2] = cz / l;
+    }
+    return { scaled, unit };
+  }
+
+  /** Write the normal attribute for the active shading mode. Flat = three's
+   *  face normals; smooth = crease-aware averaging (30°): each corner blends
+   *  the area-weighted normals of the adjacent triangles whose face normal is
+   *  within the crease angle of its own — hard edges stay hard, curved faces
+   *  lose the tessellation facets. Runs on the CURRENT positions, so it is
+   *  re-applied after pose changes. */
+  private applyShading() {
+    if (!this.geometry) return;
+    if (!this.smoothShadingOn || !this.weldIds || !this.vertTriOffsets || !this.vertTriList) {
+      this.geometry.computeVertexNormals();
+      return;
+    }
+    const fn = this.faceNormals();
+    if (!fn) return;
+    const COS_CREASE = Math.cos((30 * Math.PI) / 180);
+    this.geometry.computeVertexNormals(); // ensures the attribute exists/sized
+    const normals = this.geometry.getAttribute("normal")!.array as Float32Array;
+    const { scaled, unit } = fn;
+    const weld = this.weldIds;
+    const offs = this.vertTriOffsets;
+    const list = this.vertTriList;
+    const nCorners = this.triCount * 3;
+    for (let c = 0; c < nCorners; c++) {
+      const t = (c / 3) | 0;
+      const nx = unit[3 * t];
+      const ny = unit[3 * t + 1];
+      const nz = unit[3 * t + 2];
+      let sx = 0;
+      let sy = 0;
+      let sz = 0;
+      const v = weld[c];
+      for (let i = offs[v]; i < offs[v + 1]; i++) {
+        const u = list[i];
+        if (nx * unit[3 * u] + ny * unit[3 * u + 1] + nz * unit[3 * u + 2] > COS_CREASE) {
+          sx += scaled[3 * u];
+          sy += scaled[3 * u + 1];
+          sz += scaled[3 * u + 2];
+        }
+      }
+      const l = Math.hypot(sx, sy, sz) || 1;
+      normals[3 * c] = sx / l;
+      normals[3 * c + 1] = sy / l;
+      normals[3 * c + 2] = sz / l;
+    }
+    this.geometry.getAttribute("normal")!.needsUpdate = true;
+  }
+
+  /** Toggle crease-aware smooth shading. */
+  setSmoothShading(on: boolean) {
+    if (this.smoothShadingOn === on) return;
+    this.smoothShadingOn = on;
+    this.applyShading();
+  }
+
+  /** Derive the feature-edge overlay from the CURRENT patch segmentation:
+   *  an edge is a feature when its two triangles belong to different patches
+   *  (CAD face borders on STEP, crease borders on STL/3MF), or when it is
+   *  open / non-manifold. Stored as corner-index pairs so pose changes only
+   *  re-read positions (`refreshFeatureEdgePositions`). */
+  private buildFeatureEdges() {
+    if (!this.weldIds || !this.patchIds || this.patchIds.length !== this.triCount) {
+      this.featureEdgePairs = null;
+      this.rebuildFeatureEdgeLines();
+      return;
+    }
+    const weld = this.weldIds;
+    const pids = this.patchIds;
+    // key = minVert·2^22 + maxVert (weld ids stay far below 2^22).
+    const edges = new Map<number, { ca: number; cb: number; patch: number; n: number; feat: boolean }>();
+    for (let t = 0; t < this.triCount; t++) {
+      for (let e = 0; e < 3; e++) {
+        const ca = 3 * t + e;
+        const cb = 3 * t + ((e + 1) % 3);
+        const va = weld[ca];
+        const vb = weld[cb];
+        if (va === vb) continue; // degenerate
+        const key = (va < vb ? va : vb) * 4194304 + (va < vb ? vb : va);
+        const ent = edges.get(key);
+        if (!ent) {
+          edges.set(key, { ca, cb, patch: pids[t], n: 1, feat: false });
+        } else {
+          ent.n++;
+          if (pids[t] !== ent.patch) ent.feat = true;
+        }
+      }
+    }
+    const pairs: number[] = [];
+    for (const ent of edges.values()) {
+      if (ent.feat || ent.n !== 2) {
+        pairs.push(ent.ca, ent.cb);
+      }
+    }
+    this.featureEdgePairs = Uint32Array.from(pairs);
+    this.rebuildFeatureEdgeLines();
+  }
+
+  /** (Re)create the feature-edge line object from the stored pairs. */
+  private rebuildFeatureEdgeLines() {
+    if (this.featureEdgeLines) {
+      this.scene.remove(this.featureEdgeLines);
+      this.featureEdgeLines.geometry.dispose();
+      (this.featureEdgeLines.material as THREE.Material).dispose();
+      this.featureEdgeLines = null;
+    }
+    if (!this.featureEdgePairs || this.featureEdgePairs.length === 0) return;
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute(
+      "position",
+      new THREE.BufferAttribute(new Float32Array(this.featureEdgePairs.length * 3), 3)
+    );
+    this.refreshFeatureEdgePositions(geo);
+    const mat = new THREE.LineBasicMaterial({
+      color: 0x2b3440, // ink-dark, crisper than the wireframe overlay
+      transparent: true,
+      opacity: 0.85,
+    });
+    this.featureEdgeLines = new THREE.LineSegments(geo, mat);
+    this.featureEdgeLines.visible =
+      this.featureEdgesOn && (this.viewMode === "setup" || this.viewMode === "mesh");
+    this.scene.add(this.featureEdgeLines);
+    this.refreshClipping();
+  }
+
+  /** Re-read the edge endpoint coordinates from the model's current position
+   *  buffer (pose changes move vertices, connectivity stays). */
+  private refreshFeatureEdgePositions(geo?: THREE.BufferGeometry) {
+    const target = geo ?? this.featureEdgeLines?.geometry;
+    const pos = this.geometry?.getAttribute("position")?.array as Float32Array | undefined;
+    if (!target || !pos || !this.featureEdgePairs) return;
+    const attr = target.getAttribute("position") as THREE.BufferAttribute;
+    const out = attr.array as Float32Array;
+    const pairs = this.featureEdgePairs;
+    for (let i = 0; i < pairs.length; i++) {
+      const c = pairs[i];
+      out[3 * i] = pos[3 * c];
+      out[3 * i + 1] = pos[3 * c + 1];
+      out[3 * i + 2] = pos[3 * c + 2];
+    }
+    attr.needsUpdate = true;
+    target.computeBoundingSphere();
+  }
+
+  /** Toggle the feature-edge overlay. */
+  setFeatureEdges(on: boolean) {
+    this.featureEdgesOn = on;
+    this.refreshView();
+  }
+
+  /** Per-triangle CAD base colors (linear RGB, 3 floats/tri) or null. */
+  setCadColors(triColors: Float32Array | null) {
+    this.colorMgr.setBaseColors(triColors);
+    this.colorMgr.repaint();
   }
 
   /** Force arrows + classic support triangles (4-sided cones read as ▽). */
@@ -2463,6 +2718,7 @@ export class SceneManager {
     };
     apply(this.mesh?.material, partPlanes);
     apply(this.wireframeLines?.material, partPlanes);
+    apply(this.featureEdgeLines?.material, partPlanes);
     for (const c of this.results.voxelGroup.children) apply((c as THREE.Mesh).material, voxelPlanes);
     for (const c of this.results.voxRes?.group.children ?? []) {
       apply((c as THREE.Mesh).material, planes);
@@ -2523,6 +2779,7 @@ export class SceneManager {
       this.results.voxelGroup.visible = false;
       if (this.results.voxRes) this.results.voxRes.group.visible = false;
       if (this.wireframeLines) this.wireframeLines.visible = false;
+      if (this.featureEdgeLines) this.featureEdgeLines.visible = false;
       this.bcMarkers.visible = false;
       this.callouts.setBcCalloutsVisible(false);
       return;
@@ -2560,6 +2817,13 @@ export class SceneManager {
         this.wireframeOn &&
         this.mesh.visible &&
         (this.viewMode === "setup" || this.viewMode === "mesh");
+    }
+    // Feature edges share the wireframe's rest-shape rule (they are built
+    // from the undeformed pose) but stay on the OPAQUE setup surface only —
+    // in the ghosted mesh view they would read as a fake wireframe.
+    if (this.featureEdgeLines) {
+      this.featureEdgeLines.visible =
+        this.featureEdgesOn && this.mesh.visible && this.viewMode === "setup";
     }
     this.regionMeshes.forEach((m, i) => {
       m.visible = infill && this.regionVisible[i] !== false;
@@ -2612,6 +2876,15 @@ export class SceneManager {
       this.results.applyPositions(undefined, frac, true);
     }
     this.controls.update();
+    if (this.headlight) {
+      const cam = this.camera;
+      const d = cam.position.distanceTo(this.controls.target) || 100;
+      this.headlight.position
+        .copy(cam.position)
+        .addScaledVector(this._hlRight.set(1, 0, 0).applyQuaternion(cam.quaternion), d * 0.5)
+        .addScaledVector(this._hlUp.set(0, 1, 0).applyQuaternion(cam.quaternion), d * 0.6);
+      this.headlight.target.position.copy(this.controls.target);
+    }
     const r = this.renderer;
     if (this.viewW <= 0 || this.viewH <= 0) return;
     r.setScissorTest(false);

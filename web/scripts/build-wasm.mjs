@@ -31,11 +31,8 @@ function run(cmd, env = {}) {
 
 const which = process.argv[2] ?? "both";
 
-// STEP import is DEACTIVATED (2026-06): truck's tessellation is unreliable on
-// trimmed periodic surfaces (it twists cylinders — see DESIGN.md §9). The code
-// stays behind the `step` cargo feature. To RE-ENABLE: add `step` back to the
-// `--features` list in BOTH builds below, and restore the `.step,.stp` accept
-// lists + labels in web/src/App.tsx and web/src/ui/StepPanel.tsx.
+// STEP import lives in the JS meshStep worker (DESIGN §18), NOT in wasm —
+// the truck-based `step` cargo feature was deleted 2026-07-24.
 
 if (which === "st" || which === "both") {
   // simd128 comes from .cargo/config.toml; keep RUSTFLAGS unset so the

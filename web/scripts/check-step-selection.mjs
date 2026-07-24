@@ -8,6 +8,7 @@ const {
   trisForFaceIds,
   exactCylinderForSelection,
   selectionCadArea,
+  cadTriangleColors,
   composeTransform,
   transformPoint,
   transformDir,
@@ -95,5 +96,19 @@ assert(eq(transformPoint(both, [2, 0, 0]).map((v) => Math.round(v * 1e9) / 1e9),
 const d = transformDir(both, [1, 0, 0]);
 assert(eq(d.map((v) => Math.round(v * 1e9) / 1e9), [0, 1, 0]), "directions rotate, ignore translation");
 assert(eq(transformPoint(IDENTITY_TRANSFORM, [3, 4, 5]), [3, 4, 5]), "identity transform is identity");
+
+// ---- M4: CAD color baking ----
+{
+  const palette = [[1, 0, 0], [0, 0.5, 1]];
+  const idx = Int32Array.from([0, -1, 1]); // face0 red, face1 unstyled, face2 blue-ish
+  const cols = cadTriangleColors(cad1, idx, palette);
+  assert(cols && cols.length === cad1.length * 3, "per-triangle color buffer sized 3/tri");
+  assert(cols[0] === 1 && cols[1] === 0 && cols[2] === 0, "sRGB 1.0 stays 1.0 in linear (face 0 red)");
+  assert(Math.abs(cols[6] - 0.3178) < 0.01, "unstyled face falls back to the linear base grey");
+  assert(cols[12] === 0 && Math.abs(cols[13] - 0.2140) < 0.01, "sRGB 0.5 converts to linear ≈0.214");
+  assert(cadTriangleColors(cad1, Int32Array.from([-1, -1, -1]), palette) === null,
+    "no styled face → null (plain grey, no buffer)");
+  assert(cadTriangleColors(cad1, null, null) === null, "colorless model → null");
+}
 
 console.log("\nSTEP SELECTION HELPERS PASS");

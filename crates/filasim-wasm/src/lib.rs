@@ -94,135 +94,16 @@ pub fn set_progress_buffer(count: js_sys::Int32Array, data: js_sys::Float32Array
     })));
 }
 
-/// STEP import (dev/debug surface): tessellate a STEP file with truck and
-/// return the BASE tessellation as a binary STL so a Node harness can inspect
-/// it. `surface_deviation` <= 0 means "auto". This is pre-refinement; the real
-/// product path is `new Model(stepBytes, name)`, which refines the base exactly
-/// like an imported STL.
-#[cfg(feature = "step")]
-#[wasm_bindgen]
-pub fn step_import_stl(bytes: &[u8], surface_deviation: f64) -> Result<Vec<u8>, JsError> {
-    Ok(step_import_inner(bytes, surface_deviation)?.mesh.to_stl_binary())
-}
-
-/// Companion to `step_import_stl`: returns base-tessellation metadata as JSON
-/// (`shells`, `faces`, `tolerance`, `tris`).
-#[cfg(feature = "step")]
-#[wasm_bindgen]
-pub fn step_import_info(bytes: &[u8], surface_deviation: f64) -> Result<String, JsError> {
-    let imp = step_import_inner(bytes, surface_deviation)?;
-    Ok(format!(
-        "{{\"shells\":{},\"faces\":{},\"tolerance\":{},\"tris\":{}}}",
-        imp.shell_count,
-        imp.face_count,
-        imp.tolerance,
-        imp.mesh.tris.len()
-    ))
-}
-
-/// Per-BREP-face tessellation report (dev/debug), JSON array of
-/// `{id, tris, area, dim:[dx,dy,dz], maxEdge}`. A real face reduced to a couple
-/// of triangles, or with a `maxEdge` near its whole `dim`, is a truck failure.
-#[cfg(feature = "step")]
-#[wasm_bindgen]
-pub fn step_face_report(bytes: &[u8], surface_deviation: f64) -> Result<String, JsError> {
-    let imp = step_import_inner(bytes, surface_deviation)?;
-    let nf = imp.face_count;
-    let mut tris = vec![0u32; nf];
-    let mut area = vec![0f64; nf];
-    let mut max_edge = vec![0f64; nf];
-    let mut lo = vec![[f64::INFINITY; 3]; nf];
-    let mut hi = vec![[f64::NEG_INFINITY; 3]; nf];
-    for (t, &f) in imp.mesh.tris.iter().zip(&imp.face_of_tri) {
-        let f = f as usize;
-        tris[f] += 1;
-        let p = |k: usize| [t[3 * k] as f64, t[3 * k + 1] as f64, t[3 * k + 2] as f64];
-        let (a, b, c) = (p(0), p(1), p(2));
-        for v in [a, b, c] {
-            for d in 0..3 {
-                lo[f][d] = lo[f][d].min(v[d]);
-                hi[f][d] = hi[f][d].max(v[d]);
-            }
-        }
-        let e = |u: [f64; 3], w: [f64; 3]| {
-            ((u[0] - w[0]).powi(2) + (u[1] - w[1]).powi(2) + (u[2] - w[2]).powi(2)).sqrt()
-        };
-        max_edge[f] = max_edge[f].max(e(a, b)).max(e(b, c)).max(e(c, a));
-        let cr = [
-            (b[1] - a[1]) * (c[2] - a[2]) - (b[2] - a[2]) * (c[1] - a[1]),
-            (b[2] - a[2]) * (c[0] - a[0]) - (b[0] - a[0]) * (c[2] - a[2]),
-            (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]),
-        ];
-        area[f] += 0.5 * (cr[0] * cr[0] + cr[1] * cr[1] + cr[2] * cr[2]).sqrt();
-    }
-    let mut out = String::from("[");
-    let mut first = true;
-    for f in 0..nf {
-        if tris[f] == 0 {
-            continue;
-        }
-        let dim = [hi[f][0] - lo[f][0], hi[f][1] - lo[f][1], hi[f][2] - lo[f][2]];
-        if !first {
-            out.push(',');
-        }
-        first = false;
-        out.push_str(&format!(
-            "{{\"id\":{},\"tris\":{},\"area\":{:.2},\"dim\":[{:.2},{:.2},{:.2}],\"maxEdge\":{:.2}}}",
-            f, tris[f], area[f], dim[0], dim[1], dim[2], max_edge[f]
-        ));
-    }
-    out.push(']');
-    Ok(out)
-}
-
-/// Dev/debug: the base triangles of ONE BREP face, as a binary STL.
-#[cfg(feature = "step")]
-#[wasm_bindgen]
-pub fn step_face_stl(bytes: &[u8], surface_deviation: f64, face_id: u32) -> Result<Vec<u8>, JsError> {
-    let imp = step_import_inner(bytes, surface_deviation)?;
-    let tris: Vec<[f32; 9]> = imp
-        .mesh
-        .tris
-        .iter()
-        .zip(&imp.face_of_tri)
-        .filter(|(_, &f)| f == face_id)
-        .map(|(t, _)| *t)
-        .collect();
-    Ok(filasim_core::mesh::TriMesh::from_triangles(tris).to_stl_binary())
-}
-
-#[cfg(feature = "step")]
-fn step_import_inner(
-    bytes: &[u8],
-    surface_deviation: f64,
-) -> Result<filasim_core::step::StepImport, JsError> {
-    use filasim_core::step::{import_step, StepTessellation};
-    let settings = StepTessellation {
-        surface_deviation: (surface_deviation > 0.0).then_some(surface_deviation),
-        ..Default::default()
-    };
-    import_step(bytes, &settings).map_err(|e| JsError::new(&e.to_string()))
-}
-
 /// Import the raw file bytes to a base triangle soup + object count, dispatching
-/// on format: 3MF (zip magic `PK`), STEP (`ISO-10303-21` header), else STL.
-/// STEP tessellates through truck; the result is then refined by `Model::new`
-/// with the SAME edge-length subdivision used for STL/3MF.
-/// Returns (base mesh, object count, per-base-triangle BREP-face id). The face
-/// map is `Some` only for STEP — it lets the user pick exact CAD faces.
+/// on format: 3MF (zip magic `PK`), else STL. STEP never reaches this path —
+/// it tessellates in the JS meshStep worker and enters via `Model::from_mesh`
+/// (DESIGN §18; the truck-based in-wasm STEP path was deleted 2026-07-24).
+/// Returns (base mesh, object count, per-base-triangle BREP-face id — always
+/// None here; `from_mesh` supplies it for STEP).
 fn import_any(bytes: &[u8]) -> Result<(TriMesh, usize, Option<Vec<u32>>), JsValue> {
     if bytes.len() >= 2 && &bytes[..2] == b"PK" {
         let (mesh, objects) = import_3mf(bytes).map_err(err)?;
         return Ok((mesh, objects, None));
-    }
-    #[cfg(feature = "step")]
-    {
-        let head = &bytes[..bytes.len().min(256)];
-        if head.windows(12).any(|w| w == b"ISO-10303-21") {
-            use filasim_core::step::{import_step, StepTessellation};
-            let imp = import_step(bytes, &StepTessellation::default()).map_err(err)?;
-            return Ok((imp.mesh, imp.shell_count.max(1), Some(imp.face_of_tri)));
-        }
     }
     Ok((TriMesh::from_stl(bytes).map_err(err)?, 1, None))
 }
@@ -963,10 +844,11 @@ impl Model {
                 .sqrt();
                 let target = diag / 60.0;
                 if cad_face_of_orig.is_some() {
-                    // STEP: longest-edge bisection. truck under-tessellates
-                    // developable faces (cylinders/extrusions) into full-length
-                    // slivers; a barycentric split would shatter those into
-                    // needles, so split only the long edge.
+                    // STEP (via meshStep + from_mesh): longest-edge bisection
+                    // as a safety cap — CAD tessellations can carry long thin
+                    // triangles on developable faces; a barycentric split
+                    // would shatter those into needles, so split only the
+                    // long edge. meshStep meshes usually pass through.
                     mesh_orig.capped_edges(target, 160_000)
                 } else {
                     mesh_orig.subdivided_with_parents(target, 160_000)
@@ -1026,9 +908,9 @@ impl Model {
 
 #[wasm_bindgen]
 impl Model {
-    /// Parse STL (binary/ASCII), 3MF (zip magic), or STEP (`ISO-10303-21`
-    /// header, tessellated via truck); segment at 10° (fine patches pick
-    /// better; the slider re-segments live).
+    /// Parse STL (binary/ASCII) or 3MF (zip magic); segment at 10° (fine
+    /// patches pick better; the slider re-segments live). STEP loads through
+    /// `from_mesh` — tessellated JS-side by meshStep (DESIGN §18).
     #[wasm_bindgen(constructor)]
     pub fn new(bytes: &[u8], name: &str) -> Result<Model, JsValue> {
         let (mesh_orig, mesh_objects, cad_face_of_orig) = import_any(bytes)?;

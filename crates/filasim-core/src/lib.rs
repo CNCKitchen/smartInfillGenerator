@@ -30,8 +30,6 @@ pub mod segment;
 pub mod selfsupport;
 pub mod simp;
 pub mod solve;
-#[cfg(feature = "step")]
-pub mod step;
 pub mod strength;
 pub mod stress;
 pub mod threemf;

@@ -20,6 +20,7 @@ import {
   type StepTessOpts,
 } from "./engine/StepImporter";
 import {
+  cadTriangleColors,
   composeTransform,
   exactCylinderForSelection,
   IDENTITY_TRANSFORM,
@@ -651,6 +652,12 @@ interface AppState {
   /** Overlay the model's triangle mesh as a wireframe (Setup/Mesh views) so
    *  the input mesh quality can be inspected. */
   wireframe: boolean;
+  /** Crease-aware smooth shading of the part surface (meshstep-viewer parity). */
+  smoothShading: boolean;
+  /** Feature-edge overlay: CAD face borders (STEP) / crease borders (STL). */
+  featureEdges: boolean;
+  /** Show the STEP file's CAD face colors on the part (colored models only). */
+  cadColors: boolean;
   deformScale: number;
   animateDeformed: boolean;
   /** Display autoscale chosen by the viewer (deformation exaggeration base). */
@@ -699,6 +706,8 @@ interface AppState {
         faceEntityIds: Uint32Array;
         faces: StepFaceInfo[] | null;
         toWorld: number[];
+        /** Baked per-working-triangle CAD colors (linear RGB) or null. */
+        cadTriColors: Float32Array | null;
       })
     | null;
   /** Densities of the extracted modifier regions (for the region list). */
@@ -991,6 +1000,9 @@ interface AppState {
   openProject(file: File): Promise<void>;
   setViewMode(mode: ViewMode): Promise<void>;
   setWireframe(on: boolean): void;
+  setSmoothShading(on: boolean): void;
+  setFeatureEdges(on: boolean): void;
+  setCadColors(on: boolean): void;
   setDeformScale(s: number): void;
   setAnimateDeformed(on: boolean): void;
   /** Stop the running solve/optimization at its next solver checkpoint. */
@@ -1457,6 +1469,12 @@ export interface SceneEvents {
   onMeshFieldColor?: (on: boolean) => void;
   /** Toggle the triangle-mesh wireframe overlay on the model. */
   onWireframe?: (on: boolean) => void;
+  /** Toggle crease-aware smooth shading. */
+  onSmoothShading?: (on: boolean) => void;
+  /** Toggle the feature-edge overlay. */
+  onFeatureEdges?: (on: boolean) => void;
+  /** Per-triangle CAD base colors (linear RGB, 3/tri) or null for plain grey. */
+  onCadColors?: (triColors: Float32Array | null) => void;
   /** Voxel-true section active: the scene must NOT plane-clip the voxel
    *  group (the cut already lives in the geometry) and hides its cap. */
   onVoxelCutActive?: (on: boolean) => void;
@@ -2852,6 +2870,9 @@ export const useStore = create<AppState>((set, get) => ({
   resultEpochs: { ...ZERO_EPOCHS },
   viewMode: "setup",
   wireframe: false,
+  smoothShading: false,
+  featureEdges: true,
+  cadColors: true,
   deformScale: 1,
   animateDeformed: false,
   autoScale: 1,
@@ -2932,14 +2953,16 @@ export const useStore = create<AppState>((set, get) => ({
         // Selection identity for project save (DESIGN §18 M2). The reply's
         // patchIds ARE the load-time CAD segmentation (STEP default) — copy
         // them before the live segSource can diverge.
+        const cadPatchIds = model.patchIds.slice();
         stepInfo = {
           meshstepVersion: imp.meshstepVersion,
           opts: imp.opts,
           sha256: imp.sha256,
-          cadPatchIds: model.patchIds.slice(),
+          cadPatchIds,
           faceEntityIds: imp.faceEntityIds,
           faces: imp.faces,
           toWorld: IDENTITY_TRANSFORM.slice(),
+          cadTriColors: cadTriangleColors(cadPatchIds, imp.faceColorIdx, imp.palette),
         };
       } else {
         model = await engine.load(bytes, cleanName);
@@ -3044,6 +3067,8 @@ export const useStore = create<AppState>((set, get) => ({
       sceneEvents.onVoxelMesh?.(null, null);
       sceneEvents.onOptShape?.(null, null);
       sceneEvents.onModelLoaded?.(model);
+      // CAD colors ride separately from the model payload (STEP only).
+      sceneEvents.onCadColors?.(get().cadColors ? (stepInfo?.cadTriColors ?? null) : null);
       sceneEvents.onViewState?.("setup", get().deformScale);
       pushSymmetry(get); // hide a previous model's symmetry plane
       const [bx, by, bz] = [
@@ -5514,14 +5539,16 @@ export const useStore = create<AppState>((set, get) => ({
           stepBytes,
           stepName
         );
+        const cadPatchIds = mi.patchIds.slice();
         stepInfo = {
           meshstepVersion: imp.meshstepVersion,
           opts: imp.opts,
           sha256: imp.sha256,
-          cadPatchIds: mi.patchIds.slice(),
+          cadPatchIds,
           faceEntityIds: imp.faceEntityIds,
           faces: imp.faces,
           toWorld: IDENTITY_TRANSFORM.slice(),
+          cadTriColors: cadTriangleColors(cadPatchIds, imp.faceColorIdx, imp.palette),
         };
         // Hash mismatch "cannot happen" (the bytes embed verbatim) — treat it
         // like a version change rather than trusting stale indices.
@@ -5665,6 +5692,7 @@ export const useStore = create<AppState>((set, get) => ({
       sceneEvents.onRegions?.(null);
       sceneEvents.onOptShape?.(null, null);
       sceneEvents.onModelLoaded?.(get().model!);
+      sceneEvents.onCadColors?.(get().cadColors ? (stepInfo?.cadTriColors ?? null) : null);
       pushBcGlyphs(get, null);
       // Phase 2: restore the design + result buffers into the engine. On a
       // stale STEP tessellation the design/results were computed on a mesh
@@ -5815,6 +5843,21 @@ export const useStore = create<AppState>((set, get) => ({
   setWireframe(on) {
     set({ wireframe: on });
     sceneEvents.onWireframe?.(on);
+  },
+
+  setSmoothShading(on) {
+    set({ smoothShading: on });
+    sceneEvents.onSmoothShading?.(on);
+  },
+
+  setFeatureEdges(on) {
+    set({ featureEdges: on });
+    sceneEvents.onFeatureEdges?.(on);
+  },
+
+  setCadColors(on) {
+    set({ cadColors: on });
+    sceneEvents.onCadColors?.(on ? (get().stepInfo?.cadTriColors ?? null) : null);
   },
 
   setDeformScale(s) {

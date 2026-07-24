@@ -121,7 +121,7 @@ impl TriMesh {
     /// the LONGEST edge.
     ///
     /// The aspect criterion is the important one for STEP: a chord-tolerance
-    /// tessellator (truck) leaves developable faces (cylinders, cones,
+    /// tessellator can leave developable faces (cylinders, cones,
     /// extrusions — flat along one direction → no chord error → no split there)
     /// as full-length slivers. Capping length alone turns one 98 mm sliver into
     /// a stack of *short* slivers (still thin → looks broken in wireframe);
@@ -252,9 +252,9 @@ impl TriMesh {
         }
         // Guard: STEP is ASCII text, not an STL. Without this the binary fallback
         // below reinterprets the text bytes as f32 coordinates and yields absurd
-        // geometry (e.g. ~1e34 mm). Fail clearly. (When the `step` feature is on,
-        // callers route STEP to truck before reaching here; this protects builds
-        // that lack it.)
+        // geometry (e.g. ~1e34 mm). Fail clearly. (STEP tessellates in the JS
+        // meshStep worker and enters via `Model::from_mesh` — DESIGN §18; bytes
+        // reaching here mean a mis-routed file.)
         if data[..data.len().min(256)].windows(12).any(|w| w == b"ISO-10303-21") {
             return Err(MeshError::Malformed(
                 "input looks like a STEP file, not an STL (STEP import unavailable in this build)"

@@ -124,6 +124,18 @@ self.onmessage = async (ev: MessageEvent<StepImportRequest>) => {
         };
       });
     }
+    // CAD presentation colors (DESIGN §18 M4): remap the per-entity palette
+    // indices onto the dense face ids. Face-level entries already include
+    // composed body colors (meshStep contract), so one lookup suffices.
+    let palette: [number, number, number][] | null = null;
+    let faceColorIdx: Int32Array | null = null;
+    if (r.colors) {
+      palette = r.colors.palette.map((c) => [c[0], c[1], c[2]] as [number, number, number]);
+      faceColorIdx = new Int32Array(face.table.length).fill(-1);
+      face.table.forEach((entity, d) => {
+        faceColorIdx![d] = r.colors!.faceColor.get(entity) ?? -1;
+      });
+    }
     const payload: StepMeshPayload = {
       positions: new Float32Array(r.mesh.positions), // f64 mm → f32 for GPU/wasm
       indices: r.mesh.indices,
@@ -133,6 +145,8 @@ self.onmessage = async (ev: MessageEvent<StepImportRequest>) => {
       solidEntityIds: solid.table,
       openSolids,
       faces,
+      palette,
+      faceColorIdx,
       diagnostics: r.diagnostics,
       stats: r.stats,
       units: r.units,

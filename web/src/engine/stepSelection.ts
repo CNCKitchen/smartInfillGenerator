@@ -143,6 +143,40 @@ export function isCylindricalSelection(
   return exactCylinderForSelection(tris, cadPatchIds, faces) !== null;
 }
 
+// ---- CAD presentation colors (DESIGN §18 M4) ----
+
+const srgbToLinear = (c: number) => (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4);
+/** The viewer's default part grey (0x9aa3ad) in linear space — unstyled faces
+ *  of a colored model fall back to it so they match uncolored models. */
+const BASE_GREY_LINEAR = [0x9a, 0xa3, 0xad].map((v) => srgbToLinear(v / 255)) as [
+  number,
+  number,
+  number,
+];
+
+/** Bake the STEP palette into per-WORKING-triangle linear RGB (3 floats/tri)
+ *  for the viewer's vertex colors. Null when the model has no styled face at
+ *  all (plain grey then, no buffer to carry around). */
+export function cadTriangleColors(
+  cadPatchIds: Uint32Array,
+  faceColorIdx: Int32Array | null,
+  palette: [number, number, number][] | null
+): Float32Array | null {
+  if (!faceColorIdx || !palette || !faceColorIdx.some((i) => i >= 0)) return null;
+  const lin = palette.map(
+    ([r, g, b]) => [srgbToLinear(r), srgbToLinear(g), srgbToLinear(b)] as [number, number, number]
+  );
+  const out = new Float32Array(cadPatchIds.length * 3);
+  for (let t = 0; t < cadPatchIds.length; t++) {
+    const idx = faceColorIdx[cadPatchIds[t]] ?? -1;
+    const c = idx >= 0 && idx < lin.length ? lin[idx] : BASE_GREY_LINEAR;
+    out[3 * t] = c[0];
+    out[3 * t + 1] = c[1];
+    out[3 * t + 2] = c[2];
+  }
+  return out;
+}
+
 // ---- rigid-transform bookkeeping (import frame → current world) ----
 
 /** Compose 12-value rigid transforms (row-major 3×3 + translation), applying

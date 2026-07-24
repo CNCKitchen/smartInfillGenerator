@@ -1075,3 +1075,33 @@ PROJECT_SCHEMA=1 (absent fields = M1/STL behavior):
   sums, transform composition vs sequential application), tsc + vite build clean, e2e
   seam test recovers the real bore's r=5.000 exactly + CAD area on cylinderWithHole.step.
   `faces` is NOT persisted in the manifest — it's rebuilt from the re-import on open.
+
+**Status (2026-07-24): truck path DELETED + M4 SHIPPED + viewport parity.**
+- **Truck deletion** (dec. 1 gate passed — real-part proving): `step.rs`, the `step`
+  cargo feature (both crates), all truck deps, the wasm debug exports
+  (`step_import_stl/info`, `step_face_report/stl`), `stepbench`, `stepnode_test.mjs` and
+  the deny.toml/build-wasm notes are gone. `import_any` handles 3MF/STL only; a STEP
+  byte-stream reaching it errors clearly. Regbench +0.000%, full smoke suite green after
+  the wasm rebuild.
+- **M4 CAD colors**: worker resolves STYLED_ITEM colors to a palette + per-DENSE-face
+  index (meshStep composes body→face already); `cadTriangleColors` bakes per-working-
+  triangle LINEAR RGB (unstyled faces = the base grey) into `stepInfo.cadTriColors`;
+  ColorManager takes them as the repaint/hover base under BC tints; "Colors" chip
+  (shown only when the file has colors, default on).
+- **Viewport (meshstep-viewer parity, works for STL and STEP alike)**:
+  camera-following key light (offset up-right in view space per frame, static cool fill
+  + hemi keep a world anchor); optional crease-aware (30°) smooth shading — corner
+  normals average area-weighted face normals within the crease over a welded-vertex CSR
+  adjacency, rebuilt per model, re-applied per pose (rigid transforms preserve both weld
+  and crease grouping); feature-edge overlay derived from PATCH borders (CAD face
+  borders on STEP, dihedral borders on STL) + open/non-manifold edges, stored as
+  corner-index pairs so pose changes just re-read coordinates. "Edges" (default on) +
+  "Smooth" (default off) chips beside Wireframe; edges show on the opaque setup surface,
+  follow section clipping, and join the orientation-preview rotation.
+- **M4 named-body picker: DEFERRED** — it is an analysis feature (engine-side body
+  filtering to solve one body of a multi-body file), not presentation; revisit when a
+  real multi-body workflow demands it. meshStep's `vertexNormals`/`structure` payloads
+  stay unused for now (computed crease normals cover the shading need without the
+  subdivision remapping).
+- Verified: check:step extended with color-baking cases (sRGB→linear, grey fallback,
+  null on colorless), tsc + vite build clean, regbench + smoke green post-deletion.

@@ -38,6 +38,13 @@ export function ViewportChips() {
       selectResult: s.selectResult,
       wireframe: s.wireframe,
       setWireframe: s.setWireframe,
+      smoothShading: s.smoothShading,
+      setSmoothShading: s.setSmoothShading,
+      featureEdges: s.featureEdges,
+      setFeatureEdges: s.setFeatureEdges,
+      cadColors: s.cadColors,
+      setCadColors: s.setCadColors,
+      hasCadColors: !!s.stepInfo?.cadTriColors,
       strainView: s.strainView,
       setStrainView: s.setStrainView,
       strainLayer: s.strainLayer,
@@ -82,6 +89,29 @@ export function ViewportChips() {
           >
             Wireframe
           </button>
+          <button
+            className={s.featureEdges ? "on" : ""}
+            onClick={() => s.setFeatureEdges(!s.featureEdges)}
+            title="Outline the part's feature edges (CAD face borders on STEP, crease borders on STL)"
+          >
+            Edges
+          </button>
+          <button
+            className={s.smoothShading ? "on" : ""}
+            onClick={() => s.setSmoothShading(!s.smoothShading)}
+            title="Smooth-shade curved surfaces (crease-aware) instead of flat facets"
+          >
+            Smooth
+          </button>
+          {s.hasCadColors && (
+            <button
+              className={s.cadColors ? "on" : ""}
+              onClick={() => s.setCadColors(!s.cadColors)}
+              title="Show the CAD file's face colors on the part"
+            >
+              Colors
+            </button>
+          )}
           {/* Build Sim: inherent-strain layer view — scrub the build height and
               color cells by their per-element strain source. */}
           {s.appMode === "buildsim" && s.viewMode === "mesh" && (

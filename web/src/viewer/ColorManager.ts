@@ -155,6 +155,11 @@ export class ColorManager {
   private lastDispRange: { min: number; max: number } | null = null;
 
   private triBcColor: (THREE.Color | null)[] = [];
+  /** Optional per-triangle base colors (LINEAR rgb, 3 floats/tri) replacing
+   *  the flat BASE_COLOR — the STEP file's CAD face/body colors (DESIGN §18
+   *  M4). BC tints and hover still paint over them. */
+  private baseTriColors: Float32Array | null = null;
+  private readonly _baseCol = new THREE.Color();
   private hoverPatch: number | null = null;
   /** Set by repaint() (full color rewrite), cleared after the next render. While
    *  set, setHover uploads in full too, so its partial range can't shadow a
@@ -191,6 +196,21 @@ export class ColorManager {
   /** New patch set: any hovered patch id is stale. */
   resetHover() {
     this.hoverPatch = null;
+  }
+
+  /** Install / clear the per-triangle CAD base colors (null = plain grey). */
+  setBaseColors(triColors: Float32Array | null) {
+    this.baseTriColors = triColors;
+  }
+
+  /** Base color of a triangle (CAD color when present, else the grey). The
+   *  returned Color is a reused scratch — copy it if it must outlive the call. */
+  private baseColorOf(t: number): THREE.Color {
+    const b = this.baseTriColors;
+    if (b && 3 * t + 2 < b.length) {
+      return this._baseCol.setRGB(b[3 * t], b[3 * t + 1], b[3 * t + 2]);
+    }
+    return BASE_COLOR;
   }
 
   /** New model geometry: back to plain BC vertex colors. */
@@ -278,7 +298,7 @@ export class ColorManager {
     const hover = this.hoverPatch !== null ? this.host.patchToTris().get(this.hoverPatch) : undefined;
     const hoverSet = hover ? new Set(hover) : null;
     for (let t = 0; t < triCount; t++) {
-      let c = triColor[t] ?? BASE_COLOR;
+      let c = triColor[t] ?? this.baseColorOf(t);
       if (hoverSet?.has(t)) {
         c = triColor[t] ? triColor[t]!.clone().lerp(HOVER_TINT, 0.65) : HOVER_TINT;
       }
@@ -320,7 +340,7 @@ export class ColorManager {
     };
     if (prev !== null) {
       const tris = this.host.patchToTris().get(prev);
-      if (tris) for (const t of tris) paint(t, this.triBcColor[t] ?? BASE_COLOR);
+      if (tris) for (const t of tris) paint(t, this.triBcColor[t] ?? this.baseColorOf(t));
     }
     if (patch !== null) {
       const tris = this.host.patchToTris().get(patch);
