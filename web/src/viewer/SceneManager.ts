@@ -2827,10 +2827,12 @@ export class SceneManager {
     mat.needsUpdate = true;
     const voxResult = this.results.voxResultActive();
     // Part Topo: the optimized body IS the result — drop the original envelope
-    // hull in the density/regions views so it doesn't moiré against the
-    // coincident body surface (the carved regions sit inside it; the retained
-    // faces sit exactly on it).
-    const hideHull = this.resultSolid && (this.viewMode === "density" || infill);
+    // hull in the REGIONS view so it doesn't moiré against the coincident body
+    // surface (the carved regions sit inside it; the retained faces sit exactly
+    // on it). The DENSITY cutaway keeps the translucent envelope around the
+    // carved body — it shows what was removed, and the body's polygonOffset
+    // already wins the depth test on coincident faces.
+    const hideHull = this.resultSolid && infill;
     // Bed-peel heatmap on screen: hide the part so the plate map reads cleanly
     // (no need to look under or through the model).
     this.mesh.visible = !voxResult && !hideHull && !this.results.peelMap;

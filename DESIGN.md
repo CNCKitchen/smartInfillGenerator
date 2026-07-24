@@ -1154,6 +1154,14 @@ Decisions:
    a result switch or threshold change, both of which invalidate the voxel hull
    + field caches.
 
+Follow-up (2026-07-24, Stefan): the DENSITY view now keeps the translucent
+original-envelope ghost around the Part Topo cutaway body (it shows what was
+carved away). Since d7399fd the hull was hidden in BOTH density and Regions
+views to avoid moiré against the coincident retained faces; the density body's
+`polygonOffset` already wins that depth test, so only the REGIONS view still
+drops the hull. Verified visually in the live app (ghost stable across re-runs,
+no moiré).
+
 Known limitations (accepted for v1): the multi-step worst-case ENVELOPE still
 reduces + renders on the STL surface (envelope reduction is forced to "stl");
 the volumetric section-cap payload and interior-extreme markers are unmasked
