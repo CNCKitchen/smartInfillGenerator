@@ -134,7 +134,7 @@ export function ValidateOrientation() {
   return (
     <div className="group">
       <div
-        className="g-label"
+        className="sec-head"
         title="Sweep every print orientation for the worst layer-adhesion safety factor — one solve, no re-analysis"
       >
         <span>Optimize orientation</span>

@@ -14,7 +14,7 @@ const OPTIMIZE_STEPS: { n: number; label: string; title: string }[] = [
   { n: 2, label: "Loads", title: "2 · Boundary conditions" },
   { n: 3, label: "Properties", title: "3 · Properties — material, print settings, analysis grid" },
   { n: 4, label: "Verify", title: "4 · Verify setup" },
-  { n: 5, label: "Optimize", title: "5 · Optimize infill" },
+  { n: 5, label: "Optimize", title: "5 · Optimization — infill density & print orientation" },
   { n: 6, label: "Export", title: "6 · View & export" },
 ];
 

@@ -50,7 +50,7 @@ const HEAD: Record<number, { title: string; sub: string }> = {
   2: { title: "Boundary conditions", sub: "Where the part is held, how it is loaded." },
   3: { title: "Properties", sub: "Material, print settings, analysis grid." },
   4: { title: "Verify setup", sub: "Check constraints, then analyze the print or the solid." },
-  5: { title: "Optimize infill", sub: "Distribute density where the loads need it." },
+  5: { title: "Optimization", sub: "Infill density where the loads need it — and the best print orientation." },
   6: { title: "View & export", sub: "Inspect the result, hand off to the slicer." },
 };
 
@@ -2162,6 +2162,9 @@ function StepOptimize() {
   );
   return (
     <>
+      <div className="sec-head">
+        <span>Optimize infill</span>
+      </div>
       <div className="group">
         <div className="g-label">
           <span>Goal</span>
@@ -2499,6 +2502,7 @@ function StepOptimize() {
         <div className="dim small">Results land in the panel on the right — export from step 6.</div>
       )}
 
+      <div className="divider" />
       <ValidateOrientation />
     </>
   );

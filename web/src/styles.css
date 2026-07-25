@@ -423,6 +423,29 @@ a.iconbtn:hover {
   text-transform: none;
 }
 
+/* Sub-section heading inside a step panel — sits between the panel title and
+   the small group labels (step 5: Optimize infill / Optimize orientation). */
+.sec-head {
+  font-family: var(--cond);
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ink);
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.sec-head b {
+  font-family: var(--mono);
+  font-size: 11.5px;
+  letter-spacing: 0;
+  font-weight: 400;
+  text-transform: none;
+}
+
 .seg {
   display: flex;
   background: var(--well);
