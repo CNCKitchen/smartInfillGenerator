@@ -4,7 +4,7 @@
 // One panel, one step: the active station's controls. Everything the old
 // all-at-once sidebar offered is still here, just shown one step at a time.
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useShallow } from "zustand/shallow";
 import {
   budgetBounds,
@@ -23,7 +23,10 @@ import { RESULT_FIELDS, type Bc, type ForceMode, type LoadStep, type PatternKey 
 import { shrinkFromPhysics, ROOM_TEMP_C } from "../materials";
 import { fmtDisp, fmtLen, lenUnit, rampCss } from "./fmt";
 import { BC_HELP, bcLabel, KIND_DOT, KIND_LABEL, SUPPORT_KINDS } from "./bcmeta";
-import { HelpTip } from "./HelpTip";
+import { HelpTip, InfoTip } from "./HelpTip";
+import { Section } from "./Section";
+import { BUILD_HELP, EXPORT_HELP, MODEL_HELP, OPT_HELP, PROP_HELP, VERIFY_HELP } from "./helptext";
+import { SettingsOptimizer } from "./SettingsOptimizer";
 import { ValidateOrientation } from "./ValidateOrientation";
 import { isCylindricalSelection, selectionCadArea } from "../engine/stepSelection";
 import {
@@ -91,6 +94,7 @@ function SurfacePatchControl() {
       <div className="g-label">
         <span>Surface detection</span>
         {s.segSource === "angle" && <b>{shown}°</b>}
+        <InfoTip help={MODEL_HELP.surface} />
       </div>
       {cad && (
         <div className="toolrow">
@@ -111,7 +115,10 @@ function SurfacePatchControl() {
         </div>
       )}
       {s.segSource === "angle" ? (
-        <>
+        // With the source toggle present the slider belongs to the "Crease
+        // angle" button, so it sits in that button's column instead of
+        // spanning the whole row.
+        <div className={cad ? "segslider" : "segslider-plain"}>
           <input
             type="range"
             min={0}
@@ -122,16 +129,9 @@ function SurfacePatchControl() {
             onKeyUp={commit}
             onBlur={commit}
           />
-          <div className="dim small">
-            Splits the skin into pickable surfaces — lower the angle if patches merge, raise it if
-            they shatter.
-          </div>
-        </>
-      ) : (
-        <div className="dim small">
-          Picking whole CAD faces from the STEP file. Switch to crease angle for a custom grouping
-          (e.g. to merge a filleted region).
         </div>
+      ) : (
+        <div className="dim small">Picking whole CAD faces from the STEP file.</div>
       )}
     </>
   );
@@ -265,6 +265,7 @@ function StepModel() {
             <div className="g-label">
               <span>Print orientation</span>
               <b>Z = build direction</b>
+              <InfoTip help={MODEL_HELP.orientation} />
             </div>
             <div className="toolrow">
               <button
@@ -284,11 +285,11 @@ function StepModel() {
                 ⟳Z
               </button>
             </div>
-            <div className="dim small">
-              {s.tool === "place"
-                ? "Click the face the part prints ON — it turns to the build plate (Z−)."
-                : "Layer-adhesion safety treats Z as the layer direction. Loads keep their world directions; results reset on reorientation."}
-            </div>
+            {s.tool === "place" && (
+              <div className="dim small">
+                Click the face the part prints ON — it turns to the build plate (Z−).
+              </div>
+            )}
           </div>
           <div className="group" data-keeptool>
             <SurfacePatchControl />
@@ -297,6 +298,7 @@ function StepModel() {
             <div className="g-label">
               <span>Rescale</span>
               <b className="dim">wrong import unit?</b>
+              <InfoTip help={MODEL_HELP.rescale} />
             </div>
             <div className="toolrow">
               <button onClick={() => void s.rescaleModel(1 / 25.4)} title="Scale ÷25.4 (mm → inch-sized)">
@@ -311,10 +313,6 @@ function StepModel() {
               <button onClick={() => void s.rescaleModel(10)} title="Scale ×10">
                 ×10
               </button>
-            </div>
-            <div className="dim small">
-              An STL imported in the wrong unit comes in 25.4× off. Rescale here without re-importing —
-              the bounding box in the status bar confirms the size.
             </div>
           </div>
         </>
@@ -367,6 +365,9 @@ function StepBcs() {
           </HelpTip>
           <HelpTip help={BC_HELP.displacement}>
             <button onClick={() => s.addBc("displacement")}>+ Displacement</button>
+          </HelpTip>
+          <HelpTip help={BC_HELP.cylindrical}>
+            <button onClick={() => s.addBc("cylindrical")}>+ Cylindrical</button>
           </HelpTip>
         </div>
       </div>
@@ -620,6 +621,7 @@ function BcRow({ bc }: { bc: Bc }) {
       {bc.kind === "accel" && <AccelEditor bc={bc} step={step} />}
       {bc.kind === "mass" && <MassEditor bc={bc} step={step} />}
       {bc.kind === "displacement" && <DisplacementEditor bc={bc} />}
+      {bc.kind === "cylindrical" && <CylindricalEditor bc={bc} />}
       {bc.kind === "pressure" && (
         <div onClick={(e) => e.stopPropagation()}>
           <div className="bcparams">
@@ -907,7 +909,7 @@ function ForceDirTools({
         ⊹ Pick direction
       </button>
       <button onClick={onFlip} title="Reverse the force direction">
-        ⇄ Flip
+        ⇄ Flip direction
       </button>
       <button
         onClick={onNormal}
@@ -939,15 +941,73 @@ function BearingEditor({ bc, step }: { bc: Bc; step?: LoadStep }) {
     <>
       <ForceEditor bc={bc} step={step} />
       <div className="forceedit" onClick={(e) => e.stopPropagation()} style={{ paddingTop: 0 }}>
-        <BearingCylStatus bc={bc} />
+        <CylFitStatus
+          bc={bc}
+          prompt={
+            <>
+              Pick a <b>cylindrical</b> surface (a bore or boss). The load presses the wall in the F
+              direction, cosine-distributed over the contacted half; any component along the axis is
+              ignored.
+            </>
+          }
+        />
       </div>
     </>
   );
 }
 
-/** Cylinder-fit feedback for a bearing load: the fitted ⌀/axis once valid, the
- *  hard-block message when a non-cylindrical face was picked, or a prompt. */
-function BearingCylStatus({ bc }: { bc: Bc }) {
+/** Cylindrical support editor: which of the selection's OWN three directions
+ *  are held (radial / tangential / axial) plus the live cylinder readout — the
+ *  fit defines the local frame, so the same status line as the bearing load. */
+function CylindricalEditor({ bc }: { bc: Bc }) {
+  const toggle = useStore((s) => s.toggleBcCylDof);
+  const dof = bc.cylDof ?? [true, false, true];
+  const ROWS: { label: string; title: string }[] = [
+    { label: "Radial", title: "Hold the wall in / out — the load-carrying direction of a bore" },
+    { label: "Tangential", title: "Hold the part against turning about the axis" },
+    { label: "Axial", title: "Hold the part along the axis" },
+  ];
+  return (
+    <div onClick={(e) => e.stopPropagation()}>
+      <div className="forcegrid">
+        {ROWS.map((r, i) => (
+          <label key={r.label} className="forcerow dispaxis cyldof" title={r.title}>
+            <input type="checkbox" checked={dof[i]} onChange={() => toggle(bc.id, i as 0 | 1 | 2)} />
+            <span className="flabel">{r.label}</span>
+            <span className={dof[i] ? "dofstate on" : "dofstate"}>{dof[i] ? "fixed" : "free"}</span>
+          </label>
+        ))}
+      </div>
+      <CylFitStatus
+        bc={bc}
+        prompt={
+          <>
+            Pick a <b>cylindrical</b> surface (a bore or a shaft seat). The checked directions are
+            held on the fitted cylinder's own axes.
+          </>
+        }
+      />
+      {/* One state-dependent line only (DESIGN §21): the two cases that change
+          what the user has to do next. The rest lives in the help card. */}
+      {!dof[0] && !dof[1] && !dof[2] ? (
+        <div className="dim small" style={{ color: "#c0392b" }}>
+          Nothing is held — this support has no effect. Check at least one direction.
+        </div>
+      ) : !dof[1] ? (
+        <div className="dim small">
+          Tangential free — the part can still turn about the axis. Another support has to react that
+          turn, or the check reports a free rotation.
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/** Cylinder-fit feedback for the cylinder-bound conditions (bearing load,
+ *  cylindrical support): the fitted ⌀/axis once valid, the hard-block message
+ *  when a non-cylindrical face was picked, or `prompt` before anything is
+ *  selected. */
+function CylFitStatus({ bc, prompt }: { bc: Bc; prompt: ReactNode }) {
   if (bc.cylError) {
     return (
       <div className="dim small" style={{ color: "#c0392b" }}>
@@ -956,13 +1016,7 @@ function BearingCylStatus({ bc }: { bc: Bc }) {
     );
   }
   if (bc.tris.length === 0) {
-    return (
-      <div className="dim small">
-        Pick a <b>cylindrical</b> surface (a bore or boss). The load presses the wall in the F
-        direction, cosine-distributed over the contacted half; any component along the axis is
-        ignored.
-      </div>
-    );
+    return <div className="dim small">{prompt}</div>;
   }
   if (bc.cyl?.ok) {
     const a = bc.cyl.axis;
@@ -1273,7 +1327,7 @@ function BaseAccelEditor({ bc }: { bc: Bc }) {
               ↓ 1 g down
             </button>
             <button onClick={() => s.flipAccelDir(bc.id)} title="Reverse the acceleration direction">
-              ⇄ Flip
+              ⇄ Flip direction
             </button>
           </div>
         </>
@@ -1325,7 +1379,7 @@ function StepAccelEditor({ bc, step }: { bc: Bc; step: LoadStep }) {
               ↓ 1 g down
             </button>
             <button onClick={() => setVec([-a[0], -a[1], -a[2]])} title="Reverse the acceleration direction">
-              ⇄ Flip
+              ⇄ Flip direction
             </button>
           </div>
         </>
@@ -1516,6 +1570,7 @@ function StepProperties() {
       <div className="group">
         <div className="g-label">
           <span>Material</span>
+          <InfoTip help={PROP_HELP.material} />
         </div>
         <select
           value={s.material.name}
@@ -1548,6 +1603,7 @@ function StepProperties() {
           <div className="g-label">
             <span>Line width</span>
             <b>{unitLabel("length")}</b>
+            <InfoTip help={PROP_HELP.walls} />
           </div>
           <UnitInput
             value={s.lineWidth}
@@ -1559,10 +1615,7 @@ function StepProperties() {
           />
         </div>
       </div>
-      <div className="dim small">
-        ≈ {format(wall, "length")} solid wall — what the analysis assumes and what the 3MF's
-        wall_loops will print. Match the line width to your profile.
-      </div>
+      <div className="dim small">≈ {format(wall, "length")} solid wall.</div>
 
       <div className="duo">
         <div className="group">
@@ -1581,6 +1634,7 @@ function StepProperties() {
           <div className="g-label">
             <span>Layer height</span>
             <b>{unitLabel("length")}</b>
+            <InfoTip help={PROP_HELP.shells} />
           </div>
           <UnitInput
             value={s.layerHeight}
@@ -1594,8 +1648,8 @@ function StepProperties() {
       </div>
       <div className="dim small">
         {s.topBottomLayers > 0
-          ? `≈ ${format(s.topBottomLayers * s.layerHeight, "length")} solid shells on up/down-facing surfaces — exported as top/bottom shell layers.`
-          : "0 layers: no top/bottom shells — the infill shows through the surface (showpieces). Exported as 0 shell layers."}
+          ? `≈ ${format(s.topBottomLayers * s.layerHeight, "length")} solid shells on up/down-facing surfaces.`
+          : "No top/bottom shells — the infill shows through the surface."}
       </div>
 
       <div className="duo">
@@ -1613,6 +1667,7 @@ function StepProperties() {
           <div className="g-label">
             <span>Infill</span>
             <b>{s.printInfill} %</b>
+            <InfoTip help={PROP_HELP.infill} />
           </div>
           <input
             type="range"
@@ -1624,14 +1679,12 @@ function StepProperties() {
           />
         </div>
       </div>
-      <div className="dim small">
-        The uniform ratio "Solve as printed" analyzes (the optimizer's budget follows it as a
-        starting point). The pattern's E(ρ) curve is editable in ⚙ Settings.
-      </div>
+      <div className="dim small">The uniform print that "Solve as printed" analyzes.</div>
 
       <div className="group">
         <div className="g-label">
           <span>Analysis resolution</span>
+          <InfoTip help={PROP_HELP.resolution} />
         </div>
         <select
           value={s.resolution}
@@ -1748,6 +1801,7 @@ function StepVerify() {
       <div className="group">
         <div className="g-label">
           <span>Analysis</span>
+          <InfoTip help={VERIFY_HELP.analysis} />
         </div>
         <div className="seg">
           <button
@@ -1765,15 +1819,11 @@ function StepVerify() {
             Modal
           </button>
         </div>
-        <div className="dim small">
-          {modal
-            ? "Constrained, undamped modal — the lowest natural frequencies + mode shapes of the part as supported by the first load case. Force-free; the selected stiffness (below) sets both stiffness and mass."
-            : "Linear static solve under the current loads & supports."}
-        </div>
       </div>
       <div className="group">
         <div className="g-label">
           <span>Stiffness</span>
+          <InfoTip help={VERIFY_HELP.stiffness} />
         </div>
         <div className="seg">
           <button
@@ -1793,8 +1843,8 @@ function StepVerify() {
         </div>
         <div className="dim small">
           {s.analyzeMode === "printed"
-            ? `Skin ${s.perimeters} × ${format(s.lineWidth, "length")} at 100%, interior ${s.printInfill}% ${s.pattern} — accuracy is the accuracy of the calibrated E(ρ) curve.`
-            : "Fully dense E₀ everywhere — answers \"how much stiffness does printing cost me?\" next to an as-printed run."}
+            ? `Skin ${s.perimeters} × ${format(s.lineWidth, "length")} at 100%, interior ${s.printInfill}% ${s.pattern}.`
+            : "Fully dense E₀ everywhere — the CAD-ideal reference."}
         </div>
       </div>
       {modal && (
@@ -1825,7 +1875,11 @@ function StepVerify() {
           </label>
         </div>
       )}
-      <div className="toolrow">
+      <div className="g-label">
+        <span>Run</span>
+        <InfoTip help={VERIFY_HELP.run} />
+      </div>
+      <div className="toolrow" style={{ marginTop: -6 }}>
         <button onClick={() => void s.runCheck()} disabled={!!s.busy}>
           Check setup
         </button>
@@ -1855,12 +1909,6 @@ function StepVerify() {
           {s.stats.iterations} iters · {s.stats.seconds.toFixed(1)} s
         </div>
       )}
-      <div className="hint">
-        Check animates any remaining rigid-body freedom. Solve lands in the <b>Results</b> view —
-        the field picker sits under the view tabs, playback at the bottom, min/max markers and
-        click-to-edit scale & exaggeration in the legend. As-printed results land in the dock on
-        the right (mass, deflection, min safety factor).
-      </div>
     </>
   );
 }
@@ -1898,30 +1946,19 @@ function StepBuildSim() {
         <div className="g-label">
           <span>Material</span>
           <b>{s.material.name}</b>
+          <InfoTip help={phys ? BUILD_HELP.shrinkPhys : BUILD_HELP.shrink} />
         </div>
-        {phys ? (
-          <div className="dim small">
-            Inherent-strain warp via sequential layer activation. Shrink from physics — locks at{" "}
-            {s.material.tLock} °C (Tg/Tc), CTE {((s.material.cte ?? 0) * 1e6).toFixed(0)} ppm/°C: XY{" "}
-            {(Math.abs(phys.shrink) * 100).toFixed(2)}% · Z{" "}
-            {(Math.abs(phys.shrinkZ) * 100).toFixed(2)}% (lock → {ROOM_TEMP_C} °C room) — from
-            Tg/CTE, edit in{" "}
-            <button className="linkbtn" onClick={() => s.openSettings(true)}>
-              ⚙ Settings
-            </button>
-            . Uncalibrated: the warp shape is meaningful, the absolute magnitude is not.
-          </div>
-        ) : (
-          <div className="dim small">
-            Inherent-strain warp via sequential layer activation. Shrink is a material property (
-            <b>{s.material.name}</b>: XY {(s.material.shrink * 100).toFixed(2)}% · Z{" "}
-            {((s.material.shrinkZ ?? s.material.shrink) * 100).toFixed(2)}%) — edit it in{" "}
-            <button className="linkbtn" onClick={() => s.openSettings(true)}>
-              ⚙ Settings
-            </button>
-            . Uncalibrated: the warp shape is meaningful, the absolute magnitude is not.
-          </div>
-        )}
+        <div className="dim small">
+          Shrink XY{" "}
+          {((phys ? Math.abs(phys.shrink) : s.material.shrink) * 100).toFixed(2)}% · Z{" "}
+          {(
+            (phys ? Math.abs(phys.shrinkZ) : (s.material.shrinkZ ?? s.material.shrink)) * 100
+          ).toFixed(2)}
+          %{phys ? ` · locks at ${s.material.tLock} °C` : ""} —{" "}
+          <button className="linkbtn" onClick={() => s.openSettings(true)}>
+            ⚙ Settings
+          </button>
+        </div>
       </div>
       {phys && (
         <>
@@ -1943,6 +1980,7 @@ function StepBuildSim() {
               <div className="g-label">
                 <span>Chamber temp</span>
                 <b>°C</b>
+                <InfoTip help={BUILD_HELP.temps} />
               </div>
               <NumInput
                 value={s.buildChamberTemp}
@@ -1953,17 +1991,13 @@ function StepBuildSim() {
               />
             </div>
           </div>
-          <div className="dim small">
-            Bed & chamber set the temperature ladder — which layers are still warm while the part
-            builds. The total shrink (lock → room) is unchanged.
-          </div>
         </>
       )}
-      <div className="toolrow">
+      <HelpTip help={BUILD_HELP.run}>
         <button className="primary" onClick={() => void s.runSolve()} disabled={!!s.busy}>
           Run build simulation
         </button>
-      </div>
+      </HelpTip>
       {bp && (
         <div className="group">
           <div className="g-label">
@@ -1997,24 +2031,30 @@ function StepBuildSim() {
         </div>
       )}
       {!bp && br && (
-        <div className="dim small">
-          Both states saved — switch On&nbsp;bed / Released on the <b>Results</b> bar (top). On bed{" "}
-          <b>{fmtDisp(br.bondedMax)}</b> · released <b>{fmtDisp(br.releasedMax)}</b>. Stiffness &amp;
-          strain field:{" "}
-          <b>{br.densityAware ? "as-printed infill density" : "solid hull"}</b>
-          {br.densityAware ? "" : " (optimize the part first to use the printed infill)"}.
-          <br />
-          Bed peel — peak traction <b>{format(br.peakLift, "stress")}</b> · shear{" "}
-          <b>{format(br.peakShear, "stress")}</b>. Pick <b>Peel traction</b> on the Results bar's field
-          menu to see where the part wants to lift (mesh-independent, uncalibrated indicator).
-        </div>
+        <>
+          <div className="kv">
+            <span>On bed / released</span>
+            <b>
+              {fmtDisp(br.bondedMax)} · {fmtDisp(br.releasedMax)}
+            </b>
+          </div>
+          <div className="kv">
+            <span>Bed peel — traction / shear</span>
+            <b>
+              {format(br.peakLift, "stress")} · {format(br.peakShear, "stress")}
+            </b>
+          </div>
+          <div className="kv">
+            <span>Stiffness field</span>
+            <b>{br.densityAware ? "as-printed density" : "solid hull"}</b>
+          </div>
+          <div className="dim small">
+            Both states are saved — switch On&nbsp;bed / Released on the <b>Results</b> bar, no
+            re-solve.
+            {br.densityAware ? "" : " Optimize the part first to use the printed infill."}
+          </div>
+        </>
       )}
-      <div className="hint">
-        Build sim ignores supports/loads — its only inputs are the part, the material shrink, the
-        as-printed infill density (when optimized), and the build plate. It runs on a coarser grid
-        than analysis for speed. Solve lands in the deformed <b>Results</b> view; switch On&nbsp;bed /
-        Released there to compare with no re-solve.
-      </div>
     </>
   );
 }
@@ -2073,7 +2113,8 @@ function LevelsGroup() {
     <div className="group">
       <div className="g-label">
         <span>Density levels</span>
-        <b>{manual ? "pinned" : `auto · ${s.nBins}`}</b>
+        <b>{manual ? `pinned · ${s.nBins}` : `auto · ${s.nBins}`}</b>
+        <InfoTip help={OPT_HELP.levels} />
       </div>
       <div className="toolrow">
         <select
@@ -2099,7 +2140,7 @@ function LevelsGroup() {
           }}
         />
         <button
-          className={manual ? "" : "on"}
+          className={manual ? "tight" : "tight on"}
           onClick={() => {
             if (manual) s.updateLevelSettings({ mode: "auto" });
           }}
@@ -2107,11 +2148,6 @@ function LevelsGroup() {
         >
           auto
         </button>
-      </div>
-      <div className="dim small">
-        {manual
-          ? "Pinned: exactly these densities are used — match them to values you have calibration data for. A level at 100% exports as solid rectilinear fill. Clear the box (or press auto) to go back."
-          : "Auto: the optimizer places the levels from the density field, bottom pinned at the printability floor. Type e.g. 10, 40, 70 to pin your own."}
       </div>
     </div>
   );
@@ -2160,349 +2196,347 @@ function StepOptimize() {
       optSummary: s.optSummary,
     }))
   );
+  const solid = s.optMode === "solid";
+  // Folded "Constraints" still has to report itself — the badge is what is
+  // actually switched on, in the order the controls appear.
+  const cons = [
+    s.selfSupport ? `${s.overhangDeg}°` : null,
+    s.symOn ? symLabel(s.symNormal, s.symC).split(" @ ")[0] : null,
+    s.minMemberMm != null ? format(s.minMemberMm, "length") : null,
+  ].filter(Boolean);
   return (
     <>
-      <div className="sec-head">
-        <span>Optimize infill</span>
-      </div>
-      <div className="group">
-        <div className="g-label">
-          <span>Goal</span>
-        </div>
-        <div className="seg">
-          <button
-            className={s.goal === "budget" ? "on" : ""}
-            onClick={() => s.setGoal("budget")}
-            title="Maximize stiffness at a given material budget"
-          >
-            Stiffest
-          </button>
-          {s.optMode !== "solid" && (
-            <button
-              className={s.goal === "match" ? "on" : ""}
-              onClick={() => s.setGoal("match")}
-              title="Find the lightest design that is as stiff as a uniform print at X%"
-            >
-              Match stiffness
-            </button>
-          )}
-          <button
-            className={s.goal === "strength" ? "on" : ""}
-            onClick={() => s.setGoal("strength")}
-            title="Find the lightest design whose safety factor stays at or above a target"
-          >
-            Safety factor
-          </button>
-        </div>
-      </div>
-
-      {s.goal === "strength" ? (
+      <Section
+        title={solid ? "Optimize shape" : "Optimize infill"}
+        defaultOpen
+        help={OPT_HELP.section}
+        badge={
+          s.goal === "strength"
+            ? `SF ≥ ${s.sfTarget}`
+            : `${s.budget} %${s.goal === "match" ? " ref" : ""}`
+        }
+      >
         <div className="group">
           <div className="g-label">
-            <span>Target safety factor</span>
-            <b>≥ {s.sfTarget}</b>
+            <span>Goal</span>
+            <InfoTip help={OPT_HELP.goal} />
           </div>
-          <NumInput
-            value={s.sfTarget}
-            min={1}
-            max={9.5}
-            step={0.1}
-            onCommit={(v) => s.setSfTarget(v)}
-          />
-          <div className="seg" style={{ marginTop: 6 }}>
+          <div className="seg">
             <button
-              className={s.sfMeasure === "both" ? "on" : ""}
-              onClick={() => s.setSfMeasure("both")}
-              title="Worst of material and layer-adhesion safety factor per cell — matches the SF plot"
+              className={s.goal === "budget" ? "on" : ""}
+              onClick={() => s.setGoal("budget")}
+              title="Maximize stiffness at a given material budget"
             >
-              Material + layers
+              Stiffest
             </button>
+            {s.optMode !== "solid" && (
+              <button
+                className={s.goal === "match" ? "on" : ""}
+                onClick={() => s.setGoal("match")}
+                title="Find the lightest design that is as stiff as a uniform print at X%"
+              >
+                Match stiffness
+              </button>
+            )}
             <button
-              className={s.sfMeasure === "material" ? "on" : ""}
-              onClick={() => s.setSfMeasure("material")}
-              title="Von Mises stress vs the in-plane tensile strength"
+              className={s.goal === "strength" ? "on" : ""}
+              onClick={() => s.setGoal("strength")}
+              title="Find the lightest design whose safety factor stays at or above a target"
             >
-              Material
-            </button>
-            <button
-              className={s.sfMeasure === "layer" ? "on" : ""}
-              onClick={() => s.setSfMeasure("layer")}
-              title="Layer adhesion: tension across the layers + interlayer shear (how FDM parts usually fail)"
-            >
-              Layers
+              Safety factor
             </button>
           </div>
-          <div className="dim small">
-            Uses as little material as possible while the safety factor stays at or above the
-            target under every included load step. A pre-flight check reports honestly when even
-            100% fill can&apos;t reach it. Strengths come from the material presets (or your
-            measurements) with Gibson–Ashby scaling — a design aid, not a certified safety factor.
-          </div>
         </div>
-      ) : (
-        <div className="group">
-          <div className="g-label">
-            <span>
-              {s.optMode === "solid"
-                ? "Retained volume"
-                : s.goal === "match"
-                  ? "As stiff as uniform"
-                  : "Infill budget"}
-            </span>
-            <b>{s.budget} %</b>
-          </div>
-          <input
-            type="range"
-            min={budgetBounds(s)[0]}
-            max={budgetBounds(s)[1]}
-            step={1}
-            value={s.budget}
-            onChange={(e) => s.setBudget(Number(e.target.value))}
-          />
-          <div className="dim small">
-            {s.optMode === "solid"
-              ? `Keeps ${s.budget}% of the design volume as solid material and removes the rest — the stiffest shape at that mass. Load/support regions are kept regardless.`
-              : s.goal === "match"
-                ? `Finds the LIGHTEST layout with the stiffness of a uniform ${s.budget}% print (a few warm-started passes search the needed budget).`
-                : s.optMode === "binary"
-                  ? `Mean interior density: cells are either ${s.levelSettings.binaryFloorPct}% (so it prints) or 100% solid. The optimizer runs SIMP-penalized so the design goes black/white.`
-                  : "Mean infill of the interior — same scale as your slicer's uniform infill %. Walls and shells come on top."}
-          </div>
-        </div>
-      )}
 
-      <div className="group">
-        <div className="g-label">
-          <span>Mode</span>
-        </div>
-        <div className="seg">
-          <button
-            className={s.optMode === "graded" ? "on" : ""}
-            onClick={() => s.setOptMode("graded")}
-            title="Several discrete infill densities, placed from the optimized field"
-          >
-            Graded
-          </button>
-          <button
-            className={s.optMode === "binary" ? "on" : ""}
-            onClick={() => s.setOptMode("binary")}
-            title="Hollow or solid: interior is either the printability floor or 100% dense"
-          >
-            Binary
-          </button>
-          <button
-            className={s.optMode === "solid" ? "on" : ""}
-            onClick={() => s.setOptMode("solid")}
-            title="Topology optimization: REMOVE material to make a new lightweight shape (no infill, no walls — the kept material prints solid)"
-          >
-            Part Topo
-          </button>
-        </div>
-        {s.optMode === "solid" && (
-          <div className="dim small">
-            Removes material to make a new shape — not infill. The kept material prints
-            solid; regions under loads &amp; supports are kept automatically.
-          </div>
-        )}
-      </div>
-
-      {s.optMode === "binary" && (
-        <div className="group">
-          <div className="g-label">
-            <span>Solid fill</span>
-          </div>
-          <select
-            value={s.solidPattern}
-            onChange={(e) => s.setSolidPattern(e.target.value as "rectilinear" | "concentric")}
-          >
-            <option value="rectilinear">Rectilinear</option>
-            <option value="concentric">Concentric</option>
-          </select>
-        </div>
-      )}
-
-      <div className="group">
-        <div className="g-label">
-          <span>Self-supporting</span>
-          <b>{s.selfSupport ? `${s.overhangDeg}°` : "off"}</b>
-        </div>
-        <label className="rowcheck">
-          <input
-            type="checkbox"
-            checked={s.selfSupport}
-            onChange={(e) => s.setSelfSupport(e.target.checked)}
-          />
-          <span>Print without supports (overhang constraint)</span>
-        </label>
-        {s.selfSupport && (
-          <>
+        {s.goal === "strength" ? (
+          <div className="group">
             <div className="g-label">
-              <span className="dim small">Angle from horizontal — 0° off, 90° vertical</span>
+              <span>Target safety factor</span>
+              <b>≥ {s.sfTarget}</b>
+              <InfoTip help={OPT_HELP.sfTarget} />
+            </div>
+            <NumInput
+              value={s.sfTarget}
+              min={1}
+              max={9.5}
+              step={0.1}
+              onCommit={(v) => s.setSfTarget(v)}
+            />
+            <div className="g-label" style={{ marginTop: 2 }}>
+              <span>Measured against</span>
+              <InfoTip help={OPT_HELP.sfMeasure} />
+            </div>
+            <div className="seg">
+              <button
+                className={s.sfMeasure === "both" ? "on" : ""}
+                onClick={() => s.setSfMeasure("both")}
+                title="Worst of material and layer-adhesion safety factor per cell — matches the SF plot"
+              >
+                Material + layers
+              </button>
+              <button
+                className={s.sfMeasure === "material" ? "on" : ""}
+                onClick={() => s.setSfMeasure("material")}
+                title="Von Mises stress vs the in-plane tensile strength"
+              >
+                Material
+              </button>
+              <button
+                className={s.sfMeasure === "layer" ? "on" : ""}
+                onClick={() => s.setSfMeasure("layer")}
+                title="Layer adhesion: tension across the layers + interlayer shear (how FDM parts usually fail)"
+              >
+                Layers
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className="group">
+            <div className="g-label">
+              <span>
+                {solid ? "Retained volume" : s.goal === "match" ? "As stiff as uniform" : "Infill budget"}
+              </span>
+              <b>{s.budget} %</b>
+              <InfoTip
+                help={
+                  solid
+                    ? OPT_HELP.budgetSolid
+                    : s.goal === "match"
+                      ? OPT_HELP.budgetMatch
+                      : s.optMode === "binary"
+                        ? OPT_HELP.budgetBinary
+                        : OPT_HELP.budget
+                }
+              />
             </div>
             <input
               type="range"
-              min={10}
-              max={80}
-              step={5}
-              value={s.overhangDeg}
-              onChange={(e) => s.setOverhangDeg(Number(e.target.value))}
+              min={budgetBounds(s)[0]}
+              max={budgetBounds(s)[1]}
+              step={1}
+              value={s.budget}
+              onChange={(e) => s.setBudget(Number(e.target.value))}
             />
-          </>
+            {s.optMode === "binary" && (
+              <div className="dim small">
+                Cells end up either at {s.levelSettings.binaryFloorPct}% (so it prints) or 100% solid.
+              </div>
+            )}
+          </div>
         )}
-        <div className="dim small">
-          Build direction is Z (the print orientation).{" "}
-          {s.optMode === "solid"
-            ? "The shape is constrained so downward faces stay steeper than this angle — it prints without supports."
-            : "Constrains the dense regions to the overhang angle; unsupported material falls to the floor density."}{" "}
-          {s.selfSupport
-            ? `0° allows flat overhangs (no constraint), 90° allows only vertical walls.`
-            : ""}{" "}
-          Advisory: the voxel staircase can still nick the angle locally.
-        </div>
-      </div>
 
-      {s.optMode === "solid" ? (
         <div className="group">
-          <label className="rowcheck">
-            <input
-              type="checkbox"
-              checked={s.retainBc}
-              onChange={(e) => s.setRetainBc(e.target.checked)}
-            />
-            <span>Keep load &amp; support regions solid</span>
-          </label>
-          <div className="dim small">
-            Outer shape is optimized — no walls/infill.{" "}
-            {s.retainBc
-              ? "Material under every load and support is forced to stay (recommended)."
-              : "Load/support regions can also be removed — pure topology optimization; the result may carve under a load."}
+          <div className="g-label">
+            <span>Mode</span>
+            <InfoTip help={OPT_HELP.mode} />
+          </div>
+          <div className="seg">
+            <button
+              className={s.optMode === "graded" ? "on" : ""}
+              onClick={() => s.setOptMode("graded")}
+              title="Several discrete infill densities, placed from the optimized field"
+            >
+              Graded
+            </button>
+            <button
+              className={s.optMode === "binary" ? "on" : ""}
+              onClick={() => s.setOptMode("binary")}
+              title="Hollow or solid: interior is either the printability floor or 100% dense"
+            >
+              Binary
+            </button>
+            <button
+              className={s.optMode === "solid" ? "on" : ""}
+              onClick={() => s.setOptMode("solid")}
+              title="Topology optimization: REMOVE material to make a new lightweight shape (no infill, no walls — the kept material prints solid)"
+            >
+              Part Topo
+            </button>
           </div>
         </div>
-      ) : (
-        <>
-          {s.optMode === "graded" && <LevelsGroup />}
-          <div className="row">
-            <div className="dim small" style={{ flex: 1 }}>
-              Skin {s.perimeters} × {format(s.lineWidth, "length")} · {s.pattern} —{" "}
+
+        {s.optMode === "binary" && (
+          <div className="group">
+            <div className="g-label">
+              <span>Solid fill</span>
+              <InfoTip help={OPT_HELP.solidFill} />
+            </div>
+            <select
+              value={s.solidPattern}
+              onChange={(e) => s.setSolidPattern(e.target.value as "rectilinear" | "concentric")}
+            >
+              <option value="rectilinear">Rectilinear</option>
+              <option value="concentric">Concentric</option>
+            </select>
+          </div>
+        )}
+
+        {solid ? (
+          <div className="group">
+            <div className="g-label">
+              <span>Retained regions</span>
+              <InfoTip help={OPT_HELP.retainBc} />
+            </div>
+            <label className="rowcheck">
+              <input
+                type="checkbox"
+                checked={s.retainBc}
+                onChange={(e) => s.setRetainBc(e.target.checked)}
+              />
+              <span>Keep load &amp; support regions solid</span>
+            </label>
+          </div>
+        ) : (
+          <>
+            {s.optMode === "graded" && <LevelsGroup />}
+            <div className="dim small">
+              Skin {s.perimeters} × {format(s.lineWidth, "length")} · {s.pattern}
+              {s.optMode === "binary" ? " · 2 levels (hollow/solid)" : ""} —{" "}
               <a className="link" onClick={() => s.setActiveStep(3)}>
                 edit in Properties
               </a>
             </div>
-            {s.optMode === "binary" && (
-              <span className="dim small">2 levels (hollow/solid)</span>
-            )}
-          </div>
-        </>
-      )}
-
-      <div className="group">
-        <div className="g-label">
-          <span>Symmetry</span>
-          {s.symOn && <b>{symLabel(s.symNormal, s.symC)}</b>}
-        </div>
-        <label className="rowcheck">
-          <input type="checkbox" checked={s.symOn} onChange={() => s.toggleSymmetry()} />
-          <span>Planar symmetry constraint</span>
-        </label>
-        {s.symOn && (
-          <>
-            <div className="toolrow">
-              {(["x", "y", "z"] as const).map((a) => {
-                const aligned =
-                  Math.abs(s.symNormal[a === "x" ? 0 : a === "y" ? 1 : 2]) > 0.9999;
-                return (
-                  <button
-                    key={a}
-                    className={aligned ? "on" : ""}
-                    onClick={() => s.setSymAxis(a)}
-                    title={`Align the plane normal with ${a.toUpperCase()}`}
-                  >
-                    ⊥{a.toUpperCase()}
-                  </button>
-                );
-              })}
-              <button
-                onClick={() => s.centerSymmetry()}
-                title="Center the plane in the part's bounding box"
-              >
-                ⌖ Center
-              </button>
-            </div>
-            <div className="dim small">
-              Mirror-paired cells share one density. Drag the orange plane's arrow to move it,
-              the rings to tilt it (shown while editing on this step). Cells whose mirror lands
-              outside the part stay free.
-            </div>
           </>
         )}
-      </div>
 
-      <div className="group">
-        <div className="g-label">
-          <span>Minimum member size</span>
-          <b>
-            {s.minMemberMm == null
-              ? `auto · ${format(2 * s.lineWidth, "length")}`
-              : unitLabel("length")}
-          </b>
-        </div>
-        <div className="toolrow">
-          <UnitInput
-            value={s.minMemberMm ?? 2 * s.lineWidth}
-            kind="length"
-            step={0.1}
-            min={0}
-            max={10}
-            onCommit={(v) => s.setMinMemberMm(v)}
-          />
-          <button
-            className={s.minMemberMm == null ? "on" : ""}
-            onClick={() => s.setMinMemberMm(null)}
-            title="Back to auto (2× line width)"
-          >
-            auto
-          </button>
-        </div>
-        {(() => {
-          const eff = s.minMemberMm ?? 2 * s.lineWidth;
-          const h = s.voxelInfo?.h ?? 0;
-          const capped = h > 0 && eff / (2 * h) > 8;
-          return (
-            <div className="dim small">
-              Thicker members print more reliably; thinner ones blur away during
-              optimization (≈ the filter diameter). Defaults to 2× your line width.
-              {eff <= 1e-9 && " Off — only the numerical anti-checkerboard floor applies."}
-              {capped &&
-                ` At this resolution (h=${format(h, "length")}) the filter is capped — the` +
-                  ` enforced size tops out near ${format(16 * h, "length")}; use a coarser mesh` +
-                  ` for larger members.`}
+        <Section title="Constraints" badge={cons.length ? cons.join(" · ") : "none"}>
+          <div className="group">
+            <div className="g-label">
+              <span>Self-supporting</span>
+              <b>{s.selfSupport ? `${s.overhangDeg}° from horizontal` : "off"}</b>
+              <InfoTip help={OPT_HELP.selfSupport} />
             </div>
-          );
-        })()}
-      </div>
+            <label className="rowcheck">
+              <input
+                type="checkbox"
+                checked={s.selfSupport}
+                onChange={(e) => s.setSelfSupport(e.target.checked)}
+              />
+              <span>Print without supports</span>
+            </label>
+            {s.selfSupport && (
+              <input
+                type="range"
+                min={10}
+                max={80}
+                step={5}
+                value={s.overhangDeg}
+                onChange={(e) => s.setOverhangDeg(Number(e.target.value))}
+              />
+            )}
+          </div>
 
-      <button className="primary" onClick={() => void s.runOptimize()} disabled={!!s.busy}>
-        {s.optMode === "solid" ? "Optimize shape" : "Optimize infill"}
-      </button>
-      {s.optProgress && (
-        <div className="progress">
-          <div
-            className="bar"
-            style={{ width: `${(100 * s.optProgress.iteration) / s.optProgress.maxIter}%` }}
-          />
-          <span>
-            {(s.optProgress.passes ?? 1) > 1
-              ? `pass ${s.optProgress.pass}/${s.optProgress.passes} · `
-              : ""}
-            iteration {s.optProgress.iteration} of max {s.optProgress.maxIter}
-          </span>
-        </div>
-      )}
-      {s.optSummary && (
-        <div className="dim small">Results land in the panel on the right — export from step 6.</div>
-      )}
+          <div className="group">
+            <div className="g-label">
+              <span>Symmetry</span>
+              {s.symOn && <b>{symLabel(s.symNormal, s.symC)}</b>}
+              <InfoTip help={OPT_HELP.symmetry} />
+            </div>
+            <label className="rowcheck">
+              <input type="checkbox" checked={s.symOn} onChange={() => s.toggleSymmetry()} />
+              <span>Planar symmetry constraint</span>
+            </label>
+            {s.symOn && (
+              <div className="toolrow">
+                {(["x", "y", "z"] as const).map((a) => {
+                  const aligned =
+                    Math.abs(s.symNormal[a === "x" ? 0 : a === "y" ? 1 : 2]) > 0.9999;
+                  return (
+                    <button
+                      key={a}
+                      className={aligned ? "on" : ""}
+                      onClick={() => s.setSymAxis(a)}
+                      title={`Align the plane normal with ${a.toUpperCase()}`}
+                    >
+                      ⊥{a.toUpperCase()}
+                    </button>
+                  );
+                })}
+                <button
+                  onClick={() => s.centerSymmetry()}
+                  title="Center the plane in the part's bounding box — drag its arrow to move it, the rings to tilt it"
+                >
+                  ⌖ Center
+                </button>
+              </div>
+            )}
+          </div>
 
-      <div className="divider" />
+          <div className="group">
+            <div className="g-label">
+              <span>Minimum member size</span>
+              <b>
+                {s.minMemberMm == null
+                  ? `auto · ${format(4 * s.lineWidth, "length")}`
+                  : unitLabel("length")}
+              </b>
+              <InfoTip help={OPT_HELP.minMember} />
+            </div>
+            <div className="toolrow">
+              <UnitInput
+                value={s.minMemberMm ?? 4 * s.lineWidth}
+                kind="length"
+                step={0.1}
+                min={0}
+                max={10}
+                onCommit={(v) => s.setMinMemberMm(v)}
+              />
+              <button
+                className={s.minMemberMm == null ? "tight on" : "tight"}
+                onClick={() => s.setMinMemberMm(null)}
+                title="Back to auto (4× line width)"
+              >
+                auto
+              </button>
+            </div>
+            {(() => {
+              // Only the two states the tip can't cover, because they depend on
+              // this part's grid: the filter switched off, and a mesh too coarse
+              // to hold the size that was asked for.
+              const eff = s.minMemberMm ?? 4 * s.lineWidth;
+              const h = s.voxelInfo?.h ?? 0;
+              const capped = h > 0 && eff / (2 * h) > 8;
+              if (eff > 1e-9 && !capped) return null;
+              return (
+                <div className="dim small">
+                  {eff <= 1e-9
+                    ? "Off — only the numerical anti-checkerboard floor applies."
+                    : `Capped by the grid (h = ${format(h, "length")}): the enforced size tops out` +
+                      ` near ${format(16 * h, "length")} — use a coarser mesh for larger members.`}
+                </div>
+              );
+            })()}
+          </div>
+        </Section>
+
+        <button className="primary" onClick={() => void s.runOptimize()} disabled={!!s.busy}>
+          {solid ? "Optimize shape" : "Optimize infill"}
+        </button>
+        {s.optProgress && (
+          <div className="progress">
+            <div
+              className="bar"
+              style={{ width: `${(100 * s.optProgress.iteration) / s.optProgress.maxIter}%` }}
+            />
+            <span>
+              {(s.optProgress.passes ?? 1) > 1
+                ? `pass ${s.optProgress.pass}/${s.optProgress.passes} · `
+                : ""}
+              iteration {s.optProgress.iteration} of max {s.optProgress.maxIter}
+            </span>
+          </div>
+        )}
+        {s.optSummary && (
+          <div className="dim small">Results land in the panel on the right — export from step 6.</div>
+        )}
+      </Section>
+
+      {/* DESIGN §20: a settings search is an OPTIMIZATION — "what should I
+          print?" — so it sits with the other optimizers, above the orientation
+          sweep it often sends the user to when layer adhesion binds. Both stay
+          folded until asked for: they answer different questions than the
+          infill run this station is named after. */}
+      <SettingsOptimizer />
       <ValidateOrientation />
     </>
   );
@@ -2558,6 +2592,7 @@ function StepExport() {
         <div className="group">
           <div className="g-label">
             <span>Fine-tune surface</span>
+            <InfoTip help={EXPORT_HELP.tune} />
           </div>
           <input
             type="range"
@@ -2571,11 +2606,6 @@ function StepExport() {
             <span className="dim small">retain less</span>
             <span className="dim small">retain more</span>
           </div>
-          <div className="dim small">
-            Moves the exported {s.optSummary.solid ? "surface" : "dense region"} in or out by
-            re-cutting the optimized field — <b>not</b> the budget. Updates live; exports use what
-            you see.
-          </div>
         </div>
       )}
       {/* Graded: display-only cutaway (no single export level). */}
@@ -2587,6 +2617,7 @@ function StepExport() {
             <div className="g-label">
               <span>Density cutaway</span>
               <b>{s.densityThreshold >= 10 ? `ρ ≥ ${s.densityThreshold}%` : "off"}</b>
+              <InfoTip help={EXPORT_HELP.cutaway} />
             </div>
             <input
               type="range"
@@ -2596,10 +2627,6 @@ function StepExport() {
               value={s.densityThreshold}
               onChange={(e) => s.setDensityThreshold(Number(e.target.value))}
             />
-            <div className="dim small">
-              Shows only material denser than the threshold — look inside the part instead of
-              just its painted surface.
-            </div>
           </div>
         )}
       {s.viewMode === "infill" && s.regionInfos.length > 0 && (
@@ -2659,6 +2686,7 @@ function StepExport() {
           <div className="g-label">
             <span>Region smoothing</span>
             <b>{s.smoothIters === 0 ? "off" : `${s.smoothIters}×`}</b>
+            <InfoTip help={EXPORT_HELP.smoothing} />
           </div>
           <input
             type="range"
@@ -2668,26 +2696,17 @@ function StepExport() {
             value={s.smoothIters}
             onChange={(e) => s.setSmoothIters(Number(e.target.value))}
           />
-          <div className="dim small">
-            Melts the voxel staircase off the exported surface — updates live, exports use what
-            you see. Crank it up for a fully smooth part.
-          </div>
         </div>
       )}
       {s.optSummary && s.optSummary.solid && (
         <div className="group">
           <div className="g-label">
             <span>Optimized shape</span>
+            <InfoTip help={EXPORT_HELP.shape} />
           </div>
           <button className="primary" onClick={() => void s.downloadShape()}>
             Download optimized shape (.stl)
           </button>
-          <div className="hint">
-            A single watertight body of the kept material — re-slice it (print it solid /
-            100% infill) or re-import it into CAD. Material under loads &amp; supports was
-            kept automatically; floating islands were dropped. A single-object project 3MF is
-            a planned follow-up.
-          </div>
         </div>
       )}
       {s.optSummary && !s.optSummary.solid && (
@@ -2695,6 +2714,7 @@ function StepExport() {
           <div className="group">
             <div className="g-label">
               <span>Hand off</span>
+              <InfoTip help={EXPORT_HELP.threemf} />
             </div>
             <div className="seg">
               <button
@@ -2723,14 +2743,10 @@ function StepExport() {
               Download {SLICER_NAMES[s.exportSlicer]} project (.3mf)
             </button>
             <button onClick={() => void s.downloadStls()}>Download modifier STLs (.zip)</button>
-          </div>
-          <div className="hint">
-            The 3MF opens in {SLICER_NAMES[s.exportSlicer]} with the part, the modifier volumes,
-            and their infill densities already set (base infill{" "}
-            {Math.round(s.optSummary.baseDensity * 100)}% on the object). Only densities are
-            overridden — walls, shells, and everything else come from your own profiles.
-            {!s.optSummary.binary &&
-              " A level pinned at 100% also gets rectilinear infill on its region, so it slices truly solid."}
+            <div className="dim small">
+              Base infill {Math.round(s.optSummary.baseDensity * 100)}% on the object, modifier
+              volumes on top.
+            </div>
           </div>
         </>
       )}
@@ -2738,6 +2754,7 @@ function StepExport() {
         <div className="group">
           <div className="g-label">
             <span>Color 3MF</span>
+            <InfoTip help={EXPORT_HELP.color3mf} />
           </div>
           <label className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
             <span className="dim small">Color steps</span>
@@ -2756,12 +2773,10 @@ function StepExport() {
           >
             Download color 3MF (.3mf)
           </button>
-          <div className="hint">
-            The active result —{" "}
+          <div className="dim small">
+            Paints{" "}
             <b>{RESULT_FIELDS.find((f) => f.value === s.resultField)?.label ?? s.resultField}</b> —
-            painted into {s.colorSteps} discrete filament bands across the current contour min/max.
-            Triangles are cut along the band iso-lines for sharp, watertight transitions. Opens
-            painted in Bambu Studio / OrcaSlicer.
+            the active result field — into {s.colorSteps} filament bands.
           </div>
         </div>
       )}

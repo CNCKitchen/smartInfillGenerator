@@ -170,6 +170,52 @@ struct OptOutput {
     binary: bool,
 }
 
+/// Options for `Model::settings_sweep` (DESIGN §20), passed as one JSON object
+/// from the worker. Line width / layer height / pattern law come from the
+/// user's current print settings and are HELD (dec. 4); only walls and infill
+/// are searched.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct SettingsSweepOpts {
+    /// Required minimum safety factor (dec. 2).
+    sf_target: f64,
+    /// "material" | "layer" | "both" (§17 dec. 2).
+    sf_measure: String,
+    /// Calibrated infill law E/E0 = coeff·ρ^exponent of the chosen pattern.
+    exponent: f64,
+    coeff: f64,
+    line_width: f64,
+    layer_height: f64,
+    /// Wall counts to consider; None ⇒ the full 1–8 band.
+    walls: Option<Vec<u32>>,
+    /// Infill fractions to consider; None ⇒ the full 13-step 10–70 % grid.
+    /// A single value turns the call into a one-candidate VERIFICATION of
+    /// exactly those settings on the current (possibly re-snapped) grid.
+    densities: Option<Vec<f64>>,
+    /// "search" (default, the bisection + pruning driver) or "full" (backfill
+    /// the whole landscape).
+    mode: Option<String>,
+    /// Full-map mode: [wallIndex, densityIndex] pairs already solved.
+    skip: Option<Vec<[u32; 2]>>,
+}
+
+impl Default for SettingsSweepOpts {
+    fn default() -> Self {
+        Self {
+            sf_target: 2.0,
+            sf_measure: "both".into(),
+            exponent: 1.5,
+            coeff: 1.0,
+            line_width: 0.45,
+            layer_height: 0.2,
+            walls: None,
+            densities: None,
+            mode: None,
+            skip: None,
+        }
+    }
+}
+
 /// Options for `Model::optimize`, passed as one JSON object from the worker.
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -210,8 +256,8 @@ struct OptimizeOpts {
     /// "match" = LIGHTEST design as stiff as a uniform print at budget_pct —
     /// a guarded secant on the budget, each pass warm-started, until the
     /// BINNED design's compliance meets the uniform reference within 2%;
-    /// "strength" (DESIGN §17) = LIGHTEST design whose trimmed-percentile
-    /// safety factor SF_crit meets `sf_target` on every included load step —
+    /// "strength" (DESIGN §17) = LIGHTEST design whose safety-factor criterion
+    /// SF_crit meets `sf_target` on every included load step —
     /// an all-at-cap pre-flight decides feasibility, then the same secant
     /// machinery walks the budget against SF_crit (never accepting below).
     goal: String,
@@ -1259,6 +1305,20 @@ impl Model {
     ) {
         self.bcs.push(BcSpec {
             kind: BcKind::Displacement([fx, fy, fz], [vx, vy, vz]),
+            tris: tris.to_vec(),
+        });
+        self.solution = None;
+        self.opt = None;
+    }
+
+    /// Cylindrical support: lock any subset of the LOCAL cylinder directions of
+    /// a cylindrical selection — radial / tangential / axial (Ansys-style). The
+    /// selection is fitted to a cylinder; each locked direction gets stiff
+    /// penalty springs per node. Radial+axial with tangential free = a journal
+    /// bearing (the part can still turn about the axis).
+    pub fn add_cylindrical(&mut self, tris: &[u32], radial: bool, tangential: bool, axial: bool) {
+        self.bcs.push(BcSpec {
+            kind: BcKind::Cylindrical([radial, tangential, axial]),
             tris: tris.to_vec(),
         });
         self.solution = None;
@@ -2536,6 +2596,21 @@ impl Model {
         // DESIGN §16 dec. 10: a self-weight-loaded optimization compares designs
         // that each carry their OWN true weight — surfaced with a fine-print note.
         let has_self_weight = load_set.has_self_weight();
+        // DESIGN §20 dec. 5/7: the BC singularity exclusion, unioned over EVERY
+        // included step so the envelope scores one consistent cell set. Only the
+        // strength goal reads it (budget/match never build a criterion mask), so
+        // those paths stay byte-identical.
+        let bc_excl = if opts.goal == "strength" {
+            let sets: Vec<&[BcSpec]> = if self.load_cases.is_empty() {
+                vec![&self.bcs]
+            } else {
+                self.load_cases.iter().map(|(b, _, _)| b.as_slice()).collect()
+            };
+            self.bc_exclusion(grid, &sets)?
+        } else {
+            Vec::new()
+        };
+        let bc_excl_cells = bc_excl.iter().filter(|&&e| e).count();
 
         let params = OptimizeParams {
             // Budget = target mean INFILL density of the interior — the
@@ -2622,6 +2697,7 @@ impl Model {
             n_bins,
             levels_pct: levels_clean.as_deref(),
             smooth_iters,
+            bc_excl: &bc_excl,
         };
         let tris = &self.mesh.tris;
         let max_iter = params.max_iter;
@@ -2771,6 +2847,9 @@ impl Model {
             o.insert("sfPerStep".into(), serde_json::json!(oc.sf_per_step));
             o.insert("bindingCellCount".into(), serde_json::json!(oc.binding_cells.len()));
             o.insert("bindingSkinShare".into(), serde_json::json!(oc.binding_skin_share));
+            // §20 dec. 5/7: how much the criterion stopped scoring, so the
+            // exclusion is never silent.
+            o.insert("bcExcludedCells".into(), serde_json::json!(bc_excl_cells));
             o.insert(
                 "sfTrace".into(),
                 serde_json::json!(oc.sf_trace
@@ -3075,17 +3154,36 @@ impl Model {
             }
             Ok(c)
         };
+        let sf_worst = || -> Result<Vec<f32>, JsValue> {
+            let mut a = sf_material();
+            let b = sf_layer()?;
+            for (va, &vb) in a.iter_mut().zip(&b) {
+                *va = va.min(vb);
+            }
+            Ok(a)
+        };
+        // DESIGN §20 dec. 7: the `…x` kinds plot the CRITERION — the very field
+        // the SF-target goal and the settings optimizer reduce to one number.
+        // That means the §17 chain, not just the raw per-cell factor: masked
+        // nodal smoothing (single-cell staircase spikes are mesh artifacts) with
+        // the BC singularity zone dropped, greyed out below. Whether the display
+        // smoothing toggle is on does NOT change it — otherwise the plot and the
+        // reported number would disagree for a display reason, which is exactly
+        // the confusion these kinds exist to remove. The plain `sf`/`sfm`/`sfz`
+        // fields stay raw and unmasked: they keep showing the clamp hotspot.
+        let criterion = |cells: Vec<f32>, this: &Self| -> Vec<f32> {
+            let excl = this.bc_exclusion_live();
+            let excl = if excl.len() == cells.len() { excl } else { Vec::new() };
+            let mask = filasim_core::strength::criterion_mask(grid, &[], &[], false, &excl);
+            filasim_core::strength::smooth_masked(grid, &cells, &mask)
+        };
         Ok(match kind {
             "sfm" => sf_material(),
             "sfz" => sf_layer()?,
-            "sf" => {
-                let mut a = sf_material();
-                let b = sf_layer()?;
-                for (va, &vb) in a.iter_mut().zip(&b) {
-                    *va = va.min(vb);
-                }
-                a
-            }
+            "sf" => sf_worst()?,
+            "sfmx" => criterion(sf_material(), self),
+            "sfzx" => criterion(sf_layer()?, self),
+            "sfx" => criterion(sf_worst()?, self),
             _ => {
                 let k = FieldKind::parse(kind).ok_or_else(|| err("unknown result field"))?;
                 cell_field_eigen(grid, &sol.u, self.settings.e0, self.settings.nu, factor, eigen, k)
@@ -3108,11 +3206,42 @@ impl Model {
     pub fn result_field(&self, kind: &str) -> Result<Vec<f32>, JsValue> {
         let cells = self.cell_values(kind)?;
         let (grid, _eps, _eigen) = self.solution_grid()?;
-        if self.smooth_stress {
+        // DESIGN §20 dec. 7: `sfx`/`sfmx`/`sfzx` grey the BC singularity zone —
+        // the cells the criterion does NOT score. Excluded cells are kept out
+        // of the nodal recovery too (so they can't drag their neighbors), then
+        // blanked to NaN, which the renderer draws in its neutral mask grey.
+        let excl = self.criterion_exclusion(kind, grid.cell_count());
+        let is_criterion = matches!(kind, "sfx" | "sfmx" | "sfzx");
+        let mut out = if self.smooth_stress && !is_criterion {
             let nodal = recover_nodal(grid, &cells);
-            Ok(sample_nodal_values(&self.mesh.tris, grid, &nodal, &cells))
+            sample_nodal_values(&self.mesh.tris, grid, &nodal, &cells)
         } else {
-            Ok(sample_cell_values(&self.mesh.tris, grid, &cells))
+            // A criterion field is already the smoothed one — recovering it
+            // again would blur past what the number was computed from.
+            sample_cell_values(&self.mesh.tris, grid, &cells)
+        };
+        if !excl.is_empty() {
+            let flags: Vec<f32> = excl.iter().map(|&e| if e { 1.0 } else { 0.0 }).collect();
+            for (v, f) in out.iter_mut().zip(sample_cell_values(&self.mesh.tris, grid, &flags)) {
+                if f > 0.5 {
+                    *v = f32::NAN;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The exclusion a `…x` criterion field greys, or empty for every other
+    /// kind (and whenever the display grid isn't the analysis grid).
+    fn criterion_exclusion(&self, kind: &str, cells: usize) -> Vec<bool> {
+        if !matches!(kind, "sfx" | "sfmx" | "sfzx") {
+            return Vec::new();
+        }
+        let excl = self.bc_exclusion_live();
+        if excl.len() == cells {
+            excl
+        } else {
+            Vec::new()
         }
     }
 
@@ -3186,9 +3315,17 @@ impl Model {
         let cells = self.cell_values(kind)?;
         let (grid, _) = self.grid.as_ref().ok_or_else(|| err("no grid"))?;
         let mask = if solid_body { self.solid_topo_keep() } else { None };
-        let keep = |ci: usize| mask.as_ref().map_or(true, |k| k[ci]);
-        let (tris, _edges, cell_of_tri) = grid.surface_mesh_where(&keep);
-        if self.smooth_stress {
+        // §20 dec. 7: a `…x` criterion field also drops the BC singularity zone
+        // from the recovery, and greys those triangles below.
+        let excl = self.criterion_exclusion(kind, grid.cell_count());
+        let is_criterion = matches!(kind, "sfx" | "sfmx" | "sfzx");
+        let keep = |ci: usize| {
+            mask.as_ref().map_or(true, |k| k[ci]) && (excl.is_empty() || !excl[ci])
+        };
+        let (tris, _edges, cell_of_tri) = grid.surface_mesh_where(&|ci| {
+            mask.as_ref().map_or(true, |k| k[ci])
+        });
+        let mut out = if self.smooth_stress && !is_criterion {
             let nodal = recover_nodal_where(grid, &cells, &keep);
             let (mx, my, mz) = (grid.nx + 1, grid.ny + 1, grid.nz + 1);
             let (h, o) = (grid.h, grid.origin);
@@ -3200,14 +3337,29 @@ impl Model {
                 let y = (((p[1] as f64 - o[1]) / h).round() as usize).min(my - 1);
                 let z = (((p[2] as f64 - o[2]) / h).round() as usize).min(mz - 1);
                 let v = nodal[(z * my + y) * mx + x];
+                // NaN here means "no contributing cell" — void in the plain
+                // case, the excluded zone in a criterion field. 0.0 keeps the
+                // legacy look; the explicit grey pass below overrides it where
+                // the exclusion is what did it.
                 out.push(if v.is_nan() { 0.0 } else { v });
             }
-            return Ok(out);
-        }
-        let mut out = Vec::with_capacity(cell_of_tri.len() * 3);
-        for &ci in &cell_of_tri {
-            let v = cells[ci as usize];
-            out.extend_from_slice(&[v, v, v]);
+            out
+        } else {
+            let mut out = Vec::with_capacity(cell_of_tri.len() * 3);
+            for &ci in &cell_of_tri {
+                let v = cells[ci as usize];
+                out.extend_from_slice(&[v, v, v]);
+            }
+            out
+        };
+        if !excl.is_empty() {
+            for (t, &ci) in cell_of_tri.iter().enumerate() {
+                if excl[ci as usize] {
+                    for v in out[3 * t..3 * t + 3].iter_mut() {
+                        *v = f32::NAN;
+                    }
+                }
+            }
         }
         Ok(out)
     }
@@ -3222,7 +3374,8 @@ impl Model {
     /// the effective interlayer shear strength; allowables scale with the
     /// solve's per-cell stiffness factor exactly like the SF plots. A fixed
     /// ring around rigid-constraint nodes (Fixed / Frictionless /
-    /// Displacement — NOT loads, NOT the compliant Elastic foundation) is
+    /// Displacement / Cylindrical — NOT loads, NOT the compliant Elastic
+    /// foundation) is
     /// excluded from the scored value but still reported in the all-cells
     /// value (§15 dec. 3). Returns JSON
     /// `{ n, stepDeg, pixels, cellsSeen, cellsKept, scoredCells }`;
@@ -3279,12 +3432,177 @@ impl Model {
             .filter(|(bc, _)| {
                 matches!(
                     bc.kind,
-                    BcKind::Fixed | BcKind::Frictionless | BcKind::Displacement(_, _)
+                    BcKind::Fixed
+                        | BcKind::Frictionless
+                        | BcKind::Displacement(_, _)
+                        | BcKind::Cylindrical(_)
                 )
             })
             .map(|(_, nodes)| nodes.as_slice())
             .collect();
         Ok(orient::constraint_ring_mask(grid, &constraint_nodes))
+    }
+
+    /// **BC singularity exclusion** (DESIGN §20 dec. 5/6) for `bc_sets` — one
+    /// entry per included load step, so the criterion mask is the SAME for
+    /// every step of an envelope. A BC contributes its attached nodes when it
+    /// is an artificial infinite-stiffness interface: fixed / displacement /
+    /// frictionless / cylindrical supports (all four are penalty- or
+    /// elimination-enforced kinematic constraints, so all inject the same
+    /// non-convergent corner stress) and §16 RIGID mounts. Deliberately NOT
+    /// included:
+    /// - force / pressure / bearing / moment pads and deformable masses — an
+    ///   under-sized load introduction is a REAL failure mode the criterion
+    ///   must keep seeing (dec. 6);
+    /// - elastic (Winkler) supports, whose whole point is a compliant mount
+    ///   that spreads the interface stress physically.
+    ///
+    /// Each patch gets its own physical radius, so a small tab and a large
+    /// clamped face are treated at their own scales.
+    fn bc_exclusion(&self, grid: &VoxelGrid, bc_sets: &[&[BcSpec]]) -> Result<Vec<bool>, JsValue> {
+        let mut patches: Vec<Vec<u32>> = Vec::new();
+        for bcs in bc_sets {
+            if bcs.is_empty() {
+                continue;
+            }
+            // Purely geometric — only the per-BC node lists are read, so no
+            // body load is needed.
+            let asm = assemble(&self.mesh, grid, bcs, None, &self.settings).map_err(err)?;
+            for (bc, nodes) in bcs.iter().zip(&asm.bc_nodes) {
+                let rigid_iface = match &bc.kind {
+                    BcKind::Fixed | BcKind::Frictionless | BcKind::Displacement(_, _) => true,
+                    // Same penalty-enforced kinematic constraint; an all-free
+                    // cylindrical support constrains nothing, so it excludes
+                    // nothing.
+                    BcKind::Cylindrical(dofs) => dofs.iter().any(|&d| d),
+                    // A rigid mount whose patch is degenerate (< 3 nodes) falls
+                    // back to a deformable load in `assemble` — no artificial
+                    // stiffness, nothing to exclude.
+                    BcKind::Mass { rigid, .. } => *rigid && nodes.len() >= 3,
+                    _ => false,
+                };
+                if rigid_iface && !nodes.is_empty() {
+                    patches.push(nodes.clone());
+                }
+            }
+        }
+        if patches.is_empty() {
+            return Ok(Vec::new()); // no rigid constraints ⇒ the pre-§20 criterion
+        }
+        let refs: Vec<&[u32]> = patches.iter().map(|p| p.as_slice()).collect();
+        Ok(filasim_core::strength::bc_exclusion(grid, &refs))
+    }
+
+    /// The exclusion for the CURRENT bcs (the live solution's step) — what the
+    /// greyed `sf*x` criterion fields plot.
+    fn bc_exclusion_live(&self) -> Vec<bool> {
+        let Some((grid, _)) = self.grid.as_ref() else { return Vec::new() };
+        self.bc_exclusion(grid, &[&self.bcs]).unwrap_or_default()
+    }
+
+    /// The §17/§20 criterion of ONE displacement field on the analysis grid:
+    /// `sf_cells → smooth_masked → sf_min` over the BC-excluded mask — i.e.
+    /// the MINIMUM of exactly the field `result_field("sfx")` plots.
+    /// Returns (SF_crit, smoothed field, mask).
+    fn criterion_of(
+        &self,
+        grid: &VoxelGrid,
+        u: &[f32],
+        eps: &[f32],
+        measure: filasim_core::strength::SfMeasure,
+        bc_excl: &[bool],
+    ) -> (f64, Vec<f32>, Vec<bool>) {
+        use filasim_core::strength as sg;
+        let spec = sg::StrengthSpec {
+            measure,
+            strength: self.strength,
+            strength_z: self.strength_z,
+            shear_z: self.shear_strength_z_eff(),
+        };
+        let mask = sg::criterion_mask(grid, &[], &[], false, bc_excl);
+        let cells = sg::sf_cells(grid, u, self.settings.e0, self.settings.nu, eps, &mask, &spec);
+        let sm = sg::smooth_masked(grid, &cells, &mask);
+        let crit = sg::sf_min(grid, &sm, &mask);
+        (crit, sm, mask)
+    }
+
+    /// World position + value of the WORST scored cell of a smoothed criterion
+    /// field — where the part is closest to failing, once the support
+    /// singularity is out of the way. This is what the Settings Optimizer pins
+    /// so "SF 1.84" always comes with a "…right here".
+    fn worst_scored_cell(
+        grid: &VoxelGrid,
+        smoothed: &[f32],
+        mask: &[bool],
+    ) -> Option<([f64; 3], f64)> {
+        let mut best: Option<(usize, f32)> = None;
+        for (ci, &m) in mask.iter().enumerate() {
+            if !m || grid.scale[ci] <= 0.0 {
+                continue;
+            }
+            let v = smoothed[ci];
+            if best.map_or(true, |(_, b)| v < b) {
+                best = Some((ci, v));
+            }
+        }
+        let (ci, v) = best?;
+        let (cx, cy, cz) =
+            (ci % grid.nx, (ci / grid.nx) % grid.ny, ci / (grid.nx * grid.ny));
+        Some((
+            [
+                grid.origin[0] + (cx as f64 + 0.5) * grid.h,
+                grid.origin[1] + (cy as f64 + 0.5) * grid.h,
+                grid.origin[2] + (cz as f64 + 0.5) * grid.h,
+            ],
+            v as f64,
+        ))
+    }
+
+    /// **Criterion of the LIVE solution** (DESIGN §17 dec. 4 + §20 dec. 5):
+    /// SF_crit and where it binds, computed from whatever result is currently
+    /// active — no solve, no re-assembly, nothing invalidated. This is how the
+    /// Settings Optimizer verifies its delivery after the standard As-Printed
+    /// run: the number comes from the SAME field the user is looking at.
+    /// JSON `{ sf, excludedCells, scoredCells, worst: {x, y, z, sf} | null }`.
+    pub fn criterion_sf(&self, measure: &str) -> Result<String, JsValue> {
+        let sol =
+            self.solution.as_ref().ok_or_else(|| err("no solution — run Solve or Optimize"))?;
+        let (grid, _) = self.grid.as_ref().ok_or_else(|| err("no grid"))?;
+        if sol.mx != grid.nx + 1 || sol.my != grid.ny + 1 || sol.mz != grid.nz + 1 {
+            return Err(err("the active result predates the current analysis grid"));
+        }
+        let scale_eps;
+        let eps: &[f32] = match self.solution_eps.as_deref() {
+            Some(e) if e.len() == grid.cell_count() => e,
+            _ => {
+                scale_eps = grid.scale.clone();
+                &scale_eps
+            }
+        };
+        let excl = self.bc_exclusion_live();
+        let m = filasim_core::strength::SfMeasure::parse(measure)
+            .unwrap_or(filasim_core::strength::SfMeasure::Both);
+        let (crit, sm, mask) = self.criterion_of(grid, &sol.u, eps, m, &excl);
+        let worst = Self::worst_scored_cell(grid, &sm, &mask);
+        // How peaked the field is at the binding cell (§17 dec. 4, 2026-07-25):
+        // ~1 = a broad weak region, SF_crit is a converged property of the
+        // part; well above 1 = a notch tip, where SF_crit keeps falling as the
+        // mesh is refined. Reported so the UI can say so instead of the old
+        // trim silently papering over it.
+        let riser = filasim_core::strength::riser_ratio(grid, &sm, &mask).map(|(_, r)| r);
+        Ok(serde_json::json!({
+            "sf": crit,
+            // Identical to `sf` since the trim was retired — kept so callers
+            // written against the old two-number contract keep working.
+            "rawMin": worst.map(|(_, v)| v).unwrap_or(crit),
+            "riserRatio": riser,
+            "excludedCells": excl.iter().filter(|&&e| e).count(),
+            "scoredCells": mask.iter().filter(|&&m| m).count(),
+            "worst": worst.map(|(p, v)| serde_json::json!({
+                "x": p[0], "y": p[1], "z": p[2], "sf": v,
+            })),
+        })
+        .to_string())
     }
 
     /// Per-CELL layer-adhesion SF for build direction `(a, b, c)`, min-folded
@@ -3460,6 +3778,308 @@ impl Model {
     /// Drop the sweep context built by `orientation_sweep_begin`.
     pub fn orientation_sweep_end(&mut self) {
         self.sweep = None;
+    }
+
+    /// **Settings Optimizer** (DESIGN §20): search uniform print settings —
+    /// perimeters × infill % — for the LIGHTEST print whose safety factor still
+    /// clears `sfTarget`.
+    ///
+    /// Everything runs on the CURRENT analysis grid (dec. 9): each candidate is
+    /// re-classified into skin / composite-wall / infill cells there and solved
+    /// under every included load step, then reduced to the §17 criterion with
+    /// the §20 BC exclusion applied. Line width, layer height and pattern are
+    /// held at the user's values — they are printer choices, not strength knobs
+    /// (dec. 4); the shell count follows the walls
+    /// (`ceil(perimeters·lineWidth / layerHeight)`).
+    ///
+    /// `mode: "search"` (default) walks the dec. 8 bisection + weight pruning
+    /// (typically 15–30 solves). `mode: "full"` backfills the whole 8 × 13
+    /// landscape, skipping the `skip` cells a previous call already solved.
+    ///
+    /// `progress` receives one JSON push per solved candidate. Returns JSON
+    /// `{ walls, densities, candidates, winner, feasible, bestSf, prunedWalls,
+    /// solves, excludedCells, scoredCells, … }`.
+    pub fn settings_sweep(
+        &mut self,
+        opts_json: &str,
+        progress: &js_sys::Function,
+    ) -> Result<String, JsValue> {
+        use filasim_core::settings as st;
+        let opts: SettingsSweepOpts = serde_json::from_str(opts_json).map_err(err)?;
+        self.ensure_grid()?;
+        let (grid, levels) = self.grid.as_ref().unwrap();
+        let (levels, grid) = (*levels, grid);
+
+        // Load steps, exactly as the optimizer registers them (§13/§16): the
+        // first case is primary, the rest weighted extras; each assembles
+        // MASS-ONLY so the candidate's own self-weight rides the RHS.
+        let primary_bcs: &[BcSpec] =
+            if self.load_cases.is_empty() { &self.bcs } else { &self.load_cases[0].0 };
+        let primary_accel =
+            if self.load_cases.is_empty() { self.accel } else { self.load_cases[0].2 };
+        let asm = assemble(
+            &self.mesh,
+            grid,
+            primary_bcs,
+            Self::mass_only_body(primary_accel, self.density),
+            &self.settings,
+        )
+        .map_err(err)?;
+        if !check_problem(grid, &asm).ok {
+            return Err(err("model is under-constrained — fix the setup first (run Check)"));
+        }
+        let mut load_set = filasim_core::simp::LoadSet {
+            primary_body: Self::opt_body_accel(primary_accel, self.density),
+            ..Default::default()
+        };
+        if !self.load_cases.is_empty() {
+            load_set.primary_weight = self.load_cases[0].1;
+            for (case_bcs, w, case_accel) in &self.load_cases[1..] {
+                let a = assemble(
+                    &self.mesh,
+                    grid,
+                    case_bcs,
+                    Self::mass_only_body(*case_accel, self.density),
+                    &self.settings,
+                )
+                .map_err(err)?;
+                if !check_problem(grid, &a).ok {
+                    return Err(err("a load case is under-constrained — fix the setup first (run Check)"));
+                }
+                load_set.extra.push((a.problem, *w));
+                load_set.extra_body.push(Self::opt_body_accel(*case_accel, self.density));
+            }
+        }
+        let bc_sets: Vec<&[BcSpec]> = if self.load_cases.is_empty() {
+            vec![&self.bcs]
+        } else {
+            self.load_cases.iter().map(|(b, _, _)| b.as_slice()).collect()
+        };
+        let bc_excl = self.bc_exclusion(grid, &bc_sets)?;
+        let excluded_cells = bc_excl.iter().filter(|&&e| e).count();
+
+        let walls: Vec<u32> = match &opts.walls {
+            Some(w) if !w.is_empty() => {
+                let mut w: Vec<u32> =
+                    w.iter().map(|&v| v.clamp(st::WALLS_MIN, st::WALLS_MAX)).collect();
+                w.sort_unstable();
+                w.dedup();
+                w
+            }
+            _ => st::wall_grid(),
+        };
+        let densities: Vec<f64> = match &opts.densities {
+            Some(d) if !d.is_empty() => {
+                let mut d: Vec<f64> =
+                    d.iter().map(|&v| v.clamp(st::DENSITY_MIN, st::DENSITY_MAX)).collect();
+                d.sort_by(f64::total_cmp);
+                d.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+                d
+            }
+            _ => st::density_grid(),
+        };
+        let cfg = st::SweepCfg {
+            walls: &walls,
+            densities: &densities,
+            line_width: opts.line_width.clamp(LINE_WIDTH_MM.0, LINE_WIDTH_MM.1),
+            layer_height: opts.layer_height.clamp(0.04, 0.6),
+            composite_skin: self.composite_skin,
+            eval: filasim_core::pipeline::EvalLaw {
+                exp: opts.exponent.clamp(1.0, 3.5),
+                coeff: opts.coeff.clamp(0.05, 2.0),
+            },
+            // ≥ SF_CAP would be infeasible by construction (the per-cell factor
+            // is capped there), so the band matches the §17 goal's.
+            target: opts.sf_target.clamp(1.0, 9.5),
+            spec: filasim_core::strength::StrengthSpec {
+                measure: filasim_core::strength::SfMeasure::parse(&opts.sf_measure)
+                    .unwrap_or(filasim_core::strength::SfMeasure::Both),
+                strength: self.strength,
+                strength_z: self.strength_z,
+                shear_z: self.shear_strength_z_eff(),
+            },
+            bc_excl: &bc_excl,
+            material_density: self.density,
+        };
+        let full_map = opts.mode.as_deref() == Some("full");
+        let total = if full_map {
+            walls.len() * densities.len()
+        } else {
+            // dec. 8's budget: the ceiling probe + one probe at the top density
+            // + ≤ 3 bisection steps per wall count. Only a progress denominator.
+            walls.len() * 4 + 1
+        };
+        let measure = filasim_core::strength::SfMeasure::parse(&opts.sf_measure)
+            .unwrap_or(filasim_core::strength::SfMeasure::Both);
+        let mut sweep =
+            st::Sweep::new(grid, levels, &asm.problem, &self.settings, &load_set, cfg);
+        let target = opts.sf_target.clamp(1.0, 9.5);
+        // The landscape's axes go out FIRST, so the panel can draw the empty
+        // grid and fill it in as candidates land instead of showing nothing
+        // until the search ends.
+        let _ = progress.call1(
+            &JsValue::NULL,
+            &JsValue::from_str(
+                &serde_json::json!({
+                    "phase": "begin", "done": 0, "total": total,
+                    "walls": walls, "densities": densities, "target": target,
+                })
+                .to_string(),
+            ),
+        );
+        // Each solved candidate carries its own SAFETY-FACTOR field to the UI —
+        // the live preview: you watch the part recolor as the search walks the
+        // settings, instead of staring at a spinner. Sampling is the same path
+        // `result_field` takes, on this candidate's own displacement + eps.
+        let mesh_tris = &self.mesh.tris;
+        let smooth = self.smooth_stress;
+        let push = |c: &st::Candidate, u: &[f64], eps: &[f32], done: usize| {
+            let json = serde_json::json!({
+                "phase": "candidate", "done": done, "total": total,
+                "wall": c.wall, "wallIndex": c.wall_index,
+                "density": c.density, "densityIndex": c.density_index,
+                "topBottomLayers": c.top_bottom_layers,
+                "sf": c.sf, "massGrams": c.mass_g,
+                "feasible": c.feasible(target),
+            })
+            .to_string();
+            let u32f: Vec<f32> = u.iter().map(|&v| v as f32).collect();
+            let (_, sm, _) = self.criterion_of(grid, &u32f, eps, measure, &bc_excl);
+            let field = if smooth {
+                let nodal = recover_nodal(grid, &sm);
+                sample_nodal_values(mesh_tris, grid, &nodal, &sm)
+            } else {
+                sample_cell_values(mesh_tris, grid, &sm)
+            };
+            let _ = progress.call2(
+                &JsValue::NULL,
+                &JsValue::from_str(&json),
+                &js_sys::Float32Array::from(field.as_slice()),
+            );
+        };
+
+        #[allow(clippy::type_complexity)]
+        let (candidates, winner, feasible, best_sf, pruned, ceiling_stop): (
+            Vec<st::Candidate>,
+            Option<st::Candidate>,
+            bool,
+            f64,
+            Vec<u32>,
+            bool,
+        ) = if full_map {
+            let skip: std::collections::HashSet<(u32, u32)> =
+                opts.skip.unwrap_or_default().into_iter().map(|p| (p[0], p[1])).collect();
+            let mut out: Vec<st::Candidate> = Vec::new();
+            let mut prog = |c: &st::Candidate, u: &[f64], e: &[f32], n: usize| push(c, u, e, n);
+            for wi in 0..walls.len() {
+                for di in 0..densities.len() {
+                    if skip.contains(&(wi as u32, di as u32)) {
+                        continue;
+                    }
+                    st::eval_cell(&mut sweep, &mut out, wi, di, &mut prog).map_err(err)?;
+                }
+            }
+            let best = out
+                .iter()
+                .filter(|c| c.feasible(target))
+                .min_by(|a, b| a.mass_g.total_cmp(&b.mass_g).then(b.sf.total_cmp(&a.sf)))
+                .cloned();
+            let best_sf = out.iter().map(|c| c.sf).fold(f64::NEG_INFINITY, f64::max);
+            let feasible = best.is_some();
+            (out, best, feasible, best_sf, Vec::new(), false)
+        } else {
+            let mut prog = |c: &st::Candidate, u: &[f64], e: &[f32], n: usize| push(c, u, e, n);
+            let out = st::search(&mut sweep, &mut prog).map_err(err)?;
+            (
+                out.evaluated,
+                Some(out.winner),
+                out.feasible,
+                out.best_sf,
+                out.pruned_walls,
+                out.ceiling_stop,
+            )
+        };
+
+        let cell_json = |c: &st::Candidate| {
+            serde_json::json!({
+                "wall": c.wall,
+                "wallIndex": c.wall_index,
+                "density": c.density,
+                "densityIndex": c.density_index,
+                "topBottomLayers": c.top_bottom_layers,
+                "massGrams": c.mass_g,
+                "sf": c.sf,
+                "sfPerStep": c.sf_steps,
+                "maxDisplacement": c.max_disp,
+                "converged": c.converged,
+                "feasible": c.feasible(target),
+            })
+        };
+        // Solid mass reference (the 100 % print at the winner's wall count) —
+        // what the panel quotes the saving against.
+        let solid_mass = winner.as_ref().map(|w| {
+            let g = sweep.geometry(w.wall_index);
+            g.mass_g(grid, self.density, 1.0)
+        });
+        // Promote the winner to the LIVE solution: one extra solve buys the
+        // user a real result they can select, plot and section — instead of a
+        // number they have to take on faith. (The winner is rarely the last
+        // candidate the bisection touched, so re-solving is the honest way to
+        // get its field back without holding every candidate's ndof vector.)
+        let mut worst_json = serde_json::Value::Null;
+        let mut raw_min = 0f64;
+        let mut riser = serde_json::Value::Null;
+        if let Some(w) = winner.as_ref() {
+            let (_c, u, eps) = sweep.evaluate_keep(w.wall_index, w.density_index).map_err(err)?;
+            let u32f: Vec<f32> = u.iter().map(|&v| v as f32).collect();
+            let (_, sm, mask) = self.criterion_of(grid, &u32f, &eps, measure, &bc_excl);
+            if let Some((p, v)) = Self::worst_scored_cell(grid, &sm, &mask) {
+                worst_json = serde_json::json!({"x": p[0], "y": p[1], "z": p[2], "sf": v});
+                raw_min = v;
+            }
+            if let Some((_, r)) = filasim_core::strength::riser_ratio(grid, &sm, &mask) {
+                riser = serde_json::json!(r);
+            }
+            let sol = filasim_core::solve::Solution {
+                u: u32f,
+                mx: grid.nx + 1,
+                my: grid.ny + 1,
+                mz: grid.nz + 1,
+                h: grid.h,
+                origin: grid.origin,
+                active: active_nodes(grid),
+                iterations: 0,
+                rel_residual: 0.0,
+                converged: w.converged,
+                residuals: Vec::new(),
+            };
+            self.solution = Some(sol);
+            self.solution_eps = Some(eps);
+        }
+        Ok(serde_json::json!({
+            "worst": worst_json,
+            "rawMin": raw_min,
+            "riserRatio": riser,
+            "walls": walls,
+            "densities": densities,
+            "candidates": candidates.iter().map(cell_json).collect::<Vec<_>>(),
+            "winner": winner.as_ref().map(cell_json),
+            "feasible": feasible,
+            "bestSf": if best_sf.is_finite() { best_sf } else { 0.0 },
+            "target": target,
+            "sfMeasure": opts.sf_measure,
+            "prunedWalls": pruned,
+            "ceilingStop": ceiling_stop,
+            "solves": sweep.solves(),
+            "loadSteps": 1 + load_set.extra.len(),
+            "excludedCells": excluded_cells,
+            "scoredCells": sweep.scored_cells(),
+            "lineWidth": opts.line_width,
+            "layerHeight": opts.layer_height,
+            "massSolidGrams": solid_mass,
+            "fullMap": full_map,
+        })
+        .to_string())
     }
 
     /// Volumetric section payload for the CAD-style capped section view: the

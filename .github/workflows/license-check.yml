@@ -9,6 +9,12 @@
 #  - npm: license-checker against the same allowlist (full tree, dev included;
 #    CC-BY-4.0 is data-only — caniuse-lite; the private root package is
 #    excluded because license-checker reports `private: true` as UNLICENSED)
+#
+# meshstep is AGPL-3.0-only but is OUR OWN package (same copyright holder, same
+# CLA, dual-licensed on the same terms), so it does not break the commercial
+# exception — CONTRIBUTING.md §2 bans AGPL code *we don't own*. It is excluded
+# by exact version on purpose: a meshstep bump must fail here once and be
+# re-confirmed as first-party before the exclusion is updated.
 name: License check
 
 on:
@@ -42,6 +48,7 @@ jobs:
       - name: npm license allowlist
         run: >-
           npx --yes license-checker --excludePrivatePackages
+          --excludePackages "meshstep@0.1.1"
           --onlyAllow "MIT;Apache-2.0;BSD-2-Clause;BSD-3-Clause;ISC;0BSD;Zlib;CC0-1.0;MPL-2.0;Unicode-3.0;Unlicense;CC-BY-4.0"
           --summary
         working-directory: web

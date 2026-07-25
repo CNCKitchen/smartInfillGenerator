@@ -216,6 +216,11 @@ self.onmessage = async (ev: MessageEvent<EngineWorkerRequest>) => {
             const a = bc.axes ?? [false, false, true];
             const v = bc.disp ?? [0, 0, 0];
             m.add_displacement(bc.tris, !!a[0], !!a[1], !!a[2], v[0] ?? 0, v[1] ?? 0, v[2] ?? 0);
+          } else if (bc.kind === "cylindrical") {
+            // Local cylinder DOFs [radial, tangential, axial]; the engine
+            // re-fits the cylinder itself to build the frame.
+            const d = bc.cylDof ?? [true, false, true];
+            m.add_cylindrical(bc.tris, !!d[0], !!d[1], !!d[2]);
           } else if (bc.kind === "elastic") m.add_elastic(bc.tris, bc.stiffness ?? 100);
           else if (bc.kind === "force") {
             const f = bc.force ?? [0, 0, 0];
@@ -376,6 +381,38 @@ self.onmessage = async (ev: MessageEvent<EngineWorkerRequest>) => {
         const stats = JSON.parse(requireModel().set_build_state(msg.state));
         const displacements = requireModel().vertex_displacements();
         reply(msg, { stats, displacements }, [displacements.buffer]);
+        return;
+      }
+      case "settingsSweep": {
+        // DESIGN §20: one blocking call in the worker (each candidate is a
+        // full solve of every included load step); the wasm side pushes a
+        // progress JSON per solved candidate, forwarded here so the panel can
+        // narrate the landscape filling in.
+        if (cancelArr) Atomics.store(cancelArr, 0, 0); // arm fresh
+        const result = JSON.parse(
+          requireModel().settings_sweep(
+            JSON.stringify(msg.opts),
+            // The axes push arrives with no field; every candidate push carries
+            // its own per-soup-vertex SF field (the live preview), forwarded in
+            // the progress message's `density` slot like the optimizer's.
+            (json: string, field?: Float32Array) => {
+              (self as unknown as Worker).postMessage(
+                {
+                  id: msg.id,
+                  progress: true,
+                  data: JSON.parse(json),
+                  density: field,
+                },
+                field && field.length > 0 ? [field.buffer] : []
+              );
+            }
+          )
+        );
+        reply(msg, result);
+        return;
+      }
+      case "criterionSf": {
+        reply(msg, JSON.parse(requireModel().criterion_sf(msg.measure)));
         return;
       }
       case "orientationSweep": {

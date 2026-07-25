@@ -5,6 +5,7 @@ export type BcKind =
   | "fixed"
   | "frictionless"
   | "displacement"
+  | "cylindrical"
   | "elastic"
   | "force"
   | "pressure"
@@ -16,9 +17,9 @@ export type BcKind =
   | "accel"
   | "mass";
 
-/** Fitted cylinder for a bearing load: axis + radius recovered from the
- *  selected surface, plus the cylindricity check. `ok=false` means the
- *  selection isn't cylindrical and the bearing load can't be applied. */
+/** Fitted cylinder for a bearing load or a cylindrical support: axis + radius
+ *  recovered from the selected surface, plus the cylindricity check. `ok=false`
+ *  means the selection isn't cylindrical and the condition can't be applied. */
 export interface CylFit {
   ok: boolean;
   axis: [number, number, number];
@@ -54,6 +55,12 @@ export interface Bc {
   /** Prescribed displacement per global axis in mm (displacement support only);
    *  0 = pin to zero. Only axes enabled in `axes` are enforced. */
   disp?: [number, number, number];
+  /** Which LOCAL cylinder directions are fixed (cylindrical support only), in
+   *  the order [radial, tangential, axial]; unchecked = free. Default
+   *  [true, false, true] — a journal bearing: the bore wall carries the radial
+   *  load and holds the part axially, but it can still turn about the axis.
+   *  The fitted cylinder that defines the frame is cached in `cyl`. */
+  cylDof?: [boolean, boolean, boolean];
   /** Force definition mode (force only); defaults to "direction". */
   forceMode?: ForceMode;
   /** Unit direction for "direction" mode (force only). */
@@ -67,10 +74,11 @@ export interface Bc {
   //     forceMag as the bearing force vector (total N). The loaded half of the
   //     bore is the half this vector points into. `cyl` caches the fit of the
   //     selected cylindrical surface. ---
-  /** Fitted cylinder for the bearing selection (bearing only); null until a
-   *  valid cylindrical surface is selected. */
+  /** Fitted cylinder of the selection (bearing load AND cylindrical support —
+   *  the support's local radial/tangential/axial frame comes from the same fit);
+   *  null until a valid cylindrical surface is selected. */
   cyl?: CylFit | null;
-  /** Transient validation message when a bearing selection isn't cylindrical. */
+  /** Transient validation message when the selection isn't cylindrical. */
   cylError?: string;
   // --- Moment (kind "moment"): a deformable distributed couple (N·mm). Dual
   //     mode like force, but its own fields so the two never collide. ---
@@ -286,6 +294,13 @@ export const RESULT_FIELDS: ResultFieldDef[] = [
   { value: "sf", label: "Safety factor — worst case", unit: "" },
   { value: "sfm", label: "Safety factor — material σₜ/σᵥᴹ", unit: "" },
   { value: "sfz", label: "Safety factor — layer adhesion", unit: "" },
+  // DESIGN §20 dec. 7 — the criterion's view of the three fields above: the
+  // SAME masked smoothing the SF-target goal and the settings optimizer
+  // evaluate, with the BC singularity zone greyed out. Plotting one of these
+  // shows the field the reported number comes from.
+  { value: "sfx", label: "Criterion SF — worst case", unit: "" },
+  { value: "sfmx", label: "Criterion SF — material", unit: "" },
+  { value: "sfzx", label: "Criterion SF — layer adhesion", unit: "" },
   { value: "vm", label: "von Mises σ", unit: "MPa" },
   { value: "svm", label: "Signed von Mises σ", unit: "MPa" },
   { value: "sxx", label: "Normal σxx", unit: "MPa" },

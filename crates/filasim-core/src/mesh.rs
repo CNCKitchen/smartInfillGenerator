@@ -450,4 +450,36 @@ pub mod primitives {
         }
         TriMesh::from_triangles(tris)
     }
+
+    /// Closed solid cylinder along +Z from `center` (bottom cap centre) upward,
+    /// outward normals. Triangle layout is contiguous per face so a test can
+    /// select one: side wall `0..2*segs`, bottom fan `2*segs..3*segs`, top fan
+    /// `3*segs..4*segs`. The side wall is what the cylindrical support and the
+    /// bearing load need.
+    pub fn cylinder(center: [f32; 3], r: f32, height: f32, segs: usize) -> TriMesh {
+        let (z0, z1) = (center[2], center[2] + height);
+        let ring = |i: usize, z: f32| -> [f32; 3] {
+            let phi = 2.0 * std::f32::consts::PI * (i % segs) as f32 / segs as f32;
+            [center[0] + r * phi.cos(), center[1] + r * phi.sin(), z]
+        };
+        let tri = |a: [f32; 3], b: [f32; 3], c: [f32; 3]| -> [f32; 9] {
+            [a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2]]
+        };
+        let mut tris = Vec::with_capacity(4 * segs);
+        for i in 0..segs {
+            let (a, b) = (ring(i, z0), ring(i + 1, z0));
+            let (c, d) = (ring(i, z1), ring(i + 1, z1));
+            tris.push(tri(a, b, d));
+            tris.push(tri(a, d, c));
+        }
+        let bottom = [center[0], center[1], z0];
+        let top = [center[0], center[1], z1];
+        for i in 0..segs {
+            tris.push(tri(bottom, ring(i + 1, z0), ring(i, z0)));
+        }
+        for i in 0..segs {
+            tris.push(tri(top, ring(i, z1), ring(i + 1, z1)));
+        }
+        TriMesh::from_triangles(tris)
+    }
 }

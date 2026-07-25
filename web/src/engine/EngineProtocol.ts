@@ -42,6 +42,8 @@ export interface BcPayload {
   stiffness?: number;
   axes?: boolean[];
   disp?: number[];
+  /** Cylindrical support: locked LOCAL directions [radial, tangential, axial]. */
+  cylDof?: boolean[];
   moment?: number[];
   // Inertial loads (DESIGN §16). `accel` is the resolved world acceleration
   // vector (mm/s²); the worker SUMS every active accel entity into one vector
@@ -149,6 +151,11 @@ export interface EngineRequests {
   layerSfField: { dir: [number, number, number]; ids: string[]; surface: "stl" | "voxel" };
   /** Toggle the shear term of the layer criterion (display-side derived). */
   setLayerShear: { on: boolean };
+  /** Settings Optimizer sweep (DESIGN §20): search uniform print settings for
+   *  the lightest print that still clears the safety-factor target. */
+  settingsSweep: { opts: SettingsSweepOptions };
+  /** Criterion SF of the LIVE result (read-only — no solve, no invalidation). */
+  criterionSf: { measure: "material" | "layer" | "both" };
 }
 
 export type Op = keyof EngineRequests;
@@ -269,6 +276,8 @@ export interface EngineResponses {
   orientationSweep: OrientationSweepResult;
   layerSfField: Float32Array;
   setLayerShear: void;
+  settingsSweep: SettingsSweepResult;
+  criterionSf: CriterionSfResult;
 }
 
 /** Orientation-sweep result: two n×n grids of min layer-adhesion SF (pitch
@@ -291,6 +300,138 @@ export interface SweepProgress {
   done: number;
   total: number;
 }
+
+/** Settings Optimizer request (DESIGN §20). Line width / layer height / the
+ *  pattern's E(ρ) law come from the current print settings and are HELD —
+ *  only walls and infill are searched. */
+export interface SettingsSweepOptions {
+  sfTarget: number;
+  sfMeasure: "material" | "layer" | "both";
+  exponent: number;
+  coeff: number;
+  lineWidth: number;
+  layerHeight: number;
+  /** Wall counts to consider; omit for the full 1–8 band. */
+  walls?: number[];
+  /** Infill fractions (0..1) to consider; omit for the full 13-step grid. A
+   *  single value + `mode: "full"` verifies exactly those settings. */
+  densities?: number[];
+  /** "search" = the bisection + weight-pruning driver; "full" = backfill the
+   *  whole walls × density landscape. */
+  mode?: "search" | "full";
+  /** Full-map mode: [wallIndex, densityIndex] pairs already solved. */
+  skip?: [number, number][];
+}
+
+/** One solved landscape cell. */
+export interface SettingsCandidate {
+  wall: number;
+  wallIndex: number;
+  /** Infill fraction (0..1) — the grid value, already a 5 % step. */
+  density: number;
+  densityIndex: number;
+  topBottomLayers: number;
+  massGrams: number;
+  /** SF_crit of the envelope (min over included load steps). */
+  sf: number;
+  sfPerStep: number[];
+  maxDisplacement: number;
+  converged: boolean;
+  feasible: boolean;
+}
+
+/** Where the delivered design comes closest to failing — the worst SCORED
+ *  cell of the criterion field (support singularity already excluded). */
+export interface CriterionWorst {
+  x: number;
+  y: number;
+  z: number;
+  sf: number;
+}
+
+export interface SettingsSweepResult {
+  walls: number[];
+  densities: number[];
+  candidates: SettingsCandidate[];
+  /** The delivered settings — the lightest feasible candidate, or the best
+   *  achievable one when the target is out of reach. */
+  winner: SettingsCandidate | null;
+  feasible: boolean;
+  bestSf: number;
+  target: number;
+  sfMeasure: string;
+  /** Wall counts skipped because their lightest print already outweighed the
+   *  best feasible candidate — reported, never silent. */
+  prunedWalls: number[];
+  /** The search stopped on its opening CEILING PROBE: the strongest print the
+   *  band can deliver (most walls, densest infill) already missed the target,
+   *  so nothing lighter can hold it — one solve instead of the whole sweep. */
+  ceilingStop: boolean;
+  solves: number;
+  loadSteps: number;
+  /** Cells the BC singularity exclusion removed from the criterion (§20 dec. 5). */
+  excludedCells: number;
+  scoredCells: number;
+  lineWidth: number;
+  layerHeight: number;
+  /** Mass of the 100 % print at the winner's wall count. */
+  massSolidGrams: number | null;
+  fullMap: boolean;
+  /** Where the WINNER binds — pinned in the viewport after the search. */
+  worst: CriterionWorst | null;
+  /** Same as the winner's `sf` (see CriterionSfResult). */
+  rawMin: number;
+  /** Stress-riser ratio at the winner's binding cell (see CriterionSfResult). */
+  riserRatio: number | null;
+}
+
+/** `criterionSf`: the §17/§20 criterion of the LIVE result — no solve, nothing
+ *  invalidated. Used to verify a delivery on the real (snapped) mesh. */
+export interface CriterionSfResult {
+  /** SF_crit — the MINIMUM of the criterion field (§17 dec. 4, 2026-07-25).
+   *  Identical to the value the viewport's min marker shows on `sfx`/`sfmx`/
+   *  `sfzx`: one number, one picture. */
+  sf: number;
+  /** Same value as `sf` since the 0.2 %-volume trim was retired; kept so the
+   *  older two-number call sites keep compiling. */
+  rawMin: number;
+  /** How sharply the field climbs away from the binding cell (mean SF in a
+   *  ±2-cell box ÷ the minimum). ~1 = a broad weak region, SF_crit is a
+   *  converged property of the part. Well above 1 = the number is sitting on a
+   *  notch tip and WILL fall as the mesh is refined — the app says so instead
+   *  of trimming it away. Null when nothing is scored. */
+  riserRatio: number | null;
+  excludedCells: number;
+  scoredCells: number;
+  worst: CriterionWorst | null;
+}
+
+/** settingsSweep progress. The FIRST push carries the landscape axes so the
+ *  panel can draw the empty grid immediately; every later push is one solved
+ *  candidate, and arrives with that candidate's per-soup-vertex safety-factor
+ *  field for the live preview. */
+export type SettingsSweepProgress =
+  | {
+      phase: "begin";
+      done: number;
+      total: number;
+      walls: number[];
+      densities: number[];
+      target: number;
+    }
+  | {
+      phase: "candidate";
+      done: number;
+      total: number;
+      wall: number;
+      wallIndex: number;
+      density: number;
+      densityIndex: number;
+      topBottomLayers: number;
+      sf: number;
+      massGrams: number;
+      feasible: boolean;
+    };
 
 // ---- wire envelopes ----
 
@@ -358,7 +499,13 @@ export interface ModalProgressMessage {
 export interface WorkerProgressMessage {
   id: number;
   progress: true;
-  data: OptProgress | OptPhase | BuildSimProgress | ModalProgress | SweepProgress;
+  data:
+    | OptProgress
+    | OptPhase
+    | BuildSimProgress
+    | ModalProgress
+    | SweepProgress
+    | SettingsSweepProgress;
   density?: Float32Array;
   skelPositions?: Float32Array;
   skelIndices?: Uint32Array;

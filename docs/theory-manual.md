@@ -433,6 +433,7 @@ elimination**; loads are converted to **consistent nodal forces**.
 | **Fixed support** | u = 0 | all 3 DOF of attached nodes eliminated (Dirichlet) | rigid clamp; can over-stiffen & create edge singularities — prefer Elastic for realism |
 | **Displacement support** | pin chosen X/Y/Z | stiff axis penalty springs on the selected global axes only | roller/slider; `[true;3]` ≈ Fixed (penalty form) |
 | **Frictionless support** | u·n = 0 | penalty spring along the patch's area-weighted average normal | works on arbitrary (non-axis-aligned) patches |
+| **Cylindrical support** | pin chosen r / t / a | penalty springs along the LOCAL directions of the fitted cylinder, per node: radial `r̂`, tangential `t̂ = â × r̂`, axial `â` | for bores/shaft seats; radial+axial with tangential free = journal bearing (the axial rotation stays a real free mode — the §9 check reports it); all three ⇒ `k(r̂r̂ᵀ+t̂t̂ᵀ+ââᵀ) = k·I` ≡ Displacement on all axes |
 | **Elastic support** | σ = k·u | Winkler foundation; each node gets 3 axis springs of `k × tributary area` | bedding modulus `k` (N/mm³); area-consistent so total stiffness = k·A independent of mesh |
 | **Surface force** | total **N** | area-weighted (Voronoi) split into consistent nodal forces | defined as X/Y/Z components OR direction + magnitude; direction defaults to the patch's average normal |
 | **Pressure** | MPa | `f = −p·(Σ area-vectors)`, per-sample normals | correct on curved patches; acts along inward normal |
@@ -440,11 +441,22 @@ elimination**; loads are converted to **consistent nodal forces**.
 | **Acceleration / self-weight** | **a** (mm/s²), ρ | per-cell body force `ρ·φₑ·a·h³` lumped ⅛ to 8 nodes; `φₑ` = material volume fraction | world-fixed vector (§7.1); self-weight ALWAYS on when an acceleration is active |
 | **Remote point mass** | m at **p** | `F = m·a` area-weighted over the patch **+** transported couple `M = (p−c)×F` via the moment operator | deformable (load-only), adds no stiffness; `c` = patch area-weighted centroid |
 
-**Penalty stiffness.** Frictionless/Displacement springs use
+**Penalty stiffness.** Frictionless/Displacement/Cylindrical springs use
 `k = 300 · E₀ · h` (`SPRING_FACTOR = 300`) — stiff enough to enforce the
 constraint to engineering tolerance, soft enough to keep `K` well-conditioned.
 Penalty constraints allow a small (bounded) constraint violation by construction;
 the axial-bar and roller patch tests confirm < 3% error (Verification Manual).
+
+**Cylindrical frame.** The local `r̂ / t̂ / â` triad of a cylindrical support comes
+from the same least-squares cylinder fit that validates a bearing selection: the
+axis is the smallest-eigenvalue eigenvector of the area-weighted surface-normal
+covariance `Σ aᵢnᵢnᵢᵀ` (every normal on a cylinder is ⟂ the axis), the radius and
+centre from an algebraic circle fit in the plane ⟂ that axis. The editor rejects a
+patch whose cylindricity residual (RMS radial deviation / radius) exceeds 7 %, so
+the frame is only ever built on a genuinely cylindrical selection; assembly
+re-fits the same triangles, so the picture and the solver agree. `r̂` is
+per-node, so a full bore is held toward its own centre everywhere, not along one
+averaged direction.
 
 **Consistent loads.** Surface forces and pressures are distributed by the actual
 tributary area of each node (corner/edge/interior nodes get their proper share),
@@ -871,7 +883,7 @@ number.
   converge — ignore those peaks; use nominal stress away from them.
 - **Rigid Fixed supports** over-stiffen and create edge stress singularities;
   prefer Elastic (Winkler) support for realistic mounts.
-- **Penalty constraints** (frictionless/displacement/elastic) admit a small,
+- **Penalty constraints** (frictionless/displacement/cylindrical/elastic) admit a small,
   bounded constraint violation (validated < 3% on patch tests).
 - **Resolution cap** of 4 M cells; very large or very thin-walled parts may be
   under-resolved at the chosen preset.

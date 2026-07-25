@@ -22,6 +22,9 @@ export const BC_COLORS: Record<string, THREE.Color> = {
   fixed: new THREE.Color(0x2563eb),
   frictionless: new THREE.Color(0x0e9cbf),
   displacement: new THREE.Color(0x7c3aed),
+  // Deep petrol — reads as a support (cool) but never confuses with the lighter
+  // frictionless cyan next to it in the roster.
+  cylindrical: new THREE.Color(0x0b7285),
   elastic: new THREE.Color(0x1f9d6b),
   force: new THREE.Color(0xd93025),
   pressure: new THREE.Color(0xc97b10),

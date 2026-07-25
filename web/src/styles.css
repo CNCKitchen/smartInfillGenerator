@@ -32,10 +32,6 @@
   --green: #2e7d46; /* status lamp */
   --red: #b3361c;
   --amber: #c97b10;
-  --lcd-bg: #20241f; /* readout windows */
-  --lcd: #c9e89b;
-  --lcd-hero: #b7e37e;
-  --lcd-dim: #7e8f66;
   --strip: #26282a; /* machine status strip */
   --ui: "Barlow", "Segoe UI", system-ui, sans-serif;
   --cond: "Barlow Semi Condensed", var(--ui);
@@ -414,6 +410,13 @@ a.iconbtn:hover {
   gap: 8px;
 }
 
+/* The name takes the slack, so the value and the ⓘ stay together on the right
+   however long the label is. */
+.g-label > span:first-child {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
 .g-label b {
   font-family: var(--mono);
   font-size: 11.5px;
@@ -421,6 +424,35 @@ a.iconbtn:hover {
   letter-spacing: 0;
   font-weight: 400;
   text-transform: none;
+}
+
+/* "What is this?" glyph (InfoTip) at the end of a group label or section head.
+   One control per line, its explanation a pointer-rest away — the panels stay
+   instrument-dense instead of turning into documentation. */
+button.infotip {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  padding: 0;
+  border: 1px solid var(--line-strong);
+  border-radius: 50%;
+  background: var(--well);
+  color: var(--dim);
+  font-family: var(--ui);
+  font-size: 10px;
+  font-weight: 700;
+  font-style: italic;
+  line-height: 1;
+  letter-spacing: 0;
+  text-transform: none;
+  cursor: help;
+}
+
+button.infotip:hover:not(:disabled),
+button.infotip:focus-visible {
+  color: #fff;
+  background: var(--accent);
+  border-color: var(--accent);
 }
 
 /* Sub-section heading inside a step panel — sits between the panel title and
@@ -444,6 +476,81 @@ a.iconbtn:hover {
   letter-spacing: 0;
   font-weight: 400;
   text-transform: none;
+  color: var(--dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Foldable sub-section (Section.tsx): the head is the whole clickable strip,
+   the badge reports the section's state while it is folded. */
+.subsec {
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+}
+
+.subsec-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+button.sec-head {
+  flex: 1;
+  min-width: 0;
+  align-items: center;
+  padding: 0 0 5px;
+  background: none;
+  border: none;
+  border-bottom: 1px solid var(--line);
+  border-radius: 0;
+  text-align: left;
+}
+
+button.sec-head:hover:not(:disabled) {
+  border-color: var(--line-strong);
+  color: var(--accent-d);
+}
+
+.sec-head .t {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+/* Drawn, not typed: a ▾ glyph at this size renders as a hairline dash in
+   Barlow. Points right when folded, down when open. */
+.sec-head .caret {
+  flex: none;
+  width: 0;
+  height: 0;
+  margin-right: 3px;
+  border-left: 5px solid var(--faint);
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  transition: transform 0.12s ease;
+}
+
+.subsec.open > .subsec-head .caret {
+  transform: rotate(90deg);
+}
+
+button.sec-head:hover:not(:disabled) .caret {
+  border-left-color: var(--accent-d);
+}
+
+/* A section nested inside a section (step 5: Constraints) is subordinate to
+   the optimizer it belongs to — quieter head, no heavy rule. */
+.subsec .subsec button.sec-head {
+  font-size: 10.5px;
+  color: var(--dim);
+  border-bottom-style: dashed;
+}
+
+.subsec-body {
+  display: flex;
+  flex-direction: column;
+  gap: 13px;
 }
 
 .seg {
@@ -484,12 +591,36 @@ a.iconbtn:hover {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 10px;
+  /* A long label on one side used to wrap and shove its input a row lower
+     than its neighbour's. Bottom-align the two cells so the CONTROLS line up
+     whatever the labels do. */
+  align-items: end;
 }
 
 .toolrow {
   display: flex;
   gap: 6px;
   flex-wrap: wrap;
+}
+
+/* The crease-angle slider modifies the "Crease angle" button above it, so it
+   sits in that button's column of the source toggle rather than spanning the
+   row. Columns/gap mirror the two flex:1 buttons in .toolrow. Without the
+   toggle (no CAD faces) the wrapper is layout-transparent. */
+.segslider {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px;
+}
+
+.segslider > input[type="range"] {
+  grid-column: 2;
+  width: 100%;
+  min-width: 0;
+}
+
+.segslider-plain {
+  display: contents;
 }
 
 /* Add-BC buttons: a fixed 2-per-row grid (supports and loads each form 2×2). */
@@ -551,6 +682,12 @@ a.iconbtn:hover {
   flex: 1;
   white-space: nowrap;
   padding: 6px 8px;
+}
+
+/* A trailing "auto" in a toolrow modifies the input beside it — it is not an
+   equal partner, so it takes its label's width instead of half the row. */
+.toolrow button.tight {
+  flex: none;
 }
 
 .row {
@@ -737,6 +874,17 @@ input[type="number"] {
   text-decoration: underline;
 }
 
+/* An action that sits INSIDE a sentence ("… edit in ⚙ Settings"). It was
+   rendering as a full boxed button mid-line — it reads as a link. */
+button.linkbtn {
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--accent-d);
+  font: inherit;
+  text-decoration: underline;
+}
+
 /* boundary-condition rows */
 
 .bc {
@@ -905,6 +1053,28 @@ input[type="number"] {
 .forcerow.dispaxis input[type="checkbox"] {
   flex: none;
   margin: 0;
+}
+
+/* Cylindrical support: the local DOF locks (radial / tangential / axial) are
+   named, not single letters, and carry a fixed/free state instead of a value. */
+.forcerow.cyldof .flabel {
+  flex: 1;
+  width: auto;
+  font-family: inherit;
+  color: var(--ink);
+}
+
+.forcerow.cyldof .dofstate {
+  flex: none;
+  font-size: 11px;
+  font-family: var(--mono);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--dim);
+}
+
+.forcerow.cyldof .dofstate.on {
+  color: var(--ink);
 }
 
 .forcerow .fnum {
@@ -1747,11 +1917,21 @@ input[type="number"] {
   gap: 8px;
 }
 
+/* Caveat under a readout — why the number above is not the whole story
+   (e.g. SF_crit sitting on a stress riser). */
+.dro-note {
+  margin-top: 6px;
+  font-size: 10.5px;
+  line-height: 1.35;
+  color: var(--dim);
+}
+
 .dro-window {
-  background: var(--lcd-bg);
+  background: var(--well);
+  border: 1px solid var(--line);
   border-radius: 2px;
-  padding: 6px 10px;
-  box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.55);
+  padding: 5px 10px;
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.1);
   display: flex;
   align-items: baseline;
   justify-content: space-between;
@@ -1762,20 +1942,131 @@ input[type="number"] {
   font-family: var(--mono);
   font-size: 18px;
   font-weight: 700;
-  color: var(--lcd);
+  color: var(--ink);
   white-space: nowrap;
 }
 
 .dro-window span {
   font-family: var(--mono);
   font-size: 9.5px;
-  color: var(--lcd-dim);
+  color: var(--dim);
   letter-spacing: 0.06em;
   text-align: right;
 }
 
 .dro.hero .dro-window b {
-  color: var(--lcd-hero);
+  color: var(--accent-d);
+}
+
+/* A safety factor under 1 means the part fails under the load — the window
+   reads as an alarm lamp (tinted well, red bezel and digits) so it can't be
+   skimmed past as just another number. */
+.dro-window.alarm {
+  background: #f8ece8;
+  border-color: #ddb4a8;
+  box-shadow: inset 0 1px 3px rgba(140, 47, 24, 0.14);
+}
+
+.dro-window.alarm b,
+.dro.hero .dro-window.alarm b {
+  color: var(--red);
+}
+
+/* comparison instrument: max-deflection bars for the equal-mass uniform fill,
+   the optimized design, and 100 % solid — the "how much better / how far off"
+   readout of the results dock. */
+
+.cmpcard {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  padding: 9px 11px 10px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.cmp-head {
+  font-size: 11.5px;
+  color: var(--dim);
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.cmprow {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.cmp-line {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 11.5px;
+  color: var(--dim);
+}
+
+.cmp-line b {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--ink);
+  white-space: nowrap;
+}
+
+.cmp-line b.neg {
+  color: var(--red);
+  font-weight: 700;
+}
+
+.cmprow.me .cmp-line {
+  color: var(--ink);
+  font-weight: 500;
+}
+
+.cmp-bar {
+  height: 5px;
+  border-radius: 2px;
+  background: var(--well);
+  box-shadow: var(--inset);
+  overflow: hidden;
+}
+
+.cmp-bar i {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  background: var(--line-strong);
+}
+
+.cmprow.me .cmp-bar i {
+  background: var(--accent);
+}
+
+.cmp-notes {
+  border-top: 1px solid var(--line);
+  padding-top: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11.5px;
+  color: var(--dim);
+  line-height: 1.4;
+}
+
+.cmp-notes.noline {
+  border-top: none;
+  padding-top: 0;
+}
+
+.cmp-notes b {
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--ink);
 }
 
 .kv {
@@ -1795,10 +2086,77 @@ input[type="number"] {
   text-align: right;
 }
 
+/* Same alarm as .dro-window.alarm, for values that live in a key/value row
+   (a safety factor under 1). */
+.kv b.neg {
+  color: var(--red);
+  font-weight: 700;
+}
+
 .divider {
   border-top: 1px solid var(--line);
   margin: 2px 0;
 }
+
+/* ---------------- settings landscape (DESIGN §20 dec. 10) ----------------
+   Walls × infill grid of SOLVED candidates. Recessed like the other readouts;
+   unsolved cells keep the well tone so "not solved" never reads as "safe". */
+
+.landscape {
+  margin: 8px 0 2px;
+}
+
+.lmap {
+  display: grid;
+  gap: 1px;
+  background: var(--line);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r);
+  padding: 1px;
+  box-shadow: var(--inset);
+}
+
+.lcell {
+  aspect-ratio: 1;
+  min-height: 12px;
+  position: relative;
+}
+
+/* Lightest feasible infill for its wall count — the dec. 10 curve. */
+.lcell.light::after {
+  content: "";
+  position: absolute;
+  inset: 1px;
+  border: 1px solid rgba(38, 40, 42, 0.55);
+}
+
+.lcell.win::after {
+  content: "◎";
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  line-height: 1;
+  color: #14251a;
+}
+
+.laxis {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  color: var(--dim);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--panel);
+  padding: 0 3px;
+}
+
+.laxis.bottom {
+  padding-top: 2px;
+}
+
 
 .warnrow {
   font-size: 11.5px;
@@ -2141,6 +2499,14 @@ input[type="number"] {
 .extreme-dot.max {
   background: #ef4444;
 }
+/* Flipped-colormap fields (safety factor): the MIN is the critical/red end,
+   so the marker colors swap to match the surface plot. */
+.extreme-dot.min.flip {
+  background: #ef4444;
+}
+.extreme-dot.max.flip {
+  background: #3b82f6;
+}
 /* Interior extreme: hollow ring = the point sits INSIDE the part (shown only
    when the volumetric extreme beats the surface one). */
 .extreme-dot.interior {
@@ -2152,6 +2518,12 @@ input[type="number"] {
 }
 .extreme-chip.max {
   color: #c2330e;
+}
+.extreme-chip.min.flip {
+  color: #c2330e;
+}
+.extreme-chip.max.flip {
+  color: #1d5fc4;
 }
 .extreme-chip.interior {
   color: #c2330e;

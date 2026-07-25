@@ -138,7 +138,10 @@ rigid_deformable_nonrigidity	0.0004469232017166329	I
 rigid_mass_iters	26	I
 rigid_mass_residual	0.00000002003424377518562	I
 rigid_deformable_iters	7	I
-strength_sfcrit_solid	4.523165702819824	Q
-strength_rawmin_solid	4.515922546386719	Q
-strength_sfcrit_infill	0.743232011795044	Q
+strength_sfcrit_solid	4.515922546386719	Q
+strength_rawmin_solid	3.041984796524048	Q
+strength_sfcrit_infill	0.742041826248169	Q
+strength_sfcrit_excl	4.537606239318848	Q
+strength_excl_cells	64	Q
+strength_excl_radius_mm	2	Q
 strength_time_ms	297.9794	I

@@ -35,9 +35,14 @@ const SHOW_DELAY_MS = 400;
 export function HelpTip({
   help,
   children,
+  sticky = false,
 }: {
   help: HelpContent;
   children: ReactElement<Record<string, unknown>>;
+  /** Clicking the trigger toggles the card instead of dismissing it — for
+   *  controls whose ONLY job is to explain (the ⓘ glyph), where a click is a
+   *  request for the card, not an action that should get out of its way. */
+  sticky?: boolean;
 }) {
   const [anchor, setAnchor] = useState<DOMRect | null>(null);
   const timer = useRef(0);
@@ -52,6 +57,11 @@ export function HelpTip({
     window.clearTimeout(timer.current);
     setAnchor(null);
   };
+  const toggle = (e: SyntheticEvent) => {
+    const el = e.currentTarget as HTMLElement;
+    window.clearTimeout(timer.current);
+    setAnchor((a) => (a ? null : el.getBoundingClientRect()));
+  };
   const chain =
     (name: string, next: (e: SyntheticEvent) => void) =>
     (e: SyntheticEvent, ...rest: unknown[]) => {
@@ -65,7 +75,7 @@ export function HelpTip({
     onFocus: chain("onFocus", show),
     onBlur: chain("onBlur", hide),
     // The action happened — get the card out of the way.
-    onClick: chain("onClick", hide),
+    onClick: chain("onClick", sticky ? toggle : hide),
   });
 
   return (
@@ -73,6 +83,19 @@ export function HelpTip({
       {trigger}
       {anchor && createPortal(<HelpCard help={help} anchor={anchor} />, document.body)}
     </>
+  );
+}
+
+/** The "what is this?" glyph that sits at the end of a group label or section
+ *  head. Panels keep ONE short line per control — the paragraph that used to
+ *  live under it moves in here, a pointer-rest away. */
+export function InfoTip({ help }: { help: HelpContent }) {
+  return (
+    <HelpTip help={help} sticky>
+      <button type="button" className="infotip" aria-label={`About ${help.title}`}>
+        i
+      </button>
+    </HelpTip>
   );
 }
 

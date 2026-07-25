@@ -30,6 +30,27 @@ function boxStl(lo, hi) {
     const c = f.map(([x, y, z]) => v(x, y, z));
     tris.push([c[0], c[1], c[2]], [c[0], c[2], c[3]]);
   }
+  return stlBytes(tris);
+}
+
+// --- closed solid cylinder about +Z from z=0 (side wall + two capping fans) ---
+function cylinderStl(r, h, segs) {
+  const ring = (i, z) => {
+    const phi = (2 * Math.PI * (i % segs)) / segs;
+    return [r * Math.cos(phi), r * Math.sin(phi), z];
+  };
+  const tris = [];
+  for (let i = 0; i < segs; i++) {
+    const [a, b, c, d] = [ring(i, 0), ring(i + 1, 0), ring(i, h), ring(i + 1, h)];
+    tris.push([a, b, d], [a, d, c]);
+  }
+  for (let i = 0; i < segs; i++) tris.push([[0, 0, 0], ring(i + 1, 0), ring(i, 0)]);
+  for (let i = 0; i < segs; i++) tris.push([[0, 0, h], ring(i, h), ring(i + 1, h)]);
+  return stlBytes(tris);
+}
+
+/** Binary STL from a list of [p0, p1, p2] triangles (normals left zero). */
+function stlBytes(tris) {
   const buf = new ArrayBuffer(84 + 50 * tris.length);
   const dv = new DataView(buf);
   dv.setUint32(80, tris.length, true);
@@ -366,6 +387,51 @@ assert(report.ok === true, "elastic springs alone constrain the part");
 }
 console.log("ok: elastic foundation path solves");
 
+// Cylindrical support: the local radial / tangential / axial locks on a fitted
+// cylinder. Own model — a bore needs a cylindrical face, which the beam has not.
+{
+  const cm = new Model(cylinderStl(10, 20, 48), "shaft");
+  cm.set_material(2000, 0.3, 1.24, 50, 35);
+  cm.set_resolution(60_000);
+  const cpos = cm.positions();
+  const nc = cm.triangle_count();
+  const side = [];
+  const top = [];
+  for (let t = 0; t < nc; t++) {
+    const c = [0, 1, 2].map((d) => (cpos[9 * t + d] + cpos[9 * t + 3 + d] + cpos[9 * t + 6 + d]) / 3);
+    if (Math.abs(Math.hypot(c[0], c[1]) - 10) < 0.3) side.push(t);
+    else if (c[2] > 19.7) top.push(t);
+  }
+  const wall = new Uint32Array(side);
+  const cap = new Uint32Array(top);
+  assert(wall.length > 100 && cap.length > 20, `cylinder faces selected (${wall.length} wall tris)`);
+  const fit = JSON.parse(cm.fit_cylinder(wall));
+  assert(
+    fit.ok && Math.abs(fit.radius - 10) < 0.2 && Math.abs(Math.abs(fit.axis[2]) - 1) < 1e-3,
+    `side wall fits ⌀${(2 * fit.radius).toFixed(2)} about Z (residual ${fit.residual.toFixed(4)})`
+  );
+  // Journal-bearing default (radial + axial held, tangential free): the part can
+  // still turn about the bore axis, and the pre-solve check must say so.
+  cm.add_cylindrical(wall, true, false, true);
+  const spin = JSON.parse(cm.check());
+  assert(spin.ok === false, "tangential-free cylindrical support leaves the axial spin free");
+  const mode = spin.components[0].mode;
+  assert(
+    Math.abs(mode.r[2]) > 0.9 * Math.hypot(...mode.r),
+    "the reported free motion IS the rotation about the cylinder axis"
+  );
+  // All three held ≈ a fixed bore: fully constrained, and it solves.
+  cm.clear_bcs();
+  cm.add_cylindrical(wall, true, true, true);
+  cm.add_force(cap, 20, 0, -60);
+  assert(JSON.parse(cm.check()).ok === true, "all three local DOFs held constrains the part");
+  const cs = JSON.parse(cm.solve());
+  assert(cs.converged && cs.maxDisplacement > 0,
+    `cylindrical-support solve converges (max |u| ${cs.maxDisplacement.toFixed(4)} mm)`);
+  cm.free();
+}
+console.log("ok: cylindrical support (radial / tangential / axial locks)");
+
 // ---- as-printed verify: voxel snap + skin/infill solve ----
 model.clear_bcs();
 model.add_fixed(sel(0, "min"));
@@ -415,6 +481,152 @@ model.add_force(sel(0, "max"), 0, 0, -5);
   assert(worstOk, "sf = elementwise min(sfm, sfz)");
   assert(fmin(sfm) >= sfPrintedMin - 1e-6 && fmin(sfz) >= sfPrintedMin - 1e-6,
     `worst SF is the most conservative (m ${fmin(sfm).toFixed(1)}, z ${fmin(sfz).toFixed(1)}, worst ${sfPrintedMin.toFixed(1)})`);
+
+  // ---- DESIGN §20: BC singularity exclusion + Settings Optimizer ----
+  // The `…x` criterion fields carry the SAME values as their base field, with
+  // the zone around rigid supports NaN (the renderer's grey) — the plain field
+  // must stay untouched (dec. 7).
+  {
+    const sfx = model.result_field("sfx");
+    assert(sfx.length === sfPrinted.length, "criterion SF field has the base field's length");
+    let greyed = 0;
+    let sfxMin = Infinity;
+    for (const v of sfx) {
+      if (Number.isNaN(v)) greyed++;
+      else if (v < sfxMin) sfxMin = v;
+    }
+    assert(greyed > 0, `criterion SF greys the clamped face's zone (${greyed} samples)`);
+    // The criterion field is the SMOOTHED one the optimizers reduce — masked
+    // nodal recovery melts single-cell staircase spikes, so its minimum sits
+    // at or above the raw field's. (Equality would mean no smoothing ran.)
+    assert(sfxMin >= sfPrintedMin - 1e-4,
+      `criterion SF is smoothed: min ${sfxMin.toFixed(3)} >= raw min ${sfPrintedMin.toFixed(3)}`);
+    assert(sfx.every((v) => Number.isNaN(v) || (v > 0 && v <= 10)), "criterion SF stays in range");
+    assert(sfPrinted.every((v) => Number.isFinite(v)), "the plain SF field is never masked");
+    const sfmx = model.result_field("sfmx");
+    const sfzx = model.result_field("sfzx");
+    assert(sfmx.length === sfx.length && sfzx.length === sfx.length,
+      "material/layer criterion fields match in length");
+  }
+
+  // The search itself: lightest walls × infill that clears a target SF.
+  {
+    const t3 = performance.now();
+    let pushes = 0;
+    let axes = null;
+    let fields = 0;
+    const sweep = JSON.parse(model.settings_sweep(
+      JSON.stringify({
+        sfTarget: 2.0, sfMeasure: "both", exponent: 1.5, coeff: 1.0,
+        lineWidth: 0.45, layerHeight: 0.2,
+      }),
+      (json, field) => {
+        const p = JSON.parse(json);
+        if (p.phase === "begin") { axes = p; return; }
+        pushes++;
+        // Every candidate carries its own SF field for the live preview.
+        if (field && field.length === nTri * 3 && field.some((v) => Number.isFinite(v))) fields++;
+      }
+    ));
+    console.log(
+      `   settings sweep: ${sweep.solves} solves in ${((performance.now() - t3) / 1000).toFixed(1)} s, ` +
+      `winner ${sweep.winner?.wall} walls @ ${Math.round((sweep.winner?.density ?? 0) * 100)}% ` +
+      `= ${sweep.winner?.massGrams.toFixed(1)} g at SF ${sweep.winner?.sf.toFixed(2)} ` +
+      `(${sweep.excludedCells} cells excluded near supports)`);
+    assert(sweep.walls.length === 7 && sweep.densities.length === 13,
+      "landscape is the 7 × 13 walls/density grid (2–8 perimeters)");
+    assert(sweep.walls[0] === 2, "a single perimeter is never recommended");
+    assert(axes && axes.walls.length === 7 && axes.densities.length === 13,
+      "the axes arrive up front so the landscape can draw before any solve");
+    assert(fields === pushes, `every candidate pushed a live SF field (${fields}/${pushes})`);
+    assert(sweep.candidates.length > 0 && sweep.candidates.length < 91,
+      `search solved a subset, not the full map (${sweep.candidates.length})`);
+    assert(pushes === sweep.candidates.length, "one progress push per solved candidate");
+    assert(sweep.winner, "a winner is always delivered (best achievable when infeasible)");
+    assert(sweep.excludedCells > 0 && sweep.scoredCells > sweep.excludedCells,
+      "the clamped face is excluded from the criterion, the part is not");
+    // Top/bottom layers follow the walls: ceil(walls * lw / layerHeight).
+    for (const c of sweep.candidates) {
+      const want = Math.max(1, Math.ceil((c.wall * 0.45) / 0.2));
+      assert(c.topBottomLayers === want,
+        `shells ceil the wall thickness (${c.wall} walls → ${c.topBottomLayers}, want ${want})`);
+      assert(c.density >= 0.1 - 1e-9 && c.density <= 0.7 + 1e-9, "density stays in the 10–70 % band");
+    }
+    if (sweep.feasible) {
+      assert(sweep.winner.sf >= 2.0, "the delivered settings meet the target");
+      for (const c of sweep.candidates) {
+        assert(!(c.feasible && c.massGrams < sweep.winner.massGrams * 0.99),
+          "no lighter feasible candidate was passed over");
+      }
+    }
+    // DESIGN §20: the winner is left LIVE so it can be retained as a real,
+    // selectable result — and `criterion_sf` re-scores whatever is live
+    // WITHOUT re-assembling anything (the bug that made Apply drop the
+    // solution it had just verified).
+    const crit = JSON.parse(model.criterion_sf("both"));
+    assert(Math.abs(crit.sf - sweep.winner.sf) < 1e-6,
+      `criterion_sf reproduces the winner's SF (${crit.sf.toFixed(4)} vs ${sweep.winner.sf.toFixed(4)})`);
+    // §17 dec. 4 (2026-07-25): SF_crit IS the minimum of the criterion field —
+    // the 0.2 %-volume trim is gone, so there is no longer a second number to
+    // reconcile. `rawMin` must now equal `sf` exactly, on both call paths.
+    assert(Math.abs(crit.rawMin - crit.sf) < 1e-9,
+      `SF_crit is the field minimum, untrimmed (${crit.sf.toFixed(4)} vs ${crit.rawMin.toFixed(4)})`);
+    assert(Math.abs(crit.rawMin - sweep.rawMin) < 1e-6, "the sweep reports the same minimum");
+    assert(crit.riserRatio === null || crit.riserRatio >= 1 - 1e-6,
+      `the riser ratio is a climb away from the binding cell (${crit.riserRatio})`);
+    // …and plotting the CRITERION field must show that same minimum: the
+    // number and the picture come from one field (the deviation Stefan hit).
+    const sfxField = model.result_field("sfx");
+    let plotMin = Infinity;
+    for (const v of sfxField) if (Number.isFinite(v) && v < plotMin) plotMin = v;
+    assert(plotMin >= crit.sf - 1e-3,
+      `the plotted criterion minimum matches the reported one (${plotMin.toFixed(3)} vs ${crit.sf.toFixed(3)})`);
+    assert(crit.worst && Number.isFinite(crit.worst.x) && crit.worst.sf > 0,
+      "the criterion reports WHERE it binds (the pinned point)");
+    assert(sweep.worst && Math.abs(sweep.worst.sf - crit.worst.sf) < 1e-6,
+      "the sweep reports the same binding point as the live criterion");
+    assert(crit.excludedCells === sweep.excludedCells, "same exclusion either way");
+    // Reading a field must not disturb the live solution.
+    const sfLive = model.result_field("sf");
+    assert(sfLive.length === nTri * 3 && sfLive.every((v) => Number.isFinite(v)),
+      "the winner's own SF field is queryable — it IS a result");
+    const crit2 = JSON.parse(model.criterion_sf("both"));
+    assert(crit2.sf === crit.sf, "criterion_sf is read-only (repeatable)");
+
+    // Single-candidate verification path.
+    const verify = JSON.parse(model.settings_sweep(
+      JSON.stringify({
+        sfTarget: 2.0, sfMeasure: "both", exponent: 1.5, coeff: 1.0,
+        lineWidth: 0.45, layerHeight: 0.2, mode: "full",
+        walls: [sweep.winner.wall], densities: [sweep.winner.density],
+      }),
+      () => {}
+    ));
+    assert(verify.candidates.length === 1, "verification solves exactly one candidate");
+    assert(Math.abs(verify.candidates[0].sf - sweep.winner.sf) < 1e-6,
+      "re-measuring the winner on the same grid reproduces its SF");
+
+    // DESIGN §20 dec. 8, ceiling probe: an unreachable target must cost ONE
+    // solve — the strongest print in the band settles the whole question.
+    assert(sweep.ceilingStop === false, "a reachable target does not stop at the ceiling");
+    // (Band restricted so the ceiling is known to miss on THIS beam — the
+    // solve-budget claim itself is pinned by the core unit test.)
+    const hopeless = JSON.parse(model.settings_sweep(
+      JSON.stringify({
+        sfTarget: 9.5, sfMeasure: "both", exponent: 1.5, coeff: 1.0,
+        lineWidth: 0.45, layerHeight: 0.2, walls: [2], densities: [0.1],
+      }),
+      () => {}
+    ));
+    assert(!hopeless.feasible && hopeless.ceilingStop,
+      "an unreachable target stops on the ceiling probe");
+    assert(hopeless.candidates.length === 1,
+      `one solve settles it (${hopeless.candidates.length})`);
+    assert(hopeless.winner && hopeless.winner.sf < 9.5,
+      "the probe is delivered as the best achievable, not an error");
+    console.log(`   ceiling probe: target 9.5 refused after ${hopeless.candidates.length} solve ` +
+      `(best ${hopeless.bestSf.toFixed(2)})`);
+  }
 
   // Voxel mesh with element density + voxel-true section cut: skin cells
   // carry 1.0, exposed interior cells the uniform infill ratio (25%).

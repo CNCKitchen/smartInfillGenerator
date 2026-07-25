@@ -12,8 +12,12 @@ import type {
   EngineWorkerMessage,
   LoadedModelData,
   Op,
+  CriterionSfResult,
   OrientationSweepResult,
   SectionVolume,
+  SettingsSweepOptions,
+  SettingsSweepProgress,
+  SettingsSweepResult,
   SweepProgress,
 } from "./EngineProtocol";
 
@@ -229,6 +233,7 @@ export class EngineClient {
       stiffness: bc.stiffness,
       axes: bc.axes,
       disp: bc.disp,
+      cylDof: bc.cylDof,
       moment: bc.moment,
       accel: bc.accel,
       massGrams: bc.massGrams,
@@ -335,6 +340,30 @@ export class EngineClient {
       [],
       onProgress ? (data: unknown) => onProgress(data as SweepProgress) : undefined
     );
+  }
+
+  /** Settings Optimizer sweep (DESIGN §20): the lightest uniform print
+   *  settings that still clear the safety-factor target. `onProgress` fires
+   *  once per solved candidate. */
+  settingsSweep(
+    opts: SettingsSweepOptions,
+    onProgress?: (p: SettingsSweepProgress, field?: Float32Array) => void
+  ): Promise<SettingsSweepResult> {
+    return this.call(
+      { op: "settingsSweep", opts },
+      [],
+      onProgress
+        ? (data: unknown, field?: Float32Array) =>
+            onProgress(data as SettingsSweepProgress, field)
+        : undefined
+    );
+  }
+
+  /** Criterion SF (DESIGN §17 dec. 4 + §20 dec. 5) of whatever result is LIVE,
+   *  plus where it binds. Read-only: no solve, no BC push, nothing invalidated
+   *  — so it can verify a delivery without destroying the result it measures. */
+  criterionSf(measure: "material" | "layer" | "both"): Promise<CriterionSfResult> {
+    return this.call({ op: "criterionSf", measure });
   }
 
   /** Per-vertex layer-adhesion SF for one build direction — the heatmap
@@ -715,8 +744,9 @@ export interface OptimizeOptions {
   solidPattern: string | null;
   /** "budget" = stiffest at the given mean infill; "match" = lightest design
    *  as stiff as a uniform print at budgetPct (secant on the budget);
-   *  "strength" = lightest design whose trimmed-percentile safety factor
-   *  meets `sfTarget` on every included load step (DESIGN §17). */
+   *  "strength" = lightest design whose safety-factor criterion SF_crit (the
+   *  lowest smoothed scored cell) meets `sfTarget` on every included load
+   *  step (DESIGN §17). */
   goal: "budget" | "match" | "strength";
   /** Strength goal: required SF_crit (advisory design aid — §17 dec. 8). */
   sfTarget?: number;
@@ -841,6 +871,10 @@ export interface OptSummary {
   /** Volume share of the binding region in SKIN cells: ≳0.5 reads
    *  "skin-limited — infill can't fix this", else "interior at cap". */
   bindingSkinShare?: number;
+  /** Cells the BC singularity exclusion took OUT of the criterion (§20 dec.
+   *  5/7) — > 0 means the binding view should show the greyed criterion
+   *  field, and that the number ignores the clamp corner on purpose. */
+  bcExcludedCells?: number;
   sfTrace?: { budget: number; sf: number }[];
   // ---- match mode only ----
   /** Reference uniform infill the stiffness was matched to (percent). */

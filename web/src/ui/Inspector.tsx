@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
 
-// Results dock: DRO-style readout windows. Optimization results take
-// precedence; an as-printed verify solve gets its own readouts (mass at the
-// print settings, deflection, min safety factor). Empty instrument = hidden.
+// Results dock: DRO-style readout windows for the SELECTED result — outcomes
+// only (deflection first, then how the design compares). The settings a result
+// was computed with live on the provenance card in the viewport, not here.
+// An as-printed entry gets the printed dock even while an optimization exists;
+// optimized / uniform / solid entries get the optimizer dock.
 
 import { useShallow } from "zustand/shallow";
 import { useStore } from "../store";
@@ -17,27 +19,43 @@ export function Inspector() {
       printedStats: s.printedStats,
       stats: s.stats,
       hasResult: s.hasResult,
+      results: s.results,
+      activeResultId: s.activeResultId,
     }))
   );
+  const entry = s.results.find((r) => r.id === s.activeResultId);
+  if (entry?.kind === "asprinted" && s.printedStats) return <PrintedResults />;
   if (s.optSummary) return <OptResults />;
   if (s.printedStats && s.stats && s.hasResult) return <PrintedResults />;
   return null;
 }
 
-/** Dock after "Solve once · As printed": the part at today's print settings. */
+/** Dock for "Solve once · As printed": the part at today's print settings. */
 function PrintedResults() {
   const s = useStore(
     useShallow((s) => ({
       printedStats: s.printedStats,
       stats: s.stats,
       material: s.material,
+      results: s.results,
+      activeResultId: s.activeResultId,
       unitRev: s.unitRev,
     }))
   );
   const p = s.printedStats!;
-  const stats = s.stats!;
-  const [defl, deflUnit] = fmtDispParts(stats.maxDisplacement);
-  const [mass, massUnit] = formatParts(p.massGrams, "mass");
+  // Prefer the selected as-printed entry (a load step or the worst-case
+  // envelope) over the last solve's live stats, so switching results in the
+  // viewer switches these readouts with it.
+  const active = s.results.find((r) => r.id === s.activeResultId);
+  const entry = active?.kind === "asprinted" ? active : undefined;
+  const maxDisp = entry?.maxDisplacement ?? s.stats?.maxDisplacement;
+  if (maxDisp == null) return null;
+  const converged = entry ? entry.converged : s.stats?.converged ?? true;
+  const minSf = entry ? entry.minSf : p.minSf;
+  const massGrams = entry?.massGrams ?? p.massGrams;
+  const multiStep = s.results.filter((r) => r.kind === "asprinted").length > 1;
+  const [defl, deflUnit] = fmtDispParts(maxDisp);
+  const [mass, massUnit] = formatParts(massGrams, "mass");
   return (
     <aside className="inspector" aria-label="Results">
       <div className="i-head">
@@ -45,34 +63,28 @@ function PrintedResults() {
         <span>as printed</span>
       </div>
 
-      {!stats.converged && (
+      {!converged && (
         <div className="warnbanner">
-          ⚠ <b>Solve did not converge.</b> It stopped at the {stats.iterations}-iteration cap with
-          relative residual {stats.relResidual.toExponential(1)} (target{" "}
-          {(stats.tol ?? 1e-5).toExponential(0)}). The deflection, stress and safety-factor numbers
-          below are an <b>unconverged approximation</b> — treat them as indicative only. A coarser
-          mesh (Preview / Normal) converges reliably and is usually just as accurate for homogenized
-          infill.
+          ⚠ <b>Solve did not converge.</b>{" "}
+          {s.stats && !s.stats.converged ? (
+            <>
+              It stopped at the {s.stats.iterations}-iteration cap with relative residual{" "}
+              {s.stats.relResidual.toExponential(1)} (target {(s.stats.tol ?? 1e-5).toExponential(0)}
+              ).{" "}
+            </>
+          ) : (
+            <>It stopped at the iteration cap. </>
+          )}
+          The numbers below are an <b>unconverged approximation</b> — treat them as indicative only.
+          A coarser mesh (Preview / Normal) converges reliably and is usually just as accurate for
+          homogenized infill.
         </div>
       )}
 
-      <div className="dro">
-        <div className="dro-label">
-          <span>Mass</span>
-          <span>
-            of {format(p.massSolidGrams, "mass")} solid ·{" "}
-            {Math.round((100 * p.massGrams) / Math.max(p.massSolidGrams, 1e-9))} %
-          </span>
-        </div>
-        <div className="dro-window">
-          <b>{mass}</b>
-          <span>{massUnit}</span>
-        </div>
-      </div>
-
-      <div className="dro">
+      <div className="dro hero">
         <div className="dro-label">
           <span>Max deflection</span>
+          {multiStep && entry && <span>{entry.loadStepName}</span>}
         </div>
         <div className="dro-window">
           <b>{defl}</b>
@@ -80,7 +92,7 @@ function PrintedResults() {
         </div>
       </div>
 
-      <div className="dro hero">
+      <div className="dro">
         <div className="dro-label">
           <span>Min safety factor</span>
           <span>
@@ -94,37 +106,37 @@ function PrintedResults() {
                 : `σₜ ${format(s.material.strength, "stress")} / σₜᶻ ${format(s.material.strengthZ, "stress")}`}
           </span>
         </div>
-        <div className="dro-window">
-          <b>{p.minSf !== null ? p.minSf.toFixed(2) : "—"}</b>
+        {/* Below 1 the part does not hold the load — red, not a plain digit. */}
+        <div className={minSf !== null && minSf < 1 ? "dro-window alarm" : "dro-window"}>
+          <b>{minSf !== null ? minSf.toFixed(2) : "—"}</b>
           <span>×</span>
+        </div>
+        {/* §17 dec. 4 (2026-07-25): this IS the optimizers' number — the
+            criterion's lowest scored cell, not the raw surface minimum — so
+            the dock can confirm or refute a goal instead of contradicting it.
+            When it rides a notch tip, say so where it is read. */}
+        {p.sfRiser != null && p.sfRiser > 1.6 && (
+          <div className="dro-note">
+            on a sharp stress riser ({p.sfRiser.toFixed(1)}× safer one cell away) — a finer mesh
+            will report less
+          </div>
+        )}
+      </div>
+
+      <div className="dro">
+        <div className="dro-label">
+          <span>Mass</span>
+          <span>
+            of {format(p.massSolidGrams, "mass")} solid ·{" "}
+            {Math.round((100 * (massGrams ?? p.massGrams)) / Math.max(p.massSolidGrams, 1e-9))} %
+          </span>
+        </div>
+        <div className="dro-window">
+          <b>{mass}</b>
+          <span>{massUnit}</span>
         </div>
       </div>
 
-      <div className="divider" />
-      <div className="kv">
-        <span>Print settings</span>
-        <b>
-          {p.perimeters} × {format(p.lineWidth, "length")} · {p.infillPct}% {p.pattern}
-        </b>
-      </div>
-      <div className="kv">
-        <span>Skin resolution</span>
-        <b>
-          {p.compositeSkin
-            ? `${p.skinLayers.toFixed(2)} layers · composite`
-            : `${p.skinLayers} cell layer${p.skinLayers === 1 ? "" : "s"}`}
-        </b>
-      </div>
-      <div className="kv">
-        <span>{stats.converged ? "Solved" : "Stopped at cap"}</span>
-        <b>
-          {stats.iterations} it · {stats.seconds.toFixed(1)} s
-        </b>
-      </div>
-      <div className="kv">
-        <span>Advisory</span>
-        <b>homogenized infill · static linear</b>
-      </div>
       {!p.compositeSkin && p.skinLayers === 1 && (
         <div className="warnrow">
           The wall is one voxel layer at this resolution — coarse. Raise the resolution in
@@ -139,7 +151,9 @@ function OptResults() {
   const s = useStore(
     useShallow((s) => ({
       optSummary: s.optSummary,
-      budget: s.budget,
+      optMinSf: s.optMinSf,
+      results: s.results,
+      activeResultId: s.activeResultId,
       unitRev: s.unitRev,
       setResultField: s.setResultField,
       setLegendRange: s.setLegendRange,
@@ -151,24 +165,83 @@ function OptResults() {
   const stiff = Math.round(o.stiffnessVsSolid * 100);
   const gain = (o.gainVsUniform * 100).toFixed(1);
   const uniformPct = Math.round(o.meanInfill * 100);
-  // Solid topology: the comparison is against the SAME material spread evenly
-  // (not a uniform infill %); the win is the optimized layout at equal mass.
-  const uniformLabel = solid
-    ? "vs material spread evenly, same weight"
-    : `vs ${uniformPct} % uniform, same weight`;
   const isMatch = o.goal === "match" && o.massUniformRefGrams != null;
   const isStrength = o.goal === "strength";
   const saved = isMatch ? 1 - o.massGrams / o.massUniformRefGrams! : 0;
-  const [defl, deflUnit] = fmtDispParts(o.maxDisplacement);
+  // The deflection readout follows the SELECTED result (an optimized load step,
+  // the envelope, or one of the baselines); the comparison card below always
+  // holds the optimizer's primary-load trio.
+  const active = s.results.find((r) => r.id === s.activeResultId);
+  const entry =
+    active && (active.kind === "optimized" || active.kind === "uniform" || active.kind === "solid")
+      ? active
+      : undefined;
+  const multiStep = s.results.filter((r) => r.kind === "optimized").length > 1;
+  const deflSub =
+    entry && entry.kind !== "optimized"
+      ? entry.label
+      : entry && multiStep
+        ? entry.loadStepName
+        : undefined;
+  const [defl, deflUnit] = fmtDispParts(entry?.maxDisplacement ?? o.maxDisplacement);
+  const hasBars = !!o.hasBaselines && o.uniformMaxDisp != null && o.solidMaxDisp != null;
   // One-click binding view (DESIGN §17 dec. 6): the SF field of the run's
   // measure, banded in two colors with the boundary AT the target — every
   // red cell is below the required safety factor.
   const showSfView = () => {
-    const field = o.sfMeasure === "material" ? "sfm" : o.sfMeasure === "layer" ? "sfz" : "sf";
+    const base = o.sfMeasure === "material" ? "sfm" : o.sfMeasure === "layer" ? "sfz" : "sf";
+    // DESIGN §20 dec. 7: when the run excluded a support's singularity zone,
+    // show the CRITERION's view — that zone greyed — so the red cells are
+    // exactly the ones the goal was unable to fix. Never hidden silently: the
+    // plain field is one pick away in the field chip.
+    const field = (o.bcExcludedCells ?? 0) > 0 ? `${base}x` : base;
     void s.setResultField(field);
     s.setLegendRange(0, 2 * (o.sfTarget ?? 2));
     s.setBandCount(2);
   };
+
+  const bars = hasBars
+    ? [
+        {
+          key: "uniform",
+          name: `Uniform ${uniformPct} %`,
+          mass: o.massGrams,
+          d: o.uniformMaxDisp!,
+          me: false,
+        },
+        { key: "opt", name: "Optimized", mass: o.massGrams, d: o.maxDisplacement, me: true },
+        { key: "solid", name: "Solid 100 %", mass: o.massSolidGrams, d: o.solidMaxDisp!, me: false },
+      ]
+    : [];
+  const barMax = Math.max(...bars.map((b) => b.d), 1e-12);
+
+  // Efficiency = stiffness per unit weight, solid = 100 %. Derived from the
+  // summary's compliance ratios: optimized is stiffnessVsSolid at massFrac of
+  // the weight; the equal-mass uniform fill is (1 + gainVsUniform)× softer at
+  // that same weight. No extra solves involved.
+  const effOpt = o.stiffnessVsSolid / Math.max(o.massFrac, 1e-9);
+  const effUni = effOpt / (1 + o.gainVsUniform);
+  const effRows = [
+    {
+      key: "uniform",
+      name: solid ? "Even spread" : `Uniform ${uniformPct} %`,
+      e: effUni,
+      me: false,
+    },
+    { key: "opt", name: "Optimized", e: effOpt, me: true },
+    { key: "solid", name: "Solid 100 %", e: 1, me: false },
+  ];
+  const effMax = Math.max(...effRows.map((r) => r.e), 1e-12);
+
+  // Min safety factor per design: min over the part, worst load step for the
+  // optimized design; the baselines exist under the primary load only. The SF
+  // fields are capped at 10 in the engine, so at-cap reads "≥ 10".
+  const sfRows = [
+    { key: "uniform", name: `Uniform ${uniformPct} %`, v: s.optMinSf?.uniform, me: false },
+    { key: "opt", name: "Optimized", v: s.optMinSf?.optimized, me: true },
+    { key: "solid", name: "Solid 100 %", v: s.optMinSf?.solid, me: false },
+  ].filter((r) => r.v != null);
+  const sfLabel = (sf: number) => (sf >= 10 ? "≥ 10" : `${sf.toFixed(2)} ×`);
 
   return (
     <aside className="inspector" aria-label="Results">
@@ -209,7 +282,7 @@ function OptResults() {
         </div>
       )}
 
-      {isStrength ? (
+      {isStrength && (
         <div className="dro hero">
           <div className="dro-label">
             <span>
@@ -225,12 +298,13 @@ function OptResults() {
                   : "material & layer adhesion"}
             </span>
           </div>
-          <div className="dro-window">
+          <div className={(o.sfAchieved ?? 0) < 1 ? "dro-window alarm" : "dro-window"}>
             <b>{(o.sfAchieved ?? 0).toFixed(2)}</b>
             <span>× SF</span>
           </div>
         </div>
-      ) : isMatch ? (
+      )}
+      {isMatch && (
         <div className="dro hero">
           <div className="dro-label">
             <span>vs {Math.round(o.refUniformPct!)} % uniform, same stiffness</span>
@@ -244,15 +318,104 @@ function OptResults() {
             <span>% WEIGHT</span>
           </div>
         </div>
+      )}
+
+      <div className={isStrength || isMatch ? "dro" : "dro hero"}>
+        <div className="dro-label">
+          <span>Max deflection</span>
+          {deflSub && <span>{deflSub}</span>}
+        </div>
+        <div className="dro-window">
+          <b>{defl}</b>
+          <span>{deflUnit}</span>
+        </div>
+      </div>
+
+      {hasBars ? (
+        <div className="cmpcard">
+          <div className="cmp-head">
+            <span>How it compares</span>
+            <span>max deflection{multiStep ? " · primary load" : ""}</span>
+          </div>
+          {bars.map((b) => (
+            <div key={b.key} className={b.me ? "cmprow me" : "cmprow"}>
+              <div className="cmp-line">
+                <span>
+                  {b.name} · {format(b.mass, "mass")}
+                </span>
+                <b>{fmtDispParts(b.d).join(" ")}</b>
+              </div>
+              <div className="cmp-bar">
+                <i style={{ width: `${Math.max(2, (100 * b.d) / barMax)}%` }} />
+              </div>
+            </div>
+          ))}
+          <div className="cmp-notes">
+            <div>
+              <b>+{gain} %</b> stiffer than {uniformPct} % uniform at the same weight
+            </div>
+            <div>
+              <b>{stiff} %</b> of solid stiffness at {Math.round(o.massFrac * 100)} % of the weight
+            </div>
+          </div>
+        </div>
       ) : (
-        <div className="dro hero">
-          <div className="dro-label">
-            <span>{uniformLabel}</span>
+        // Part Topo (solid-topology) runs have no baseline solves to plot —
+        // the comparison collapses to its two takeaway lines.
+        <div className="cmpcard">
+          <div className="cmp-head">
+            <span>How it compares</span>
           </div>
-          <div className="dro-window">
-            <b>+{gain}</b>
-            <span>% STIFFER</span>
+          <div className="cmp-notes noline">
+            <div>
+              <b>+{gain} %</b> stiffer than{" "}
+              {solid ? "the same material spread evenly" : `${uniformPct} % uniform`} at the same
+              weight
+            </div>
+            <div>
+              <b>{stiff} %</b> of solid stiffness at {Math.round(o.massFrac * 100)} % of the weight
+            </div>
           </div>
+        </div>
+      )}
+
+      <div className="cmpcard">
+        <div className="cmp-head">
+          <span>Efficiency</span>
+          <span>stiffness ÷ weight · solid = 100 %</span>
+        </div>
+        {effRows.map((r) => (
+          <div key={r.key} className={r.me ? "cmprow me" : "cmprow"}>
+            <div className="cmp-line">
+              <span>{r.name}</span>
+              <b>{Math.round(100 * r.e)} %</b>
+            </div>
+            <div className="cmp-bar">
+              <i style={{ width: `${Math.max(2, (100 * r.e) / effMax)}%` }} />
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {sfRows.length > 0 && (
+        <div
+          className="cmpcard"
+          title="Min over the part; the optimized design takes its worst load step, the baselines were solved under the primary load. Advisory — preset/measured strengths with Gibson–Ashby scaling."
+        >
+          <div className="cmp-head">
+            <span>Safety factor</span>
+            <span>worst case · min SF</span>
+          </div>
+          {sfRows.map((r) => (
+            <div key={r.key} className={r.me ? "cmprow me" : "cmprow"}>
+              <div className="cmp-line">
+                <span>
+                  {r.name} · {r.v!.governs === "layer" ? "layer adhesion" : "material"}
+                </span>
+                <b className={r.v!.minSf < 1 ? "neg" : ""}>{sfLabel(r.v!.minSf)}</b>
+              </div>
+            </div>
+          ))}
         </div>
       )}
 
@@ -269,19 +432,9 @@ function OptResults() {
         </div>
       </div>
 
-      <div className="dro">
-        <div className="dro-label">
-          <span>Max deflection</span>
-        </div>
-        <div className="dro-window">
-          <b>{defl}</b>
-          <span>{deflUnit}</span>
-        </div>
-      </div>
-
-      <div className="divider" />
       {isStrength && (
         <>
+          <div className="divider" />
           <div className="kv">
             <span>SF at 100 % fill (cap)</span>
             <b>{(o.sfBest ?? 0).toFixed(2)} ×</b>
@@ -301,36 +454,6 @@ function OptResults() {
             </b>
           </div>
         </>
-      )}
-      {isMatch && (
-        <div className="kv">
-          <span>vs {uniformPct} % uniform, same weight</span>
-          <b>+{gain} %</b>
-        </div>
-      )}
-      <div className="kv">
-        <span>Stiffness vs 100 % solid</span>
-        <b>{stiff} %</b>
-      </div>
-      <div className="kv">
-        <span>{solid ? "Retained volume" : "Infill levels"}</span>
-        <b>
-          {solid
-            ? `${uniformPct} %`
-            : `${o.bins.map((b) => `${Math.round(b.density * 100)}`).join(" · ")} %`}
-        </b>
-      </div>
-      <div className="kv">
-        <span>{o.converged ? "Converged" : "Stopped at cap"}</span>
-        <b>
-          {o.iterations} it{o.passes > 1 ? ` · ${o.passes} passes` : ""} · {o.seconds.toFixed(1)} s
-        </b>
-      </div>
-      {Math.abs(o.targetInfill * 100 - s.budget) > 0.5 && (
-        <div className="kv">
-          <span>Target clamped (printable band)</span>
-          <b>{Math.round(o.targetInfill * 100)} %</b>
-        </div>
       )}
 
       {isMatch && Math.abs(o.matchDeviation ?? 0) > 0.02 && (

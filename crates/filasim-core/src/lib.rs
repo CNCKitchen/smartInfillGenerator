@@ -28,6 +28,7 @@ pub mod progress;
 pub mod rigid;
 pub mod segment;
 pub mod selfsupport;
+pub mod settings;
 pub mod simp;
 pub mod solve;
 pub mod strength;

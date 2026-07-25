@@ -201,7 +201,7 @@ impl LoadSet {
 /// constrained-zeroed (the caller zeros the full RHS). Matches the `assemble`
 /// self-weight lumping exactly, so the optimizer's load agrees with the
 /// verification solve. Remote masses are design-independent and NOT here.
-fn self_weight_rhs(grid: &VoxelGrid, body: BodyAccel, vfrac: &[f32]) -> Vec<f64> {
+pub(crate) fn self_weight_rhs(grid: &VoxelGrid, body: BodyAccel, vfrac: &[f32]) -> Vec<f64> {
     let (nx, ny, nz) = (grid.nx, grid.ny, grid.nz);
     let (mx, my) = (nx + 1, ny + 1);
     let h = grid.h;

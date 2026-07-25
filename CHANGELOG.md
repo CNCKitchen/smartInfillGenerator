@@ -10,6 +10,17 @@ compatibility or simulation results; patch releases are fixes only.
 ## [Unreleased]
 
 ### Added
+- **Cylindrical support**: pick a bore or shaft seat and hold it in its own
+  frame — radial, tangential and axial each free or fixed. The selection is
+  fitted to a cylinder (same check and CAD-exact axis as the bearing load) and
+  every attached node gets stiff penalty springs along the locked local
+  directions, so a full bore is held toward its own centre everywhere. Defaults
+  to radial + axial fixed with tangential free — a journal bearing or a
+  bolted-through hole; the axial spin stays a real free rigid-body mode that the
+  pre-solve check reports instead of being quietly locked. All three fixed is a
+  press fit and is identical to a three-axis displacement support. The viewport
+  draws the fitted axis (with end stops when axial is held) through the support
+  cones.
 - CAD-style capped section view: the section plane closes the cut with a solid
   cap (distinct clay cut-face color) instead of exposing a hollow interior; the
   cap also covers the voxel-result surface, which previously had no cap at all.
@@ -34,6 +45,12 @@ compatibility or simulation results; patch releases are fixes only.
   mesh.
 
 ### Fixed
+- Reorienting the part (rotate, place-on-face, rescale) left the cached cylinder
+  fit of a cylindrical support or a bearing load behind, so its axis glyph and
+  bore-fan drew at the old pose while the part had moved. The cached fit now
+  moves with the part. The CONSTRAINT and the load were never affected — the
+  engine re-fits the cylinder from the current triangles on every assembly, which
+  a rotated-pose invariance test now locks down.
 - Section cap was invisible when the cut was viewed from the removed side
   (one-sided cap quad was back-face culled), which made a sectioned part look
   hollow.

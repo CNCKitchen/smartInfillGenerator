@@ -27,7 +27,7 @@ Reference points:
 | 2 | Discretization | **Voxel grid** from **fast winding-number voxelization** (robust to triangle soup: holes, self-intersections, non-manifold). Matrix-free FEA with geometric multigrid. No tet meshing. |
 | 3 | Input formats | **STL + 3MF in v1. STEP added 2026-06 via the `truck` CAD kernel** (Apache-2.0, pure-Rust → wasm-clean; OpenCASCADE was rejected — LGPL breaks the commercial-exception model, see #14). truck parses the BREP exactly and tessellates it; BREP faces are preserved as one-click selectable surfaces (the segmentation "CAD faces" source). **Known truck limitation:** its tessellation can TWIST trimmed periodic faces (cylinders) and emits developable-surface slivers — display artifacts only (the mesh is voxelized, so analysis is unaffected). We mitigate the slivers with longest-edge/aspect refinement, but the twist made it unshippable, so **STEP import is DEACTIVATED in the build as of 2026-06** — all code stays behind the `step` cargo feature; re-enable via `web/scripts/build-wasm.mjs` (add `step` to `--features`) + restore the `.step/.stp` accept lists in the UI. See §9. |
 | 4 | Surface selection | **Auto-segmentation** (region-growing across edges with dihedral angle < ~30°, slider-adjustable) makes CAD-derived patches one-click selectable. **Brush/lasso + click-to-grow fallback** for organic meshes. |
-| 5 | Loads & BCs (v1) | Fixed support, **elastic support** (Winkler foundation, bedding modulus k in N/mm³, σ = k·u — area-consistent axis springs per node; added 2026-06 because rigid Fixed patches artificially stiffen the part and produce edge stress singularities), **displacement support** (enforce any subset of the global X/Y/Z axes via stiff axis penalty springs — a roller/slider; `[true;3]` ≈ Fixed; added 2026-06. **2026-06: per-axis PRESCRIBED VALUE in mm** — 0 = the classic pin-to-zero, a non-zero value is an enforced motion (e.g. 1 mm in X), applied as an equivalent `k·value` penalty force so it rides the force RHS path and never invalidates the cached matrix; per-axis activate/deactivate + a value, since 0 ≠ off), surface force (total N over patch, defined as **X/Y/Z components OR a direction + magnitude**; the direction defaults to the selection's area-weighted average normal and is re-aimable by clicking a triangle on the model), pressure, gravity/self-weight, **frictionless support** (renamed 2026-06 from "slide"). *Note: frictionless on arbitrary (non-axis-aligned) patches via penalty/transformed constraints along averaged patch normal.* |
+| 5 | Loads & BCs (v1) | Fixed support, **elastic support** (Winkler foundation, bedding modulus k in N/mm³, σ = k·u — area-consistent axis springs per node; added 2026-06 because rigid Fixed patches artificially stiffen the part and produce edge stress singularities), **displacement support** (enforce any subset of the global X/Y/Z axes via stiff axis penalty springs — a roller/slider; `[true;3]` ≈ Fixed; added 2026-06. **2026-06: per-axis PRESCRIBED VALUE in mm** — 0 = the classic pin-to-zero, a non-zero value is an enforced motion (e.g. 1 mm in X), applied as an equivalent `k·value` penalty force so it rides the force RHS path and never invalidates the cached matrix; per-axis activate/deactivate + a value, since 0 ≠ off), surface force (total N over patch, defined as **X/Y/Z components OR a direction + magnitude**; the direction defaults to the selection's area-weighted average normal and is re-aimable by clicking a triangle on the model), pressure, gravity/self-weight, **frictionless support** (renamed 2026-06 from "slide"), **cylindrical support** (added 2026-07-25 — a cylindrical selection constrained in its OWN frame: radial / tangential / axial each free or fixed, penalty springs along the local directions of the fitted cylinder — the same fit the bearing load uses. Default radial+axial fixed, tangential free = a journal bearing / bolted-through hole; all three fixed = a press fit (≈ Fixed on a bore). Tangential-free deliberately leaves the axial spin as a real rigid-body mode for the §6 check to report rather than quietly locking it). *Note: frictionless on arbitrary (non-axis-aligned) patches via penalty/transformed constraints along averaged patch normal.* |
 | 6 | Under-constraint check | Pre-solve: rank test of the 6 rigid-body modes against the constraint set + connected-component (floating island) check. On failure: **block the run and animate the offending rigid-body motion** so the user sees what's unconstrained. |
 | 7 | Material model | **Walls + infill core.** Boundary voxels get solid-material skin stiffness (wall count × line width; defaults 2 × 0.45 mm, plus top/bottom shells). Interior voxels get per-pattern Gibson-Ashby law **E(ρ) = E₀ · c · ρⁿ**. |
 | 8 | Optimization | **Continuous SIMP-style compliance minimization** under mass constraint using the *physical* E(ρ) (no artificial penalization — graded infill is the one case where intermediate density is printable). Optimality-criteria updates, ~50–100 multigrid solves. Then discretize to bins → **final verification solve** with binned densities + walls → report. |
@@ -174,7 +174,7 @@ Reference points:
   prior numerical behavior (`d = 0`/off ≡ before, and coarse meshes where `2r < 1.6`
   cells are unchanged); the 8-cell cap bounds the explicit filter's `(2r+1)³` stencil
   cost (the filter build uses a dense cell→slot array so even the capped radius stays
-  cheap). **Default `d` = 2× line width** (a true smallest printable rib), exposed as
+  cheap). **Default `d` = 4× line width** (a robustly printable smallest rib), exposed as
   an editable mm value with an "auto" reset; the panel warns when a fine mesh hits the
   8-cell cap (enforced size then ≈ `16·h`). This is **advisory**, not a hard
   guarantee — members below the size blur below the bin threshold and drop out, the
@@ -569,7 +569,7 @@ or compare the optimized design against the homogeneous print.
 | 2 | Result set | **Manual population** — results exist only after you run them. But ONE Optimize yields several at once because the engine already solves them: **Optimized**, **Uniform · equal mass** (the "evenly distributed" baseline at the optimized mean density), and **Solid** (CAD-ideal reference). **As printed** comes from Solve once (As printed). No arbitrary verification runs — "as printed" in the Verify tab *is* the verification run. |
 | 3 | Equal-mass is free | The optimize pipeline ALREADY solves the equal-mass uniform field (`x_uniform = mean_binned`) and the solid field for the comparison card (`pipeline.rs`, `c_uniform`/`c_solid`), then **discarded their displacement vectors** (`let (c_uniform, _, _) = …`). We now KEEP `u_uniform`/`u_solid` and surface them as selectable results — near-zero extra compute. |
 | 4 | Selector placement | A result dropdown **inside the Results view only**, in the floating field-chip beside the STL/Voxel + field-type controls. Density/Regions tabs are untouched (they belong to the optimized run; a uniform field has no density map) and don't show the selector. |
-| 5 | Provenance window | A small **top-left overlay, legend-style** (`.provenance`), showing the SELECTED result's inputs (kind · mode/goal · budget or infill % · pattern · material · mesh h/cells) and headline outputs (mass, max deflection, min SF, convergence), plus a stale notice. |
+| 5 | Provenance window | A small **top-left overlay, legend-style** (`.provenance`), showing the SELECTED result's **inputs only** (kind · mode/goal · budget or infill % · pattern · levels · material · mesh h/cells · solver run/convergence), plus a stale notice. Outputs (mass, max deflection, min SF, comparisons) appear **once**, in the results dock — which follows the selected result: as-printed entries get the printed dock, optimized/uniform/solid the optimizer dock, and its deflection readout tracks the selected step/envelope/baseline. The optimizer dock leads with max deflection and a **comparison instrument**: deflection bars for equal-mass uniform vs optimized vs 100 % solid, with the two takeaways "+X % stiffer than N % uniform at the same weight" and "Y % of solid stiffness at Z % of the weight" — plus an **efficiency instrument** (stiffness ÷ weight, solid = 100 %, derived from the summary's compliance ratios) and a **safety-factor instrument** (min SF, worst load step for the optimized design, per-design stashed eps so allowables track each design's densities; infill modes only, persisted additively as `optMinSf`) ranking uniform / optimized / solid (2026-07 consolidation). |
 | 6 | Staleness — non-destructive | Changing an invalidating input no longer drops results; it **marks them stale** (badge in the dropdown, caution in the provenance window, export guard) and the result stays viewable. Re-run **from the origin step** (Solve once / Optimize) — no in-place re-run button. |
 | 7 | Staleness — per-result signature | Each result records the inputs it was built from; a change stales **only** dependents. Shared (geometry/pose, mesh resolution/snap/composite, loads & supports, material) → all stale. Optimized + Equal-mass → also budget/goal/mode/levels/min-member/symmetry/self-support/skin (Equal-mass is stale exactly when its parent Optimized is). As printed → also print infill/pattern/perimeters/line-width/shells/layer-height. Solid → shared only. |
 
@@ -763,8 +763,8 @@ wasm `set_material` gained an optional 6th arg (old callers keep working); theor
 updated. **(2)** sweep kernel ✅ DONE (2026-07-05) — `filasim-core/src/orient.rs`: fused
 6-component tensor pass, closed-form principal-stress prune (drop cells whose best-possible SF
 stays ≥ cap at every n), 26-neighbor constraint-ring mask (`RING_DILATIONS = 2` + node seeding ≈
-3 cells; Fixed/Frictionless/Displacement only — loads and the compliant Elastic foundation stay
-scored), pixel-parallel sweep returning (scored, all) per pixel; 6 unit tests (hand-calc uniaxial /
+3 cells; Fixed/Frictionless/Displacement/Cylindrical only — loads and the compliant Elastic
+foundation stay scored), pixel-parallel sweep returning (scored, all) per pixel; 6 unit tests (hand-calc uniaxial /
 shear / compression, flip symmetry, prune bound). wasm API `orientation_sweep_begin(ids, stepDeg)`
 (ids = result-stash ids to fold worst-case, [] = current solution; returns meta JSON) →
 `orientation_sweep_rows(start, count)` (chunked so the worker posts progress between calls) →
@@ -904,7 +904,7 @@ graded mode is a bounded sizing problem, not 0/1 topology.
 | 1 | Goal shape | **Third goal alongside budget/match: minimize material s.t. SF_crit ≥ target** (default target 2.0, user-editable). Not a constraint bolted onto the existing goals (muddier UX, harder problem) and not max-SF-at-budget (users have a load and want a margin). |
 | 2 | SF measure | **Per-project toggle: material / layer adhesion / both; default = both** (`sf` field) — "optimizer says SF 2.0" must match what the SF display shows, and layer adhesion is the failure mode FDM parts actually die from. |
 | 3 | Algorithm | **Staged. M1 = outer guarded secant on budget reusing the match machinery**: inner layout stays stiffness-driven OC (unchanged), SF_crit is evaluated on the **verified binned design** after each pass, budget walks to the smallest value with SF_crit ≥ target. Tolerance band sits ABOVE target only (never accept below — unlike match's symmetric ±2%); bisection fallback guards non-monotonic blips. **M2 (only if M1 measurably over-spends)**: local redistribution — inflate per-cell floors where SF is violated, `floor ← floor·(target/SF)^(1/n)` (Gibson-Ashby strength exponent), re-run layout. Textbook stress-constrained SIMP (p-norm aggregate, adjoint solves, MMA) rejected as machinery the bounded-density problem doesn't need. |
-| 4 | Criterion (the notch answer) | **SF_crit = volume-weighted percentile-trimmed global min over all solid cells**: the SF value such that cells totaling ≤ 0.2% of SOLID VOLUME lie below it, evaluated on the **nodal-recovered (smoothed) stress**. Volume weighting (not cell count) keeps the number stable across Preview→Fine; smoothing kills single-cell staircase spikes; the trim fraction lives in code (tunable against test parts), NOT in the UI. Known residual risk: a real hotspot smaller than the trim volume (small load pad, thin rib) can hide in the tail — the dec. 6 binding-region view is the safety net. |
+| 4 | Criterion (the notch answer) | **SF_crit = the MINIMUM of the smoothed criterion field over the scored cells** — literally the minimum of what `sfx`/`sfmx`/`sfzx` plot, so the number always has a cell you can point at. Smoothing (nodal recovery + re-interpolation) still kills single-cell staircase spikes; the only material left OUT of the number is left out *visibly*, via the §20 mask (void, ersatz void, BC singularity zones — greyed in the plot). **Revised 2026-07-25**: the original criterion trimmed the worst **0.2 % of solid volume** first, on the critical-distance argument that notch-tip stress is mesh-dependent while a fixed volume fraction ≈ a fixed distance from the tip. Correct in theory, unusable in practice — the margin it bought depended on the SHAPE of the hot spot (measured: **+2 % on a beam** whose weakest material is a long uniform fiber, **+23 % on a hook** whose weakest material is one fillet) and on PART SIZE (0.2 % of a 400 g bracket is a far bigger blob than of a 12 g hook). Unpredictable margin + a panel reading 2.02 over a plot marked 1.64 = users correctly reading it as a bug. **Accepted consequence:** SF_crit now falls as the mesh is refined near a riser, and never converges at a perfectly sharp re-entrant corner. Handled by SAYING SO, not by hiding it: `riser_ratio` (mean SF in a ±2-cell box ÷ the minimum) is reported with the number, and above ~1.6 the panel and the dock warn that a finer mesh will report less. |
 | 5 | Load steps | **SF enforced on the envelope over included steps** — every included step must meet the target (matches the §13 dec. 9 envelope pseudo-step). Per-step weight sliders keep their existing meaning (inner stiffness layout only); safety is worst-case, never weighted. |
 | 6 | Infeasibility (the 100%-fill answer) | **Pre-flight solve with all designable cells at cap, before any optimization.** If SF_crit(cap) < target: skip the loop, deliver the all-at-cap design, banner "Target SF N not reachable — best achievable is X", plus a diagnosis of the binding region — skin-limited ("infill can't fix this: reorient / thicker walls / stronger material") vs interior-at-cap ("raise the cap") — with a one-click view of the binding cells. When feasible, the same solve is the secant's upper bracket, so it is never wasted. |
 | 7 | Mode scope | **All three modes (graded/binary/solid) at launch.** Graded and binary need nothing special (SF is evaluated on the binned design either way). Solid mode masks ersatz-void cells (density < ~2× the 1e-3 void) out of the percentile so meaningless void stress cannot pollute the criterion. |
@@ -912,7 +912,7 @@ graded mode is a bounded sizing problem, not 0/1 topology.
 
 **Build order** (each milestone shippable, gated by regbench `--check` + the wasm smoke
 test; budget/match paths must stay **byte-identical**): **(1) criterion + pre-flight** —
-SF_crit reduction (volume-weighted trimmed percentile on recovered stress, per-step +
+SF_crit reduction (minimum of the smoothed recovered field, per-step +
 envelope, solid-mode void mask), all-at-cap pre-flight solve + binding-region
 classification; regbench case: SF_crit on the §14 cantilever, drift-guarded. **(2) M1 outer
 loop** — goal plumbing (store goal kind, SF measure toggle, target input), secant-on-budget
@@ -923,7 +923,8 @@ on the table where layer-adhesion hotspots miss compliance hotspots.
 **Status (2026-07-24): milestones 1 + 2 SHIPPED; M2 redistribution deferred as planned.**
 Implementation notes for the record:
 - Criterion lives in `filasim-core/src/strength.rs` (`sf_cells` → `smooth_masked` →
-  `sf_percentile`, trim `SF_TRIM_FRAC = 0.002` in code). Per-cell SF is the DISPLAY math
+  `sf_min`; it was `sf_percentile` with a 0.2 %-volume trim until 2026-07-25, see
+  dec. 4). Per-cell SF is the DISPLAY math
   (allowable and stress both scale by the cell's eps, so the factor cancels), and the
   SMOOTHED field is the SF field itself (nodal recovery + cell re-average) — the display's
   smooth-stress toggle recovers `sf` to nodes too, so dec. 2's "the number matches the plot"
@@ -1170,3 +1171,212 @@ displayed ranges stay honest); the §15 orientation-sweep voxel layer view is
 unmasked. Verified: regbench PASS (+0.000% everywhere), filasim-core tests,
 tsc clean, smoke test extended (masked hull vs full, nodal max |u| matches the
 verification solve, per-cell field alignment, hull follows `set_iso_threshold`).
+
+## 20. Settings Optimizer — min-weight print settings for a target SF (interview 2026-07-25)
+
+**Problem.** The graded/binary/solid optimizers answer "where should material go?",
+but many users just print with uniform slicer settings and want the simpler
+question answered: "what infill % and how many walls do I need so the part holds
+with safety factor ≥ N — at the lowest weight?" That is a search over PRINT
+SETTINGS (the §"As printed" model), not over a density field. Second driver:
+fixed supports produce mesh-divergent corner stress that §17's smoothing only
+partially suppresses — a settings search hammering on SF_crit needs
+constrained-face singularities excluded properly and VISIBLY. (At the time §17
+also trimmed the worst 0.2 % of volume, which suppressed some of it by luck;
+that trim was retired 2026-07-25, making the explicit exclusion load-bearing.)
+
+**Existing machinery (found 2026-07-25).** `engine.solvePrinted()` already solves
+exactly one candidate: uniform `printInfill`% + perimeters × lineWidth walls +
+topBottomLayers × layerHeight shells, returning mass (store.ts ~4564). The §17
+criterion chain (`sf_cells → smooth_masked → sf_min`,
+envelope-over-steps, SfMeasure toggle, infeasibility banner) is the evaluation
+scalar. Composite skin (2026-06) represents sub-voxel wall bands on a fixed grid.
+Store clamps: perimeters 1–8. `criterion_mask` currently lets clamp-face cells
+compete in the percentile — no BC-specific exclusion anywhere.
+
+| # | Topic | Decision |
+|---|-------|----------|
+| 1 | Placement | **Standalone panel** (Validate-Orientation-style) in **station 5 · Optimize**, not a fourth optimizer goal — the deliverable is SETTINGS + a sweep landscape, not a density field. It is an optimization ("what should I print?"), so it sits with the other optimizers, above the orientation sweep it sends the user to when layer adhesion binds. The winner is **retained as a selectable result** (kind `settings`) so the delivery can be plotted/sectioned like any other; **Apply** writes the settings into the print-settings fields and re-verifies. |
+| 2 | Target | **Minimum safety factor** (app-wide SF convention, default 2.0) — NOT "MoS". One convention everywhere; the panel's number is the number the SF plot and §17 goal show. |
+| 3 | Density axis | Search **10–70%**, deliver in **5% steps rounded UP** (conservative), SF re-verified at the snapped value. No >70% recommendations — above that the answer is "more walls" (Gibson–Ashby validity + skin-dominates regime). |
+| 4 | Wall axis | Perimeters **2–8** (the store allows 1, the search does not — a single perimeter is not a print anyone ships, and the composite-skin model is least trustworthy when the wall band is thinner than a cell; the optimizer must not "save weight" by recommending it). lineWidth / layerHeight / pattern held at current settings (printer choices, not strength knobs). **topBottomLayers = ceil(perimeters·lineWidth / layerHeight)** — ceiling, so the adhesion-critical top/bottom shell is never thinner than the walls just justified. Apply overwrites the manual top/bottom value (that coupling IS the feature). |
+| 5 | BC singularity exclusion (the singularity answer) | Exclude cells within a **physical, patch-scaled radius** of constrained nodes: `d = max(2 voxels, ~0.15 × patch characteristic diameter)`, constant in code beside `SF_TRIM_FRAC` (tunable, NOT in UI). Physical distance is mesh-stable (Saint-Venant: BC pollution decays over the patch scale; stress at fixed physical r converges under refinement) — a cell-count ring is not (it walks into the singularity as h shrinks, SF_crit recedes = the §17 dec. 4 disease). |
+| 6 | Exclusion scope | **Fixed/displacement constraints AND §16 rigid mounts** (both artificial infinite-stiffness interfaces). **Force/load pads stay IN the criterion** — under-sized load introduction is a real failure mode the optimizer must not paper over; smoothing eats single-cell edge spikes there. (With the trim retired, a pad's own peak now reaches the number directly. Revisit if pads turn out to bind in practice; the honest fix would be excluding them VISIBLY like supports, not a statistical filter.) |
+| 7 | §17 retrofit | Exclusion lives in **`criterion_mask` itself → shared by the §17 SF-target goal, this panel, and `binding_cells`** — one criterion, one number (§17 dec. 2 consistency, now internal too). Regbench strength anchors re-baselined DELIBERATELY (documented behavior change: SF-target designs near clamps come out slightly lighter). Excluded zone drawn greyed in the binding-cells view (never look like hiding stress); the raw SF display field stays untouched — the plot keeps showing the clamp hotspot, only the scalar ignores it. |
+| 8 | Search | Opens with the **ceiling probe** (added 2026-07-25): the strongest print the band can make — most walls at the densest infill — is solved FIRST. If it misses the target, nothing lighter can hold it, so the search stops after **one solve** instead of walking every wall count to the same answer (`SearchOutcome.ceiling_stop`, narrated in the log and the infeasibility banner). It also puts the best-possible safety factor on screen within one solve, so the user can judge whether to keep waiting. Costs one extra solve when the target IS reachable (the top row is usually weight-pruned before it would be evaluated) — the deliberate price of the early exit. Then: per wall count, **bisect density on the 13-step grid** (≤4 solves each; SF monotone-increasing in both axes, physically expected — bisection is robust to small non-monotonic blips) with **weight pruning**: weight needs no solve (geometry × density), so wall counts whose minimum-density weight already exceeds the best feasible weight are skipped. Typically **15–30 as-printed solves** (× included load steps). Tie-break within ~1% weight → higher measured SF. |
+| 9 | Sweep mesh | **One frozen grid for all candidates** (user's current resolution + snap state); each candidate's walls/shells enter via composite-skin fractions in `classify_cells` — apples-to-apples SF, neighbor warm starts. **Apply runs the standard As-Printed solve as final verification** under normal snap behavior; if snap shifts SF below target the panel says so rather than silently passing. |
+| 10 | Landscape | Walls × density grid rendering **solved cells** (SF-colored, feasible/infeasible banding), unsolved dimmed, winner marked; per-wall-count "lightest feasible" cell outlined, with weight + SF in its tooltip. Drawn from the FIRST progress push — axes first, one cell per solve — so the run is legible while it happens, with the part **recoloring live** by each candidate's safety factor. **"Solve full map"** backfills the rest on demand. |
+| 11 | Inherited from §17 | Load steps: SF on the **envelope**, every included step must meet target, weights never dilute safety (§17 dec. 5). SF measure: material / layer / both toggle, default both (dec. 2). Infeasibility: if 8 walls + 70% misses, deliver that best candidate + banner "best achievable is SF X" + binding-region diagnosis, escalation copy → reorient / stronger material / graded optimizer (dec. 6 pattern). Honesty copy at the target input (dec. 8). |
+
+**Build order** (each milestone shippable; gated by regbench `--check` + wasm smoke
+test; budget/match paths byte-identical, §17 strength anchors re-baselined once in M1):
+**(M1) BC exclusion in `criterion_mask`** — constrained-node + rigid-mount seed set,
+patch characteristic diameter, physical-radius dilation; greyed exclusion zone in the
+binding view; regbench: new anchor for SF_crit-with-exclusion on a clamped cantilever
+(drift-guarded), §17 anchors re-baselined with a NOTE in the baseline commit.
+**(M2) sweep kernel + panel** — wasm sweep entry (frozen grid, per-candidate
+classify + solvePrinted + SF_crit, warm starts), bisection/pruning driver, panel UI
+(target input, run, winner card, Apply → store writeback + As-Printed verify).
+**(M3) landscape + full-map backfill** — solved-cell grid heatmap, lightest-feasible
+curve, "solve full map".
+
+**Status (2026-07-25): M1 + M2 + M3 SHIPPED.** Implementation notes for the record:
+- **Exclusion** lives in `filasim-core/src/strength.rs`: `bc_exclusion(grid, patches)`
+  with `BC_EXCL_PATCH_FRAC = 0.15` / `BC_EXCL_MIN_CELLS = 2.0` beside `SF_TRIM_FRAC`.
+  Radius per patch = `max(2h, 0.15·d_c)`, `d_c = 2√(A/π)` with `A = node_count·h²` —
+  the node COUNT is mesh-dependent but the AREA is not, so the radius converges
+  (O(1/n) from above). Distance is the exact Euclidean transform from the constraint
+  NODES evaluated at CELL CENTERS (separable Felzenszwalb lower envelope with a
+  half-cell output shift, O(cells) per patch), so no staircase bias is introduced.
+  `criterion_mask` gained a `bc_excl` argument; **empty ⇒ the pre-§20 criterion**,
+  which is why budget/match stayed byte-identical and the §17 regbench anchors did
+  NOT need re-baselining (`bench_strength` builds its mask inline). New drift-guarded
+  anchors instead: `strength_sfcrit_excl` / `strength_excl_cells` /
+  `strength_excl_radius_mm`.
+- **Scope (dec. 6), one deliberate extension:** Frictionless supports are excluded
+  too. They are penalty-enforced kinematic constraints with the SAME `SPRING_FACTOR`
+  as Displacement — a Displacement BC along a rotated axis — so excluding one and not
+  the other would be inconsistent. The cylindrical support (2026-07-25) joins them for
+  the same reason: its locks are the identical springs on the fitted cylinder's local
+  axes, and an all-free one (which constrains nothing) excludes nothing. Elastic (Winkler) supports are NOT excluded (their
+  whole point is a compliant mount that spreads the interface stress physically), and
+  neither is any load pad.
+- **Empirical note:** how much the exclusion moves SF_crit is strongly setup-dependent.
+  A fully-supported flat end face is barely singular (the exclusion shifts SF_crit by
+  well under 1 % on the §14 beam, in either direction); a small pad on a large body is
+  where it earns its keep — and it became load-bearing once the trim was retired.
+  This is expected: the radius scales with the PATCH, so a benign clamp gets a benign
+  exclusion. The core tests assert what is universally true (mesh stability of the
+  excluded volume, exact distances, mass untouched, scored set shrinks).
+- **Sweep kernel**: `filasim-core/src/settings.rs` — `WallGeometry` (one
+  `classify_cells` per wall count + its volume components, so every density on that
+  row costs a multiplication, not a solve), `Sweep` (frozen grid, criterion mask built
+  once, one multigrid cache reused across candidates on the primary step, extras via
+  `step_displacement` with their own self-weight), and `search` (the dec. 8 ceiling
+  probe first; then per wall count: probe the top density, then bisect; prune and BREAK
+  once a row's 10 %-infill weight exceeds the best feasible + the 1 % tie band, since
+  weight grows with wall count). Delivery is the lightest feasible candidate,
+  tie-broken on measured SF; when nothing is feasible the strongest candidate ships
+  with the honest ceiling.
+- **Ceiling probe (dec. 8, added 2026-07-25 on use).** `search` opens by solving the
+  top wall count at the top density and returns immediately with `ceiling_stop: true`
+  when it misses the target. Considered and rejected: probing only AFTER the first row
+  fails, which would save the extra solve in the feasible case — but the probe's
+  second job is putting the best-achievable number on screen within one solve, and a
+  user staring at a search that cannot succeed is the case worth optimizing. The core
+  test pins the budget (one solve, one landscape cell, `pruned_walls` empty); the
+  wasm smoke pins the plumbing on a restricted band.
+- **wasm**: `Model::settings_sweep(opts, progress)` — `mode: "search" | "full"`, with
+  `walls`/`densities` overrides so a ONE-candidate call re-verifies the applied
+  settings on the (possibly re-snapped) grid. Optimize passes the union of every
+  included step's exclusion into `PipelineCfg::bc_excl` and reports `bcExcludedCells`.
+- **The criterion fields (dec. 7)**: `sfx` / `sfmx` / `sfzx` plot the CRITERION — the
+  §17 chain itself: masked nodal smoothing with the BC singularity zone dropped (NaN →
+  the renderer's neutral mask grey), independent of the display smoothing toggle. The
+  plain `sf`/`sfm`/`sfz` stay raw and unmasked and keep showing the clamp hotspot.
+  **This is what reconciles the number with the picture** (see below); the §17 "show the
+  critical region" button and the §20 auto-view both switch to a `…x` kind, and the
+  field chip always offers the criterion group.
+- **"The reported SF is higher than the plotted one" (found in use, 2026-07-25).** Fixed
+  in two rounds, and the second one is the interesting one.
+  **Round 1** made the `…x` kinds plot exactly the field the number is reduced from
+  (before, they were the plain field with grey bits) and reported the untrimmed minimum
+  as a second number, "Lowest scored cell". That closed the *plot vs plot* gap but left
+  the real one: on Stefan's hook the panel said **2.02** while the plot's marker said
+  **1.64**, and "we trim the worst 0.2 % of volume" is not an answer a user can act on
+  when they are about to print the thing.
+  **Round 2 retired the trim** (§17 dec. 4). SF_crit is now `sf_min` — the minimum of
+  the criterion field — so reported == plotted by construction and `rawMin` is a
+  synonym kept only for API compatibility. Measured cost of the trim before removal:
+  §14 beam `strength_sfcrit_solid` 4.5232 → 4.5159 (**−0.16 %**), smoke part 8.18 →
+  7.92 (**−3 %**), the hook (**−19 %**) — the spread across those three IS the argument.
+  The new mesh-dependence is surfaced, not hidden: `strength::riser_ratio` reports how
+  fast the field climbs away from the binding cell, and above ~1.6 the panel and the
+  dock both say a finer mesh will report less.
+- **The dock had a FIFTH number** (same session): "Min safety factor" was the raw
+  minimum of the display field on the surface soup — the readout a user checks after
+  the optimizer promises SF ≥ 2, showing ~30 % less. `computeMinSf` now calls
+  `criterion_sf` for both measures and reports the criterion, so the station that
+  validates a goal uses the goal's own reduction. **Rule: one quantity, one reduction,
+  everywhere it appears** — a "safety factor" that means something different in each
+  panel is worse than no safety factor.
+- **Panel**: `web/src/ui/SettingsOptimizer.tsx` in station 5 · Optimize — target +
+  measure, winner card, honesty rows (solves, pruned wall counts, excluded cells), the
+  walls × infill landscape with the lightest-feasible outline and the winner ring
+  (weight and safety factor live in the cell tooltip — a weight column overflowed the
+  panel and said less than the hover), "Solve full map" backfill (merged into the existing landscape,
+  winner re-decided), and **Apply settings & verify**. `settingsSfTarget` persists
+  additively in PROJECT_SCHEMA=1; the landscape itself is never saved and is dropped
+  by every invalidation that stales results.
+- **Live run (2026-07-25 revision)**: the sweep's first progress push carries the
+  landscape AXES, so the grid draws before the first solve and fills in one cell per
+  candidate; every later push carries that candidate's own per-soup-vertex SF field,
+  and the part recolors with it (scale pinned to [0, 2×target] so candidates are
+  comparable frame to frame). `Sweep::evaluate_keep` returns the primary displacement
+  + eps for exactly this, which also lets the winner be promoted without holding every
+  candidate's ndof vector. `enterSettingsPreview` also switches the field KIND to the
+  criterion SF (and bands it at the target) before the first push — as §15 does with
+  `sfz`. Found in use: it did not, so the legend kept the previous field's name and the
+  live safety factors were labelled "Displacement |u|, mm". **A legend that names the
+  wrong quantity is worse than no legend**; any preview that pushes values must claim
+  them. Set directly, not through `setResultField` — that re-fetches from the live
+  solution, which the sweep is busy replacing.
+- **The winner is a RESULT**: after the search the engine re-solves the winner (one
+  extra solve, cheaper than retaining 30 displacement fields) and leaves it as the live
+  solution; the store stashes it under a new `settings` result kind and selects it, then
+  switches to the criterion SF field banded at the target with the min/max markers on —
+  so the panel's number and the red spot in the viewport are the same fact. That result
+  stales only on loads/material (it carries its own walls/infill in its provenance) and
+  survives an optimize run. The banded criterion plot is a VIEW of that delivery, not a
+  new global default: `criterionViewPrev` snapshots the field/banding/legend/extremes it
+  replaced and `selectResult` restores them the moment another result is picked.
+- **Verification bug found in review**: Apply originally re-ran a one-candidate
+  `settings_sweep` to re-measure SF_crit, which calls `setBcs` → `clear_bcs` → **drops
+  the engine's solution**, leaving the As-Printed run the user was looking at with no
+  stress/SF fields at all (displacement only, from the client-side buffer). Replaced by
+  `Model::criterion_sf(measure)`: the §17 chain over the §20 mask on whatever result is
+  LIVE — no solve, no assembly, nothing invalidated — which also returns the worst
+  scored cell's world position for the pin. Smoke-tested as read-only and repeatable.
+- Verified: `cargo test -p filasim-core` (73 lib + all integration), regbench `--check`
+  PASS at +0.000 % on every pre-existing anchor, `tsc` clean, wasm smoke test extended
+  (criterion fields grey only the support zone and match the base field elsewhere; the
+  axes arrive before any solve; every candidate pushes a live SF field; the search stays
+  a strict subset of the 7 × 13 map; shells ceil the walls; no lighter feasible candidate
+  passed over; `criterion_sf` reproduces the winner's SF, reports where it binds, and is
+  read-only).
+
+**Deferred.** Per-step SF targets (as in §17). Exposing the exclusion radius in the UI. lineWidth/layerHeight as search axes. Non-uniform per-region settings
+(that's what the graded optimizer is for). Warm-starting the sweep's extra load steps
+(only the primary step reuses its multigrid hierarchy today).
+
+## 21. Panel copy & fold conventions (2026-07-25)
+
+**Problem.** Station 5 had grown into a wall of text: three optimizers stacked
+open (infill, print settings, orientation), each control carrying a paragraph of
+`.dim small` under it. ~2000 px of scrolling before the first click, and the
+explanation crowded out the instrument. The other stations were drifting the
+same way.
+
+**The rule (applies to every step panel).**
+- A control shows its **name, its live value, and at most ONE short line** — and
+  that line only if it changes with the state (a computed wall thickness, a
+  capped filter, a warning that actually fired). Static explanation is not panel
+  furniture.
+- Everything that **explains, qualifies, or caveats in the abstract** moves into
+  a hover card: `<InfoTip help={…}/>` at the end of the group label, or
+  `<HelpTip>` wrapped around the control it describes. Copy lives in
+  `ui/helptext.ts` (per station), next to the existing `BC_HELP` in `bcmeta.ts`.
+  Cards are for reading; panels are for operating.
+- The ⓘ is a real button: hover or keyboard-focus shows the card after the usual
+  delay, click toggles it (touch + deliberate taps), blur dismisses.
+- **Sub-sections fold** (`ui/Section.tsx`). A folded section still reports itself
+  through a live badge — `30 %`, `SF ≥ 2`, `best 1.84×`, the active constraints —
+  so nothing is hidden, only collapsed. Station 5 opens on the infill optimizer;
+  Constraints (self-supporting / symmetry / min member), Optimize print settings
+  and Optimize orientation start folded. Fold state is remembered per title for
+  the tab's lifetime, so stepping 5 → 4 → 5 does not re-fold what you were using.
+
+**Result.** Station 5 is ~520 px with everything reachable in one screen (~870 px
+with every section expanded), and the same scheme now runs across stations 1–6
+plus the build-sim panel. No behaviour or engine change — copy, layout and two
+small components only.

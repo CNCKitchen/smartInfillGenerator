@@ -40,6 +40,19 @@ pub enum BcKind {
     /// zero; a non-zero value is an enforced motion). `([true;3],[0;3])` behaves
     /// like Fixed (penalty form).
     Displacement([bool; 3], [f64; 3]),
+    /// Cylindrical support: constrain a CYLINDRICAL selection in its own local
+    /// frame — `[radial, tangential, axial]`, each either fixed (`true`) or free.
+    /// The selection is fitted to a cylinder (the same fit the bearing load
+    /// uses), and every attached node gets a stiff penalty spring along each
+    /// locked local direction: radial r̂ (node's radial offset from the axis),
+    /// tangential t̂ = axis × r̂, axial â = the cylinder axis. This is the
+    /// Ansys-Mechanical "Cylindrical Support": radial+axial fixed with tangential
+    /// free is a plain journal bearing / bolted-through hole (the part can still
+    /// TURN about the axis — the rigid-body check flags that honestly unless
+    /// another support reacts the torque); all three fixed ≈ Fixed on a bore.
+    /// A degenerate selection that cannot be fitted contributes nothing (the UI
+    /// blocks a non-cylindrical pick; the pre-solve check catches the rest).
+    Cylindrical([bool; 3]),
     /// Elastic ("soft") support: Winkler foundation with bedding modulus k in
     /// N/mm³ (surface pressure per unit displacement, σ = k·u). Each attached
     /// node gets three axis springs of k × its tributary selection area —
@@ -242,6 +255,40 @@ pub fn assemble(
                                 let mut f = [0f64; 3];
                                 f[d] = k * values[d];
                                 problem.forces.push((n, f));
+                            }
+                        }
+                    }
+                }
+            }
+            BcKind::Cylindrical(dofs) => {
+                // Stiff penalty springs along the LOCKED local cylinder
+                // directions, per node — same penalty form as Frictionless /
+                // Displacement, but the directions come from the fitted
+                // cylinder instead of a surface normal or a world axis. A
+                // selection that will not fit (degenerate patch) contributes
+                // nothing; the RBM check then reports the component as
+                // unconstrained rather than silently accepting a fake support.
+                if dofs.iter().any(|&d| d) {
+                    if let Some(cyl) = fit_selection_cylinder(mesh, &sel) {
+                        let k = SPRING_FACTOR * settings.e0 * h;
+                        for &n in &nodes {
+                            let p = node_pos(n);
+                            let basis = cylindrical_basis(cyl.axis, cyl.point, p);
+                            for (d, &locked) in dofs.iter().enumerate() {
+                                if !locked {
+                                    continue;
+                                }
+                                // A node ON the axis has no radial/tangential
+                                // direction (undefined there) — only the axial
+                                // lock survives. Cannot happen on a bore wall,
+                                // but a boss selection plus a coarse grid can.
+                                let dir = match basis {
+                                    Some(b) => b[d],
+                                    None if d == 2 => cyl.axis,
+                                    None => continue,
+                                };
+                                problem.springs.push((n, dir, k));
+                                constraints.push(ConstraintDir { pos: p, dir });
                             }
                         }
                     }
@@ -681,6 +728,31 @@ pub fn fit_selection_cylinder(mesh: &TriMesh, sel: &[u32]) -> Option<crate::cyli
     crate::cylinder::fit(&pts, &nrm, &ws)
 }
 
+/// Local cylindrical frame at `p` for the cylinder (`axis` unit, `point` on the
+/// axis): `[radial r̂, tangential t̂, axial â]` — a right-handed orthonormal
+/// triad with `t̂ = â × r̂`. `None` when `p` sits ON the axis, where the radial
+/// (and hence tangential) direction is undefined. Drives
+/// [`BcKind::Cylindrical`]; the spring direction's SIGN is irrelevant (a penalty
+/// spring resists both ways), so r̂ pointing outward is not a convention the
+/// caller has to care about.
+fn cylindrical_basis(
+    axis: [f64; 3],
+    point: [f64; 3],
+    p: [f64; 3],
+) -> Option<[[f64; 3]; 3]> {
+    let d = [p[0] - point[0], p[1] - point[1], p[2] - point[2]];
+    let a = dot3(d, axis);
+    let radial = [d[0] - a * axis[0], d[1] - a * axis[1], d[2] - a * axis[2]];
+    let rl = dot3(radial, radial).sqrt();
+    if rl < 1e-9 {
+        return None;
+    }
+    let rhat = [radial[0] / rl, radial[1] / rl, radial[2] / rl];
+    // axis ⟂ rhat by construction, so the cross product is already unit length.
+    let that = cross3(axis, rhat);
+    Some([rhat, that, axis])
+}
+
 /// One sample per selected triangle: (centroid, unit normal, area). Feeds the
 /// cylinder fit for bearing loads.
 fn selection_samples(mesh: &TriMesh, sel: &[u32]) -> (Vec<[f64; 3]>, Vec<[f64; 3]>, Vec<f64>) {
@@ -1010,4 +1082,180 @@ pub fn check_problem(grid: &VoxelGrid, assembled: &Assembled) -> CheckReport {
     }
 
     CheckReport { ok: all_ok, island_count: isl.count, components }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mesh::primitives;
+    use crate::solve::solve_nodes;
+    use crate::pad_for_levels;
+
+    const SEGS: usize = 48;
+
+    /// Solid ⌀20×20 cylinder about the Z axis + its face selections:
+    /// (mesh, side-wall tris, top-cap tris).
+    fn test_cylinder() -> (TriMesh, Vec<u32>, Vec<u32>) {
+        let mesh = primitives::cylinder([0.0, 0.0, 0.0], 10.0, 20.0, SEGS);
+        let side: Vec<u32> = (0..2 * SEGS as u32).collect();
+        let top: Vec<u32> = (3 * SEGS as u32..4 * SEGS as u32).collect();
+        (mesh, side, top)
+    }
+
+    #[test]
+    fn cylindrical_basis_is_orthonormal() {
+        let axis = [0.0, 0.0, 1.0];
+        let point = [1.0, 2.0, 5.0];
+        let b = cylindrical_basis(axis, point, [4.0, 2.0, 9.0]).expect("off-axis point");
+        let [r, t, a] = b;
+        // r̂ points from the axis to the sample; t̂ = â × r̂; all three unit ⟂.
+        assert!((r[0] - 1.0).abs() < 1e-12 && r[1].abs() < 1e-12 && r[2].abs() < 1e-12);
+        assert!((t[1] - 1.0).abs() < 1e-12);
+        for v in [r, t, a] {
+            assert!((dot3(v, v) - 1.0).abs() < 1e-12);
+        }
+        assert!(dot3(r, t).abs() < 1e-12 && dot3(t, a).abs() < 1e-12 && dot3(a, r).abs() < 1e-12);
+        // On the axis the radial direction is undefined.
+        assert!(cylindrical_basis(axis, point, [1.0, 2.0, 0.0]).is_none());
+    }
+
+    /// The locked DOFs really are the LOCAL cylinder directions: a
+    /// radial+axial support puts exactly two springs on each node — one along
+    /// the node's own radial offset, one along the axis — and none tangential.
+    #[test]
+    fn cylindrical_support_springs_follow_the_local_frame() {
+        let (mesh, side, _) = test_cylinder();
+        let grid0 = VoxelGrid::voxelize(&mesh, 1.0);
+        let settings = SolveSettings::default();
+        let (grid, _levels) = pad_for_levels(&grid0, settings.max_levels);
+        let bcs = vec![BcSpec { kind: BcKind::Cylindrical([true, false, true]), tris: side }];
+        let asm = assemble(&mesh, &grid, &bcs, None, &settings).unwrap();
+        let nodes = &asm.bc_nodes[0];
+        assert!(nodes.len() > 100, "attached nodes {}", nodes.len());
+        assert_eq!(asm.problem.springs.len(), 2 * nodes.len());
+        let (mx, my) = (grid.nx + 1, grid.ny + 1);
+        for &(n, dir, _k) in &asm.problem.springs {
+            let n = n as usize;
+            let p = [
+                grid.origin[0] + (n % mx) as f64 * grid.h,
+                grid.origin[1] + ((n / mx) % my) as f64 * grid.h,
+                grid.origin[2] + (n / (mx * my)) as f64 * grid.h,
+            ];
+            let axial = dir[2].abs() > 0.999; // the fitted axis is ±Z
+            if axial {
+                continue;
+            }
+            // Radial: in the XY plane and parallel to the node's own offset from
+            // the axis (a tangential spring would be perpendicular to it).
+            assert!(dir[2].abs() < 1e-6, "spring neither radial nor axial: {dir:?}");
+            let rl = (p[0] * p[0] + p[1] * p[1]).sqrt();
+            let cos = (dir[0] * p[0] + dir[1] * p[1]) / rl.max(1e-12);
+            assert!(cos.abs() > 0.999, "spring not radial (cos {cos}) at {p:?}");
+        }
+    }
+
+    /// Tangential FREE leaves the part able to turn about the bore axis — the
+    /// pre-solve rigid-body check must say so, and locking tangential fixes it.
+    #[test]
+    fn tangential_free_reports_the_spin_mode() {
+        let (mesh, side, _) = test_cylinder();
+        let grid0 = VoxelGrid::voxelize(&mesh, 1.0);
+        let settings = SolveSettings::default();
+        let (grid, _levels) = pad_for_levels(&grid0, settings.max_levels);
+        let check = |dofs: [bool; 3]| {
+            let bcs = vec![BcSpec { kind: BcKind::Cylindrical(dofs), tris: side.clone() }];
+            let asm = assemble(&mesh, &grid, &bcs, None, &settings).unwrap();
+            check_problem(&grid, &asm)
+        };
+        let spin = check([true, false, true]);
+        assert!(!spin.ok, "radial+axial only must leave the axial rotation free");
+        let mode = spin.components[0].mode.as_ref().expect("free mode");
+        // The free motion is a rotation about the cylinder (Z) axis.
+        let r = mode.r;
+        assert!(
+            r[2].abs() > 0.9 * (r[0] * r[0] + r[1] * r[1] + r[2] * r[2]).sqrt(),
+            "free mode is not the axial spin: {mode:?}"
+        );
+        assert!(check([true, true, true]).ok, "all three locked must be fully constrained");
+    }
+
+    /// Reorienting the part carries the support with it: the local frame is
+    /// re-derived from the CURRENT triangles at assembly, so the same selection
+    /// in a rotated pose is the same physics. (The front end's cached fit is a
+    /// glyph/readout only — this is what the solver actually uses.) Rotating by
+    /// exactly 90° about X keeps the voxel discretization equivalent (the grid is
+    /// axis-aligned), so the two solves must agree to solver accuracy.
+    #[test]
+    fn cylindrical_support_follows_a_reoriented_part() {
+        let (mesh, side, top) = test_cylinder();
+        // (x, y, z) → (x, −z, y): the cylinder axis goes +Z → +Y.
+        let rotated = TriMesh::from_triangles(
+            mesh.tris
+                .iter()
+                .map(|t| {
+                    let mut o = [0f32; 9];
+                    for v in 0..3 {
+                        o[3 * v] = t[3 * v];
+                        o[3 * v + 1] = -t[3 * v + 2];
+                        o[3 * v + 2] = t[3 * v + 1];
+                    }
+                    o
+                })
+                .collect(),
+        );
+        let settings = SolveSettings { e0: 2400.0, nu: 0.35, tol: 1e-8, ..Default::default() };
+        let solve = |m: &TriMesh, force: [f64; 3]| {
+            let grid0 = VoxelGrid::voxelize(m, 1.0);
+            let (grid, levels) = pad_for_levels(&grid0, settings.max_levels);
+            let bcs = vec![
+                // Radial FREE, tangential + axial held: still fully constrained
+                // (a ring blocks every rigid motion in shear) but maximally
+                // frame-SENSITIVE — unlike all-three-locked, which is isotropic
+                // and would pass even with a wrong frame.
+                BcSpec { kind: BcKind::Cylindrical([false, true, true]), tris: side.clone() },
+                BcSpec { kind: BcKind::Force(force), tris: top.clone() },
+            ];
+            let asm = assemble(m, &grid, &bcs, None, &settings).unwrap();
+            solve_nodes(&grid, levels, &asm.problem, &settings).unwrap().max_displacement()
+        };
+        // The part frame's +X stays world +X under this rotation, so one force
+        // vector is the same transverse push on the cap in both poses.
+        let a = solve(&mesh, [40.0, 0.0, 0.0]);
+        let b = solve(&rotated, [40.0, 0.0, 0.0]);
+        assert!(a > 1e-6, "degenerate solve: max |u| = {a}");
+        assert!(
+            (a - b).abs() / a < 1e-3,
+            "support did not follow the reoriented part: {a} vs {b}"
+        );
+    }
+
+    /// With all three local DOFs locked the penalty matrix is
+    /// `k(r̂r̂ᵀ + t̂t̂ᵀ + ââᵀ) = k·I` — so a Cylindrical support must reproduce a
+    /// Displacement support on all three world axes to solver accuracy. Any
+    /// non-orthonormal frame breaks this identity, which makes it a sharp check
+    /// of the whole fit → frame → spring path.
+    #[test]
+    fn fully_locked_cylindrical_equals_a_three_axis_displacement_support() {
+        let (mesh, side, top) = test_cylinder();
+        let grid0 = VoxelGrid::voxelize(&mesh, 1.0);
+        let settings = SolveSettings { e0: 2400.0, nu: 0.35, tol: 1e-8, ..Default::default() };
+        let (grid, levels) = pad_for_levels(&grid0, settings.max_levels);
+        let solve = |kind: BcKind| {
+            let bcs = vec![
+                BcSpec { kind, tris: side.clone() },
+                // Off-axis tip load: exercises radial, tangential AND axial.
+                BcSpec { kind: BcKind::Force([40.0, 0.0, -100.0]), tris: top.clone() },
+            ];
+            let asm = assemble(&mesh, &grid, &bcs, None, &settings).unwrap();
+            solve_nodes(&grid, levels, &asm.problem, &settings).unwrap()
+        };
+        let cyl = solve(BcKind::Cylindrical([true, true, true]));
+        let disp = solve(BcKind::Displacement([true; 3], [0.0; 3]));
+        let (a, b) = (cyl.max_displacement(), disp.max_displacement());
+        assert!(a > 1e-6, "degenerate solve: max |u| = {a}");
+        assert!(
+            (a - b).abs() / b < 1e-4,
+            "cylindrical {a} vs displacement {b} — the local frame is not orthonormal"
+        );
+    }
 }

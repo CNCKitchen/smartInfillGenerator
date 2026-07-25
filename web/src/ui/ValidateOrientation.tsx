@@ -16,7 +16,9 @@ import { useEffect, useRef, useState } from "react";
 import { useShallow } from "zustand/shallow";
 import { useStore } from "../store";
 import { jet } from "../viewer/colormaps";
+import { OPT_HELP } from "./helptext";
 import { NumInput } from "./NumInput";
+import { Section } from "./Section";
 
 /** Canvas display size (px) — the n×n grid upscales with pixelated sampling. */
 const MAP_SIZE = 222;
@@ -132,20 +134,11 @@ export function ValidateOrientation() {
   };
 
   return (
-    <div className="group">
-      <div
-        className="sec-head"
-        title="Sweep every print orientation for the worst layer-adhesion safety factor — one solve, no re-analysis"
-      >
-        <span>Optimize orientation</span>
-        {sw && best && <b>best {best.sf.toFixed(2)}×</b>}
-      </div>
-      <div className="dim small">
-        Scores every build direction (rotation X/Y ±90°) by the minimum layer-adhesion safety
-        factor of the current result — all load steps, worst case. Peaks within ~3 cells of rigid
-        constraints are excluded from the score but reported alongside. Click or drag on the map
-        to preview an orientation; rotation and coloring are display-only.
-      </div>
+    <Section
+      title="Optimize orientation"
+      help={OPT_HELP.orientation}
+      badge={sw && best ? `best ${best.sf.toFixed(2)}×` : undefined}
+    >
       <label
         className="rowcheck"
         title="Layers also fail by sliding along the layer plane (τ vs τᶻ, the interaction criterion). Off = pure tension across the layers — affects the sfz/sf results too, and deletes the current map."
@@ -278,7 +271,7 @@ export function ValidateOrientation() {
           )}
         </>
       )}
-    </div>
+    </Section>
   );
 }
 

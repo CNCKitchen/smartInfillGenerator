@@ -42,14 +42,7 @@ export function StepRail() {
   );
   const buildsim = s.appMode === "buildsim";
   const STEPS = buildsim ? BUILDSIM_STEPS : OPTIMIZE_STEPS;
-  const hasSupport = s.bcs.some(
-    (b) =>
-      (b.kind === "fixed" ||
-        b.kind === "elastic" ||
-        b.kind === "frictionless" ||
-        b.kind === "displacement") &&
-      b.tris.length > 0
-  );
+  const hasSupport = s.bcs.some((b) => SUPPORT_KINDS.includes(b.kind) && b.tris.length > 0);
   const hasLoad = s.bcs.some((b) => {
     if (SUPPORT_KINDS.includes(b.kind)) return false;
     // Acceleration is selection-less (DESIGN §16) — it's a load with no surface.

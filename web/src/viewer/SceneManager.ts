@@ -1162,7 +1162,8 @@ export class SceneManager {
         bc.kind === "fixed" ||
         bc.kind === "frictionless" ||
         bc.kind === "displacement" ||
-        bc.kind === "elastic"
+        bc.kind === "elastic" ||
+        bc.kind === "cylindrical"
       ) {
         this.buildSupportGlyphs(bc, inactive);
       }
@@ -1313,8 +1314,13 @@ export class SceneManager {
         minD2[i] = Math.min(minD2[i], items[i].c.distanceToSquared(items[best].c));
       }
     }
-    const hCone = 0.034 * this.bboxDiag;
-    const rCone = 0.017 * this.bboxDiag;
+    // A cylindrical support usually sits INSIDE a bore, where the cones point at
+    // the wall from within — cap them to the fitted radius so they stay in the
+    // hole instead of shooting out the far side of a small one.
+    const capH =
+      bc.kind === "cylindrical" && bc.cyl?.ok ? 0.55 * bc.cyl.radius : Number.POSITIVE_INFINITY;
+    const hCone = Math.min(0.034 * this.bboxDiag, capH);
+    const rCone = hCone / 2;
     // 4 radial segments: from any side the cone reads as the textbook ▽.
     const coneGeo = new THREE.ConeGeometry(rCone, hCone, 4);
     const mat = new THREE.MeshStandardMaterial({
@@ -1370,9 +1376,78 @@ export class SceneManager {
         this.bcMarkers.add(coil);
       }
     }
+    // Cylindrical: also draw the fitted axis — the frame the radial/tangential/
+    // axial locks are defined in, and the line the part turns about when
+    // tangential is free.
+    let label = bc.name ?? "Support";
+    if (bc.kind === "cylindrical") {
+      this.buildCylAxisGlyph(bc, mat);
+      const dof = bc.cylDof ?? [true, false, true];
+      const held = ["radial", "tangential", "axial"].filter((_, i) => dof[i]);
+      label += ` · ${held.length === 3 ? "all held" : held.length ? `${held.join("+")} held` : "nothing held"}`;
+    }
     // Name callout on the support patch — supports carry no magnitude, so the
     // chip just identifies which support it is (in its roster colour).
-    this.pushBcCallout(bc, this.selectionCentroid(bc.tris), bc.name ?? "Support", inactive);
+    this.pushBcCallout(bc, this.selectionCentroid(bc.tris), label, inactive);
+  }
+
+  /** The fitted cylinder axis of a cylindrical support, drawn as a thin shaft
+   *  through the selection (plus end discs when the AXIAL direction is held, the
+   *  textbook "shoulder stops it sliding"). Shares the support's material, so it
+   *  ghosts with the rest when the support is off in this step. */
+  private buildCylAxisGlyph(bc: Bc, mat: THREE.Material) {
+    const cyl = bc.cyl;
+    if (!cyl?.ok) return;
+    const axis = new THREE.Vector3(cyl.axis[0], cyl.axis[1], cyl.axis[2]).normalize();
+    const center = new THREE.Vector3(cyl.point[0], cyl.point[1], cyl.point[2]);
+    const [amin, amax] = this.selectionAxialExtent(bc.tris, center, axis);
+    const over = Math.max(0.5 * cyl.radius, 0.15 * (amax - amin));
+    const len = amax - amin + 2 * over;
+    const r = Math.max(0.05 * cyl.radius, 0.003 * this.bboxDiag);
+    const shaftGeo = new THREE.CylinderGeometry(r, r, len, 10);
+    this.markerDisposables.push(shaftGeo);
+    const up = new THREE.Vector3(0, 1, 0);
+    const mid = center.clone().addScaledVector(axis, (amin + amax) / 2);
+    const shaft = new THREE.Mesh(shaftGeo, mat);
+    shaft.quaternion.setFromUnitVectors(up, axis);
+    shaft.position.copy(mid);
+    this.bcMarkers.add(shaft);
+    if ((bc.cylDof ?? [true, false, true])[2]) {
+      const discGeo = new THREE.CylinderGeometry(2.2 * r, 2.2 * r, 0.8 * r, 16);
+      this.markerDisposables.push(discGeo);
+      for (const a of [amin - over, amax + over]) {
+        const disc = new THREE.Mesh(discGeo, mat);
+        disc.quaternion.setFromUnitVectors(up, axis);
+        disc.position.copy(center).addScaledVector(axis, a);
+        this.bcMarkers.add(disc);
+      }
+    }
+  }
+
+  /** Axial extent [min, max] of a selection's vertices projected on `axis`,
+   *  measured from `center`. Shared by the bearing fan and the cylindrical
+   *  support's axis glyph. Returns [0, 0] with no geometry loaded. */
+  private selectionAxialExtent(
+    tris: Uint32Array,
+    center: THREE.Vector3,
+    axis: THREE.Vector3
+  ): [number, number] {
+    const p = this.basePositions;
+    if (!p) return [0, 0];
+    let amin = Infinity;
+    let amax = -Infinity;
+    for (const t of tris) {
+      for (let v = 0; v < 3; v++) {
+        const o = 9 * t + 3 * v;
+        const a =
+          (p[o] - center.x) * axis.x +
+          (p[o + 1] - center.y) * axis.y +
+          (p[o + 2] - center.z) * axis.z;
+        if (a < amin) amin = a;
+        if (a > amax) amax = a;
+      }
+    }
+    return isFinite(amin) ? [amin, amax] : [0, 0];
   }
 
   /** Bearing load: a fan of arrows over the loaded half of the fitted cylinder,
@@ -1390,24 +1465,7 @@ export class SceneManager {
     const center = new THREE.Vector3(cyl.point[0], cyl.point[1], cyl.point[2]);
     const radius = cyl.radius;
     // Axial extent of the selection (its vertices projected on the axis).
-    const p = this.basePositions;
-    let amin = Infinity;
-    let amax = -Infinity;
-    for (const t of bc.tris) {
-      for (let v = 0; v < 3; v++) {
-        const o = 9 * t + 3 * v;
-        const a =
-          (p[o] - center.x) * axis.x +
-          (p[o + 1] - center.y) * axis.y +
-          (p[o + 2] - center.z) * axis.z;
-        if (a < amin) amin = a;
-        if (a > amax) amax = a;
-      }
-    }
-    if (!isFinite(amin)) {
-      amin = 0;
-      amax = 0;
-    }
+    const [amin, amax] = this.selectionAxialExtent(bc.tris, center, axis);
     const w = new THREE.Vector3().crossVectors(axis, loadDir).normalize();
     const baseLen = Math.min(radius * 0.9, this.bboxDiag * 0.12);
     const mat = new THREE.MeshStandardMaterial({
@@ -2333,8 +2391,10 @@ export class SceneManager {
     try {
       const prev = r.getRenderTarget();
       r.setScissorTest(false);
+      // setRenderTarget already applies the target's full 512² viewport — do
+      // NOT call r.setViewport here: it multiplies by the canvas pixel ratio
+      // (>1 on scaled displays), which crops the render to a corner.
       r.setRenderTarget(rt);
-      r.setViewport(0, 0, size, size);
       r.clear();
       r.render(this.scene, cam);
       const rgba = new Uint8Array(size * size * 4);

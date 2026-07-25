@@ -573,6 +573,12 @@ export class CalloutManager {
       beats && this.host.interiorDisplayedPos(int!.flip ? int!.minAt : int!.maxAt, this.extremeWorld.int)
     );
     if (!positionsOnly) {
+      // SF fields ("×") use the flipped colormap — the min is the critical/red
+      // end — so swap the marker colors to match the surface plot.
+      const flip = this.extremesUnit === "×";
+      for (const el of [els.minDot, els.minChip, els.maxDot, els.maxChip]) {
+        el.classList.toggle("flip", flip);
+      }
       els.minChip.textContent = `min ${this.fmtExtreme(d.minVal)}`;
       els.maxChip.textContent = `max ${this.fmtExtreme(d.maxVal)}`;
       if (int) {

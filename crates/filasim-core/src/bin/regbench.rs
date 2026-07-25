@@ -656,18 +656,18 @@ fn bench_rigid_mass(m: &mut Metrics) {
 
 /// SF_crit criterion (DESIGN §17 dec. 4) on the §14 solid cantilever under
 /// bending: per-cell SF (material + §15 layer interaction, worst of both) →
-/// masked nodal smoothing → volume-weighted 0.2%-trimmed percentile. Two
-/// anchors, drift-guarded so the number the strength goal optimizes against
-/// cannot move silently:
-///  (a) SOLID beam — plus the untrimmed min for contrast (guards smoothing
-///      and trim separately);
+/// masked nodal smoothing → MINIMUM over the scored cells (the 0.2%-volume
+/// trim was retired 2026-07-25 — see strength.rs). Two anchors, drift-guarded
+/// so the number the strength goal optimizes against cannot move silently:
+///  (a) SOLID beam — plus the RAW per-cell min for contrast, which isolates
+///      the only reduction left between the number and the plain SF plot;
 ///  (b) UNIFORM 30% INFILL — same load. A uniform stiffness scale leaves the
 ///      stress field unchanged (u scales by 1/eps) while the Gibson–Ashby
 ///      allowable scales by eps, so SF_crit must come out ≈ eps × the solid
 ///      value — this isolates the graded-allowable wiring.
 fn bench_strength(m: &mut Metrics) {
     use filasim_core::strength::{
-        sf_cells, sf_percentile, smooth_masked, SfMeasure, StrengthSpec, SF_TRIM_FRAC,
+        sf_cells, sf_min, smooth_masked, SfMeasure, StrengthSpec,
     };
     let (nx, ny, nz, h) = (64usize, 8usize, 4usize, 1.0f64);
     let s = SolveSettings { e0: BEAM_E0, nu: BEAM_NU, tol: 1e-6, max_iter: 400, ..Default::default() };
@@ -701,27 +701,57 @@ fn bench_strength(m: &mut Metrics) {
         shear_z: 21.0,
     };
     let mask: Vec<bool> = grid.scale.iter().map(|&sc| sc > 0.0).collect();
+    // DESIGN §20 M1: the same criterion with the CLAMPED FACE's singularity
+    // zone excluded — physical radius `max(2h, 0.15·d_c)` around the fixed
+    // nodes. Anchored (cell count + radius + the resulting SF_crit) so the
+    // exclusion the settings optimizer and the §17 goal now share cannot drift
+    // silently.
+    let excl = filasim_core::strength::bc_exclusion(&grid, &[&prob.fixed]);
+    let excl_r = filasim_core::strength::bc_exclusion_radius(&grid, prob.fixed.len());
+    let mask_excl: Vec<bool> =
+        mask.iter().zip(&excl).map(|(&keep, &drop)| keep && !drop).collect();
     let t0 = Instant::now();
-    let mut run = |eps_val: f32| -> (f64, f64) {
+    let run = |eps_val: f32, mask: &[bool]| -> (f64, f64) {
         let eps: Vec<f32> =
             grid.scale.iter().map(|&sc| if sc > 0.0 { eps_val } else { 0.0 }).collect();
         let r = solve_cached(&mut None, &grid, levels, &prob, &s, eps.clone(), s.tol, s.max_iter)
             .expect("strength solve");
         let u: Vec<f32> = r.u.iter().map(|&v| v as f32).collect();
-        let cells = sf_cells(&grid, &u, BEAM_E0, BEAM_NU, &eps, &mask, &spec);
-        let sm = smooth_masked(&grid, &cells, &mask);
-        (sf_percentile(&grid, &sm, &mask, SF_TRIM_FRAC), sf_percentile(&grid, &sm, &mask, 0.0))
+        let cells = sf_cells(&grid, &u, BEAM_E0, BEAM_NU, &eps, mask, &spec);
+        let sm = smooth_masked(&grid, &cells, mask);
+        // SF_crit (the smoothed minimum) and, as a second anchor, the RAW
+        // per-cell minimum the plain `sf` plot shows — the smoothing gap is
+        // the only reduction left between the number and that picture, so it
+        // is worth guarding against silent drift.
+        let raw = cells
+            .iter()
+            .enumerate()
+            .filter(|(ci, _)| mask[*ci])
+            .map(|(_, &v)| v as f64)
+            .fold(f64::INFINITY, f64::min);
+        (sf_min(&grid, &sm, mask), raw)
     };
-    let (crit_solid, rawmin_solid) = run(1.0);
+    let (crit_solid, rawmin_solid) = run(1.0, &mask);
     let eps_infill = (INFILL_COEFF * INFILL_X.powf(INFILL_EXP)) as f32;
-    let (crit_infill, _) = run(eps_infill);
+    let (crit_infill, _) = run(eps_infill, &mask);
+    let (crit_excl, _) = run(1.0, &mask_excl);
     let dt = t0.elapsed().as_secs_f64();
     m.q("strength_sfcrit_solid", crit_solid);
     m.q("strength_rawmin_solid", rawmin_solid);
     m.q("strength_sfcrit_infill", crit_infill);
+    m.q("strength_sfcrit_excl", crit_excl);
+    m.q("strength_excl_cells", excl.iter().filter(|&&e| e).count() as f64);
+    m.q("strength_excl_radius_mm", excl_r);
     m.i("strength_time_ms", dt * 1000.0);
-    // Sanity at bench time: trim can only raise the number, the infill SF
-    // tracks the Gibson–Ashby allowable, and nothing sits at the cap.
+    // The exclusion must bite (some cells leave) without swallowing the part.
+    let excl_share = excl.iter().filter(|&&e| e).count() as f64 / excl.len() as f64;
+    assert!(
+        (0.001..0.30).contains(&excl_share),
+        "BC exclusion covers a sane share of the beam: {excl_share}"
+    );
+    // Sanity at bench time: smoothing can only raise the number above the raw
+    // per-cell minimum, the infill SF tracks the Gibson–Ashby allowable, and
+    // nothing sits at the cap.
     assert!(
         crit_solid >= rawmin_solid && crit_solid < 9.9,
         "criterion discriminates: crit {crit_solid}, raw {rawmin_solid}"

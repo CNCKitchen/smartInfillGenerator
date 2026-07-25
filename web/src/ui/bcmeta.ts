@@ -12,6 +12,7 @@ export const KIND_LABEL: Record<BcKind, string> = {
   fixed: "Fixed support",
   frictionless: "Frictionless support",
   displacement: "Displacement support",
+  cylindrical: "Cylindrical support",
   elastic: "Elastic support",
   force: "Force",
   pressure: "Pressure",
@@ -26,6 +27,7 @@ export const KIND_DOT: Record<BcKind, string> = {
   fixed: "#2563eb",
   frictionless: "#0e9cbf",
   displacement: "#7c3aed",
+  cylindrical: "#0b7285", // deep petrol — must match BC_COLORS.cylindrical
   elastic: "#1f9d6b",
   force: "#d93025",
   pressure: "#c97b10",
@@ -35,7 +37,13 @@ export const KIND_DOT: Record<BcKind, string> = {
   mass: "#0f766e", // teal — must match BC_COLORS.mass in ColorManager.ts
 };
 
-export const SUPPORT_KINDS: BcKind[] = ["fixed", "elastic", "frictionless", "displacement"];
+export const SUPPORT_KINDS: BcKind[] = [
+  "fixed",
+  "elastic",
+  "frictionless",
+  "displacement",
+  "cylindrical",
+];
 
 /** Loads applied to a triangle SELECTION (as opposed to the selection-less
  *  "accel"). Drives the "needs a surface" attach validation + glyph anchoring. */
@@ -46,6 +54,7 @@ export const KIND_SHORT: Record<BcKind, string> = {
   fixed: "Fixed",
   frictionless: "Frictionless",
   displacement: "Displacement",
+  cylindrical: "Cylindrical",
   elastic: "Elastic",
   force: "Force",
   pressure: "Pressure",
@@ -109,6 +118,13 @@ export const BC_HELP: Record<BcKind, HelpContent> = {
     text: [
       "Prescribes how far the selected surfaces move along the global axes you enable — 0 mm pins that axis, a non-zero value enforces a motion.",
       "Axes you leave unchecked stay completely free, so it doubles as a per-axis pin.",
+    ],
+  },
+  cylindrical: {
+    title: "Cylindrical support",
+    text: [
+      "For a bore or shaft seat: select a cylindrical surface and choose which of its own three directions are held — radial (in/out), tangential (turning about the axis) and axial (along the axis).",
+      "The default — radial and axial held, tangential free — is a plain bearing or a bolted-through hole: it carries the load and keeps the part in place, but the part can still turn about the axis, so react that turn with another support. Hold all three for a press fit.",
     ],
   },
   force: {

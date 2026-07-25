@@ -11,7 +11,13 @@ import {
   type SlicerFlavor,
 } from "./engine/EngineClient";
 import { EngineSession } from "./engine/EngineSession";
-import type { LoadedModelData, SectionVolume } from "./engine/EngineProtocol";
+import type {
+  CriterionWorst,
+  LoadedModelData,
+  SectionVolume,
+  SettingsCandidate,
+  SettingsSweepResult,
+} from "./engine/EngineProtocol";
 import {
   isStepName,
   stepImporter,
@@ -211,7 +217,15 @@ export function budgetBounds(s: {
 
 /** The TYPE of a retained result. A result's full identity is (kind, load
  *  step) — see `ResultEntry.id` / `resultStashId`. */
-export type ResultKind = "optimized" | "uniform" | "solid" | "asprinted" | "modal";
+export type ResultKind =
+  | "optimized"
+  | "uniform"
+  | "solid"
+  | "asprinted"
+  // The §20 settings optimizer's delivery, retained so the winner can be
+  // inspected like any other result instead of taken on faith.
+  | "settings"
+  | "modal";
 
 /** Monotonic input epochs. A result is stale when an epoch it depends on has
  *  advanced past the value it was built at. Grid/geometry changes are NOT
@@ -264,8 +278,29 @@ export interface ResultEntry {
   epochs: ResultEpochs;
 }
 
+/** Min SF of one design: min over the part, and which limit governs there. */
+export interface DesignMinSf {
+  minSf: number;
+  governs: "layer" | "material";
+}
+
+/** The margin-of-safety comparison trio (see AppState.optMinSf). Null members
+ *  were not computed (missing stash, or the design vanished mid-run). */
+export interface OptMinSf {
+  optimized: DesignMinSf | null;
+  uniform: DesignMinSf | null;
+  solid: DesignMinSf | null;
+}
+
 /** Fixed display order in the dropdown. */
-const RESULT_ORDER: ResultKind[] = ["optimized", "uniform", "asprinted", "solid", "modal"];
+const RESULT_ORDER: ResultKind[] = [
+  "optimized",
+  "uniform",
+  "settings",
+  "asprinted",
+  "solid",
+  "modal",
+];
 
 /** Engine stash key for a (kind, load step). With a single load step we keep
  *  the BARE kind so the stash key, the result roster, and saved `.filasim`
@@ -308,8 +343,6 @@ function withEnvelope(results: ResultEntry[], steps: LoadStep[]): ResultEntry[] 
       provTitle: `${group[0].provTitle.split(" · ")[0]} · envelope`,
       provRows: [
         ["Load steps", `${group.length} combined`],
-        ["Worst max |u|", fmtMm(maxDisplacement)],
-        ...(minSf != null ? ([["Min safety factor", `${minSf.toFixed(2)}×`]] as [string, ProvVal][]) : []),
         ["Reduction", "max field · min SF, per point"],
       ],
       epochs: { ...group[0].epochs },
@@ -339,6 +372,10 @@ function sortResults(results: ResultEntry[], steps: LoadStep[]): ResultEntry[] {
 export function resultStale(e: ResultEntry, ep: ResultEpochs): boolean {
   if (ep.loads !== e.epochs.loads || ep.material !== e.epochs.material) return true;
   if (e.kind === "asprinted") return ep.print !== e.epochs.print;
+  // The settings result carries its OWN walls/infill in its provenance, so the
+  // live print settings moving (not least because Apply just wrote them) does
+  // not invalidate it — only loads/material do, and those are checked above.
+  if (e.kind === "settings") return false;
   if (e.kind === "solid") return false; // depends on grid+loads+material only
   // Modal modes depend on grid+loads+material (checked above) and, for the
   // as-printed model, the print settings — never on the optimized design.
@@ -583,7 +620,7 @@ interface AppState {
   smoothIters: number; // Taubin passes on modifier regions
   nBins: number;
   /** Minimum member size in mm (printability length scale); null = auto
-   *  (2× line width). Drives the optimizer's density-filter radius so thin,
+   *  (4× line width). Drives the optimizer's density-filter radius so thin,
    *  unprintable members are smoothed away — mesh-independent. */
   minMemberMm: number | null;
   /** Optimization goal: stiffest at a mass budget, lightest at a target
@@ -627,6 +664,11 @@ interface AppState {
   hasResult: boolean;
   optProgress: { iteration: number; maxIter: number; pass?: number; passes?: number } | null;
   optSummary: OptSummary | null;
+  /** Per-design min safety factor for the dock's margin-of-safety comparison
+   *  (infill modes; worst load step for the optimized design). Computed after
+   *  an optimize run from each design's own stashed eps, so the allowables
+   *  scale with THAT design's densities. Lives and dies with `optSummary`. */
+  optMinSf: OptMinSf | null;
   /** Validate Orientation (DESIGN §15): the finished sweep — two n×n grids of
    *  min layer-adhesion SF (scored = constraint ring excluded, all = nothing
    *  hidden), the stash ids it folded, and the orientation-independent
@@ -642,6 +684,44 @@ interface AppState {
   orientProgress: { done: number; total: number } | null;
   /** Selected heatmap pixel; non-null = display-only preview is active. */
   orientSel: { ip: number; ir: number } | null;
+  /** Settings Optimizer (DESIGN §20): the finished walls × density landscape,
+   *  its winner, and the honesty numbers (excluded cells, pruned wall counts,
+   *  solve count). Deleted whenever an input it swept from changes. */
+  settingsSweep: SettingsSweepResult | null;
+  settingsProgress: { done: number; total: number } | null;
+  /** The landscape WHILE it is being solved (DESIGN §20 dec. 10): the axes
+   *  arrive with the first progress push, cells fill in one per solve. Null
+   *  outside a run — the finished map lives in `settingsSweep`. */
+  settingsLive: {
+    walls: number[];
+    densities: number[];
+    target: number;
+    cells: {
+      wallIndex: number;
+      densityIndex: number;
+      sf: number;
+      massGrams: number;
+      feasible: boolean;
+    }[];
+  } | null;
+  /** Minimum safety factor the settings search must clear (§20 dec. 2 — the
+   *  app-wide SF convention, same number the plot and the §17 goal show). */
+  settingsSfTarget: number;
+  /** Set once the winner's settings are written into the print fields, with
+   *  the As-Printed verification's own SF_crit on the final (re-snapped) grid
+   *  — `ok` false means snapping cost enough to miss the target (§20 dec. 9). */
+  settingsApplied: { wall: number; densityPct: number; sf: number; ok: boolean } | null;
+  /** The plot state the auto criterion view (§20) replaced, restored the moment
+   *  the user selects a different result — the banded orange/blue criterion
+   *  plot belongs to the settings delivery, not to every result after it. */
+  criterionViewPrev: {
+    resultField: string;
+    bandedContour: boolean;
+    bandCount: number;
+    legendMin: number | null;
+    legendMax: number | null;
+    showExtremes: boolean;
+  } | null;
   /** Retained, selectable results for the Results view's switcher. */
   results: ResultEntry[];
   /** Which retained result the Results (deformed) view is showing — a
@@ -799,6 +879,7 @@ interface AppState {
         | "stiffness"
         | "axes"
         | "disp"
+        | "cylDof"
         | "forceMode"
         | "forceDir"
         | "forceMag"
@@ -821,6 +902,9 @@ interface AppState {
   ): void;
   /** Toggle a single global axis of a displacement support. */
   toggleBcAxis(id: string, axis: 0 | 1 | 2): void;
+  /** Toggle one local DOF of a cylindrical support (0 = radial, 1 = tangential,
+   *  2 = axial) between fixed and free. */
+  toggleBcCylDof(id: string, dof: 0 | 1 | 2): void;
   /** Switch a force load between component and direction definition. */
   setForceMode(id: string, mode: ForceMode): void;
   /** Set the magnitude (N) of a direction-mode force. */
@@ -930,7 +1014,7 @@ interface AppState {
   onSectionPlaneMoved(normal: [number, number, number], constant: number): void;
   setSmoothIters(v: number): void;
   setNBins(v: number): void;
-  /** Minimum member size in mm; null restores auto (2× line width). */
+  /** Minimum member size in mm; null restores auto (4× line width). */
   setMinMemberMm(v: number | null): void;
   setGoal(g: "budget" | "match" | "strength"): void;
   /** Strength goal: required SF_crit (clamped to a sane 1..9.5 band). */
@@ -982,6 +1066,14 @@ interface AppState {
   selectOrientation(ip: number, ir: number): Promise<void>;
   /** Drop the orientation preview: restore pose + the active result field. */
   clearOrientationPreview(): void;
+  /** Settings Optimizer (DESIGN §20): search uniform print settings for the
+   *  lightest print that still clears `settingsSfTarget`. `full` backfills the
+   *  whole 8 × 13 landscape instead of running the bisection driver. */
+  runSettingsSweep(full?: boolean): Promise<void>;
+  /** Write the winner's walls / shells / infill into the print settings and
+   *  re-verify with the standard As-Printed solve (§20 dec. 1 / dec. 9). */
+  applySettingsWinner(): Promise<void>;
+  setSettingsSfTarget(v: number): void;
   /** Constrained modal analysis (Verify tab): compute `modalModeCount` natural
    *  frequencies + mode shapes on the FIRST load case's supports, surfacing each
    *  mode as a switchable result-case. */
@@ -1036,11 +1128,16 @@ export interface PrintedSummary {
   pattern: PatternKey;
   perimeters: number;
   lineWidth: number;
-  /** Minimum safety factor over the part; null if the field fetch failed. */
+  /** SF_crit — the CRITERION's minimum over the part (the same number the SF
+   *  goal and the settings optimizer target, so the dock either confirms or
+   *  refutes them). Null if the read failed. */
   minSf: number | null;
   /** Which strength limit produced the minimum: in-layer material (σᵥᴹ)
    *  or layer adhesion (σzz tension). */
   sfGoverns: "material" | "layer" | null;
+  /** Stress-riser ratio at the binding cell: > ~1.6 means the number is
+   *  sitting on a notch tip and will fall further as the mesh is refined. */
+  sfRiser?: number | null;
 }
 
 /** One optimizer iteration for the nerd-log convergence charts. */
@@ -1058,11 +1155,17 @@ export interface OptIterSample {
 let bcCounter = 0;
 let stepCounter = 0;
 
+/** Id of the BC created by the most recent `addBc` that still has NO surfaces
+ *  assigned — the throwaway `dropUnassignedBc` cleans up. Module-level (nothing
+ *  renders it) and safe across project loads, since BC ids are never reused. */
+let pristineBcId: string | null = null;
+
 /** Short kind labels for auto-generated BC names ("Force 1", "Fixed 2", …). */
 const BC_KIND_NAME: Record<BcKind, string> = {
   fixed: "Fixed",
   frictionless: "Frictionless",
   displacement: "Displacement",
+  cylindrical: "Cylindrical",
   elastic: "Elastic",
   force: "Force",
   pressure: "Pressure",
@@ -1191,34 +1294,83 @@ function pushScalarField(set: SetState, get: () => AppState): Promise<void> {
 }
 
 /** Min safety factor of the CURRENT (live) printed solution from BOTH limits
- *  (material σᵥᴹ and layer-adhesion σzz), and which governs. Pure read. When
- *  `cache` is set the two fields are kept in the shared field cache (instant to
- *  view afterwards) — the multi-step loop passes false so a non-displayed
- *  step's fields never shadow the displayed one. Null if a fetch fails. */
+ *  (material σᵥᴹ and layer-adhesion σzz), and which governs. Pure read — no
+ *  solve, nothing invalidated. When `cache` is set the two display fields are
+ *  kept in the shared field cache (instant to view afterwards); the multi-step
+ *  loop passes false so a non-displayed step's fields never shadow the
+ *  displayed one. Null if the read fails.
+ *
+ *  This is the CRITERION (`criterion_sf`), not the raw minimum of the display
+ *  field: the dock is where a user checks whether the print the optimizer just
+ *  sized actually holds, so it has to be the very number the optimizer
+ *  targeted. It used to be the raw surface min, which on a real part read ~30 %
+ *  below the goal — "optimize for SF 2, validation says 1.6" (Stefan,
+ *  2026-07-25). Same reduction everywhere, or the number means nothing. */
 async function computeMinSf(
   cache: boolean
-): Promise<{ minSf: number; governs: "layer" | "material" } | null> {
+): Promise<{ minSf: number; governs: "layer" | "material"; riserRatio: number | null } | null> {
   try {
-    const [sfm, sfz] = await Promise.all([
-      engine.resultField("sfm"),
-      engine.resultField("sfz"),
-    ]);
     if (cache) {
+      const [sfm, sfz] = await Promise.all([
+        engine.resultField("sfm"),
+        engine.resultField("sfz"),
+      ]);
       session.setField("sfm", false, sfm);
       session.setField("sfz", false, sfz);
     }
-    let minM = Infinity;
-    let minZ = Infinity;
-    for (let i = 0; i < sfm.length; i++) minM = Math.min(minM, sfm[i]);
-    for (let i = 0; i < sfz.length; i++) minZ = Math.min(minZ, sfz[i]);
-    const minSf = Math.min(minM, minZ);
+    const [m, z] = await Promise.all([
+      engine.criterionSf("material"),
+      engine.criterionSf("layer"),
+    ]);
+    const minSf = Math.min(m.sf, z.sf);
     if (Number.isFinite(minSf)) {
-      return { minSf, governs: minZ < minM ? "layer" : "material" };
+      const governs = z.sf < m.sf ? "layer" : "material";
+      return { minSf, governs, riserRatio: (governs === "layer" ? z : m).riserRatio };
     }
   } catch {
-    // result vanished mid-fetch
+    // result vanished mid-fetch, or nothing is solved
   }
   return null;
+}
+
+/** Min SF of each design an optimize run retains (optimized / equal-mass
+ *  uniform / solid) for the dock's margin-of-safety comparison. Activates each
+ *  stash in turn — a stash carries its OWN eps, so stress and allowable both
+ *  scale with that design's densities — takes the WORST optimized load step,
+ *  then restores the display-active result. Infill modes only: a Part Topo
+ *  void cell has no meaningful per-cell safety factor. */
+async function computeOptMinSf(set: SetState, get: () => AppState) {
+  const st = get();
+  if (!st.optSummary || st.optSummary.solid) return;
+  const roster = st.results;
+  const out: OptMinSf = { optimized: null, uniform: null, solid: null };
+  const evalStash = async (id: string) => {
+    await engine.activateResult(id);
+    return computeMinSf(false);
+  };
+  try {
+    for (const r of roster) {
+      if (r.kind !== "optimized" || isEnvelope(r)) continue;
+      const v = await evalStash(r.id);
+      if (v && (!out.optimized || v.minSf < out.optimized.minSf)) out.optimized = v;
+    }
+    if (roster.some((r) => r.id === "uniform")) out.uniform = await evalStash("uniform");
+    if (roster.some((r) => r.id === "solid")) out.solid = await evalStash("solid");
+  } catch {
+    // a stash vanished mid-run — show whatever was measured
+  }
+  // Put the display result's solution back: stress/SF field queries always
+  // read the ACTIVE one, and the caches belonged to it.
+  const active = roster.find((r) => r.id === get().activeResultId);
+  if (active && !isEnvelope(active)) {
+    try {
+      await engine.activateResult(active.id);
+    } catch {
+      // keep whatever is live — the next selectResult re-activates anyway
+    }
+  }
+  session.invalidateSolution();
+  set({ optMinSf: out });
 }
 
 /** Fetch + cache both safety-factor fields and write the min (and which
@@ -1231,7 +1383,14 @@ async function refreshMinSf(
   if (!get().printedStats) return null;
   const sf = await computeMinSf(true);
   if (sf && get().printedStats) {
-    set({ printedStats: { ...get().printedStats!, minSf: sf.minSf, sfGoverns: sf.governs } });
+    set({
+      printedStats: {
+        ...get().printedStats!,
+        minSf: sf.minSf,
+        sfGoverns: sf.governs,
+        sfRiser: sf.riserRatio,
+      },
+    });
     return sf;
   }
   // no printed result, or the field vanished mid-fetch: dock shows mass/deflection only
@@ -1280,9 +1439,28 @@ async function transformModel(set: SetState, get: () => AppState, r: number[]) {
       return [q[0] + seat[0], q[1] + seat[1], q[2] + seat[2]];
     };
     const bbox = out.bbox as LoadedModel["bbox"];
-    const bcs = get().bcs.map((b) =>
-      b.kind === "mass" && b.point ? { ...b, point: movePoint(b.point) } : b
-    );
+    // A cached cylinder fit (bearing load, cylindrical support) is in WORLD
+    // coordinates, so it moves with the part like a mass CG. The engine always
+    // re-fits from the mesh at assembly, so this only keeps the glyph and the
+    // ⌀/axis readout on the bore — but a stale axis drawn across the part is
+    // exactly the kind of thing that reads as a bug. `r` here is a rotation or a
+    // uniform scale, so its column norm is the radius factor.
+    const rScale = Math.hypot(r[0], r[3], r[6]) || 1;
+    const bcs = get().bcs.map((b) => {
+      if (b.kind === "mass" && b.point) return { ...b, point: movePoint(b.point) };
+      if (b.cyl?.ok) {
+        return {
+          ...b,
+          cyl: {
+            ...b.cyl,
+            axis: transformDir([...r, ...t], b.cyl.axis),
+            point: movePoint(b.cyl.point),
+            radius: b.cyl.radius * rScale,
+          },
+        };
+      }
+      return b;
+    });
     // Keep the STEP analytic frame in lockstep: world = seat ∘ (r,t) ∘ old.
     const si = get().stepInfo;
     const stepInfo = si
@@ -1672,6 +1850,40 @@ async function pushBcs(get: () => AppState) {
   await engine.setBcs(effectiveBcs(get().bcs, activeStep(get())));
 }
 
+/** Throw away a just-created condition that never got any surfaces when the
+ *  user turns to a different one (`nextId`; null when adding a new BC). Adding
+ *  "Fixed", then realising "Elastic" was the better choice, used to leave an
+ *  empty support behind — invisible until it surfaced much later as a solve
+ *  error about a BC with no elements. Only the BC from the latest `addBc` is
+ *  eligible (see `pristineBcId`), so clearing the selection of an established,
+ *  configured condition never deletes it. */
+function dropUnassignedBc(set: SetState, get: () => AppState, nextId: string | null) {
+  const id = pristineBcId;
+  if (!id || id === nextId) return;
+  pristineBcId = null;
+  const bc = get().bcs.find((b) => b.id === id);
+  if (!bc || bc.tris.length > 0) return;
+  set({
+    bcs: get().bcs.filter((b) => b.id !== id),
+    activeBcId: get().activeBcId === id ? null : get().activeBcId,
+    // Drop any per-step overrides that referenced it (as removeBc does).
+    loadSteps: get().loadSteps.map((s) =>
+      id in s.overrides
+        ? {
+            ...s,
+            overrides: Object.fromEntries(
+              Object.entries(s.overrides).filter(([k]) => k !== id)
+            ),
+          }
+        : s
+    ),
+  });
+  appendLog(set, `Discarded “${bc.name ?? id}” — no surfaces were assigned to it`);
+  // A param edit (e.g. typing a magnitude before picking faces) can already
+  // have pushed the empty BC to the engine — resync.
+  void pushBcs(get);
+}
+
 
 /** After a per-step override edit: if it touched the ACTIVE step, re-sync the
  *  engine (live RBM check + next solve) and stale any standing result. Edits to
@@ -1968,6 +2180,7 @@ function invalidateResults(set: (p: Partial<AppState>) => void, get: () => AppSt
     stats: null,
     hasResult: false,
     optSummary: null,
+    optMinSf: null,
     printedStats: null,
     results: [],
     activeResultId: null,
@@ -2005,6 +2218,7 @@ function clearLiveResultView(set: (p: Partial<AppState>) => void, get: () => App
     stats: null,
     hasResult: false,
     optSummary: null,
+    optMinSf: null,
     printedStats: null,
     activeResultId: null,
     resultField: "u",
@@ -2044,8 +2258,10 @@ function markResultsStale(
   for (const k of keys) ep[k] += 1;
   set({ resultEpochs: ep });
   // The orientation map was swept from the now-stale inputs — delete it
-  // outright (unlike results it has no staleness badge of its own).
+  // outright (unlike results it has no staleness badge of its own). Same for
+  // the §20 settings landscape.
   clearOrientationSweep();
+  clearSettingsSweep();
 }
 
 /** Insert a freshly-computed (single-step) result, REPLACING every prior result
@@ -2057,21 +2273,21 @@ function upsertResult(set: (p: Partial<AppState>) => void, get: () => AppState, 
   set({ results: sortResults(next, get().loadSteps) });
 }
 
-/** Length provenance cell (canonical mm) — formatted live in the display unit. */
-function fmtMm(v: number): ProvVal {
-  return { v, kind: "length" };
+/** Skin-resolution provenance cell — how many cell layers model the wall. */
+function skinResLabel(p: { skinLayers: number; compositeSkin: boolean }): string {
+  return p.compositeSkin
+    ? `${p.skinLayers.toFixed(2)} layers · composite`
+    : `${p.skinLayers} cell layer${p.skinLayers === 1 ? "" : "s"}`;
 }
 
-/** Mass provenance cell (canonical g) — formatted live in the display unit. */
-function fmtMass(g: number): ProvVal {
-  return { v: g, kind: "mass" };
+/** Density-level provenance cell, e.g. "10 · 50 · 100 %". */
+function levelsLabel(sm: OptSummary): string {
+  return `${sm.bins.map((b) => `${Math.round(b.density * 100)}`).join(" · ")} %`;
 }
 
-/** Signed percentage with an explicit + (negatives carry their own −). Both
- *  "vs uniform" (positive: stiffer than even fill) and "vs solid" (negative:
- *  softer than fully dense) read off the same compliance-ratio calculation. */
-function signedPct(x: number): string {
-  return `${x >= 0 ? "+" : ""}${(x * 100).toFixed(0)}%`;
+/** Optimizer-run provenance cell: iterations, passes, wall time. */
+function optRunLabel(sm: OptSummary): string {
+  return `${sm.iterations} it${sm.passes > 1 ? ` · ${sm.passes} passes` : ""} · ${sm.seconds.toFixed(1)} s`;
 }
 
 /** Analysis-grid summary line for the provenance card. */
@@ -2123,8 +2339,10 @@ function currentLegendRange(s: AppState): [number, number] | null {
 function clearEnvelopeCache() {
   fieldServer.clearEnvelopeCache();
   // The orientation sweep (DESIGN §15) reduces over the same stashes — every
-  // invalidation that stales the envelope stales it too.
+  // invalidation that stales the envelope stales it too. The §20 settings
+  // landscape was swept on the (now dropped) analysis grid: same treatment.
   clearOrientationSweep();
+  clearSettingsSweep();
 }
 
 /** Drop the orientation sweep + preview (DESIGN §15): restores the true pose
@@ -2142,6 +2360,88 @@ function clearOrientationSweep() {
 
 /** Monotone token orphaning in-flight orientation sweeps on invalidation. */
 let orientToken = 0;
+
+/** Monotone token orphaning in-flight SETTINGS sweeps (DESIGN §20). */
+let settingsToken = 0;
+
+/** Drop the settings landscape (DESIGN §20): it was swept from inputs that
+ *  just changed, and unlike a result it carries no staleness badge. Apply
+ *  restores it deliberately — writing the winner's own settings must not
+ *  delete the map that produced them. */
+function clearSettingsSweep() {
+  settingsToken++;
+  const s = useStore.getState();
+  if (s.settingsSweep || s.settingsProgress || s.settingsApplied || s.settingsLive) {
+    useStore.setState({
+      settingsSweep: null,
+      settingsProgress: null,
+      settingsApplied: null,
+      settingsLive: null,
+    });
+  }
+}
+
+/** Register the INCLUDED load steps as engine cases for a settings sweep —
+ *  the same registration `runOptimize` does (DESIGN §13/§16), so the sweep's
+ *  SF envelope covers exactly the steps the optimizer would. */
+async function pushSweepLoadCases(get: () => AppState) {
+  const st = get();
+  await engine.clearLoadCases();
+  const included = st.loadSteps.filter((s) => s.includeInOptimize);
+  if (st.loadSteps.length > 1 && included.length >= 2) {
+    for (const step of included) {
+      await engine.setBcs(effectiveBcs(st.bcs, step));
+      await engine.addLoadCase(step.weight);
+    }
+  } else if (st.loadSteps.length > 1 && included.length === 1) {
+    await engine.setBcs(effectiveBcs(st.bcs, included[0]));
+  } else {
+    await pushBcs(get);
+  }
+}
+
+/** Merge a full-map backfill into the landscape it extended: the candidate
+ *  lists concatenate, and the winner is re-decided over ALL of them (the
+ *  backfill can surface a lighter feasible cell the search never probed). */
+function mergeSweep(
+  prev: SettingsSweepResult | null,
+  next: SettingsSweepResult
+): SettingsSweepResult {
+  if (!prev) return next;
+  const candidates = [...prev.candidates, ...next.candidates];
+  const feasibleOnes = candidates.filter((c) => c.feasible);
+  // Same rule as the kernel's search (§20 dec. 8): lighter wins, and inside a
+  // 1 % weight tie the higher measured safety factor does.
+  const winner =
+    feasibleOnes.length > 0
+      ? feasibleOnes.reduce((a, b) => {
+          if (b.massGrams < a.massGrams * 0.99) return b;
+          if (b.massGrams <= a.massGrams * 1.01) return b.sf > a.sf ? b : a;
+          return a;
+        })
+      : (candidates.reduce((a, b) => (b.sf > a.sf ? b : a), candidates[0]) ?? null);
+  return {
+    ...next,
+    candidates,
+    winner: winner ?? null,
+    feasible: feasibleOnes.length > 0,
+    bestSf: Math.max(prev.bestSf, next.bestSf),
+    // The riser ratio belongs to the WINNER, and the backfill may have moved
+    // it; only `next` re-measured one, so keep it when the winner came from
+    // there. (`rawMin` rides along for the same reason — it equals `sf` now.)
+    ...(winner &&
+    next.winner &&
+    winner.wallIndex === next.winner.wallIndex &&
+    winner.densityIndex === next.winner.densityIndex
+      ? { rawMin: next.rawMin, riserRatio: next.riserRatio }
+      : { rawMin: prev.rawMin, riserRatio: prev.riserRatio }),
+    solves: prev.solves + next.solves,
+    // A backfilled map has nothing left pruned — every cell is solved. Nor was
+    // it stopped at the ceiling: the merge only happens over a full map.
+    prunedWalls: [],
+    ceilingStop: false,
+  };
+}
 
 /** One in-flight preview-field fetch at a time; while the user drags across
  *  the heatmap only the LATEST selection is fetched when the current request
@@ -2185,6 +2485,159 @@ function orientFetchField(set: SetState, get: () => AppState) {
       orientFetchBusy = false;
     }
   })();
+}
+
+/** Stage the viewport for the §20 live preview: the Results view, undeformed
+ *  (a candidate is not a result — it has no retained displacement), with the
+ *  scalar field driven straight from the sweep's pushes. Same staging as the
+ *  §15 orientation preview.
+ *
+ *  The field KIND is switched to the criterion SF up front (§15 does the same
+ *  with `sfz`): the pushes carry safety factors, and leaving the previous
+ *  field's name on the legend labelled them "Displacement |u|, mm" — a legend
+ *  that names the wrong quantity is worse than no legend. Set directly, not
+ *  through `setResultField`: that re-fetches from the live solution, which the
+ *  sweep is busy replacing. */
+async function enterSettingsPreview(set: SetState, get: () => AppState) {
+  if (get().viewMode !== "deformed") await get().setViewMode("deformed");
+  sceneEvents.onSectionVolume?.(null);
+  const st = get();
+  snapshotCriterionView(set, st);
+  const kind = criterionKind(st.sfMeasure);
+  set({ resultField: kind });
+  sceneEvents.onShowExtremes?.(st.showExtremes, fieldUnit(kind));
+  // Banded at the target, exactly like the delivered result — every candidate
+  // reads "holds / does not hold" at a glance, and the winner's view is the
+  // same picture the search was drawing all along.
+  get().setBandCount(2);
+  const model = st.model;
+  if (model && st.resultSurface === "stl") {
+    sceneEvents.onScalarField?.(null);
+    sceneEvents.onDisplacements?.(new Float32Array(model.triCount * 9), {
+      maxDisplacement: referenceMaxDisp(get().results),
+    });
+  }
+}
+
+/** Paint one candidate's safety-factor field. The color scale is PINNED to
+ *  [0, 2 × target] with the boundary at the target, so the candidates are
+ *  comparable to each other frame to frame — an auto-fit scale would make
+ *  every candidate look equally (un)safe. */
+function pushSettingsPreviewField(set: SetState, get: () => AppState, values: Float32Array) {
+  const hi = 2 * Math.max(get().settingsSfTarget, 0.5);
+  sceneEvents.onScalarField?.(values, true, false, { min: 0, max: hi });
+  set({ fieldRange: { min: 0, max: hi }, legendMin: 0, legendMax: hi });
+  sceneEvents.onLegendRange?.(0, hi);
+}
+
+/** Retain the winner as a selectable result (§20). The engine left the
+ *  winner's own solve live, so this only stashes it and builds the roster
+ *  entry — no extra work. */
+async function retainSettingsResult(
+  set: SetState,
+  get: () => AppState,
+  sweep: SettingsSweepResult,
+  w: SettingsCandidate
+) {
+  const st = get();
+  const id: string = "settings";
+  try {
+    await engine.stashResult(id);
+  } catch {
+    return; // no live solution (nothing was solved) — nothing to retain
+  }
+  const step = activeStep(get());
+  const entry: ResultEntry = {
+    id,
+    kind: "settings",
+    loadStepId: step?.id ?? st.loadSteps[0]?.id ?? "",
+    loadStepName: step?.name ?? st.loadSteps[0]?.name ?? "",
+    label: `Settings · ${w.wall} × ${Math.round(w.density * 100)} %`,
+    maxDisplacement: w.maxDisplacement,
+    massGrams: w.massGrams,
+    minSf: w.sf,
+    converged: w.converged,
+    provTitle: sweep.feasible ? "Settings optimizer — lightest feasible" : "Settings optimizer — best achievable",
+    provRows: [
+      ["Walls", `${w.wall} × ${st.lineWidth} mm`],
+      ["Top/bottom", `${w.topBottomLayers} × ${st.layerHeight} mm`],
+      ["Infill", `${Math.round(w.density * 100)} % ${st.pattern}`],
+      ["Target SF", `${sweep.target} (${sweep.sfMeasure})`],
+      ["Search", `${sweep.solves} solves · ${sweep.candidates.length} settings`],
+    ],
+    epochs: { ...get().resultEpochs },
+  };
+  upsertResult(set, get, entry);
+  set({ hasResult: true });
+  // Route through the normal result switch so the viewport gets the stash's
+  // displacements + legend exactly like any other result.
+  await get().selectResult(id);
+  // Land on the criterion's own view with the binding point pinned — the
+  // number in the panel and the red spot in the viewport are the same fact.
+  await showCriterionField(set, get, sweep.worst);
+}
+
+/** The criterion field kind for an SF measure — what §17 and §20 actually
+ *  score, and therefore what they must plot. */
+function criterionKind(measure: string): string {
+  return measure === "material" ? "sfmx" : measure === "layer" ? "sfzx" : "sfx";
+}
+
+/** Remember the plot the criterion view is about to replace (once per visit —
+ *  the live preview snapshots first, the delivered result must not overwrite
+ *  it with the preview's own state). */
+function snapshotCriterionView(set: SetState, cur: AppState) {
+  if (cur.criterionViewPrev) return;
+  set({
+    criterionViewPrev: {
+      resultField: cur.resultField,
+      bandedContour: cur.bandedContour,
+      bandCount: cur.bandCount,
+      legendMin: cur.legendMin,
+      legendMax: cur.legendMax,
+      showExtremes: cur.showExtremes,
+    },
+  });
+}
+
+/** Show the CRITERION safety-factor field — the very field the reported number
+ *  is reduced from (masked smoothing, support singularity greyed) — banded at
+ *  the target with the min/max markers on, so the number in the panel and the
+ *  red spot in the viewport are the same fact. The previous plot state is
+ *  snapshotted and restored as soon as another result is selected. */
+async function showCriterionField(
+  set: SetState,
+  get: () => AppState,
+  worst: CriterionWorst | null
+) {
+  const cur = get();
+  snapshotCriterionView(set, cur);
+  await get().setResultField(criterionKind(cur.sfMeasure));
+  const target = get().settingsSfTarget;
+  get().setLegendRange(0, 2 * target);
+  get().setBandCount(2);
+  if (!get().showExtremes) get().setShowExtremes(true);
+  if (worst) {
+    appendLog(
+      set,
+      `  binding point: SF ${worst.sf.toFixed(2)} at ` +
+        `(${worst.x.toFixed(1)}, ${worst.y.toFixed(1)}, ${worst.z.toFixed(1)}) mm — ` +
+        "marked in the viewport"
+    );
+  }
+}
+
+/** Undo `showCriterionField` — called when the user moves to a result the
+ *  criterion view was not computed for. */
+function restoreCriterionView(set: SetState, get: () => AppState) {
+  const prev = get().criterionViewPrev;
+  if (!prev) return;
+  set({ criterionViewPrev: null });
+  get().setBandCount(prev.bandCount);
+  if (!prev.bandedContour && get().bandedContour) get().toggleBandedContour();
+  get().setLegendRange(prev.legendMin, prev.legendMax);
+  if (get().showExtremes !== prev.showExtremes) get().setShowExtremes(prev.showExtremes);
+  void get().setResultField(prev.resultField);
 }
 
 /** Layer normal n = Rx(pitch)·Ry(roll)·ẑ — must match core orient.rs. */
@@ -2266,7 +2719,7 @@ async function solveAllSteps(set: SetState, get: () => AppState) {
   const entries: ResultEntry[] = [];
   let displayStats: SolveStats | null = null;
   let displayPrinted: PrintedSummary | null = null;
-  let displayMinSf: { minSf: number; governs: "layer" | "material" } | null = null;
+  let displayMinSf: Awaited<ReturnType<typeof computeMinSf>> = null;
   for (let i = 0; i < steps.length; i++) {
     const step = steps[i];
     // The residual poll doubles as a liveness ticker in the busy chip.
@@ -2326,17 +2779,18 @@ async function solveAllSteps(set: SetState, get: () => AppState) {
           ["Load step", step.name],
           ["Infill", `${printedSummary.infillPct}% ${printedSummary.pattern}`],
           ["Skin", { v: printedSummary.lineWidth, kind: "length", prefix: `${printedSummary.perimeters} × ` }],
+          ["Skin resolution", skinResLabel(printedSummary)],
           ["Material", m.name],
           ["Mesh", meshLabel(cur)],
-          ["Mass", fmtMass(printedSummary.massGrams)],
-          ["Max |u|", fmtMm(stats.maxDisplacement)],
+          [stats.converged ? "Solved" : "Stopped at cap", `${stats.iterations} it · ${stats.seconds.toFixed(1)} s`],
+          ["Advisory", "homogenized · linear static"],
         ]
       : [
           ["Load step", step.name],
           ["Model", "fully dense E₀"],
           ["Material", m.name],
           ["Mesh", meshLabel(cur)],
-          ["Max |u|", fmtMm(stats.maxDisplacement)],
+          [stats.converged ? "Solved" : "Stopped at cap", `${stats.iterations} it · ${stats.seconds.toFixed(1)} s`],
         ];
     entries.push({
       id: rid,
@@ -2386,6 +2840,7 @@ async function solveAllSteps(set: SetState, get: () => AppState) {
           ...displayPrinted,
           minSf: displayMinSf?.minSf ?? null,
           sfGoverns: displayMinSf?.governs ?? null,
+          sfRiser: displayMinSf?.riserRatio ?? null,
         }
       : null,
     solveResiduals: finalStats.residuals ?? [],
@@ -2471,12 +2926,12 @@ async function stashOptimizedSteps(
       ["Mode", modeLabel + goalNote],
       [sm.solid ? "Retained vol" : "Mean infill", `${meanPct}%`],
     ];
-    if (!sm.solid) rows.push(["Pattern", st.pattern]);
+    if (!sm.solid)
+      rows.push(["Pattern", st.pattern], ["Levels", levelsLabel(sm)]);
     rows.push(
       ["Material", cur.material.name],
       ["Mesh", meshLabel(cur)],
-      ["Mass", fmtMass(sm.massGrams)],
-      ["Max |u|", fmtMm(stats.maxDisplacement)]
+      [sm.converged ? "Converged" : "Stopped at cap", optRunLabel(sm)]
     );
     entries.push({
       id: rid,
@@ -2520,18 +2975,22 @@ async function stashOptimizedSingle(set: SetState, get: () => AppState, out: Opt
     ["Mode", modeLabel + goalNote],
     [sm.solid ? "Retained vol" : "Mean infill", `${meanPct}%`],
   ];
-  if (!sm.solid) optRows.push(["Pattern", cur.pattern]);
+  if (!sm.solid) optRows.push(["Pattern", cur.pattern], ["Levels", levelsLabel(sm)]);
   optRows.push(
     ["Material", cur.material.name],
     ["Mesh", meshLabel(cur)],
-    ["Mass", fmtMass(sm.massGrams)],
-    ["Max |u|", fmtMm(sm.maxDisplacement)],
-    // Same compliance-ratio calc for both; vs solid comes out negative
-    // (the optimized design is softer than fully dense material).
-    ["vs solid", signedPct(sm.stiffnessVsSolid - 1)],
-    ["vs uniform", signedPct(sm.gainVsUniform)]
+    [sm.converged ? "Converged" : "Stopped at cap", optRunLabel(sm)]
   );
-  const next: ResultEntry[] = get().results.filter((r) => r.kind === "asprinted");
+  // The budget the run actually optimized for, when the printable floor/cap
+  // clamped the requested one — a run setting, so it lives on this card.
+  if (Math.abs(sm.targetInfill * 100 - cur.budget) > 0.5)
+    optRows.push(["Target clamped", `${Math.round(sm.targetInfill * 100)} %`]);
+  // Keep the as-printed baselines AND the §20 settings delivery: both are
+  // independent of the design this run produced, so an optimize must not
+  // silently delete them.
+  const next: ResultEntry[] = get().results.filter(
+    (r) => r.kind === "asprinted" || r.kind === "settings"
+  );
   next.push({
     id: "optimized",
     kind: "optimized",
@@ -2563,8 +3022,6 @@ async function stashOptimizedSingle(set: SetState, get: () => AppState, out: Opt
         ["Pattern", cur.pattern],
         ["Material", cur.material.name],
         ["Mesh", meshLabel(cur)],
-        ["Mass", fmtMass(sm.massGrams)],
-        ["Max |u|", fmtMm(sm.uniformMaxDisp ?? sm.maxDisplacement)],
       ],
       epochs: ep,
     });
@@ -2583,8 +3040,6 @@ async function stashOptimizedSingle(set: SetState, get: () => AppState, out: Opt
         ["Model", "fully dense E₀"],
         ["Material", cur.material.name],
         ["Mesh", meshLabel(cur)],
-        ["Mass", fmtMass(sm.massSolidGrams)],
-        ["Max |u|", fmtMm(sm.solidMaxDisp ?? 0)],
       ],
       epochs: ep,
     });
@@ -2626,8 +3081,6 @@ async function stashOptimizedMultiStep(set: SetState, get: () => AppState, out: 
         ["Pattern", cur.pattern],
         ["Material", cur.material.name],
         ["Mesh", meshLabel(cur)],
-        ["Mass", fmtMass(sm.massGrams)],
-        ["Max |u|", fmtMm(sm.uniformMaxDisp ?? sm.maxDisplacement)],
         ["Load case", primary.name],
       ],
       epochs: ep,
@@ -2647,14 +3100,12 @@ async function stashOptimizedMultiStep(set: SetState, get: () => AppState, out: 
         ["Model", "fully dense E₀"],
         ["Material", cur.material.name],
         ["Mesh", meshLabel(cur)],
-        ["Mass", fmtMass(sm.massSolidGrams)],
-        ["Max |u|", fmtMm(sm.solidMaxDisp ?? 0)],
         ["Load case", primary.name],
       ],
       epochs: ep,
     });
   }
-  const kept = cur.results.filter((r) => r.kind === "asprinted");
+  const kept = cur.results.filter((r) => r.kind === "asprinted" || r.kind === "settings");
   const roster = withEnvelope(
     sortResults([...kept, ...optEntries, ...baseEntries], cur.loadSteps),
     cur.loadSteps
@@ -2717,6 +3168,7 @@ function collectSettings(s: AppState) {
     goal: s.goal,
     sfTarget: s.sfTarget,
     sfMeasure: s.sfMeasure,
+    settingsSfTarget: s.settingsSfTarget,
     optMode: s.optMode,
     retainBc: s.retainBc,
     selfSupport: s.selfSupport,
@@ -2766,6 +3218,9 @@ interface ProjectManifest {
    *  so the schema version does NOT bump and old/new builds interoperate. */
   loadSteps?: SerializedLoadStep[];
   optSummary: OptSummary | null;
+  /** Margin-of-safety trio for the dock. OPTIONAL & additive (absent in files
+   *  saved before the feature — the dock just hides the card). */
+  optMinSf?: OptMinSf | null;
   regionInfos: { density: number }[];
   /** Result roster (metadata only; the buffers live in results/*.f32). Null
    *  when results were excluded from the save. */
@@ -2888,7 +3343,7 @@ export const useStore = create<AppState>((set, get) => ({
   colorSteps: CONTOUR_BANDS,
   smoothIters: 15,
   nBins: 3,
-  minMemberMm: null, // auto = 2× line width
+  minMemberMm: null, // auto = 4× line width
   goal: "budget",
   sfTarget: 2,
   sfMeasure: "both",
@@ -2910,9 +3365,16 @@ export const useStore = create<AppState>((set, get) => ({
   hasResult: false,
   optProgress: null,
   optSummary: null,
+  optMinSf: null,
   orientSweep: null,
   orientProgress: null,
   orientSel: null,
+  settingsSweep: null,
+  settingsProgress: null,
+  settingsLive: null,
+  settingsSfTarget: 2.0,
+  settingsApplied: null,
+  criterionViewPrev: null,
   results: [],
   activeResultId: null,
   resultEpochs: { ...ZERO_EPOCHS },
@@ -3072,6 +3534,7 @@ export const useStore = create<AppState>((set, get) => ({
         stats: null,
         hasResult: false,
         optSummary: null,
+        optMinSf: null,
         results: [],
         activeResultId: null,
         resultEpochs: { ...ZERO_EPOCHS },
@@ -3285,6 +3748,7 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   addBc(kind) {
+    dropUnassignedBc(set, get, null);
     // Auto-name "Force 1", "Force 2", … per kind so steps/tables read clearly.
     const nOfKind = get().bcs.filter((b) => b.kind === kind).length;
     const bc: Bc = {
@@ -3302,6 +3766,9 @@ export const useStore = create<AppState>((set, get) => ({
       // prescribed value 0 (a classic pin-to-zero until the user sets a value).
       axes: kind === "displacement" ? [false, false, true] : undefined,
       disp: kind === "displacement" ? [0, 0, 0] : undefined,
+      // Cylindrical support: journal-bearing default — radial + axial held,
+      // tangential free (the part can still turn in the bore).
+      cylDof: kind === "cylindrical" ? [true, false, true] : undefined,
       // Force: default to DIRECTION mode — the direction auto-tracks the
       // selection's average normal (forceDirAuto) and the magnitude is 10 N,
       // which is what most users want (push/pull on a face). Switch to
@@ -3312,7 +3779,9 @@ export const useStore = create<AppState>((set, get) => ({
       // Force auto-tracks the surface normal; a bearing push direction is set by
       // the user (which way the pin presses), so it does NOT auto-track.
       forceDirAuto: kind === "force" ? true : kind === "bearing" ? false : undefined,
-      cyl: kind === "bearing" ? null : undefined,
+      // Both cylinder-bound kinds cache their fit (the bearing's cosine
+      // distribution, the support's local radial/tangential/axial frame).
+      cyl: kind === "bearing" || kind === "cylindrical" ? null : undefined,
       // Moment: default to a 100 N·mm couple about +Z, components mode.
       moment: kind === "moment" ? [0, 0, 100] : undefined,
       momentMode: kind === "moment" ? "components" : undefined,
@@ -3332,6 +3801,9 @@ export const useStore = create<AppState>((set, get) => ({
       behavior: kind === "mass" ? "deformable" : undefined,
     };
     set({ bcs: [...get().bcs, bc], activeBcId: bc.id, tool: "select" });
+    // Acceleration is a whole-body field (DESIGN §16 dec. 2) — legitimately
+    // selection-less, so it is never a candidate for dropUnassignedBc.
+    pristineBcId = kind === "accel" ? null : bc.id;
     markResultsStale(set, get, "loads");
     pushBcGlyphs(get, bc.id);
   },
@@ -3354,6 +3826,7 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   setActiveBc(id) {
+    dropUnassignedBc(set, get, id);
     set({ activeBcId: id });
     if (id === null) set({ tool: "orbit" });
     pushBcGlyphs(get, id);
@@ -3367,13 +3840,13 @@ export const useStore = create<AppState>((set, get) => ({
     const positions = get().model?.positions;
     const target = get().bcs.find((b) => b.id === id);
     const prevTris = target?.tris ?? new Uint32Array(0);
-    // Bearing loads must sit on a cylindrical surface. Validate synchronously
-    // (instant feedback, no worker round-trip) and HARD-BLOCK a non-cylindrical
-    // pick by reverting to the previous selection.
-    let bearingPatch: Partial<Bc> | null = null;
-    if (target?.kind === "bearing") {
+    // Bearing loads and cylindrical supports must sit on a cylindrical surface.
+    // Validate synchronously (instant feedback, no worker round-trip) and
+    // HARD-BLOCK a non-cylindrical pick by reverting to the previous selection.
+    let cylPatch: Partial<Bc> | null = null;
+    if (target?.kind === "bearing" || target?.kind === "cylindrical") {
       if (tris.length === 0) {
-        bearingPatch = { tris, cyl: null, cylError: undefined };
+        cylPatch = { tris, cyl: null, cylError: undefined };
       } else {
         // STEP models: a whole-CAD-face cylindrical selection carries its
         // EXACT analytic axis/radius — use it instead of the least-squares
@@ -3395,14 +3868,15 @@ export const useStore = create<AppState>((set, get) => ({
             ? fitCylinderFromSelection(positions, tris)
             : null;
         if (fit?.ok) {
-          bearingPatch = { tris, cyl: fit, cylError: undefined };
+          cylPatch = { tris, cyl: fit, cylError: undefined };
         } else {
           const pct =
             fit && isFinite(fit.residual) ? ` (${(fit.residual * 100).toFixed(0)}% off-round)` : "";
-          bearingPatch = {
+          const what = target.kind === "bearing" ? "A bearing load" : "A cylindrical support";
+          cylPatch = {
             tris: prevTris,
             cyl: null,
-            cylError: `Selection isn’t a cylinder${pct} — bearing load needs a cylindrical surface.`,
+            cylError: `Selection isn’t a cylinder${pct} — ${what} needs a cylindrical surface.`,
           };
         }
       }
@@ -3410,7 +3884,7 @@ export const useStore = create<AppState>((set, get) => ({
     set({
       bcs: get().bcs.map((b) => {
         if (b.id !== id) return b;
-        if (bearingPatch) return { ...b, ...bearingPatch };
+        if (cylPatch) return { ...b, ...cylPatch };
         const next: Bc = { ...b, tris };
         // A direction-mode force that still auto-tracks re-aims along the new
         // selection's average normal (magnitude preserved).
@@ -3431,6 +3905,12 @@ export const useStore = create<AppState>((set, get) => ({
         return next;
       }),
     });
+    // Once it owns surfaces it is no longer a throwaway (see dropUnassignedBc).
+    // A rejected cylinder pick reverts to the previous (possibly empty)
+    // selection, so read the stored result back rather than trusting `tris`.
+    if (id === pristineBcId && (get().bcs.find((b) => b.id === id)?.tris.length ?? 0) > 0) {
+      pristineBcId = null;
+    }
     markResultsStale(set, get, "loads");
     pushBcGlyphs(get);
     void pushBcs(get);
@@ -3459,6 +3939,14 @@ export const useStore = create<AppState>((set, get) => ({
     const axes: [boolean, boolean, boolean] = [...(bc.axes ?? [false, false, false])];
     axes[axis] = !axes[axis];
     get().updateBcParams(id, { axes });
+  },
+
+  toggleBcCylDof(id, dof) {
+    const bc = get().bcs.find((b) => b.id === id);
+    if (!bc) return;
+    const cylDof: [boolean, boolean, boolean] = [...(bc.cylDof ?? [true, false, true])];
+    cylDof[dof] = !cylDof[dof];
+    get().updateBcParams(id, { cylDof });
   },
 
   setForceMode(id, mode) {
@@ -4184,7 +4672,7 @@ export const useStore = create<AppState>((set, get) => ({
     markResultsStale(set, get, "opt");
   },
   setMinMemberMm(v) {
-    // null = auto (2× line width); otherwise clamp to a sane printable range.
+    // null = auto (4× line width); otherwise clamp to a sane printable range.
     set({ minMemberMm: v == null ? null : Math.min(10, Math.max(0, v)) });
     markResultsStale(set, get, "opt");
   },
@@ -4309,6 +4797,9 @@ export const useStore = create<AppState>((set, get) => ({
     const cur = get();
     const e = cur.results.find((r) => r.id === id);
     if (!e || cur.busy) return;
+    // The §20 criterion view (banded orange/blue, supports greyed) describes
+    // the settings delivery. Any other result gets the plot the user had.
+    if (e.kind !== "settings" && cur.criterionViewPrev) restoreCriterionView(set, get);
     // Envelope (worst case across steps): no stashed solution — render the
     // UNDEFORMED part colored by the reduced field. Always auto-fits (its range
     // differs from any single step).
@@ -4770,16 +5261,17 @@ export const useStore = create<AppState>((set, get) => ({
             ? [
                 ["Infill", `${printedSummary.infillPct}% ${printedSummary.pattern}`],
                 ["Skin", { v: printedSummary.lineWidth, kind: "length", prefix: `${printedSummary.perimeters} × ` }],
+                ["Skin resolution", skinResLabel(printedSummary)],
                 ["Material", cur.material.name],
                 ["Mesh", meshLabel(cur)],
-                ["Mass", fmtMass(printedSummary.massGrams)],
-                ["Max |u|", fmtMm(stats.maxDisplacement)],
+                [stats.converged ? "Solved" : "Stopped at cap", `${stats.iterations} it · ${stats.seconds.toFixed(1)} s`],
+                ["Advisory", "homogenized · linear static"],
               ]
             : [
                 ["Model", "fully dense E₀"],
                 ["Material", cur.material.name],
                 ["Mesh", meshLabel(cur)],
-                ["Max |u|", fmtMm(stats.maxDisplacement)],
+                [stats.converged ? "Solved" : "Stopped at cap", `${stats.iterations} it · ${stats.seconds.toFixed(1)} s`],
               ];
           upsertResult(set, get, {
             id: rid,
@@ -5093,6 +5585,217 @@ export const useStore = create<AppState>((set, get) => ({
     else void pushScalarField(set, get);
   },
 
+  setSettingsSfTarget(v) {
+    const t = Math.min(9.5, Math.max(1, v));
+    if (t === get().settingsSfTarget) return;
+    // The landscape was swept against the old target — its feasible/infeasible
+    // banding and its winner no longer mean anything.
+    set({ settingsSfTarget: t, settingsSweep: null, settingsApplied: null });
+  },
+
+  async runSettingsSweep(full = false) {
+    const st = get();
+    if (!st.model || st.busy) return;
+    if (st.bcs.length === 0) {
+      set({ notice: "Add loads and supports first — the settings search scores them." });
+      return;
+    }
+    // Each candidate is a full solve — hold the run lock so Solve/Optimize
+    // can't queue behind (and narrate over) a search in flight.
+    if (!session.beginRun()) return;
+    const curve = st.curves[st.pattern];
+    const token = ++settingsToken;
+    const label = full ? "Solving the full settings map" : "Searching print settings";
+    set({
+      busy: `${label}…`,
+      error: null,
+      settingsProgress: { done: 0, total: 1 },
+      settingsApplied: null,
+      ...(full ? {} : { settingsSweep: null, settingsLive: null }),
+    });
+    try {
+      // Same load-step registration as the optimizer (§13/§16): every INCLUDED
+      // step is a case, and safety is the worst case over all of them.
+      await pushSweepLoadCases(get);
+      set({ busy: `${label}…` });
+      appendLog(
+        set,
+        `Settings optimizer — lightest walls + infill for SF ≥ ${st.settingsSfTarget} ` +
+          `(${st.sfMeasure === "both" ? "material & layer" : st.sfMeasure}), ` +
+          `line width ${st.lineWidth} mm · layer ${st.layerHeight} mm · ${st.pattern}` +
+          (full ? " — full map" : "")
+      );
+      const prev = full ? get().settingsSweep : null;
+      // Live preview: the part recolors with each candidate's safety factor as
+      // the search walks the settings. Undeformed (a candidate is not a result
+      // yet) — the same staging the §15 orientation preview uses.
+      let previewOn = false;
+      const out = await engine.settingsSweep(
+        {
+          sfTarget: st.settingsSfTarget,
+          sfMeasure: st.sfMeasure,
+          exponent: curve.exponent,
+          coeff: curve.coeff,
+          lineWidth: st.lineWidth,
+          layerHeight: st.layerHeight,
+          mode: full ? "full" : "search",
+          // Backfill only what the search left blank.
+          skip: prev
+            ? prev.candidates.map((c) => [c.wallIndex, c.densityIndex] as [number, number])
+            : undefined,
+        },
+        (p, field) => {
+          if (token !== settingsToken) return;
+          if (p.phase === "begin") {
+            // Draw the empty landscape immediately, seeded with whatever an
+            // earlier pass already solved (the full-map backfill).
+            set({
+              settingsProgress: { done: 0, total: p.total },
+              settingsLive: {
+                walls: p.walls,
+                densities: p.densities,
+                target: p.target,
+                cells: prev
+                  ? prev.candidates.map((c) => ({
+                      wallIndex: c.wallIndex,
+                      densityIndex: c.densityIndex,
+                      sf: c.sf,
+                      massGrams: c.massGrams,
+                      feasible: c.feasible,
+                    }))
+                  : [],
+              },
+            });
+            return;
+          }
+          const live = get().settingsLive;
+          set({
+            settingsProgress: { done: p.done, total: p.total },
+            busy:
+              `${label} — ${p.wall} walls @ ${Math.round(p.density * 100)} % → ` +
+              `SF ${p.sf.toFixed(2)}, ${p.massGrams.toFixed(1)} g`,
+            settingsLive: live
+              ? {
+                  ...live,
+                  cells: [
+                    ...live.cells,
+                    {
+                      wallIndex: p.wallIndex,
+                      densityIndex: p.densityIndex,
+                      sf: p.sf,
+                      massGrams: p.massGrams,
+                      feasible: p.feasible,
+                    },
+                  ],
+                }
+              : live,
+          });
+          if (field && field.length > 0) {
+            if (!previewOn) {
+              previewOn = true;
+              void enterSettingsPreview(set, get);
+            }
+            pushSettingsPreviewField(set, get, field);
+          }
+        }
+      );
+      if (token !== settingsToken) return; // invalidated mid-sweep
+      const merged = mergeSweep(prev, out);
+      set({ settingsSweep: merged, settingsLive: null, settingsProgress: null, busy: null });
+      const w = merged.winner;
+      appendLog(
+        set,
+        w
+          ? `  ${merged.feasible ? "lightest feasible" : "best achievable"}: ${w.wall} wall${w.wall === 1 ? "" : "s"} · ` +
+              `${Math.round(w.density * 100)} % infill · ${w.topBottomLayers} top/bottom layers — ` +
+              `${w.massGrams.toFixed(1)} g at SF ${w.sf.toFixed(2)}` +
+              ` (${merged.solves} solve${merged.solves === 1 ? "" : "s"}` +
+              (merged.excludedCells > 0
+                ? `, ${merged.excludedCells} cells excluded near rigid supports`
+                : "") +
+              ")"
+          : "  no candidate solved"
+      );
+      if (merged.prunedWalls.length > 0) {
+        appendLog(
+          set,
+          `  skipped ${merged.prunedWalls.join(", ")} wall${merged.prunedWalls.length === 1 ? "" : "s"} — ` +
+            "already heavier than the best feasible print at any infill"
+        );
+      }
+      if (merged.ceilingStop && w) {
+        appendLog(
+          set,
+          `  stopped after one solve: ${w.wall} walls @ ${Math.round(w.density * 100)} % is the ` +
+            "strongest print these settings can make, and it misses the target — " +
+            "no lighter setting can hold it either. Change the geometry, the material, or the load."
+        );
+      }
+      // The engine left the WINNER's field live: retain it as a real,
+      // selectable result so the delivery can be inspected — plotted,
+      // sectioned, compared — instead of taken on faith.
+      if (w) await retainSettingsResult(set, get, merged, w);
+      // Nothing to hand over: put the viewport back the way the live preview
+      // found it rather than leaving a candidate's coloring on screen.
+      else restoreCriterionView(set, get);
+    } catch (e) {
+      if (token !== settingsToken) return;
+      restoreCriterionView(set, get); // stopped or failed — undo the preview
+      set({
+        settingsProgress: null,
+        settingsLive: null,
+        busy: null,
+        error: (e as Error).message ?? String(e),
+      });
+    } finally {
+      session.endRun();
+    }
+  },
+
+  async applySettingsWinner() {
+    const sw = get().settingsSweep;
+    const w = sw?.winner;
+    if (!sw || !w || get().busy) return;
+    // Writing the print settings stales results (and would drop the map) —
+    // keep the landscape, it is still the answer for THESE inputs.
+    set({ analyzeMode: "printed" });
+    get().setPerimeters(w.wall);
+    get().setTopBottomLayers(w.topBottomLayers);
+    get().setPrintInfill(Math.round(w.density * 100));
+    set({ settingsSweep: sw, settingsApplied: null });
+    appendLog(
+      set,
+      `Applied print settings: ${w.wall} perimeters · ${w.topBottomLayers} top/bottom layers · ` +
+        `${Math.round(w.density * 100)} % ${get().pattern} — verifying as printed`
+    );
+    // §20 dec. 9: the delivery is verified by the STANDARD As-Printed solve,
+    // under normal snap behavior. Snapping can move the grid (and with it the
+    // wall resolution), so the criterion is re-measured on the final grid.
+    await get().runSolve();
+    if (get().error) return;
+    try {
+      // Read-only: `criterionSf` scores the result that is ALREADY live. It
+      // must not re-push BCs — `clear_bcs` drops the engine's solution, which
+      // would leave the run the user is looking at with no stress fields at all.
+      const target = get().settingsSfTarget;
+      const got = await engine.criterionSf(get().sfMeasure);
+      const ok = got.sf >= target;
+      set({
+        settingsSweep: sw,
+        settingsApplied: { wall: w.wall, densityPct: Math.round(w.density * 100), sf: got.sf, ok },
+      });
+      appendLog(
+        set,
+        `  verified as printed: SF ${got.sf.toFixed(2)} vs target ${target}` +
+          (ok ? " — holds" : " — BELOW target after snapping; raise the infill or a wall")
+      );
+      await showCriterionField(set, get, got.worst);
+    } catch {
+      // Verification is advisory — a failure leaves the settings applied and
+      // the panel simply shows no verified number.
+    }
+  },
+
   async runOptimize() {
     const st = get();
     if (!st.model || !session.beginRun()) return;
@@ -5107,6 +5810,7 @@ export const useStore = create<AppState>((set, get) => ({
       error: null,
       optProgress: null,
       optSummary: null,
+      optMinSf: null,
       printedStats: null,
       optSeries: [],
     });
@@ -5222,8 +5926,8 @@ export const useStore = create<AppState>((set, get) => ({
           symmetry: st.symOn ? [...st.symNormal, st.symC] : null,
           topBottomLayers: st.topBottomLayers,
           layerHeight: st.layerHeight,
-          // Auto = 2× line width (a true smallest printable rib); 0 disables.
-          minMemberMm: st.minMemberMm ?? 2 * st.lineWidth,
+          // Auto = 4× line width (a robustly printable smallest rib); 0 disables.
+          minMemberMm: st.minMemberMm ?? 4 * st.lineWidth,
         },
         (p, density, skelPositions, skelIndices, skelDensity) => {
           // Buffer-less phase push: narrate the silent pipeline stage and bail —
@@ -5412,6 +6116,13 @@ export const useStore = create<AppState>((set, get) => ({
         // keeps the byte-identical pre-load-step path.
         if (get().loadSteps.length > 1) await stashOptimizedMultiStep(set, get, out);
         else await stashOptimizedSingle(set, get, out);
+        // Margin-of-safety comparison for the dock: min SF of each retained
+        // design (worst load step for the optimized one).
+        if (!out.summary.solid) {
+          set({ busy: "Computing safety factors…" });
+          await computeOptMinSf(set, get);
+        }
+        set({ busy: null });
       } catch {
         set({ busy: null });
         // stash failed — the optimized result still shows, it just isn't switchable
@@ -5562,6 +6273,7 @@ export const useStore = create<AppState>((set, get) => ({
         })),
         loadSteps: serializeLoadSteps(s.bcs, s.loadSteps),
         optSummary: s.optSummary,
+        optMinSf: s.optMinSf,
         regionInfos: s.regionInfos,
         // Envelopes have no stashed buffer — they're re-derived on load.
         results: includeResults ? s.results.filter((r) => !isEnvelope(r)) : null,
@@ -5703,6 +6415,9 @@ export const useStore = create<AppState>((set, get) => ({
         // Additive fields (absent in files saved before the strength goal).
         sfTarget: st.sfTarget ?? 2,
         sfMeasure: st.sfMeasure ?? "both",
+        // Additive (DESIGN §20; absent in files saved before the settings
+        // optimizer) — the landscape itself is never saved, only its target.
+        settingsSfTarget: st.settingsSfTarget ?? 2,
         optMode: st.optMode,
         retainBc: st.retainBc,
         selfSupport: st.selfSupport,
@@ -5723,6 +6438,7 @@ export const useStore = create<AppState>((set, get) => ({
         stats: null,
         hasResult: false,
         optSummary: null,
+        optMinSf: null,
         results: [],
         activeResultId: null,
         resultEpochs: { ...ZERO_EPOCHS },
@@ -5782,6 +6498,7 @@ export const useStore = create<AppState>((set, get) => ({
       if (restore.hasDesign && mf.optSummary) {
         set({
           optSummary: mf.optSummary,
+          optMinSf: mf.optMinSf ?? null,
           regionInfos: mf.regionInfos,
           regionVisible: mf.regionInfos.map(() => true),
         });

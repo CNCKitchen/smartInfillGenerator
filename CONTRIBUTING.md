@@ -48,6 +48,12 @@ If a copyleft component is ever genuinely needed, the options are: isolate
 it behind a process/network boundary as an optional component, buy a
 commercial license for it, or write our own. Ask first.
 
+First-party exception: our own AGPL packages are fine — same copyright
+holder, same CLA, relicensable under the same commercial exception. Today
+that is `meshstep` (the STEP importer), excluded by exact version in the npm
+job. Bumping it fails CI once by design: re-confirm it is still ours, then
+update the exclusion.
+
 Checking: `cargo deny check licenses` (allowlist in [deny.toml](deny.toml))
 for Rust; `npx license-checker --excludePrivatePackages --onlyAllow "..."`
 for npm (exact allowlist in the workflow). CI enforces both on every PR and

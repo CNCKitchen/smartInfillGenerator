@@ -66,9 +66,9 @@ pub struct EvalLaw {
     pub coeff: f64,
 }
 
-/// Strength goal (DESIGN §17): minimize material such that the trimmed-
-/// percentile safety-factor criterion SF_crit stays at or above `target` on
-/// every included load step. Mutually exclusive with `goal_match`.
+/// Strength goal (DESIGN §17): minimize material such that the safety-factor
+/// criterion SF_crit — the lowest smoothed scored cell — stays at or above
+/// `target` on every included load step. Mutually exclusive with `goal_match`.
 #[derive(Clone, Copy, Debug)]
 pub struct StrengthGoal {
     /// Required minimum SF_crit (§17 dec. 1; UI default 2.0).
@@ -96,6 +96,12 @@ pub struct PipelineCfg<'a> {
     pub levels_pct: Option<&'a [f64]>,
     /// Region-smoothing slider units (× `SMOOTH_PASS_MULT` constrained passes).
     pub smooth_iters: usize,
+    /// BC singularity exclusion (DESIGN §20 dec. 5/7), per padded grid cell —
+    /// `strength::bc_exclusion` over the rigid constraint patches of EVERY
+    /// included load step. Folded into the criterion mask, so the SF-target
+    /// goal, its binding-region view and the §20 settings sweep all score the
+    /// same cells. Empty ⇒ no exclusion (the pre-§20 criterion).
+    pub bc_excl: &'a [bool],
 }
 
 /// Per-iteration update handed to the caller's progress callback. Carries the
@@ -269,8 +275,8 @@ impl Snapshot {
 }
 
 /// SF_crit of ONE design over every included load step (DESIGN §17 dec. 4/5):
-/// per-cell SF (display math) → masked nodal smoothing → volume-weighted
-/// trimmed percentile, per step; the scalar is the min over steps (every step
+/// per-cell SF (display math) → masked nodal smoothing → minimum over the
+/// scored cells, per step; the scalar is the min over steps (every step
 /// must meet the target). The primary step reuses `u_primary` (already solved
 /// for exactly this `x`); extra steps re-solve cold, each with its own
 /// self-weight when the case carries one. Returns
@@ -289,10 +295,11 @@ fn strength_eval(
     eval_coeff: f64,
     solid_mode: bool,
     spec: &StrengthSpec,
+    bc_excl: &[bool],
     u_primary: &[f64],
 ) -> Result<(f64, Vec<f64>, Vec<f32>, Vec<bool>), OptimizeError> {
     let eps = build_eps(grid, skin, design_cells, skin_frac, x, eval_exp, eval_coeff);
-    let mask = strength::criterion_mask(grid, design_cells, x, solid_mode);
+    let mask = strength::criterion_mask(grid, design_cells, x, solid_mode, bc_excl);
     let vfrac = if loads.has_self_weight() {
         build_vfrac(grid, design_cells, skin_frac, x)
     } else {
@@ -303,7 +310,7 @@ fn strength_eval(
         let u: Vec<f32> = u64.iter().map(|&v| v as f32).collect();
         let cells = strength::sf_cells(grid, &u, settings.e0, settings.nu, &eps, &mask, spec);
         let sm = strength::smooth_masked(grid, &cells, &mask);
-        let crit = strength::sf_percentile(grid, &sm, &mask, strength::SF_TRIM_FRAC);
+        let crit = strength::sf_min(grid, &sm, &mask);
         if folded.is_empty() {
             *folded = sm;
         } else {
@@ -408,7 +415,7 @@ pub fn run_optimization(
         status(PipelinePhase::SfEval);
         let (crit, steps, folded, mask) = strength_eval(
             grid, levels, settings, loads, &split.skin, &split.design, &split.skin_frac, &x_cap,
-            eval_exp, eval_coeff, solid, &sg.spec, &u_cap,
+            eval_exp, eval_coeff, solid, &sg.spec, cfg.bc_excl, &u_cap,
         )?;
         sf_cap_crit = crit;
         sf_feasible = crit >= sg.target;
@@ -554,7 +561,8 @@ pub fn run_optimization(
             status(PipelinePhase::SfEval);
             let (crit, steps, folded, mask) = strength_eval(
                 grid, levels, settings, loads, &result.skin_cells, &result.design_cells,
-                &result.skin_frac, &x_binned, eval_exp, eval_coeff, solid, &sg.spec, &u_b,
+                &result.skin_frac, &x_binned, eval_exp, eval_coeff, solid, &sg.spec, cfg.bc_excl,
+                &u_b,
             )?;
             sf_trace.push((budget_k, crit));
             let feasible_now = crit >= sg.target;
@@ -674,9 +682,9 @@ pub fn run_optimization(
 
     // ---- binding region on the DELIVERED design (§17 dec. 6) ----
     // Cells below the SF target on the folded smoothed field. On a feasible
-    // delivery this is (at most) the trimmed tail — the safety net for
-    // hotspots smaller than the trim volume; on an infeasible one it is the
-    // diagnosis: mostly-skin ⇒ infill can't fix it, else raise the cap.
+    // delivery this is EMPTY (SF_crit is the minimum, so nothing scored sits
+    // below it); on an infeasible one it is the diagnosis: mostly-skin ⇒
+    // infill can't fix it, else raise the cap.
     let (binding_cells, binding_skin_share) = if let Some(sg) = strength_goal {
         let b = strength::binding_cells(&sf_folded, &sf_mask, sg.target);
         let mut is_skin = vec![false; grid.cell_count()];
@@ -991,6 +999,7 @@ mod tests {
             n_bins: 3,
             levels_pct: None,
             smooth_iters: 4,
+            bc_excl: &[],
         };
         let oc = run_optimization(
             &mut None, &grid, levels, &asm.problem, &settings, &params, &cfg, &LoadSet::default(),
@@ -1062,6 +1071,7 @@ mod tests {
                 n_bins: 3,
                 levels_pct: None,
                 smooth_iters: 0,
+                bc_excl: &[],
             };
             run_optimization(
                 &mut None, &grid, levels, &asm.problem, &settings, &params, &cfg,
@@ -1120,6 +1130,7 @@ mod tests {
             n_bins: 3,
             levels_pct: None,
             smooth_iters: 0,
+            bc_excl: &[],
         };
         let plain = run_optimization(
             &mut None, &grid, levels, &asm.problem, &settings, &params, &cfg,
@@ -1167,6 +1178,7 @@ mod tests {
             n_bins: 3,
             levels_pct: None,
             smooth_iters: 0,
+            bc_excl: &[],
         };
         let run = |loads: &LoadSet| {
             run_optimization(
