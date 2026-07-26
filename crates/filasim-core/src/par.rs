@@ -337,6 +337,126 @@ pub fn promote(dst: &mut [f64], src: &[f32]) {
     });
 }
 
+// ---- live-set aware variants (see `mg::Level::build_live`) ----
+//
+// On a voxelized part most of the padded node grid is dead and every solver
+// vector is IDENTICALLY ZERO there. These skip whole dead blocks instead of
+// streaming zeros. Results are bit-identical: a skipped block contributes
+// exactly 0 to a sum (and `+0.0` never perturbs a running total), and the
+// element-wise updates would have written the zero that is already stored.
+//
+// `live[i]` covers nodes `[i*blk, (i+1)*blk)`, i.e. DOFs `[3*i*blk, ..)`.
+
+/// Chunk size for the live drivers, rounded DOWN to a whole number of blocks
+/// so every parallel range starts on a block boundary (otherwise `s / blk3`
+/// would not name the block that `s` lies in).
+#[inline]
+fn live_chunk(blk3: usize) -> usize {
+    const BASE: usize = 1 << 14;
+    (BASE / blk3).max(1) * blk3
+}
+
+/// Run `f(start, end)` over live sub-blocks of the DOF range `[lo, hi)`.
+#[inline]
+fn for_live_blocks(lo: usize, hi: usize, live: &[bool], blk3: usize, mut f: impl FnMut(usize, usize)) {
+    let mut s = lo;
+    while s < hi {
+        let e = (s + blk3).min(hi);
+        if live[s / blk3] {
+            f(s, e);
+        }
+        s = e;
+    }
+}
+
+/// `y[i] += a * x[i]` over live blocks.
+pub fn axpy64_live(y: &mut [f64], a: f64, x: &[f64], live: &[bool], blk3: usize) {
+    debug_assert_eq!(y.len(), x.len());
+    let n = y.len();
+    let ys = UnsafeSlice::new(y);
+    for_each_range(n, live_chunk(blk3), |lo, hi| {
+        for_live_blocks(lo, hi, live, blk3, |s, e| {
+            // SAFETY: ranges from `for_each_range` are disjoint.
+            let yc = unsafe { ys.slice_mut(s, e - s) };
+            for (yi, xi) in yc.iter_mut().zip(&x[s..e]) {
+                *yi += a * xi;
+            }
+        });
+    });
+}
+
+/// `p[i] = z[i] + beta * p[i]` (f32 z into the f64 direction) over live blocks.
+pub fn xpby_mixed_live(p: &mut [f64], z: &[f32], beta: f64, live: &[bool], blk3: usize) {
+    debug_assert_eq!(p.len(), z.len());
+    let n = p.len();
+    let ps = UnsafeSlice::new(p);
+    for_each_range(n, live_chunk(blk3), |lo, hi| {
+        for_live_blocks(lo, hi, live, blk3, |s, e| {
+            // SAFETY: ranges from `for_each_range` are disjoint.
+            let pc = unsafe { ps.slice_mut(s, e - s) };
+            for (pi, zi) in pc.iter_mut().zip(&z[s..e]) {
+                *pi = *zi as f64 + beta * *pi;
+            }
+        });
+    });
+}
+
+/// f64 → f32 demotion over live blocks (dead entries stay 0 in both).
+pub fn demote_live(dst: &mut [f32], src: &[f64], live: &[bool], blk3: usize) {
+    debug_assert_eq!(dst.len(), src.len());
+    let n = dst.len();
+    let ds = UnsafeSlice::new(dst);
+    for_each_range(n, live_chunk(blk3), |lo, hi| {
+        for_live_blocks(lo, hi, live, blk3, |s, e| {
+            // SAFETY: ranges from `for_each_range` are disjoint.
+            let dc = unsafe { ds.slice_mut(s, e - s) };
+            for (d, v) in dc.iter_mut().zip(&src[s..e]) {
+                *d = *v as f32;
+            }
+        });
+    });
+}
+
+/// `Σ a[i]·b[i]` over live blocks (dead blocks contribute exactly 0).
+pub fn dot64_live(a: &[f64], b: &[f64], live: &[bool], blk3: usize) -> f64 {
+    debug_assert_eq!(a.len(), b.len());
+    map_reduce_ranges(
+        a.len(),
+        live_chunk(blk3),
+        |lo, hi| {
+            let mut acc = 0.0;
+            for_live_blocks(lo, hi, live, blk3, |s, e| {
+                acc += a[s..e].iter().zip(&b[s..e]).map(|(x, y)| x * y).sum::<f64>();
+            });
+            acc
+        },
+        |x, y| x + y,
+        || 0.0,
+    )
+}
+
+pub fn norm2_64_live(a: &[f64], live: &[bool], blk3: usize) -> f64 {
+    dot64_live(a, a, live, blk3).sqrt()
+}
+
+/// `Σ a[i]·b[i]` with an f32 second operand, over live blocks.
+pub fn dot_mixed_live(a: &[f64], b: &[f32], live: &[bool], blk3: usize) -> f64 {
+    debug_assert_eq!(a.len(), b.len());
+    map_reduce_ranges(
+        a.len(),
+        live_chunk(blk3),
+        |lo, hi| {
+            let mut acc = 0.0;
+            for_live_blocks(lo, hi, live, blk3, |s, e| {
+                acc += a[s..e].iter().zip(&b[s..e]).map(|(x, y)| x * *y as f64).sum::<f64>();
+            });
+            acc
+        },
+        |x, y| x + y,
+        || 0.0,
+    )
+}
+
 /// Shared mutable slice for scatter writes that are disjoint BY CONSTRUCTION
 /// (e.g. cells of one color in an 8-colored hex grid never share nodes).
 /// Safety rests on that invariant; callers must uphold it.

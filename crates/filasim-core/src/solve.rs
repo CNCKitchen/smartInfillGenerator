@@ -8,7 +8,6 @@
 //!   on an already-padded grid — what the interactive app drives via attach.rs.
 //! - `solve_static`: axis-aligned box-region BCs (tests, benchmarks).
 
-use crate::fem::ke_hex;
 use crate::mg::{Level, MgSolver};
 use crate::rigid::RigidGroup;
 use crate::voxel::VoxelGrid;
@@ -103,14 +102,26 @@ impl std::error::Error for SolveError {}
 /// Pad grid dimensions so the multigrid hierarchy divides evenly; padding is
 /// void and costs nothing. Returns the padded grid and the level count.
 pub fn pad_for_levels(grid: &VoxelGrid, max_levels: usize) -> (VoxelGrid, usize) {
-    let min_dim = grid.nx.min(grid.ny).min(grid.nz);
-    let mut levels = 1usize;
-    while levels < max_levels && (min_dim >> levels) >= 2 && (min_dim >> (levels - 1)) >= 4 {
-        levels += 1;
-    }
-    let mult = 1usize << (levels - 1);
-    let pad = |n: usize| n.div_ceil(mult) * mult;
-    let (nx, ny, nz) = (pad(grid.nx), pad(grid.ny), pad(grid.nz));
+    // PER AXIS (semicoarsening): how many times can this axis be halved and
+    // still be a usable grid? Padding used to take the MINIMUM over the three
+    // axes, so one thin axis — a 3-cell-thick plate, a slender rib — capped the
+    // hierarchy for all of them and, at the extreme, left a single level with no
+    // multigrid at all. Each axis now gets padded to its own depth and the
+    // hierarchy halves whichever axes it can at each step.
+    let depth = |n: usize| {
+        let mut k = 0usize;
+        while k + 1 < max_levels && (n >> (k + 1)) >= 2 && (n >> k) >= 4 {
+            k += 1;
+        }
+        k
+    };
+    let (kx, ky, kz) = (depth(grid.nx), depth(grid.ny), depth(grid.nz));
+    let levels = 1 + kx.max(ky).max(kz);
+    let pad = |n: usize, k: usize| {
+        let mult = 1usize << k;
+        n.div_ceil(mult) * mult
+    };
+    let (nx, ny, nz) = (pad(grid.nx, kx), pad(grid.ny, ky), pad(grid.nz, kz));
     let mut scale = vec![0f32; nx * ny * nz];
     for cz in 0..grid.nz {
         for cy in 0..grid.ny {
@@ -404,14 +415,14 @@ impl SolverCache {
                 fixed[3 * n as usize + d] = true;
             }
         }
-        let ke64 = ke_hex(s.e0, s.nu, grid.h);
         let finest = Level::new(
             nx,
             ny,
             nz,
             grid.h,
             eps,
-            ke64,
+            s.e0,
+            s.nu,
             &fixed,
             problem.springs.clone(),
             problem.rigid.clone(),

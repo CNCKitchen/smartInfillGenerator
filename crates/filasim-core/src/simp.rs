@@ -1537,7 +1537,7 @@ mod tests {
 
         let (_, _, u) = eval(&x);
         // Analytic sensitivity, built exactly as the optimizer does.
-        let ke64 = ke_hex(e0, nu, h);
+
         let eps = build_eps(&grid, &skin, &design, &skin_frac, &x, exp, coeff);
         let mut fixed_bool = vec![false; 3 * (nx + 1) * (ny + 1) * (nz + 1)];
         for &nn in &fixed {
@@ -1545,7 +1545,8 @@ mod tests {
                 fixed_bool[3 * nn as usize + d] = true;
             }
         }
-        let level = Level::new(nx, ny, nz, h, eps, ke64, &fixed_bool, Vec::new(), Vec::new());
+        let ke64 = ke_hex(e0, nu, h);
+        let level = Level::new(nx, ny, nz, h, eps, e0, nu, &fixed_bool, Vec::new(), Vec::new());
         let mut se = vec![0f64; design.len()];
         cell_strain_energy(&level, &ke64, &u, &design, &mut se);
         let k = (0..se.len()).max_by(|&a, &b| se[a].total_cmp(&se[b])).unwrap();

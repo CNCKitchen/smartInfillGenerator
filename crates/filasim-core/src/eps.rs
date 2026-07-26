@@ -95,19 +95,36 @@ pub fn resolve_eps(g: &VoxelGrid, over: Option<&[f32]>) -> Vec<f32> {
     }
 }
 
-/// Child-averaged stiffness for the next-coarser grid (fine dims must be even).
-pub(crate) fn average_coarse_eps(fine_eps: &[f32], fnx: usize, fny: usize, fnz: usize) -> Vec<f32> {
-    assert!(fnx % 2 == 0 && fny % 2 == 0 && fnz % 2 == 0);
-    let (nx, ny, nz) = (fnx / 2, fny / 2, fnz / 2);
+/// Child-averaged stiffness for the next-coarser grid. `c[a]` says whether axis
+/// `a` is halved (SEMICOARSENING: a plate too thin to coarsen through-thickness
+/// still coarsens in-plane); every halved axis must have an even fine dimension.
+/// The average runs over the 2^(halved axes) children.
+pub(crate) fn average_coarse_eps(
+    fine_eps: &[f32],
+    fnx: usize,
+    fny: usize,
+    fnz: usize,
+    c: [bool; 3],
+) -> Vec<f32> {
+    let step = [
+        if c[0] { 2usize } else { 1 },
+        if c[1] { 2 } else { 1 },
+        if c[2] { 2 } else { 1 },
+    ];
+    assert!(fnx % step[0] == 0 && fny % step[1] == 0 && fnz % step[2] == 0);
+    let (nx, ny, nz) = (fnx / step[0], fny / step[1], fnz / step[2]);
+    let kids = (step[0] * step[1] * step[2]) as f32;
     let mut eps = vec![0f32; nx * ny * nz];
     for cz in 0..nz {
         for cy in 0..ny {
             for cx in 0..nx {
                 let mut s = 0f32;
-                for dz in 0..2 {
-                    for dy in 0..2 {
-                        for dx in 0..2 {
-                            s += fine_eps[((2 * cz + dz) * fny + 2 * cy + dy) * fnx + 2 * cx + dx];
+                for dz in 0..step[2] {
+                    for dy in 0..step[1] {
+                        for dx in 0..step[0] {
+                            s += fine_eps[((step[2] * cz + dz) * fny + step[1] * cy + dy) * fnx
+                                + step[0] * cx
+                                + dx];
                         }
                     }
                 }
@@ -115,7 +132,7 @@ pub(crate) fn average_coarse_eps(fine_eps: &[f32], fnx: usize, fny: usize, fnz: 
                 // for thin-shell parts (Benchy) and measurably HURT
                 // convergence (+8-12% iterations) — the softer operator is
                 // the better preconditioner here.
-                eps[(cz * ny + cy) * nx + cx] = s / 8.0;
+                eps[(cz * ny + cy) * nx + cx] = s / kids;
             }
         }
     }

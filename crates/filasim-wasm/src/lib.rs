@@ -4855,6 +4855,50 @@ pub extern "C" fn bench_voxelize(h: f64) -> u32 {
     grid.solid_count() as u32
 }
 
+/// SPARSE THIN-SHELL solve — the real-part worst case, and the only benchmark
+/// shape that exercises what a solid box cannot: a mostly-DEAD node grid (a
+/// hollow box is ~20 % live, like a 3DBenchy) and a wall too thin for the
+/// hierarchy to coarsen through. Returns the max nodal displacement (mm), which
+/// pins the result while the timing is taken outside.
+#[no_mangle]
+pub extern "C" fn bench_solve_shell(nx: u32, ny: u32, nz: u32, wall: u32, h: f64) -> f64 {
+    let (nx, ny, nz, wall) = (nx as usize, ny as usize, nz as usize, wall as usize);
+    let (e0, nu) = (2000.0f64, 0.3f64);
+    let mut grid = VoxelGrid::solid_box(nx, ny, nz, h);
+    for cz in 0..nz {
+        for cy in 0..ny {
+            for cx in 0..nx {
+                let inside = cx >= wall
+                    && cy >= wall
+                    && cz >= wall
+                    && cx + wall < nx
+                    && cy + wall < ny
+                    && cz + wall < nz;
+                if inside {
+                    grid.scale[(cz * ny + cy) * nx + cx] = 0.0;
+                }
+            }
+        }
+    }
+    let (bdim, hdim) = (ny as f64 * h, nz as f64 * h);
+    let problem = StaticProblem {
+        grid,
+        fixed: vec![BoxRegion::new([-0.1, -1.0, -1.0], [0.1, bdim + 1.0, hdim + 1.0])],
+        loads: vec![(
+            BoxRegion::new(
+                [nx as f64 * h - 0.1 * h, -1.0, -1.0],
+                [nx as f64 * h + h, bdim + 1.0, hdim + 1.0],
+            ),
+            [0.0, 0.0, -10.0],
+        )],
+        settings: SolveSettings { e0, nu, tol: 1e-5, max_iter: 3000, ..Default::default() },
+    };
+    match solve_static(&problem) {
+        Ok(s) => s.max_displacement(),
+        Err(_) => -1.0,
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn bench_solve(nx: u32, ny: u32, nz: u32, h: f64) -> f64 {
     let (nx, ny, nz) = (nx as usize, ny as usize, nz as usize);

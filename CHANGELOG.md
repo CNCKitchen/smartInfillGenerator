@@ -44,6 +44,41 @@ compatibility or simulation results; patch releases are fixes only.
   cut cells belong to the surface plot and their centers can lie outside the
   mesh.
 
+### Performance
+- **Solver: 1.5–2.5× faster with bit-identical results.** Every quality metric in
+  `regbench` is unchanged to ±0.000 %, and the MGCG iteration count is identical
+  on every fixture — this is pure cost-per-iteration and hierarchy work, not a
+  change to the physics or the convergence criterion. Four changes:
+  - **Live-set skipping.** On a voxelized part most of the padded node grid has
+    no incident solid cell and is identically zero for the whole solve (a
+    3DBenchy is 18 % live, a flat plate ~25 %), yet the smoother, the transfers
+    and the CG vector ops streamed all of it. They now skip wholly dead 16-node
+    blocks. Provably value-preserving: the skipped writes were writing the zero
+    that is already stored, and skipped terms contribute exactly 0 to the dot
+    products. Worth ~35 % on shell-like parts.
+  - **Element matvec reduction order.** KE is symmetric, so the 24×24 element
+    product can accumulate into 24 registers instead of horizontally reducing 24
+    dot products. On x86-64 AVX2 that is 1.53× faster; on wasm32 simd128 the old
+    row form is 1.26× faster (128-bit lanes spill the wide accumulator), so the
+    form is target-gated and both were measured.
+  - **Semicoarsening.** Coarsening required ALL three axes to be splittable, so a
+    single thin axis capped the hierarchy for the others — a 3-cell-thick plate
+    collapsed to ONE level with no multigrid at all, leaving the coarse-grid PCG
+    to do the entire solve. Each axis is now padded and halved to its own depth;
+    coarse cells become bricks and their element matrix is re-integrated
+    accordingly. A 1 M-cell plate goes from 1 level / 2.74 s to 5 levels / 1.93 s,
+    and the 64×8×4 beam suite (previously 2 levels) is 2.5–6× faster.
+  - **Live-set-aware f64 CG.** The outer mixed-precision CG's dot products, axpys
+    and demote pass now use the same live set, cutting its share of a Benchy
+    solve from 10 % to 3 %.
+  - Measured (16 threads, native): 3DBenchy 13.5 s → 6.4 s at 300 k cells and
+    68.6 s → 27.1 s at 1 M; MicHolder 12.2 s → 8.5 s; hook 1.35 s → 0.91 s;
+    the `regbench` solver fixtures total 16.3 s → 6.7 s (2.42×). Single-threaded
+    wasm gains ~1.2× on sparse parts (the matvec change does not apply there).
+  - `solvebench` (new `filasim-core` bin) is the harness: real STLs over a
+    mesh-refinement sweep with iteration counts, a live/dead DOF census, kernel
+    micro-timings and a nested-start probe. `mg.rs` records the negative results.
+
 ### Fixed
 - Reorienting the part (rotate, place-on-face, rescale) left the cached cylinder
   fit of a cylindrical support or a bearing load behind, so its axis glyph and

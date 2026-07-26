@@ -11,9 +11,20 @@
 //!   upper spectrum far better than a fixed-weight Jacobi sweep, which is
 //!   what cuts MGCG iterations on high-contrast (thin shell + soft infill)
 //!   grids. Cost per step is identical (one apply + one Dinv).
-//! - Coarsening: rediscretization with averaged cell stiffness (KE scales
-//!   linearly with h on cube cells), trilinear prolongation, restriction = P^T.
+//! - Coarsening: rediscretization with averaged cell stiffness, trilinear
+//!   prolongation, restriction = P^T. SEMICOARSENING: each axis is halved only
+//!   while it stays a usable grid, so a plate too thin to coarsen through
+//!   keeps its full in-plane hierarchy (coarse cells are then bricks, and
+//!   their KE is re-integrated — a brick's KE is not a multiple of a cube's).
 //! - Dirichlet/inactive DOFs are masked: vectors stay zero there throughout.
+//!   The LIVE SET (`Level::build_live`) exploits that: on a voxelized part most
+//!   of the padded node grid is dead (18 % live on a 3DBenchy), and every
+//!   node-wise kernel skips wholly dead blocks instead of streaming zeros.
+//!
+//! Where the time goes (3DBenchy, 262 k solid cells, 16 threads): ~65 % in the
+//! Chebyshev smoother, ~12 % residual, ~9 % the f64 outer operator, ~5 % the
+//! transfers, ~3 % the coarse solve. The finest level is ~88 % of all multigrid
+//! work, so that is where optimization pays.
 
 use crate::eps::average_coarse_eps;
 use crate::fem::{invert3, ke_diag_blocks, NODE_OFFSETS};
@@ -35,6 +46,23 @@ const CHEB_LMAX_SAFETY: f32 = 1.1;
 const LMAX_ITERS_COLD: usize = 8;
 const LMAX_ITERS_WARM: usize = 3;
 const NODE_CHUNK: usize = 4096;
+/// Inner form of the 24x24 element matvec. KE is SYMMETRIC, so "column j" IS
+/// row j: both forms stream the same contiguous rows, but the COLUMN form
+/// accumulates into 24 registers (24 broadcasts x 24 FMAs, no cross-lane
+/// reduction) while the ROW form does 24 dot products with a horizontal reduce
+/// each. Which wins is TARGET-DEPENDENT - measured on the 3DBenchy at 262k
+/// solid cells, not guessed:
+///   x86-64 AVX2 (256-bit):    column 1.53x faster than row
+///   wasm32 simd128 (128-bit): row 1.26x faster than column - the 24-wide
+///     column accumulator does not fit in 4-lane registers and spills.
+/// Re-measure BOTH targets before changing this.
+#[cfg(target_arch = "wasm32")]
+const KERNEL_COLUMN: bool = false;
+#[cfg(not(target_arch = "wasm32"))]
+const KERNEL_COLUMN: bool = true;
+/// Node-block granularity for the live-set skip (see `Level::build_live`).
+/// Must divide NODE_CHUNK.
+const BLK: usize = 16;
 
 /// Map (dx,dy,dz) in {0,1}^3 to the local hex node index.
 const OFF_TO_LOCAL: [[[usize; 2]; 2]; 2] = {
@@ -57,7 +85,19 @@ pub struct Level {
     pub mx: usize,
     pub my: usize,
     pub mz: usize,
+    /// Cell size of the FINEST level's x axis. Only the finest level is
+    /// guaranteed isotropic (`hv == [h; 3]`); semicoarsened levels are bricks.
     pub h: f64,
+    /// Per-axis cell size — coarsening halves only the axes it can (see
+    /// `MgSolver::new`), so coarse cells are rectangular bricks.
+    hv: [f64; 3],
+    /// Material constants, kept so a semicoarsened level can re-integrate its
+    /// brick KE (a brick's KE is not a multiple of a cube's).
+    e0: f64,
+    nu: f64,
+    /// Which axes were halved to produce this level from its parent — replayed
+    /// by `update_eps` so the eps cascade matches the geometry cascade.
+    from_parent: [bool; 3],
     ke: [[f32; 24]; 24],
     ke64: [[f64; 24]; 24],
     /// Per-cell stiffness factor; exactly 0.0 = cell skipped entirely.
@@ -73,6 +113,9 @@ pub struct Level {
     slabs: Vec<Vec<u32>>,
     /// Per-DOF mask: Dirichlet-fixed or inactive (no solid neighbor cell).
     pub constrained: Vec<bool>,
+    /// Per-`BLK`-node-block "has an active node" flag — the live set every
+    /// node-wise kernel iterates over (see `build_live`).
+    live: Vec<bool>,
     /// Per-node inverted 3x3 diagonal block, stored SYMMETRIC-packed as 6
     /// floats [d00,d01,d02,d11,d12,d22] (the block is symmetric; `invert3` of
     /// a symmetric matrix is bitwise-symmetric since the paired cofactors are
@@ -108,6 +151,12 @@ impl Level {
         3 * self.node_count()
     }
 
+    /// Live-block mask and its DOF stride, for the outer CG's vector ops.
+    #[inline]
+    pub fn live_mask(&self) -> (&[bool], usize) {
+        (&self.live, 3 * BLK)
+    }
+
     #[inline]
     pub fn node_index(&self, x: usize, y: usize, z: usize) -> usize {
         (z * self.my + y) * self.mx + x
@@ -121,11 +170,33 @@ impl Level {
         nz: usize,
         h: f64,
         eps: Vec<f32>,
-        ke64: [[f64; 24]; 24],
+        e0: f64,
+        nu: f64,
         fixed: &[bool],
         springs: Vec<(u32, [f64; 3], f64)>,
         rigid: Vec<RigidGroup>,
     ) -> Self {
+        // Isotropic entry point (the finest level is always a cube grid).
+        let ke64 = crate::fem::ke_hex(e0, nu, h);
+        Self::new_aniso(nx, ny, nz, [h; 3], e0, nu, eps, ke64, fixed, springs, rigid, [false; 3])
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_aniso(
+        nx: usize,
+        ny: usize,
+        nz: usize,
+        hv: [f64; 3],
+        e0: f64,
+        nu: f64,
+        eps: Vec<f32>,
+        ke64: [[f64; 24]; 24],
+        fixed: &[bool],
+        springs: Vec<(u32, [f64; 3], f64)>,
+        rigid: Vec<RigidGroup>,
+        from_parent: [bool; 3],
+    ) -> Self {
+        let h = hv[0];
         assert_eq!(eps.len(), nx * ny * nz);
         let (mx, my, mz) = (nx + 1, ny + 1, nz + 1);
         let ndof = 3 * mx * my * mz;
@@ -146,11 +217,16 @@ impl Level {
             my,
             mz,
             h,
+            hv,
+            e0,
+            nu,
+            from_parent,
             ke,
             ke64,
             eps,
             slabs: Vec::new(),
             constrained: vec![false; ndof],
+            live: Vec::new(),
             dinv: Vec::new(),
             springs,
             rigid,
@@ -160,6 +236,7 @@ impl Level {
             pi_w: Vec::new(),
         };
         level.build_slabs();
+        level.build_live();
         level.build_constrained(fixed);
         level.build_dinv();
         level.refresh_lmax();
@@ -212,24 +289,40 @@ impl Level {
         self.pi_w = w;
     }
 
-    /// Rediscretized coarse level: half resolution, child-averaged stiffness.
-    pub fn coarsen(&self) -> Self {
-        let eps = average_coarse_eps(&self.eps, self.nx, self.ny, self.nz);
-        let (nx, ny, nz) = (self.nx / 2, self.ny / 2, self.nz / 2);
-        // KE scales linearly with h for cube cells.
-        let mut ke64 = self.ke64;
-        for i in 0..24 {
-            for j in 0..24 {
-                ke64[i][j] *= 2.0;
-            }
-        }
-        // Inject fine Dirichlet flags at coincident nodes (2X,2Y,2Z).
+    /// Which axes this level can still be halved on. An axis is coarsened only
+    /// while it stays a usable grid: even, and at least 4 cells before the halving
+    /// (so ≥2 after). A 3-cell-thick plate therefore keeps its full x/y hierarchy
+    /// instead of collapsing the whole solver to a single level.
+    pub fn splittable(&self) -> [bool; 3] {
+        let ok = |n: usize| n % 2 == 0 && n >= 4;
+        [ok(self.nx), ok(self.ny), ok(self.nz)]
+    }
+
+    /// Rediscretized coarse level: `c[a]` halves axis `a`, child-averaged
+    /// stiffness. Semicoarsening (some `c[a]` false) makes the coarse cell a
+    /// BRICK, so its KE is re-integrated rather than scaled.
+    pub fn coarsen(&self, c: [bool; 3]) -> Self {
+        debug_assert!(c.iter().any(|&v| v), "coarsening must halve at least one axis");
+        let eps = average_coarse_eps(&self.eps, self.nx, self.ny, self.nz, c);
+        let step = [
+            if c[0] { 2usize } else { 1 },
+            if c[1] { 2 } else { 1 },
+            if c[2] { 2 } else { 1 },
+        ];
+        let (nx, ny, nz) = (self.nx / step[0], self.ny / step[1], self.nz / step[2]);
+        let hv = [
+            self.hv[0] * step[0] as f64,
+            self.hv[1] * step[1] as f64,
+            self.hv[2] * step[2] as f64,
+        ];
+        let ke64 = crate::fem::ke_hex_aniso(self.e0, self.nu, hv);
+        // Inject fine Dirichlet flags at coincident nodes (step·X, step·Y, step·Z).
         let (mx, my, mz) = (nx + 1, ny + 1, nz + 1);
         let mut fixed = vec![false; 3 * mx * my * mz];
         for z in 0..mz {
             for y in 0..my {
                 for x in 0..mx {
-                    let nf = self.node_index(2 * x, 2 * y, 2 * z);
+                    let nf = self.node_index(step[0] * x, step[1] * y, step[2] * z);
                     let nc = (z * my + y) * mx + x;
                     for d in 0..3 {
                         fixed[3 * nc + d] = self.constrained[3 * nf + d];
@@ -244,16 +337,19 @@ impl Level {
             .iter()
             .map(|&(n, dir, k)| {
                 let n = n as usize;
-                let x = ((n % self.mx + 1) / 2).min(mx - 1);
-                let y = ((n / self.mx % self.my + 1) / 2).min(my - 1);
-                let z = ((n / (self.mx * self.my) + 1) / 2).min(mz - 1);
+                let map = |v: usize, st: usize, lim: usize| {
+                    if st == 1 { v.min(lim - 1) } else { ((v + 1) / 2).min(lim - 1) }
+                };
+                let x = map(n % self.mx, step[0], mx);
+                let y = map(n / self.mx % self.my, step[1], my);
+                let z = map(n / (self.mx * self.my), step[2], mz);
                 (((z * my + y) * mx + x) as u32, dir, k)
             })
             .collect();
         // Rigid couplings are NOT coarsened (DESIGN §16: MG pass-through) — the
         // fine-level smoother handles the stiff local constraint, the coarse
         // grids reduce only the smooth global error.
-        Self::new(nx, ny, nz, self.h * 2.0, eps, ke64, &fixed, springs, Vec::new())
+        Self::new_aniso(nx, ny, nz, hv, self.e0, self.nu, eps, ke64, &fixed, springs, Vec::new(), c)
     }
 
     /// Cut the active cells into z-slabs balanced by active-cell count (cuts
@@ -295,6 +391,49 @@ impl Level {
             slabs.push(cur);
         }
         self.slabs = slabs;
+    }
+
+    /// Per-BLK-node-block "contains at least one ACTIVE node" flag.
+    ///
+    /// On a voxelized part the padded node grid is mostly dead: a 3DBenchy at
+    /// 300 k solid cells has 18 % live nodes, a flat plate ~25 %. Every DOF
+    /// outside the active set is provably ZERO for the whole solve (`r` and
+    /// `t` are masked, `dinv` is zeroed there, so the smoother writes 0 into 0
+    /// and the transfers read/write 0), yet the smoother and the transfer
+    /// operators used to stream all of them. Skipping a wholly dead block
+    /// therefore changes NO value — it only stops touching cache lines that
+    /// hold zeros. Block granularity is a trade: coarser blocks miss more
+    /// skips, finer ones cost more branch overhead per useful byte.
+    fn build_live(&mut self) {
+        let (nx, ny, nz) = (self.nx, self.ny, self.nz);
+        let (mx, my) = (self.mx, self.my);
+        let nodes = self.node_count();
+        let mut live = vec![false; nodes.div_ceil(BLK)];
+        for (b, l) in live.iter_mut().enumerate() {
+            let lo = b * BLK;
+            let hi = ((b + 1) * BLK).min(nodes);
+            'block: for n in lo..hi {
+                let x = n % mx;
+                let y = (n / mx) % my;
+                let z = n / (mx * my);
+                for dz in 0..2usize {
+                    for dy in 0..2usize {
+                        for dx in 0..2usize {
+                            if dx > x || dy > y || dz > z {
+                                continue;
+                            }
+                            let (cx, cy, cz) = (x - dx, y - dy, z - dz);
+                            if cx < nx && cy < ny && cz < nz && self.eps[(cz * ny + cy) * nx + cx] > 0.0
+                            {
+                                *l = true;
+                                break 'block;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.live = live;
     }
 
     fn build_constrained(&mut self, fixed: &[bool]) {
@@ -440,7 +579,7 @@ impl Level {
     /// Concurrent callers must not target cells sharing nodes (color rule);
     /// sequential callers are always fine.
     #[inline(always)]
-    unsafe fn apply_cell(&self, ci: usize, e: f32, x: &[f32], ys: &UnsafeSlice<f32>) {
+    unsafe fn apply_cell<const COLUMN: bool>(&self, ci: usize, e: f32, x: &[f32], ys: &UnsafeSlice<f32>) {
         let (nx, ny) = (self.nx, self.ny);
         let (mx, my) = (self.mx, self.my);
         let cx = ci % nx;
@@ -456,16 +595,28 @@ impl Level {
             xl[3 * l + 1] = x[3 * n + 1];
             xl[3 * l + 2] = x[3 * n + 2];
         }
-        // Row-reduction form: measured FASTER than the column-axpy
-        // variant under simd128 (LLVM SLP-vectorizes across rows).
+        // See KERNEL_COLUMN: identical arithmetic, different reduction order.
         let mut yl = [0f32; 24];
-        for i in 0..24 {
-            let row = &self.ke[i];
-            let mut s = 0f32;
+        if COLUMN {
             for j in 0..24 {
-                s += row[j] * xl[j];
+                let xj = xl[j];
+                let row = &self.ke[j];
+                for i in 0..24 {
+                    yl[i] += row[i] * xj;
+                }
             }
-            yl[i] = e * s;
+            for v in yl.iter_mut() {
+                *v *= e;
+            }
+        } else {
+            for i in 0..24 {
+                let row = &self.ke[i];
+                let mut s = 0f32;
+                for j in 0..24 {
+                    s += row[j] * xl[j];
+                }
+                yl[i] = e * s;
+            }
         }
         for l in 0..8 {
             let n = nidx[l];
@@ -477,9 +628,17 @@ impl Level {
 
     /// y = K x (masked at constrained DOFs). x must be zero at constrained DOFs.
     pub fn apply(&self, x: &[f32], y: &mut [f32]) {
+        if KERNEL_COLUMN {
+            self.apply_k32::<true>(x, y)
+        } else {
+            self.apply_k32::<false>(x, y)
+        }
+    }
+
+    fn apply_k32<const COLUMN: bool>(&self, x: &[f32], y: &mut [f32]) {
         debug_assert_eq!(x.len(), self.ndof());
         debug_assert_eq!(y.len(), self.ndof());
-        par::fill(y, 0.0);
+        self.fill_live_f32(y);
         {
             let ys = UnsafeSlice::new(y);
             // Threaded: two phases of z-slabs; same-phase slabs never share nodes.
@@ -489,7 +648,7 @@ impl Level {
                 // SAFETY: same-phase slabs are ≥2 cells apart in z.
                 par::for_each(&slabs, |slab| {
                     for &ci in slab.iter() {
-                        unsafe { self.apply_cell(ci as usize, self.eps[ci as usize], x, &ys) };
+                        unsafe { self.apply_cell::<COLUMN>(ci as usize, self.eps[ci as usize], x, &ys) };
                     }
                 });
             }
@@ -498,7 +657,7 @@ impl Level {
             for (ci, &e) in self.eps.iter().enumerate() {
                 if e > 0.0 {
                     // SAFETY: sequential.
-                    unsafe { self.apply_cell(ci, e, x, &ys) };
+                    unsafe { self.apply_cell::<COLUMN>(ci, e, x, &ys) };
                 }
             }
         }
@@ -516,14 +675,14 @@ impl Level {
         for g in &self.rigid {
             g.accumulate_f32(x, y);
         }
-        par::mask_zero(y, &self.constrained);
+        self.mask_live_f32(y);
     }
 
     /// f64 twin of `apply_cell` (outer-CG operator).
     /// # Safety
     /// Same disjoint-scatter rule as `apply_cell`.
     #[inline(always)]
-    unsafe fn apply_cell64(&self, ci: usize, e: f64, x: &[f64], ys: &UnsafeSlice<f64>) {
+    unsafe fn apply_cell64<const COLUMN: bool>(&self, ci: usize, e: f64, x: &[f64], ys: &UnsafeSlice<f64>) {
         let (nx, ny) = (self.nx, self.ny);
         let (mx, my) = (self.mx, self.my);
         let cx = ci % nx;
@@ -540,13 +699,26 @@ impl Level {
             xl[3 * l + 2] = x[3 * n + 2];
         }
         let mut yl = [0f64; 24];
-        for i in 0..24 {
-            let row = &self.ke64[i];
-            let mut s = 0f64;
+        if COLUMN {
             for j in 0..24 {
-                s += row[j] * xl[j];
+                let xj = xl[j];
+                let row = &self.ke64[j];
+                for i in 0..24 {
+                    yl[i] += row[i] * xj;
+                }
             }
-            yl[i] = e * s;
+            for v in yl.iter_mut() {
+                *v *= e;
+            }
+        } else {
+            for i in 0..24 {
+                let row = &self.ke64[i];
+                let mut s = 0f64;
+                for j in 0..24 {
+                    s += row[j] * xl[j];
+                }
+                yl[i] = e * s;
+            }
         }
         for l in 0..8 {
             let n = nidx[l];
@@ -566,16 +738,18 @@ impl Level {
     /// on the EXACT eps while the level hierarchy (preconditioner only) may
     /// hold contrast-clamped values. `eps` must share this level's void set.
     pub fn apply64_eps(&self, eps: &[f32], x: &[f64], y: &mut [f64]) {
+        if KERNEL_COLUMN {
+            self.apply64_k::<true>(eps, x, y)
+        } else {
+            self.apply64_k::<false>(eps, x, y)
+        }
+    }
+
+    fn apply64_k<const COLUMN: bool>(&self, eps: &[f32], x: &[f64], y: &mut [f64]) {
         debug_assert_eq!(x.len(), self.ndof());
         debug_assert_eq!(y.len(), self.ndof());
         debug_assert_eq!(eps.len(), self.eps.len());
-        #[cfg(feature = "parallel")]
-        {
-            use rayon::prelude::*;
-            y.par_chunks_mut(1 << 14).for_each(|c| c.fill(0.0));
-        }
-        #[cfg(not(feature = "parallel"))]
-        y.fill(0.0);
+        self.fill_live_f64(y);
         {
             let ys = UnsafeSlice::new(y);
             #[cfg(feature = "parallel")]
@@ -585,7 +759,7 @@ impl Level {
                 par::for_each(&slabs, |slab| {
                     for &ci in slab.iter() {
                         unsafe {
-                            self.apply_cell64(ci as usize, eps[ci as usize] as f64, x, &ys)
+                            self.apply_cell64::<COLUMN>(ci as usize, eps[ci as usize] as f64, x, &ys)
                         };
                     }
                 });
@@ -594,7 +768,7 @@ impl Level {
             for (ci, &e) in eps.iter().enumerate() {
                 if e > 0.0 {
                     // SAFETY: sequential.
-                    unsafe { self.apply_cell64(ci, e as f64, x, &ys) };
+                    unsafe { self.apply_cell64::<COLUMN>(ci, e as f64, x, &ys) };
                 }
             }
         }
@@ -610,25 +784,7 @@ impl Level {
             g.accumulate_f64(x, y);
         }
         // Mask constrained DOFs.
-        #[cfg(feature = "parallel")]
-        {
-            use rayon::prelude::*;
-            y.par_chunks_mut(1 << 14)
-                .zip(self.constrained.par_chunks(1 << 14))
-                .for_each(|(yc, mc)| {
-                    for (yi, m) in yc.iter_mut().zip(mc) {
-                        if *m {
-                            *yi = 0.0;
-                        }
-                    }
-                });
-        }
-        #[cfg(not(feature = "parallel"))]
-        for (yi, m) in y.iter_mut().zip(&self.constrained) {
-            if *m {
-                *yi = 0.0;
-            }
-        }
+        self.mask_live_f64(y);
     }
 
     /// Fused Chebyshev step: per node `w = Dinv·(r − t); d = a·d + b·w;
@@ -638,21 +794,31 @@ impl Level {
     /// the whole game.
     fn cheb_step_fused(&self, z: &mut [f32], d: &mut [f32], r: &[f32], t: &[f32], a: f32, b: f32) {
         let dinv = &self.dinv;
+        let live = &self.live;
         par::chunks2_mut_indexed(z, d, 3 * NODE_CHUNK, |off, zc, dc| {
             let n0 = off / 3;
-            for (k, (zn, dn)) in zc.chunks_mut(3).zip(dc.chunks_mut(3)).enumerate() {
-                let n = n0 + k;
-                let di = &dinv[6 * n..6 * n + 6];
-                let rr =
-                    [r[3 * n] - t[3 * n], r[3 * n + 1] - t[3 * n + 1], r[3 * n + 2] - t[3 * n + 2]];
-                let w = [
-                    di[0] * rr[0] + di[1] * rr[1] + di[2] * rr[2],
-                    di[1] * rr[0] + di[3] * rr[1] + di[4] * rr[2],
-                    di[2] * rr[0] + di[4] * rr[1] + di[5] * rr[2],
-                ];
-                for c in 0..3 {
-                    dn[c] = a * dn[c] + b * w[c];
-                    zn[c] += dn[c];
+            for (bi, (zb, db)) in zc.chunks_mut(3 * BLK).zip(dc.chunks_mut(3 * BLK)).enumerate() {
+                let nb = n0 + bi * BLK;
+                if !live[nb / BLK] {
+                    continue; // dead block: every value here is (and stays) 0
+                }
+                for (k, (zn, dn)) in zb.chunks_mut(3).zip(db.chunks_mut(3)).enumerate() {
+                    let n = nb + k;
+                    let di = &dinv[6 * n..6 * n + 6];
+                    let rr = [
+                        r[3 * n] - t[3 * n],
+                        r[3 * n + 1] - t[3 * n + 1],
+                        r[3 * n + 2] - t[3 * n + 2],
+                    ];
+                    let w = [
+                        di[0] * rr[0] + di[1] * rr[1] + di[2] * rr[2],
+                        di[1] * rr[0] + di[3] * rr[1] + di[4] * rr[2],
+                        di[2] * rr[0] + di[4] * rr[1] + di[5] * rr[2],
+                    ];
+                    for c in 0..3 {
+                        dn[c] = a * dn[c] + b * w[c];
+                        zn[c] += dn[c];
+                    }
                 }
             }
         });
@@ -662,20 +828,33 @@ impl Level {
     /// (replaces fill + diag_apply + axpby + axpy).
     fn cheb_first_fused(&self, z: &mut [f32], d: &mut [f32], r: &[f32], f: f32) {
         let dinv = &self.dinv;
+        let live = &self.live;
         par::chunks2_mut_indexed(z, d, 3 * NODE_CHUNK, |off, zc, dc| {
             let n0 = off / 3;
-            for (k, (zn, dn)) in zc.chunks_mut(3).zip(dc.chunks_mut(3)).enumerate() {
-                let n = n0 + k;
-                let di = &dinv[6 * n..6 * n + 6];
-                let rr = [r[3 * n], r[3 * n + 1], r[3 * n + 2]];
-                let w = [
-                    di[0] * rr[0] + di[1] * rr[1] + di[2] * rr[2],
-                    di[1] * rr[0] + di[3] * rr[1] + di[4] * rr[2],
-                    di[2] * rr[0] + di[4] * rr[1] + di[5] * rr[2],
-                ];
-                for c in 0..3 {
-                    dn[c] = f * w[c];
-                    zn[c] = dn[c];
+            for (bi, (zb, db)) in zc.chunks_mut(3 * BLK).zip(dc.chunks_mut(3 * BLK)).enumerate() {
+                let nb = n0 + bi * BLK;
+                if !live[nb / BLK] {
+                    // Dead block: `dinv` is zero here, so the value this would
+                    // write IS zero, and nothing else in the cycle ever writes a
+                    // non-zero into a dead DOF (`prolong_add` skips constrained
+                    // DOFs, `coarse_pcg` zero-fills). The invariant is asserted
+                    // in debug builds; release just skips the cache lines.
+                    debug_assert!(zb.iter().chain(db.iter()).all(|v| *v == 0.0));
+                    continue;
+                }
+                for (k, (zn, dn)) in zb.chunks_mut(3).zip(db.chunks_mut(3)).enumerate() {
+                    let n = nb + k;
+                    let di = &dinv[6 * n..6 * n + 6];
+                    let rr = [r[3 * n], r[3 * n + 1], r[3 * n + 2]];
+                    let w = [
+                        di[0] * rr[0] + di[1] * rr[1] + di[2] * rr[2],
+                        di[1] * rr[0] + di[3] * rr[1] + di[4] * rr[2],
+                        di[2] * rr[0] + di[4] * rr[1] + di[5] * rr[2],
+                    ];
+                    for c in 0..3 {
+                        dn[c] = f * w[c];
+                        zn[c] = dn[c];
+                    }
                 }
             }
         });
@@ -695,6 +874,9 @@ impl Level {
         degree: usize,
         from_zero: bool,
     ) {
+        if degree == 0 {
+            return;
+        }
         let lmax = (self.lmax * CHEB_LMAX_SAFETY) as f64;
         let lmin = lmax / CHEB_EIG_RATIO as f64;
         let theta = 0.5 * (lmax + lmin);
@@ -718,17 +900,123 @@ impl Level {
     }
 
     /// z = Dinv r (undamped; used as the coarse-level CG preconditioner).
+    /// `y[..] = 0` and `y[constrained] = 0`, restricted to LIVE blocks: the
+    /// scatter in `apply` only ever writes nodes incident to a non-void cell,
+    /// which are live by construction, so dead blocks are already zero and
+    /// need neither clearing nor masking.
+    fn fill_live_f32(&self, y: &mut [f32]) {
+        let live = &self.live;
+        par::chunks_mut_indexed(y, 3 * NODE_CHUNK, |off, yc| {
+            let n0 = off / 3;
+            for (bi, yb) in yc.chunks_mut(3 * BLK).enumerate() {
+                if live[(n0 + bi * BLK) / BLK] {
+                    yb.fill(0.0);
+                } else {
+                    // CONTRACT: callers hand in a buffer that is already zero at
+                    // dead DOFs (all of them allocate zeroed and only ever write
+                    // through masked kernels). Nothing clears them, so a dirty
+                    // buffer would leak stale values into the result.
+                    debug_assert!(yb.iter().all(|v| *v == 0.0));
+                }
+            }
+        });
+    }
+
+    fn mask_live_f32(&self, y: &mut [f32]) {
+        let live = &self.live;
+        let constrained = &self.constrained;
+        par::chunks_mut_indexed(y, 3 * NODE_CHUNK, |off, yc| {
+            let n0 = off / 3;
+            for (bi, yb) in yc.chunks_mut(3 * BLK).enumerate() {
+                let nb = n0 + bi * BLK;
+                if !live[nb / BLK] {
+                    continue;
+                }
+                for (i, v) in yb.iter_mut().enumerate() {
+                    if constrained[3 * nb + i] {
+                        *v = 0.0;
+                    }
+                }
+            }
+        });
+    }
+
+    fn fill_live_f64(&self, y: &mut [f64]) {
+        let live = &self.live;
+        par::chunks_mut_indexed64(y, 3 * NODE_CHUNK, |off, yc| {
+            let n0 = off / 3;
+            for (bi, yb) in yc.chunks_mut(3 * BLK).enumerate() {
+                if live[(n0 + bi * BLK) / BLK] {
+                    yb.fill(0.0);
+                } else {
+                    // CONTRACT: callers hand in a buffer that is already zero at
+                    // dead DOFs (all of them allocate zeroed and only ever write
+                    // through masked kernels). Nothing clears them, so a dirty
+                    // buffer would leak stale values into the result.
+                    debug_assert!(yb.iter().all(|v| *v == 0.0));
+                }
+            }
+        });
+    }
+
+    fn mask_live_f64(&self, y: &mut [f64]) {
+        let live = &self.live;
+        let constrained = &self.constrained;
+        par::chunks_mut_indexed64(y, 3 * NODE_CHUNK, |off, yc| {
+            let n0 = off / 3;
+            for (bi, yb) in yc.chunks_mut(3 * BLK).enumerate() {
+                let nb = n0 + bi * BLK;
+                if !live[nb / BLK] {
+                    continue;
+                }
+                for (i, v) in yb.iter_mut().enumerate() {
+                    if constrained[3 * nb + i] {
+                        *v = 0.0;
+                    }
+                }
+            }
+        });
+    }
+
+    /// `out = a - b` over LIVE blocks (both are zero elsewhere).
+    fn sub_live(&self, out: &mut [f32], a: &[f32], b: &[f32]) {
+        let live = &self.live;
+        par::chunks_mut_indexed(out, 3 * NODE_CHUNK, |off, oc| {
+            let n0 = off / 3;
+            for (bi, ob) in oc.chunks_mut(3 * BLK).enumerate() {
+                let nb = n0 + bi * BLK;
+                if !live[nb / BLK] {
+                    debug_assert!(ob.iter().all(|v| *v == 0.0));
+                    continue;
+                }
+                for (i, o) in ob.iter_mut().enumerate() {
+                    *o = a[3 * nb + i] - b[3 * nb + i];
+                }
+            }
+        });
+    }
+
     fn diag_apply(&self, r: &[f32], z: &mut [f32]) {
         let dinv = &self.dinv;
+        let live = &self.live;
         par::chunks_mut_indexed(z, 3 * NODE_CHUNK, |off, zc| {
             let n0 = off / 3;
-            for (k, zn) in zc.chunks_mut(3).enumerate() {
-                let n = n0 + k;
-                let d = &dinv[6 * n..6 * n + 6];
-                let rr = [r[3 * n], r[3 * n + 1], r[3 * n + 2]];
-                zn[0] = d[0] * rr[0] + d[1] * rr[1] + d[2] * rr[2];
-                zn[1] = d[1] * rr[0] + d[3] * rr[1] + d[4] * rr[2];
-                zn[2] = d[2] * rr[0] + d[4] * rr[1] + d[5] * rr[2];
+            for (bi, zb) in zc.chunks_mut(3 * BLK).enumerate() {
+                let nb = n0 + bi * BLK;
+                if !live[nb / BLK] {
+                    // `z` is fully OVERWRITTEN here, so a dead block must end up
+                    // zero — which it already is (dinv = 0 ⇒ the product is 0).
+                    debug_assert!(zb.iter().all(|v| *v == 0.0));
+                    continue;
+                }
+                for (k, zn) in zb.chunks_mut(3).enumerate() {
+                    let n = nb + k;
+                    let d = &dinv[6 * n..6 * n + 6];
+                    let rr = [r[3 * n], r[3 * n + 1], r[3 * n + 2]];
+                    zn[0] = d[0] * rr[0] + d[1] * rr[1] + d[2] * rr[2];
+                    zn[1] = d[1] * rr[0] + d[3] * rr[1] + d[4] * rr[2];
+                    zn[2] = d[2] * rr[0] + d[4] * rr[1] + d[5] * rr[2];
+                }
             }
         });
     }
@@ -737,10 +1025,11 @@ impl Level {
 /// Raise non-void cells to the preconditioner stiffness floor. Returns true
 /// if anything changed (callers then refresh dinv/lmax).
 fn clamp_pc_eps(eps: &mut [f32]) -> bool {
+    let floor = PC_EPS_FLOOR;
     let mut changed = false;
     for e in eps.iter_mut() {
-        if *e > 0.0 && *e < PC_EPS_FLOOR {
-            *e = PC_EPS_FLOOR;
+        if *e > 0.0 && *e < floor {
+            *e = floor;
             changed = true;
         }
     }
@@ -749,7 +1038,11 @@ fn clamp_pc_eps(eps: &mut [f32]) -> bool {
 
 /// Trilinear parent weights of fine node coordinate x (even: one parent).
 #[inline]
-fn parent_weights(x: usize) -> [(usize, f64); 2] {
+fn parent_weights(x: usize, coarsened: bool) -> [(usize, f64); 2] {
+    if !coarsened {
+        // Axis not halved: the coarse node IS this node.
+        return [(x, 1.0), (0, 0.0)];
+    }
     if x % 2 == 0 {
         [(x / 2, 1.0), (0, 0.0)]
     } else {
@@ -757,6 +1050,39 @@ fn parent_weights(x: usize) -> [(usize, f64); 2] {
     }
 }
 
+// NEGATIVE RESULTS, round 2 (2026-07-25 solver study; fixtures = 3DBenchy,
+// MicHolder, hook, surface, solid beam, plates, each at 100k/300k/1M solid
+// cells). Everything here was measured and REJECTED — do not re-tread:
+//   (a) HIERARCHY DEPTH is saturated. 3/4/5/6/7/8 levels on the Benchy give
+//       205/222/223/223/223/223 iterations; 5 is the wall-clock optimum. More
+//       coarse levels buy nothing.
+//   (b) EXTRA COARSE-LEVEL SMOOTHING (nu growing 1.4-3.5x per level, nearly
+//       free at 8^-l cost) cuts iterations 223 -> 187 but LOSES on wall clock:
+//       coarse levels are not 8x cheaper on a shell, where the node count
+//       shrinks far slower than the cell count.
+//   (c) SMOOTHER DEGREE is at its optimum. nu=1/2/3/4 give 389/264/223/196
+//       iterations; nu=2 is ~10 % faster on the HARD fixtures but blows up the
+//       easy ones (solid-beam bending 7 -> 31 iterations, modal outer iterations
+//       5 -> 11), which is the wrong trade. NU1 must equal NU2 — an asymmetric
+//       V-cycle is not an SPD preconditioner and CG stalls outright (nu 2/3
+//       needed 3000+ iterations).
+//   (d) CHEBYSHEV INTERVAL: ratio 4/8/12/20/30 -> 244/223/215/211/214. Ratio 20
+//       is ~5 % better on hard parts and worse on easy ones; not worth it.
+//   (e) lmax ESTIMATE is not the limit: 8/20/50 power iterations and safety
+//       1.1/1.3/1.6/2.0 all make it monotonically WORSE (a gentler polynomial).
+//   (f) CONTRAST is not the limit. The occupancy field has no near-zero cells
+//       (0 below eps 0.05 on the Benchy), and flooring the EXACT operator's eps
+//       at 1e-4..0.2 changes the iteration count by at most 1.
+//   (g) FLEXIBLE (Polak-Ribiere) CG — the standard fix for an inexact
+//       preconditioner — changes NO fixture's iteration count. See solve_warm.
+//   (h) NESTED / FMG START (solve at 2h, prolong as the initial guess) cuts
+//       iterations only 5-12 % (Benchy 223 -> 196) and the coarse solve costs
+//       more than that: the coarse problem is nearly as ill-conditioned as the
+//       fine one (187 iterations for MicHolder at 2h). The difficulty is
+//       present at EVERY scale, so no hierarchy trick removes it.
+// Conclusion: the residual iteration count on jagged, thin-walled voxel parts
+// is a property of the GEOMETRY, not of the cycle. Optimize cost per iteration.
+//
 // NEGATIVE RESULTS on the Benchy worst case (205 MGCG iters at 300k cells),
 // kept so nobody re-treads them: (a) renormalizing transfer weights over
 // active-only coarse parents — no change; (b) exact-solving the coarse level
@@ -772,28 +1098,43 @@ fn parent_weights(x: usize) -> [(usize, f64); 2] {
 fn restrict(fine: &Level, fine_res: &[f32], coarse: &Level, out: &mut [f32]) {
     let (cmx, cmy) = (coarse.mx, coarse.my);
     let constrained = &coarse.constrained;
+    let live = &coarse.live;
+    // Per-axis: a HALVED axis gathers the 3-point trilinear stencil; an axis the
+    // coarsening skipped is identity (one point, weight 1).
+    let c = coarse.from_parent;
+    let rng = |on: bool| if on { -1isize..=1 } else { 0..=0 };
+    let step = |on: bool| if on { 2isize } else { 1 };
     par::chunks_mut_indexed(out, 3 * NODE_CHUNK, |off, oc| {
         let n0 = off / 3;
-        for (k, on) in oc.chunks_mut(3).enumerate() {
-            let nc = n0 + k;
+        for (bi, ob) in oc.chunks_mut(3 * BLK).enumerate() {
+            let nb = n0 + bi * BLK;
+            if !live[nb / BLK] {
+                // Every DOF of a dead coarse node is constrained, so the write
+                // below would be 0 — and `out` is already 0 there.
+                debug_assert!(ob.iter().all(|v| *v == 0.0));
+                continue;
+            }
+            for (k, on) in ob.chunks_mut(3).enumerate() {
+            let nc = nb + k;
             let xx = nc % cmx;
             let yy = (nc / cmx) % cmy;
             let zz = nc / (cmx * cmy);
-            let (fx, fy, fz) = (2 * xx as isize, 2 * yy as isize, 2 * zz as isize);
+            let (fx, fy, fz) =
+                (step(c[0]) * xx as isize, step(c[1]) * yy as isize, step(c[2]) * zz as isize);
             let mut acc = [0f64; 3];
-            for dz in -1isize..=1 {
+            for dz in rng(c[2]) {
                 let z = fz + dz;
                 if z < 0 || z >= fine.mz as isize {
                     continue;
                 }
                 let wz = 1.0 - 0.5 * dz.abs() as f64;
-                for dy in -1isize..=1 {
+                for dy in rng(c[1]) {
                     let y = fy + dy;
                     if y < 0 || y >= fine.my as isize {
                         continue;
                     }
                     let wy = 1.0 - 0.5 * dy.abs() as f64;
-                    for dx in -1isize..=1 {
+                    for dx in rng(c[0]) {
                         let x = fx + dx;
                         if x < 0 || x >= fine.mx as isize {
                             continue;
@@ -809,6 +1150,7 @@ fn restrict(fine: &Level, fine_res: &[f32], coarse: &Level, out: &mut [f32]) {
             for d in 0..3 {
                 on[d] = if constrained[3 * nc + d] { 0.0 } else { acc[d] as f32 };
             }
+            }
         }
     });
 }
@@ -818,14 +1160,22 @@ fn prolong_add(fine: &Level, coarse: &Level, zc: &[f32], zf: &mut [f32]) {
     let (cmx, cmy) = (coarse.mx, coarse.my);
     let (fmx, fmy) = (fine.mx, fine.my);
     let constrained = &fine.constrained;
+    let live = &fine.live;
+    let c = coarse.from_parent;
     par::chunks_mut_indexed(zf, 3 * NODE_CHUNK, |off, fc| {
         let n0 = off / 3;
-        for (k, fnode) in fc.chunks_mut(3).enumerate() {
-            let nf = n0 + k;
+        for (bi, fb) in fc.chunks_mut(3 * BLK).enumerate() {
+            let nb = n0 + bi * BLK;
+            if !live[nb / BLK] {
+                continue; // all DOFs constrained ⇒ the += below is skipped anyway
+            }
+            for (k, fnode) in fb.chunks_mut(3).enumerate() {
+            let nf = nb + k;
             let x = nf % fmx;
             let y = (nf / fmx) % fmy;
             let z = nf / (fmx * fmy);
-            let (xw, yw, zw) = (parent_weights(x), parent_weights(y), parent_weights(z));
+            let (xw, yw, zw) =
+                (parent_weights(x, c[0]), parent_weights(y, c[1]), parent_weights(z, c[2]));
             let mut acc = [0f64; 3];
             for &(zi, wz) in &zw {
                 if wz == 0.0 {
@@ -852,6 +1202,7 @@ fn prolong_add(fine: &Level, coarse: &Level, zc: &[f32], zf: &mut [f32]) {
                     fnode[d] += acc[d] as f32;
                 }
             }
+            }
         }
     });
 }
@@ -875,18 +1226,26 @@ fn v_cycle(levels: &[Level], ws: &mut Workspaces, l: usize) {
     }
     let level = &levels[l];
     // Pre-smooth (zero initial guess).
-    level.cheb_smooth(&mut ws.z[l], &ws.r[l], &mut ws.t[l], &mut ws.d[l], NU1, true);
+    {
+        level.cheb_smooth(&mut ws.z[l], &ws.r[l], &mut ws.t[l], &mut ws.d[l], NU1, true);
+    }
     // Coarse-grid correction.
-    level.apply(&ws.z[l], &mut ws.t[l]);
-    par::sub(&mut ws.t2[l], &ws.r[l], &ws.t[l]);
-    restrict(level, &ws.t2[l], &levels[l + 1], &mut ws.r[l + 1]);
+    {
+        level.apply(&ws.z[l], &mut ws.t[l]);
+        level.sub_live(&mut ws.t2[l], &ws.r[l], &ws.t[l]);
+    }
+    {
+        restrict(level, &ws.t2[l], &levels[l + 1], &mut ws.r[l + 1]);
+    }
     v_cycle(levels, ws, l + 1);
     {
         let (za, zb) = ws.z.split_at_mut(l + 1);
         prolong_add(level, &levels[l + 1], &zb[0], &mut za[l]);
     }
     // Post-smooth.
-    level.cheb_smooth(&mut ws.z[l], &ws.r[l], &mut ws.t[l], &mut ws.d[l], NU2, false);
+    {
+        level.cheb_smooth(&mut ws.z[l], &ws.r[l], &mut ws.t[l], &mut ws.d[l], NU2, false);
+    }
 }
 
 /// Block-diagonal preconditioned CG for the coarsest level (small). `scratch`
@@ -962,15 +1321,17 @@ impl MgSolver {
         }
         let mut levels = vec![finest];
         while levels.len() < max_levels {
-            let f = levels.last().unwrap();
-            if f.nx % 2 != 0 || f.ny % 2 != 0 || f.nz % 2 != 0 {
+            // SEMICOARSENING: halve every axis that can still take it, and stop
+            // only when NO axis can. Full coarsening required all three axes to
+            // be splittable, so one thin axis (a 3-cell plate, a slender rib)
+            // collapsed the whole hierarchy to a single level and left the
+            // coarse-grid PCG doing the entire solve.
+            let c = levels.last().unwrap().splittable();
+            if !c.iter().any(|&v| v) {
                 break;
             }
-            if f.nx / 2 < 2 || f.ny / 2 < 2 || f.nz / 2 < 2 {
-                break;
-            }
-            let c = f.coarsen();
-            levels.push(c);
+            let coarse = levels.last().unwrap().coarsen(c);
+            levels.push(coarse);
         }
         let coarse_n = levels.last().unwrap().ndof();
         let ws = Workspaces {
@@ -1001,7 +1362,8 @@ impl MgSolver {
         self.levels[0].refresh_lmax();
         for l in 1..self.levels.len() {
             let f = &self.levels[l - 1];
-            let coarse = average_coarse_eps(&f.eps, f.nx, f.ny, f.nz);
+            // Replay the SAME per-axis coarsening the hierarchy was built with.
+            let coarse = average_coarse_eps(&f.eps, f.nx, f.ny, f.nz, self.levels[l].from_parent);
             self.levels[l].eps = coarse;
             self.levels[l].build_dinv();
             self.levels[l].refresh_lmax();
@@ -1051,6 +1413,14 @@ impl MgSolver {
                 u[i] = 0.0;
             }
         }
+        // Live-set mask of the finest level: every solver vector is identically
+        // zero outside it, so the CG vector ops skip those blocks (bit-identical
+        // results, ~80 % less traffic on a sparse part).
+        let (lv, lb) = {
+            let (m, s) = self.levels[0].live_mask();
+            (m.to_vec(), s)
+        };
+        let lv: &[bool] = &lv;
         let norm_b = par::norm2_64(b);
         if norm_b == 0.0 {
             u.fill(0.0);
@@ -1073,10 +1443,10 @@ impl MgSolver {
         let mut p = vec![0f64; n];
         let mut q = vec![0f64; n];
 
-        par::demote(&mut self.ws.r[0], &r);
+        par::demote_live(&mut self.ws.r[0], &r, lv, lb);
         v_cycle(&self.levels, &mut self.ws, 0);
         par::promote(&mut p, &self.ws.z[0]);
-        let mut rz = par::dot_mixed(&r, &self.ws.z[0]);
+        let mut rz = par::dot_mixed_live(&r, &self.ws.z[0], lv, lb);
 
         let mut res = f64::INFINITY;
         for it in 0..max_iter {
@@ -1085,15 +1455,17 @@ impl MgSolver {
             if crate::cancel::requested() {
                 return SolveStats { iterations: it, rel_residual: res, converged: false };
             }
-            self.levels[0].apply64_eps(&self.eps_exact, &p, &mut q);
-            let pq = par::dot64(&p, &q);
+            {
+                self.levels[0].apply64_eps(&self.eps_exact, &p, &mut q);
+            }
+            let pq = par::dot64_live(&p, &q, lv, lb);
             if !pq.is_finite() || pq <= 0.0 {
                 return SolveStats { iterations: it, rel_residual: res, converged: false };
             }
             let alpha = rz / pq;
-            par::axpy64(u, alpha, &p);
-            par::axpy64(&mut r, -alpha, &q);
-            res = par::norm2_64(&r) / norm_b;
+            par::axpy64_live(u, alpha, &p, lv, lb);
+            par::axpy64_live(&mut r, -alpha, &q, lv, lb);
+            res = par::norm2_64_live(&r, lv, lb) / norm_b;
             self.last_trace.push(res as f32);
             if !res.is_finite() {
                 // Diverged (singular/near-singular operator). Surface the
@@ -1111,11 +1483,16 @@ impl MgSolver {
             if it % PROGRESS_STRIDE == 0 {
                 crate::progress::publish(&self.last_trace);
             }
-            par::demote(&mut self.ws.r[0], &r);
+            par::demote_live(&mut self.ws.r[0], &r, lv, lb);
             v_cycle(&self.levels, &mut self.ws, 0);
-            let rz_new = par::dot_mixed(&r, &self.ws.z[0]);
+            let rz_new = par::dot_mixed_live(&r, &self.ws.z[0], lv, lb);
+            // NEGATIVE RESULT: a flexible (Polak-Ribiere) beta, the textbook
+            // remedy for an inexact preconditioner, moved the iteration count on
+            // NO fixture. The f32 V-cycle really does act as a fixed SPD
+            // operator; the residual bumps seen on jagged parts are ordinary CG
+            // non-monotonicity (norm(r) oscillates while the A-norm falls).
             let beta = rz_new / rz;
-            par::xpby_mixed(&mut p, &self.ws.z[0], beta);
+            par::xpby_mixed_live(&mut p, &self.ws.z[0], beta, lv, lb);
             rz = rz_new;
         }
         SolveStats { iterations: max_iter, rel_residual: res, converged: false }

@@ -34,6 +34,18 @@ pub const NODE_OFFSETS: [[usize; 3]; 8] = [
 /// Element stiffness matrix (24x24) for an h-sized cube, Young's modulus `e`,
 /// Poisson ratio `nu`. Full 2x2x2 Gauss integration.
 pub fn ke_hex(e: f64, nu: f64, h: f64) -> [[f64; 24]; 24] {
+    ke_hex_aniso(e, nu, [h, h, h])
+}
+
+/// Element stiffness matrix for a RECTANGULAR BRICK `hv = [hx, hy, hz]`.
+///
+/// The multigrid hierarchy semicoarsens: a level that halves only x and y (a
+/// plate too thin to coarsen through-thickness) has brick cells, and a brick's
+/// KE is NOT a scalar multiple of a cube's — the `×2` shortcut that works for
+/// uniform coarsening does not apply, so the brick KE is integrated directly.
+/// `hv = [h, h, h]` reproduces [`ke_hex`] exactly.
+pub fn ke_hex_aniso(e: f64, nu: f64, hv: [f64; 3]) -> [[f64; 24]; 24] {
+    let [hx, hy, hz] = hv;
     let lam = e * nu / ((1.0 + nu) * (1.0 - 2.0 * nu));
     let mu = e / (2.0 * (1.0 + nu));
     let mut c = [[0.0f64; 6]; 6];
@@ -47,19 +59,18 @@ pub fn ke_hex(e: f64, nu: f64, h: f64) -> [[f64; 24]; 24] {
 
     let g = 1.0 / 3.0f64.sqrt();
     let mut ke = [[0.0f64; 24]; 24];
-    let detj_w = (h / 2.0).powi(3); // |J| * gauss weight (w=1)
+    let detj_w = hx * hy * hz / 8.0; // |J| * gauss weight (w=1)
 
     for gp in 0..8 {
         let (xi, eta, zeta) =
             (g * NODE_SIGNS[gp][0], g * NODE_SIGNS[gp][1], g * NODE_SIGNS[gp][2]);
-        // dN/dx for each node (J = h/2 * I on a cube grid)
+        // dN/dx for each node (J = diag(hx,hy,hz)/2 on an axis-aligned brick)
         let mut dndx = [[0.0f64; 3]; 8];
         for l in 0..8 {
             let [sx, sy, sz] = NODE_SIGNS[l];
-            let f = 2.0 / h; // J^-1 factor
-            dndx[l][0] = f * sx * (1.0 + eta * sy) * (1.0 + zeta * sz) / 8.0;
-            dndx[l][1] = f * sy * (1.0 + xi * sx) * (1.0 + zeta * sz) / 8.0;
-            dndx[l][2] = f * sz * (1.0 + xi * sx) * (1.0 + eta * sy) / 8.0;
+            dndx[l][0] = (2.0 / hx) * sx * (1.0 + eta * sy) * (1.0 + zeta * sz) / 8.0;
+            dndx[l][1] = (2.0 / hy) * sy * (1.0 + xi * sx) * (1.0 + zeta * sz) / 8.0;
+            dndx[l][2] = (2.0 / hz) * sz * (1.0 + xi * sx) * (1.0 + eta * sy) / 8.0;
         }
         // B matrix, engineering strain order: xx yy zz xy yz zx
         let mut b = [[0.0f64; 24]; 6];
