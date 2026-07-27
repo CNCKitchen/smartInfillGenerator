@@ -10,6 +10,20 @@
 //! extract the full per-cell stress tensor once per result and, per candidate
 //! `n`, evaluate the traction on the layer plane:
 //!
+//! # THIS ASSUMPTION IS FALSE UNDER TRANSVERSE ISOTROPY (DESIGN §22)
+//!
+//! A TI infill tensor is defined ABOUT THE BUILD AXIS, so rotating the part
+//! rotates the material with it and the stress field in the part's frame is no
+//! longer orientation-independent. A correct TI sweep must RE-SOLVE per
+//! candidate — the "solve once, re-score" shortcut this whole module is built
+//! on stops being valid.
+//!
+//! The sweep therefore runs on the ISOTROPIC operator and says so, rather than
+//! silently rescoring a TI stress field it cannot legitimately rotate. Callers
+//! must pass an isotropic result here; `sweep` asserts it via
+//! [`assert_isotropic_result`]. Making the sweep TI-aware is a scheduled
+//! follow-up, not a bug — see §22.4.
+//!
 //!   σₙₙ = n·σ·n          (normal, tension-only: compression can't delaminate)
 //!   τ²  = |σ·n|² − σₙₙ²  (sliding along the layer plane)
 //!   (⟨σₙₙ⟩₊/Sᵗᶻ)² + (τ/Sˢᶻ)² = 1/SF²   (quadratic interaction, §15 dec. 1)

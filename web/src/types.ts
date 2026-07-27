@@ -255,7 +255,27 @@ export const DEFAULT_MATERIALS: Material[] = [
   { name: "ASA", e0: 2400, nu: 0.37, density: 1.07, strength: 43, strengthZ: 29, shrink: 0.006, shrinkZ: 0.003, yieldStrength: 38, tLock: 100, cte: 90e-6 },
 ];
 
-export type PatternKey = "gyroid" | "cubic" | "grid";
+/** Sparse-infill patterns the solver can model (DESIGN §22).
+ *
+ *  Only `cubic` survived the M0 calibration gate. Gyroid and grid are not
+ *  merely uncalibrated — the kernel's transverse-isotropic material model is
+ *  the wrong model CLASS for grid (it is tetragonal: TI mispredicts its
+ *  in-plane shear by 28×–86×), and gyroid's ratios swing ±32 % across the
+ *  density band against a ±15 % gate. Shipping a knob whose physics we know
+ *  is wrong is worse than not shipping it. */
+export type PatternKey = "cubic";
+
+/** Patterns removed by §22. A project saved with one of these opens on
+ *  `cubic` — see `migratePattern`. Kept as data so the UI can explain the
+ *  substitution rather than silently swapping the user's choice. */
+export const RETIRED_PATTERNS = ["gyroid", "grid"] as const;
+
+/** Sparse patterns are cubic-only; `rectilinear`/`concentric` remain for the
+ *  SOLID regions (`solidPattern`), where the material is dense and the sparse
+ *  infill law never applies. */
+export function migratePattern(p: unknown): PatternKey {
+  return p === "cubic" ? "cubic" : "cubic";
+}
 
 /** Infill stiffness law E(ρ) = coeff · E₀ · ρ^exponent (Gibson–Ashby). */
 export interface PatternCurve {
@@ -263,10 +283,22 @@ export interface PatternCurve {
   exponent: number;
 }
 
+/** Measured E(ρ) law (DESIGN §22.5), least-squares over the calibrated
+ *  20–70 % band under flow calibration.
+ *
+ *  Accurate to ±6.4 % across that band — and the residual is a limit of THIS
+ *  MODEL, not of the data. Cubic's Ep(ρ) is not a single power law: its
+ *  log-log slope climbs monotonically from ~1.05 at 20 % to ~1.80 at 70 %, so
+ *  one exponent cannot fit the whole band. A fit restricted to 20–40 %, where
+ *  most prints live, is accurate to ±1.7 % (coeff 0.5808, exponent 1.2060) —
+ *  see §22.5 for why the band-wide fit ships instead.
+ *
+ *  Two things this law is NOT valid for. It must not be extrapolated to ρ → 1
+ *  (it gives 0.69, not 1.0 — it is a local fit on the band, and solid cells
+ *  never use it: they take the solid tensor directly). And below 20 % it is
+ *  extrapolation, not measurement. */
 export const DEFAULT_CURVES: Record<PatternKey, PatternCurve> = {
-  gyroid: { coeff: 1.0, exponent: 1.5 },
-  cubic: { coeff: 1.0, exponent: 1.8 },
-  grid: { coeff: 1.0, exponent: 2.0 },
+  cubic: { coeff: 0.6933, exponent: 1.3401 },
 };
 
 export const RESOLUTIONS = {

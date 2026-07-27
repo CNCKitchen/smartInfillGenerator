@@ -132,6 +132,32 @@ pub fn sf_cells(
     mask: &[bool],
     spec: &StrengthSpec,
 ) -> Vec<f32> {
+    sf_cells_ti(grid, u, e0, nu, eps, None, mask, spec)
+}
+
+/// [`sf_cells`] with a transverse-isotropic infill share (DESIGN §22).
+///
+/// Two things change together and must not be split: the STRESS comes from the
+/// blended tensor (as in `stress::cell_field_ti`), and the ALLOWABLE scales by
+/// the TOTAL material factor `fs + fi` — the whole material share of the cell,
+/// which is what the old single `eps` meant when both shares were isotropic.
+/// Scaling the allowable by `fs` alone would collapse the safety factor of
+/// every pure-infill cell to zero.
+///
+/// Note this keeps §22.6's known limitation: allowables still scale linearly
+/// with the stiffness factor, so strength exponent = stiffness exponent. TI
+/// does not fix that; it only stops the STRESS side from being wrong too.
+#[allow(clippy::too_many_arguments)]
+pub fn sf_cells_ti(
+    grid: &VoxelGrid,
+    u: &[f32],
+    e0: f64,
+    nu: f64,
+    eps: &[f32],
+    ti: Option<(&[f32], &crate::ti::TiRatios)>,
+    mask: &[bool],
+    spec: &StrengthSpec,
+) -> Vec<f32> {
     let (nx, ny, nz) = (grid.nx, grid.ny, grid.nz);
     let (mx, my) = (nx + 1, ny + 1);
     let inv4h = 1.0 / (4.0 * grid.h);
@@ -140,7 +166,8 @@ pub fn sf_cells(
         for cy in 0..ny {
             for cx in 0..nx {
                 let ci = (cz * ny + cy) * nx + cx;
-                if eps[ci] <= 0.0 || !mask[ci] {
+                let fi = ti.map_or(0.0, |(f, _)| f[ci] as f64);
+                if (eps[ci] <= 0.0 && fi <= 0.0) || !mask[ci] {
                     continue;
                 }
                 // Strain at the cell center.
@@ -161,14 +188,36 @@ pub fn sf_cells(
                 }
                 let (exx, eyy, ezz) = (exx * inv4h, eyy * inv4h, ezz * inv4h);
                 let (gxy, gyz, gzx) = (gxy * inv4h, gyz * inv4h, gzx * inv4h);
-                let factor = eps[ci] as f64;
-                let e = e0 * factor;
-                let lam = e * nu / ((1.0 + nu) * (1.0 - 2.0 * nu));
-                let mu = e / (2.0 * (1.0 + nu));
-                let tr = exx + eyy + ezz;
-                let (sxx, syy, szz) =
-                    (lam * tr + 2.0 * mu * exx, lam * tr + 2.0 * mu * eyy, lam * tr + 2.0 * mu * ezz);
-                let (sxy, syz, szx) = (mu * gxy, mu * gyz, mu * gzx);
+                // Allowable scales with the TOTAL material share; stress comes
+                // from the blended tensor.
+                let factor = eps[ci] as f64 + fi;
+                let (sxx, syy, szz, sxy, syz, szx) = match ti {
+                    Some((_, ratios)) => {
+                        let s = crate::ti::blended_stress(
+                            e0,
+                            nu,
+                            eps[ci] as f64,
+                            fi,
+                            ratios,
+                            [exx, eyy, ezz, gxy, gyz, gzx],
+                        );
+                        (s[0], s[1], s[2], s[3], s[4], s[5])
+                    }
+                    None => {
+                        let e = e0 * factor;
+                        let lam = e * nu / ((1.0 + nu) * (1.0 - 2.0 * nu));
+                        let mu = e / (2.0 * (1.0 + nu));
+                        let tr = exx + eyy + ezz;
+                        (
+                            lam * tr + 2.0 * mu * exx,
+                            lam * tr + 2.0 * mu * eyy,
+                            lam * tr + 2.0 * mu * ezz,
+                            mu * gxy,
+                            mu * gyz,
+                            mu * gzx,
+                        )
+                    }
+                };
 
                 let sf_m = || -> f64 {
                     let vm = (0.5

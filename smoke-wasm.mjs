@@ -463,6 +463,79 @@ model.add_force(sel(0, "max"), 0, 0, -5);
   assert(Array.isArray(ps.residuals) && ps.residuals.length === ps.iterations + 1,
     "printed solve carries the residual trace");
 
+  // ---- DESIGN §22: transversely isotropic infill on the as-printed solve ----
+  // Same part, same settings, only the material model differs.
+  const psTi = JSON.parse(model.solve_printed(JSON.stringify({
+    infillPct: 25, exponent: 1.5, coeff: 1.0, perimeters: 2, lineWidth: 0.45,
+    anisotropic: true,
+  })));
+  assert(psTi.converged && psTi.maxDisplacement > 0, "TI printed solve converges");
+  // Mass is geometry, not stiffness — it must NOT move.
+  assert(Math.abs(psTi.massGrams - ps.massGrams) < 1e-6 * ps.massGrams,
+    "TI changes stiffness only, not mass");
+  // The result must MOVE. Identical values would mean the overlay never
+  // reached the operator — the exact failure the two-field plumbing exists to
+  // prevent, and one that leaves a perfectly converged solve behind.
+  const dRel = psTi.maxDisplacement / ps.maxDisplacement - 1;
+  assert(Math.abs(dRel) > 1e-5, "TI changes the answer (overlay reaches the operator)");
+  // DIRECTION IS LOAD-PATH DEPENDENT — do not assume "anisotropic = softer".
+  // This is a cantilever loaded -Z along x: the bending stress is sigma_xx,
+  // which is IN-PLANE, so Ep (unchanged) governs it and the softer build axis
+  // (Ez/Ep = 0.80) barely participates. What does change is the transverse
+  // shear, and measured Gz/Ep = 0.4247 is 15% STIFFER than the isotropic
+  // E/(2(1+nu)) = 0.370 this part used to assume. Net: very slightly stiffer.
+  assert(dRel < 0,
+    `TI is stiffer here — shear-governed, Gz/Ep 0.425 vs isotropic 0.370 ` +
+    `(${psTi.maxDisplacement.toFixed(4)} vs ${ps.maxDisplacement.toFixed(4)} mm)`);
+  console.log(`   TI printed solve: max |u| ${psTi.maxDisplacement.toFixed(4)} mm ` +
+    `(${(dRel * 100).toFixed(2)}% vs isotropic — shear-governed, see note)`);
+  // The readout must follow the solve: a finite, positive SF field, and no
+  // cell driven to zero by an allowable built from the solid share alone.
+  const sfTi = model.result_field("sf");
+  assert(sfTi.every((v) => Number.isFinite(v) && v > 0 && v <= 10),
+    "TI printed SF field sane (no zero-allowable cells)");
+  assert(fmin(sfTi) > 0, "TI min SF is positive");
+
+  // ---- DESIGN §24: property sets drive the solve ----
+  // Explicitly sending the built-in cubic's constants must be bit-identical
+  // to sending none: pins the web-side BUILTIN_CUBIC values to ti::CUBIC, so
+  // a drift between the two libraries is a test failure, not a silent physics
+  // change for new projects.
+  const psTiExplicit = JSON.parse(model.solve_printed(JSON.stringify({
+    infillPct: 25, exponent: 1.5, coeff: 1.0, perimeters: 2, lineWidth: 0.45,
+    anisotropic: true,
+    tiRatios: { ezEp: 0.8029, gzEp: 0.4247, nuP: 0.2713, nuPz: 0.3651 },
+  })));
+  assert(psTiExplicit.maxDisplacement === psTi.maxDisplacement,
+    "explicit built-in ratios ≡ none sent (BUILTIN_CUBIC pins ti::CUBIC)");
+  // A DIFFERENT physically-valid set must change the answer — the ratios
+  // reach the operator, they are not decorative.
+  const psTiOther = JSON.parse(model.solve_printed(JSON.stringify({
+    infillPct: 25, exponent: 1.5, coeff: 1.0, perimeters: 2, lineWidth: 0.45,
+    anisotropic: true,
+    tiRatios: { ezEp: 0.60, gzEp: 0.25, nuP: 0.30, nuPz: 0.35 },
+  })));
+  assert(Math.abs(psTiOther.maxDisplacement / psTi.maxDisplacement - 1) > 1e-5,
+    "a different property set changes the answer (ratios reach the operator)");
+  // A non-SPD set must be REFUSED, not solved: an indefinite K diverges on
+  // real parts only, which no converged-looking result would ever reveal.
+  let refused = false;
+  try {
+    model.solve_printed(JSON.stringify({
+      infillPct: 25, exponent: 1.5, coeff: 1.0, perimeters: 2, lineWidth: 0.45,
+      anisotropic: true,
+      tiRatios: { ezEp: 0.8029, gzEp: 0.4247, nuP: 0.2713, nuPz: 0.9 },
+    }));
+  } catch {
+    refused = true;
+  }
+  assert(refused, "non-SPD property set is refused with an error");
+  console.log("   §24 property-set plumbing: builtin-identity, distinct-set, non-SPD refusal OK");
+  // Back to isotropic so the checks below compare like with like.
+  JSON.parse(model.solve_printed(JSON.stringify({
+    infillPct: 25, exponent: 1.5, coeff: 1.0, perimeters: 2, lineWidth: 0.45,
+  })));
+
   // Stress/SF on the printed solution use the homogenized eps.
   const sfPrinted = model.result_field("sf");
   const sfPrintedMin = fmin(sfPrinted);

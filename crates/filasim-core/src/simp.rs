@@ -1398,7 +1398,7 @@ pub fn solve_with_eps_cached(
     levels: usize,
     problem: &NodeProblem,
     settings: &SolveSettings,
-    eps: Vec<f32>,
+    eps: impl Into<crate::eps::EpsField>,
 ) -> Result<(crate::solve::Solution, f64), crate::solve::SolveError> {
     let r = solve_cached(slot, grid, levels, problem, settings, eps, settings.tol, settings.max_iter)?;
     let c = r.compliance;

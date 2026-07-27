@@ -12,7 +12,7 @@ use crate::mg::{Level, MgSolver};
 use crate::rigid::RigidGroup;
 use crate::voxel::VoxelGrid;
 
-pub use crate::eps::grid_eps;
+pub use crate::eps::{grid_eps, EpsField};
 
 #[derive(Clone, Copy, Debug)]
 pub struct BoxRegion {
@@ -40,6 +40,15 @@ pub struct SolveSettings {
     pub tol: f64,
     pub max_iter: usize,
     pub max_levels: usize,
+    /// Transverse-isotropic infill tensor (DESIGN §22). `None` = the isotropic
+    /// kernel, which is what every solid solve, the optimizer and buildsim use.
+    /// When `Some`, the `EpsField` handed to the solve MUST carry its infill
+    /// weights — the pair is asserted, not inferred.
+    ///
+    /// Deliberately a MATERIAL property next to `e0`/`nu` rather than part of
+    /// the eps field: the tensor is per-pattern and constant, the weights are
+    /// per-cell and change every iteration. Same split as `e0` vs `eps`.
+    pub ti: Option<crate::ti::TiRatios>,
 }
 
 impl Default for SolveSettings {
@@ -49,7 +58,7 @@ impl Default for SolveSettings {
         // preview/normal/fine presets. Fine grids on stiff/ill-conditioned parts
         // can run far longer, so the cap is 2000 (a converging solve stops at
         // `tol` well before this; the cap only bounds non-converging runs).
-        Self { e0: 2400.0, nu: 0.35, tol: 1e-5, max_iter: 2000, max_levels: 5 }
+        Self { e0: 2400.0, nu: 0.35, tol: 1e-5, max_iter: 2000, max_levels: 5, ti: None }
     }
 }
 
@@ -381,6 +390,12 @@ pub struct SolverCache {
     fixed: Vec<u32>,
     springs: Vec<(u32, [f64; 3], f64)>,
     rigid: Vec<RigidGroup>,
+    /// The TI ratios this hierarchy's `ke_infill` was integrated from (None =
+    /// isotropic build). Compared by VALUE in `matches`: since DESIGN §24 the
+    /// ratios are a per-property-set input, and two different TI sets must
+    /// not share a hierarchy — `update_eps` refreshes weights, never the
+    /// reference element.
+    ti: Option<crate::ti::TiRatios>,
     pub solver: MgSolver,
     /// Displacement of the last solve through this cache.
     pub last_u: Vec<f64>,
@@ -405,8 +420,9 @@ impl SolverCache {
         levels: usize,
         problem: &NodeProblem,
         s: &SolveSettings,
-        eps: Vec<f32>,
+        eps: impl Into<EpsField>,
     ) -> Self {
+        let eps: EpsField = eps.into();
         let (nx, ny, nz) = (grid.nx, grid.ny, grid.nz);
         let ndof = 3 * (nx + 1) * (ny + 1) * (nz + 1);
         let mut fixed = vec![false; ndof];
@@ -415,18 +431,45 @@ impl SolverCache {
                 fixed[3 * n as usize + d] = true;
             }
         }
-        let finest = Level::new(
-            nx,
-            ny,
-            nz,
-            grid.h,
-            eps,
-            s.e0,
-            s.nu,
-            &fixed,
-            problem.springs.clone(),
-            problem.rigid.clone(),
-        );
+        let finest = match (s.ti, eps.infill) {
+            (Some(t), Some(infill)) => Level::new_ti(
+                nx,
+                ny,
+                nz,
+                grid.h,
+                eps.solid,
+                infill,
+                t.stiffness(),
+                s.e0,
+                s.nu,
+                &fixed,
+                problem.springs.clone(),
+                problem.rigid.clone(),
+            ),
+            (None, None) => Level::new(
+                nx,
+                ny,
+                nz,
+                grid.h,
+                eps.solid,
+                s.e0,
+                s.nu,
+                &fixed,
+                problem.springs.clone(),
+                problem.rigid.clone(),
+            ),
+            // Half a TI setup is worse than none: a tensor with no infill
+            // weights solves the skin alone, and weights with no tensor drop
+            // the infill entirely. Both converge happily to a wrong answer.
+            (Some(_), None) => panic!(
+                "SolveSettings::ti is set but the EpsField carries no infill weights \
+                 — use EpsField::ti(solid, infill)"
+            ),
+            (None, Some(_)) => panic!(
+                "EpsField carries infill weights but SolveSettings::ti is None \
+                 — the infill tensor is missing"
+            ),
+        };
         let solver = MgSolver::new(finest, levels);
         Self {
             nx,
@@ -439,6 +482,7 @@ impl SolverCache {
             fixed: problem.fixed.clone(),
             springs: problem.springs.clone(),
             rigid: problem.rigid.clone(),
+            ti: s.ti,
             solver,
             last_u: vec![0f64; ndof],
         }
@@ -450,8 +494,16 @@ impl SolverCache {
         levels: usize,
         problem: &NodeProblem,
         s: &SolveSettings,
-        eps: &[f32],
+        eps: &EpsField,
     ) -> bool {
+        // A hierarchy built isotropic cannot be reused for a TI solve (or vice
+        // versa) — and, since §24, neither can one built from DIFFERENT
+        // ratios: `ke_infill` is integrated from the tensor at build time and
+        // `update_eps` only refreshes weights. Value mismatch forces a cold
+        // rebuild; reusing it would silently solve with the old property set.
+        if self.ti != s.ti {
+            return false;
+        }
         self.nx == grid.nx
             && self.ny == grid.ny
             && self.nz == grid.nz
@@ -463,7 +515,13 @@ impl SolverCache {
             && self.springs == problem.springs
             && self.rigid == problem.rigid
             && self.solver.eps_exact().len() == eps.len()
-            && self.solver.eps_exact().iter().zip(eps).all(|(a, b)| (*a > 0.0) == (*b > 0.0))
+            // Void set must match in the COMBINED sense — under TI a cell can
+            // be live through the infill field alone.
+            && (0..eps.len()).all(|c| {
+                let was = self.solver.eps_exact()[c] > 0.0
+                    || self.solver.ti_eps_exact().is_some_and(|t| t[c] > 0.0);
+                was == eps.active(c)
+            })
     }
 
     /// Make `slot` valid for this problem — reuse (with `update_eps` when
@@ -474,13 +532,27 @@ impl SolverCache {
         levels: usize,
         problem: &NodeProblem,
         s: &SolveSettings,
-        eps: Vec<f32>,
+        eps: impl Into<EpsField>,
     ) -> &'a mut SolverCache {
+        let eps: EpsField = eps.into();
         let reuse = slot.as_ref().is_some_and(|c| c.matches(grid, levels, problem, s, &eps));
         if reuse {
             let c = slot.as_mut().unwrap();
-            if c.solver.eps_exact() != &eps[..] {
-                c.solver.update_eps(eps);
+            match eps.infill {
+                // TI: both fields refresh together, and either one changing
+                // means the operator changed.
+                Some(infill) => {
+                    if c.solver.eps_exact() != &eps.solid[..]
+                        || c.solver.ti_eps_exact() != Some(&infill[..])
+                    {
+                        c.solver.update_eps_ti(eps.solid, infill);
+                    }
+                }
+                None => {
+                    if c.solver.eps_exact() != &eps.solid[..] {
+                        c.solver.update_eps(eps.solid);
+                    }
+                }
             }
         } else {
             *slot = Some(Self::build(grid, levels, problem, s, eps));
@@ -543,7 +615,7 @@ impl SolveSession {
         levels: usize,
         problem: &NodeProblem,
         s: &SolveSettings,
-        eps: Vec<f32>,
+        eps: impl Into<EpsField>,
         extra_rhs: &[&[f64]],
         tol: f64,
         max_iter: usize,
@@ -558,7 +630,7 @@ pub fn solve_cached(
     levels: usize,
     problem: &NodeProblem,
     s: &SolveSettings,
-    eps: Vec<f32>,
+    eps: impl Into<EpsField>,
     tol: f64,
     max_iter: usize,
 ) -> Result<CachedSolve, SolveError> {
@@ -578,7 +650,7 @@ pub fn solve_cached_rhs(
     levels: usize,
     problem: &NodeProblem,
     s: &SolveSettings,
-    eps: Vec<f32>,
+    eps: impl Into<EpsField>,
     extra_rhs: &[&[f64]],
     tol: f64,
     max_iter: usize,
@@ -593,7 +665,7 @@ fn solve_slot(
     levels: usize,
     problem: &NodeProblem,
     s: &SolveSettings,
-    eps: Vec<f32>,
+    eps: impl Into<EpsField>,
     extra_rhs: &[&[f64]],
     tol: f64,
     max_iter: usize,

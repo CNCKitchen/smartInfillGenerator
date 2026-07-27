@@ -382,7 +382,9 @@ Reference points:
 - **Out of scope v1:** assemblies/multi-body, thermal/dynamic loads, mobile browsers.
   Print-orientation stiffness anisotropy was out of scope here until 2026-06; now a
   planned v1.x item (transverse isotropy, see §9) — toolpath-direction in-plane
-  orthotropy remains out of scope permanently (pre-slice tool, no toolpaths).
+  orthotropy remains out of scope permanently. Amended 2026-07-27 (§23): toolpaths
+  MAY be read from user-supplied G-code to measure WHERE material is (as-sliced
+  verification), never WHICH DIRECTION it is stiff in.
 
 ## 4. Pipeline
 
@@ -497,7 +499,8 @@ panel. Fallback pattern law: conservative generic n = 2.
   top. Print direction is globally Z in the grid, so a transversely isotropic material
   (E_xy, E_z, G_xz, ν's per material card) still yields ONE reference KE scaled per voxel —
   the matrix-free/SIMD fast path survives. Toolpath-direction in-plane orthotropy stays out
-  of scope (we are pre-slice by design). Supersedes the §3 out-of-scope entry.
+  of scope (we are pre-slice by design; §23 reads toolpaths for placement only, not
+  direction). Supersedes the §3 out-of-scope entry.
 - [ ] **Offline RVE homogenization tool** — small offline Rust tool: periodic-BC FE
   homogenization of gyroid/cubic/grid unit cells per density → E(ρ) curves incl.
   anisotropy tensors. Fills calibration gaps where measurements are missing, provides
@@ -1380,3 +1383,364 @@ same way.
 with every section expanded), and the same scheme now runs across stations 1–6
 plus the build-sim panel. No behaviour or engine change — copy, layout and two
 small components only.
+
+## 23. As-sliced verification — G-code density mapping (interview 2026-07-27)
+
+*(Renumbered from a duplicate §22 on 2026-07-27 — every code reference to §22
+means the transverse-isotropy section below.)*
+
+**Problem.** The As-Printed model homogenizes: nominal walls (`classify_cells`
+band) + uniform infill at the set density. Real slicers add material the model
+never sees — extra wall-adjacent lines, infill anchors, small areas flooded to
+100 %, gap fill, solid ribs where features are thin. All of these are DENSITY
+effects, and our stiffness model is density-driven, so they are exactly the
+error class we can eliminate by measuring instead of estimating. Original
+proposal was "slice the STL in the background and map the G-code onto the
+density grid"; the grilling kept the mapping and killed the background slicing.
+
+**Prior art.** `docs/build-sim-design.md` §5 already names G-code parsing "the
+common unlock for three future gains at once: bead anisotropy beyond walls,
+as-printed density mapping onto the stress model, and the delamination thermal
+proxy." This section builds the second of the three. It AMENDS the §3/§9
+standing commitment ("pre-slice tool, no toolpaths"): toolpaths are read for
+WHERE material is, never for which direction it is stiff in — in-plane
+orthotropy stays out of scope.
+
+| # | Topic | Decision |
+|---|-------|----------|
+| 1 | Scope | **Verification only, never an optimizer input** — the optimizer's premise is deciding density BEFORE slicing (chicken-and-egg). Lives in station 4 · Verify as an optional, higher-fidelity alternative to the As-Printed solve. **G-code is never required**: the standard predicted path keeps working with zero new obligations; dropping a file is an opt-in refinement. |
+| 2 | No background slicing (firm) | The USER slices and drops the G-code back in. Three reasons, each sufficient: (i) ground truth requires their exact profile + slicer version — our reconstruction from tracked settings would silently differ (seams, anchors, arachne, wall ordering are settings we don't model); (ii) browser app — a slicing service or local companion is real infrastructure for a worse result; (iii) Orca/Bambu/Prusa are AGPL, Cura LGPL — license policy (§2.14) bans both in core; arms-length CLI would dodge the license but not (i) or (ii). |
+| 3 | Audiences | **Both in v1.** (a) The InFEAll user re-verifying their own export ("does the actual slice still hit target?"). (b) The walk-in: own STL + own slice, wants a verdict — InFEAll as a checking tool. Same pipeline; (b) is (a) minus the optimize step. Print settings (pattern/density/walls/lineWidth/layerHeight) are read from the G-code's embedded config block: auto-adopted for (b), cross-checked for (a) with a mismatch warning (catches "you sliced an old export"). Uncalibrated pattern → warn, name the curve used. |
+| 4 | Part isolation | Segment by per-object markers (`EXCLUDE_OBJECT` / `M624` / `; printing object`), drop skirt/brim/support/prime-tower/raft `; FEATURE:` roles. Multi-object plates: register every candidate object, keep the best coverage score (tie/ambiguity → user picks). Out-of-hull material (brim remnants, supports) is additionally masked off by the voxel hull itself. |
+| 5 | Registration | Decomposed, cheap, and self-verifying. Z: lowest extrusion (after role filtering) → model min-z. XY + Z-rotation: 3-DOF 2D footprint registration (centroid + coarse rotation sweep + local refine). **Coverage score** = fraction of extruded volume landing inside the slightly-dilated model hull; correct registration scores ~99 %, wrong rotation or a re-oriented part scores catastrophically lower — so the failure mode is an explicit refusal, never a silently wrong map. Full 3D re-orientation (lay-flat in the slicer) is DETECTED and rejected: "re-orient in InFEAll (§15), re-export, slice without rotating" — orientation decisions belong in InFEAll by existing product design. No manual alignment UI in v1 (revisit only if real users hit the wall). Bonus: the G-code's build direction is ground truth for the layer-adhesion criterion. |
+| 6 | Material law (the scale trap) | Voxels (0.45–0.9 mm) are SMALLER than an infill unit cell (~2+ mm line spacing at 20 %), so raw rasterized infill gives oscillating near-solid/empty cells — neither homogenized (GA is only valid above the unit-cell scale; Jensen bias: exponent > 1 makes oscillating ρ average out STIFFER than truth) nor resolved (0.45 mm beads need ~0.1 mm cells = 30–100 M, over the 4 M cap). Fix is **role-split mapping**: solid roles (walls, extra wall lines, anchors, internal-solid, gap fill, top/bottom, bridges) rasterize at full resolution into measured `f_solid` (linear, like composite skin today); the sparse-infill role rasterizes then SMOOTHS over ~one local line spacing into measured ρ, fed through the SAME calibrated per-pattern GA curve. `build_eps`' composite formula survives unchanged — the G-code path supplies measured `(f_solid, ρ)` instead of `classify_cells`' estimate and the nominal density. No new material model, no direction-dependent stiffness. Rejected: everything-as-linear-solid (resolution-dependent answer; and a swapped material law makes the predicted-vs-as-sliced delta unattributable — both runs MUST share `build_eps` + curves so the delta isolates material PLACEMENT). |
+| 7 | Volume accounting | Per-segment extruded volume from **ΔE × filament cross-section**, not nominal width × height — exact under variable width (arachne), adaptive layer height, and flow tweaks. G2/G3 arcs flattened. Σ volume is the **exact printed mass** (per material density) — the card's headline number is a measurement, not an estimate. |
+| 8 | Presentation | As-sliced solve joins the result roster as a new result source (works with load steps, envelope pseudo-step, shared legend + fit, banding) **plus a delta summary card**: mass (predicted vs exact), stiffness delta, min SF predicted → as-sliced (criterion reduction — §20 rule: one quantity, one reduction, everywhere). Walk-in (b) with no predicted run: card degrades to absolute numbers (mass, min SF). The card IS the feature's message; without it the user eyeballs two contour plots. |
+| 9 | Persistence & staleness | **Session-only mapping.** Parsed segments held in memory: BC/load edit → as-sliced results stale, re-solve from retained mapping (no re-drop); resolution change → auto re-rasterize from segments; geometry/orientation change → mapping invalid, re-drop required. Project file stores only a breadcrumb (filename, settings summary, registration transform, card numbers), additive in PROJECT_SCHEMA=1; on reload the as-sliced results show stale with a "re-drop the G-code to refresh" prompt. Matches §11 philosophy: projects store intent, results are cheap to regenerate. Rejected: embedding the G-code (5–50 MB forever in every save) and persisting mapped arrays (resolution-bound, can't re-register). |
+
+**Build order** (each milestone shippable; gated by regbench `--check` + wasm smoke
+test; all existing paths byte-identical — this is a new input path, not a model change):
+**(M1) parser + registration, headless** — G-code module in `filasim-core`: dialect
+handling (Orca/Bambu/Prusa comments), object/role segmentation, ΔE volumes, arc
+flattening, config-block reader; footprint registration + coverage score. Fixture
+G-code files (sliced from our own test STLs) with tests asserting registration
+transform, coverage, per-role volume totals, and refusal on a lay-flatted fixture.
+**(M2) mapping + solve** — rasterization into the grid (measured `f_solid`,
+smoothed infill ρ), `build_eps` measured path, wasm entry (map + solve + delta
+numbers), exact-mass accounting; regbench anchor on a fixture part, existing
+anchors +0.000 %.
+**(M3) UI** — drop zone in station 4 · Verify, settings adopt/mismatch flow, delta
+card, result-kind + staleness wiring, breadcrumb persistence; wasm smoke test
+covers drop → register → solve → card and the refusal path.
+
+**Deferred.** Manual alignment fallback UI. Using the parsed G-code for the
+build-sim delamination thermal proxy + layer-time model (the other two unlocks in
+`build-sim-design.md` §5 — the parser is shared groundwork). Bead-direction
+anisotropy (permanently out, §3). Any optimizer-loop use, incl. per-candidate
+slicing in the §20 sweep. Embedding G-code in the project file.
+
+## 22. Transverse-isotropic infill from measured calibration (gate 2026-07-26)
+
+**Problem.** The infill law is one scalar: `E/E0 = coeff·ρ^exponent` (`eps.rs`),
+so every cell is isotropic and only its *magnitude* varies. Real FDM infill is
+not isotropic — it is stiffer in the layer plane than along the build axis, and
+its shear moduli are not tied to `E/(2(1+ν))`. The external calibrator
+(`FDMMaterialCaribration`, closed-source) measures the full 6×6 tensor by
+periodic homogenization of the actual sliced toolpath. §22 is how that lands.
+
+### 22.1 The gate (M0) and what it decided
+
+The kernel wants ONE precomputed `ke_infill` scaled by a per-cell scalar. That
+is only legal if the anisotropy **ratios** are near-constant across the shipped
+density band, so the scalar carries all the ρ dependence. M0 measured it
+(`docs/m0-ti-gate.md` in the calibrator repo, gate ±15 %):
+
+| pattern | verdict | binding ratio |
+|---|---|---|
+| **cubic** | **GO**, 20–70 % | `Gz/Ep` ±9.4 % |
+| grid | NO-GO | `Gxy/Ep` ±163 % |
+| gyroid | NO-GO | `Gz/Ep` ±32 % |
+| rectilinear | NO-GO | `Gz/Ep` ±171 % |
+
+Two findings drive the design:
+
+* **For grid and rectilinear, transverse isotropy is the wrong model *class*,
+  not an imprecise fit.** They are tetragonal: `Gxy` is an independent constant,
+  and TI's prediction `Gxy = Ep/(2(1+ν_p))` misses it by 28×–86×. No amount of
+  refitting rescues a TI kernel there — it needs a 6th constant (dec. 3).
+* **For cubic, TI is exact to measurement noise.** Two independent consistency
+  checks on the band-mean tensor agree to **0.06 %**: Maxwell reciprocity
+  (`ν_zp/Ez` vs `ν_pz/Ep`) and the TI identity (`Ep/(2(1+ν_p))` vs the
+  *separately measured* `Gxy/Ep`). In-plane isotropy holds too — `Ex/Ey =
+  1.0008 ± 0.2 %` — so there is no infill-angle input and no `C66` untying.
+
+Every number is a 3-rung Richardson extrapolation `v(h) = v0 + A·h`. Single-grid
+voxel-FE values are 30–60 % too stiff and biased *non-uniformly per constant*
+(+8 % on `Ep` vs +96 % on `Gxy`), so a single-grid ratio is wrong by 10–40 % —
+i.e. by more than the whole gate. **Never quote a single-rung calibration number.**
+
+### 22.2 Decisions
+
+1. **Ship cubic only, as the sparse-infill pattern.** `gyroid` and `grid` come
+   out of `PatternKey` — they are not merely uncalibrated, they are mis-modelled
+   by the kernel, and shipping a knob whose physics we know is wrong is worse
+   than not shipping it. `rectilinear`/`concentric` stay, restricted to the
+   **solid/skin regions** they already serve (`threemf.rs` `solid_pattern`),
+   where the material is dense and the sparse-infill law never applies.
+2. **Freeze the ratios at the BAND MEAN, not at a nominal density.** Freezing at
+   50 %'s values costs +11.5 % worst-case; the mean costs ±9.4 %.
+3. **Constants live in one table, not in the kernel.** `ti.rs` owns them so a
+   second pattern (or a tetragonal one) is a data change plus a 6th field, not a
+   solver rewrite.
+4. **Two weights per cell, two reference elements.** See 22.4.
+5. **Below 20 % the ratios are extrapolated, not measured** — held flat at the
+   band mean. `DENSITY_MIN` stays 0.10. M0b established that cubic @ 10 % has a
+   perfectly good unit cell (14.101 × 24.423 × 34.60 mm) that is ~54× the volume
+   of the 30 % cell, needing ~440 M elements per rung against a 12 M cap. It is
+   measurable in principle and unaffordable in practice — a narrower and much
+   better-founded claim than "no period exists", which was the first (wrong)
+   answer three times over.
+
+### 22.3 Frozen constants — cubic, band mean over 20–70 %
+
+Normalized to `Ep = 1`; the magnitude is carried by the existing scalar law.
+All seven points measured under **flow calibration** (`exact-period-v4-flowcal`)
+— see 22.5, the convention is load-bearing.
+
+| constant | value | spread over band |
+|---|---|---|
+| `Ez/Ep` | 0.8029 | ±8.4 % (binding) |
+| `Gz/Ep` | 0.4247 | ±6.4 % |
+| `ν_p` | 0.2713 | ±6.4 % |
+| `ν_pz` | 0.3651 | ±5.8 % |
+| `Gxy/Ep` | *derived* = `1/(2(1+ν_p))` = 0.3933 | measured 0.3935, ±1.3 % |
+| `ν_zp` | *derived* = `ν_pz·Ez/Ep` = 0.2931 | measured 0.2927, ±4.4 % |
+
+Two constants are DERIVED, not stored, and their measured values are kept as
+**test fixtures** instead. TI has five independent constants; storing a sixth
+or seventh would let a data-entry slip produce a tensor that is not actually TI
+while the kernel accepted it anyway. The fixtures turn that into a failing
+test: derived-vs-measured agrees to **0.05 %** on `Gxy/Ep` and **0.15 %** on
+`ν_zp`. Those two checks are independent of each other and of the mesh ladder,
+which makes them a better quality gate than any single fit residual.
+
+Both are inside the ±15 % gate, so the GO holds, but note the binding ratio
+moved: it was `Gz/Ep` under the old mixed-convention data and is now `Ez/Ep`.
+`Ez/Ep` climbs monotonically with density (0.762 → 0.871 over 30–70 %), which
+is the physically expected direction — it must reach 1 at ρ = 1.
+
+### 22.4 Kernel shape
+
+The current per-cell rule is a Voigt (parallel) blend of solid skin and infill,
+written as one scalar because both were isotropic:
+
+```
+eps[c] = occ · ( f + (1−f)·rel(ρ) ),    rel(ρ) = coeff·ρ^exponent
+```
+
+TI splits it into the *same two terms with different tensors*:
+
+```
+C_cell = occ · [ f · C_solid  +  (1−f)·rel(ρ) · Ĉ_TI ]
+         └── eps_s = occ·f ──┘   └── eps_i = occ·(1−f)·rel(ρ) ──┘
+```
+
+so `Level` carries **two** weight fields and **two** reference element matrices
+(`ke_solid`, `ke_infill`), and `apply_cell` accumulates `eps_s·KE_s + eps_i·KE_i`.
+Note `rel(ρ)` is unchanged — only the tensor *shape* it multiplies is new.
+
+Consequences:
+
+* **`Ĉ_TI == C_solid` reproduces today's kernel exactly.** That identity is the
+  regression test, and the single-material path must stay bit-identical
+  (regbench +0.000 %).
+* **Cost is bounded by cell partition, not by 2×.** Almost every cell is pure —
+  skin (`eps_i = 0`) or pure infill (`eps_s = 0`) — and only the composite-skin
+  band carries both. Cells are already grouped for the two-phase parallel
+  scatter; a per-cell branch on a zero weight costs far less than the 576 FMAs
+  it skips.
+* **Multigrid cascades both fields** (`average_coarse_eps` runs twice), and a
+  semicoarsened brick level re-integrates both KEs. `build_dinv` / `refresh_lmax`
+  take the weighted sum of the two diagonals.
+* **§15 orientation is no longer free.** `orient.rs` states the solve is
+  isotropic, so the stress field in the part frame is orientation-independent and
+  a sweep only re-evaluates the criterion. With TI that is false — rotating the
+  part rotates the material axes, so each candidate needs a real re-solve. Until
+  that is done the sweep must either keep the isotropic operator (and say so) or
+  be restricted; it must not silently report TI-invalid results.
+
+### 22.4b What is wired (2026-07-27)
+
+TI is live on the **as-printed static solve only** — `solve_printed`, behind
+`PrintedOpts::anisotropic` (Properties → "Anisotropic infill", on by default for
+new projects, OFF when loading a pre-§22 project so old results do not silently
+change). The optimizer, buildsim, modal and the §15 sweep still run isotropic.
+
+Three things that were easy to get wrong and are pinned by tests:
+
+1. **Stress had to follow stiffness.** The constitutive law appears twice
+   (`stress::cell_field`, `strength::sf_cells`), and both build an isotropic
+   λ/μ from `e0·eps`. A TI solve read back through that law reports wrong
+   stress and wrong SF *while converging perfectly* — no residual check can
+   catch it. Both now take an optional TI share and blend the same way the
+   element kernel does (`ti::blended_stress`).
+2. **The SF allowable uses the TOTAL material share**, not the solid share.
+   `factor` alone is the skin under TI, so a pure-infill cell would get a zero
+   allowable and read SF = 0 — sound material reported as failing.
+3. **`solution_eps` stores the TOTAL (solid + infill) field**, not the split.
+   Every readout predating §22 — the stashed-result roster, the orientation
+   sweep, the SF floor — reads it and evaluates isotropically; handing them
+   half a field would silently delete the infill from all of them. The
+   TI-aware path subtracts `solution_ti` back out to recover the solid share.
+
+**"Anisotropic" does not mean "softer" — the direction is load-path
+dependent.** Only `Ez/Ep = 0.80` is a softening; `Gz/Ep = 0.4247` is **15 %
+STIFFER** than the isotropic `E/(2(1+ν)) = 0.370` the old model assumed, and
+`Gxy/Ep = 0.393` is 6 % stiffer. So:
+
+| load path | governed by | effect |
+|---|---|---|
+| tension/compression along Z | `Ez` | **softer**, up to −20 % |
+| bending about an in-plane axis | `Ep` (in-plane) | ~unchanged |
+| transverse shear (short beams, webs) | `Gz` | **stiffer**, ~+15 % |
+
+The smoke suite's cantilever is the counter-intuitive case: loaded −Z but bent
+about y, so its stress is in-plane `σxx` and its deflection is shear-governed —
+TI makes it 0.1 % **stiffer**, not softer. Anyone sanity-checking TI by
+assuming "anisotropy must increase deflection" will conclude the feature is
+broken when it is working.
+
+Plumbing: `EpsField` (`eps.rs`) carries one field or two, with
+`From<Vec<f32>>`, so all ~15 pre-existing call sites compile unchanged and take
+the isotropic path; `SolveSettings::ti` carries the tensor as a material
+property alongside `e0`/`nu`. Mismatched pairs panic rather than solving half a
+model. `SolverCache::matches` refuses to reuse a hierarchy across the
+isotropic/TI boundary. Regbench: PASS, quality metrics +0.000 %.
+
+### 22.5 The `Ep(ρ)` magnitude law, and why it is only ±6.4 %
+
+**Flow calibration is not optional.** The original 30–70 % measurements used a
+union raster that loses bead-overlap volume where lines cross, under-reading the
+material fraction by 10 % at 30 % density and 22 % at 70 %. Re-running all of
+30–70 % under `exact-period-v4-flowcal` (5 configs, 4116 s total) closed it: the
+measured `rho_rel` now matches the nominal infill the slicer was given to better
+than **0.3 % at every density** (0.3005 / 0.3998 / 0.4991 / 0.5983 / 0.6999).
+That agreement is the evidence that flowcal is the *correct* convention rather
+than merely a different one.
+
+It matters for the tensor too, not just the magnitude. The build-axis ratios
+moved ~5 % (`Ez/Ep` +5.7 %, `ν_zp` +5.4 %) while the in-plane pair did not
+(`Gxy/Ep` −0.01 %, `ν_p` +0.05 %). That is not a mesh artifact: at 60 % both
+runs used the *identical* finest mesh (h = 0.0302) and `Ez/Ep` still differs by
+7.4 %. Physically it is the crossings — flowcal restores the material at bead
+intersections, which is exactly where through-layer connectivity lives.
+
+**The surprise: cubic's `Ep(ρ)` is not a single power law.** Its log-log slope
+climbs monotonically across the band:
+
+| ρ | 20→25 | 25→30 | 30→40 | 40→50 | 50→60 | 60→70 |
+|---|---|---|---|---|---|---|
+| local exponent | 1.26 | 1.05 | 1.29 | 1.38 | 1.54 | 1.80 |
+
+So the best single power law over 20–70 %, `Ep/E0 = 0.6933·ρ^1.3401`, carries
+**±6.4 %** — and that residual is a limit of the MODEL, not the data (each
+point's own extrapolation residual is 0.07–0.18 %). Restricted fits do much
+better: 20–40 % gives ±1.7 %, 20–50 % gives ±2.4 %.
+
+The band-wide fit ships anyway, because `DENSITY_MIN/MAX = 0.10/0.70` and the
+optimizer roams the whole range — a fit that is excellent at 30 % and 8 % wrong
+at 70 % would be worse in the tool's actual use than one that is evenly ±6.4 %.
+Tightening this needs a second parameter in `EvalLaw`, which is a real change to
+the density law and out of scope here.
+
+**The old fit was a coincidence worth recording.** Under the uncalibrated
+raster, 30–70 % fitted `0.4445·ρ^1.1098` at ±0.5 % — a beautifully clean power
+law, and entirely an artifact. The material-fraction bias grew with density
+(10 % → 22 %), and that systematic tilt flattened a curving log-log plot into a
+straight line. The ρ → 1 anchor exposes it: reaching `Ep/E0 = 1` at ρ = 1
+requires a local slope of 1.93 / 2.07 / 2.18 from the 50/60/70 % flowcal points
+— a smooth continuation of the measured 1.05 → 1.80 climb — whereas the old
+70 % value demanded a jump to 3.37. **A clean fit is not evidence of a clean
+measurement**; check it against a physical anchor.
+
+### 22.6 Not in scope
+
+Per-pattern strength allowables (`strength.rs` still scales allowables by the
+same `eps`, forcing strength exponent = stiffness exponent — a separate wrong
+assumption, unaffected by this section). Tetragonal patterns (grid/rectilinear,
+needs the 6th constant). Bead-direction anisotropy (permanently out, §3).
+Infill-angle input (cubic is in-plane isotropic, so there is nothing to steer).
+
+## 24. Infill Property Manager — sets, library, import/export (interview 2026-07-27)
+
+**Problem.** The infill property data is split across three homes with three
+visibility levels: `{c, n}` editable in ⚙ Settings (localStorage), the five TI
+ratios frozen and invisible in `ti.rs` (the web app sends only a boolean —
+`opts.anisotropic.then_some(ti::CUBIC)`), and the measured calibration data in
+the closed-source calibrator repo, absent from the product entirely. There is
+no way to see what a pattern's stiffness actually looks like, compare two
+calibrations, bring in third-party data, or back up your own edits.
+
+**Solution shape.** An **infill property set** becomes the unit of data: one
+named, versioned bundle of everything the solver needs to model one sparse
+infill pattern. A per-browser **library** of sets replaces the bare `curves`
+table; a full-screen **Property Manager** (entered from ⚙ Settings → Infill)
+lists, visualizes, duplicates, edits, imports and exports them; the ACTIVE
+set's constants travel through the wasm API and drive the solve.
+
+### 24.1 Decisions
+
+| # | Topic | Decision |
+|---|-------|----------|
+| 1 | Data unit | **Fits only.** A set = identity + `{c, n}` magnitude law + the five TI ratios + metadata. Measured per-density points stay OUT of the product (proprietary calibration data, license policy §2.14). Graphs draw smooth curves; fit-only is what makes third-party import a 7-number affair rather than a data-format negotiation. |
+| 2 | Model classes | **Multi-model-ready, cubic first.** Sets carry `modelClass` — `"transverse_isotropic"` now; tetragonal (6th constant, grid/rectilinear) is a future additive field, not a format break. The §22 M0 gate still governs what may ship as a solvable class: sets whose declared class the kernel cannot model are viewable in graphs but never selectable for solving. Future sets may be free or purchasable data packs. |
+| 3 | Solver wiring | **Sets drive the solve.** The active set's ratios cross the wasm boundary (`PrintedOpts.tiRatios`, additive, `None` → frozen `ti::CUBIC` so pre-§24 callers are bit-identical). `ti::CUBIC` becomes the built-in set's pinned values, guarded by the existing anti-tamper tests plus a smoke-test identity: solving with the built-in set's explicit ratios must match solving with none sent. `solution_ti` stores the ratios that actually ran. Changing the active set marks results stale like any physics edit. |
+| 4 | Project persistence | Set files carry `embedInProject`. Free/built-in sets (true): the project embeds the full set — the existing "projects embed the VALUES they used" rule. Paid sets (false): the project embeds only `{id, version, name}`. Additive in PROJECT_SCHEMA=1; the legacy `curves`+`pattern` fields keep being written (values of the active set) so pre-§24 builds open new projects with the right magnitude law. |
+| 5 | Missing referenced set | **View yes, solve locked.** Stored results display, geometry/BCs editable; Solve/Optimize preflight-blocked: "Property set 'X' is not in this library — import it, or switch to a local set (results will change)." Switching is an explicit act, marked stale. Auto-fallback to cubic is banned — same silent-physics rule as §22.4b/§15. |
+| 6 | Edit model | **Duplicate-to-edit.** Built-in and imported sets are read-only. "Duplicate" creates a user-owned copy (name suffixed), fully editable (c, n, all ratios), marked user-modified. The inline c/n fields and "Reset curves" button in Settings are REPLACED by an active-set picker + "Manage…" entry. A user set embedded in a project embeds exactly what ran. |
+| 7 | Validity band | `calibratedBand: [lo, hi]` (fractions). Graphs draw solid inside, dashed outside. If the printable band (Density Levels floor/cap) exceeds the set's band: yellow preflight note "results outside ρ∈[lo,hi] are extrapolated". Never clamps — same posture as cubic's own extrapolate-below-20 % policy (§22 dec. 5), now visible. |
+| 8 | Graphs (all four) | (a) **Stiffness-vs-density curves** — direction selector (Ep, Ez, Gz, Gxy), multi-set overlay, log-log toggle. Covers "Ep vs Ep" (two sets, one direction) and "Ep vs Ez" (one set, two directions). (b) **Directional stiffness polar section** E(θ), layer plane → build axis, at a chosen ρ (TI is in-plane isotropic, one section suffices). (c) **Anisotropy ratio bars** across sets. (d) **Reference-density readout table** (E(20 %)/E(50 %) per direction per set). Y-axis relative E/E₀ by default, absolute-GPa toggle via a chosen material's E₀. |
+| 9 | Interchange format | **`.filaprops` — branded, readable JSON bundle.** `{formatVersion, sets: [...]}`; export one/selected/all, import merges. Per set: `id` (uuid) + `version`, `name`, `pattern`, `modelClass`, `ratios {ezEp, gzEp, nuP, nuPz}` (5 independent constants, `Gxy`/`ν_zp` DERIVED — same anti-inconsistency rule as `TiRatios`), `curve {coeff, exponent}`, `calibratedBand`, `embedInProject`, `provenance {author, calibratedOn, date, license}`. Collisions: same id → offer replace (version-aware); same name, different id → import under suffixed name. **No DRM, no signing** — meaningless client-side in an AGPL app; `embedInProject:false` is the entire paid-pack mechanism. |
+| 10 | Validation | The manager clamps inputs to physical bounds; the wasm layer independently rejects non-SPD tensors (`TiRatios::is_physical`, closed-form leading-minor check) with an error instead of handing CG an indefinite K. Imports failing schema or physicality are rejected with a reason, never silently repaired. |
+
+Also resolved: the active set cannot be deleted (switch first); the
+`anisotropicInfill` toggle survives and stays orthogonal (off = isotropic
+curve-only path, whatever the active set); strength-law fields are NOT in the
+format v1 (§22.6's strength-exponent issue is separate; additive fields cover
+it later); the manager is a full-screen surface entered from Settings.
+
+### 24.2 Migration
+
+Legacy `sig.settings.v1` `curves.cubic`: equal to `DEFAULT_CURVES.cubic` →
+library = built-in cubic, active. Different (user-calibrated) → synthesize a
+user set "Cubic (customized)" carrying the old c/n + built-in ratios, active,
+so nobody's calibration silently reverts. Pre-§24 projects load as today
+(curves adopted); their synthesized session set uses built-in ratios, which is
+exactly what those projects ran with.
+
+### 24.3 Build order
+
+Each milestone shippable; gated by `cargo test`, regbench `--check`, wasm smoke
+test; single-set-cubic paths byte-identical.
+
+- **(M1) Library + manager + honest wiring** — schema/types + built-in cubic
+  set; library store (new localStorage key) + migration; `.filaprops`
+  import/export with validation; manager surface (list, metadata, duplicate,
+  rename, delete, edit user sets); Settings picker replacing inline c/n;
+  `PrintedOpts.tiRatios` plumbing so the active set's ratios genuinely run
+  (no knob lands before its wire). Smoke: built-in-explicit ≡ none-sent.
+  **SHIPPED 2026-07-27.** The smoke identity check immediately caught a real
+  bug: `SolverCache::matches` compared "is TI" but not the ratio VALUES, so
+  switching between two TI sets reused the hierarchy integrated from the old
+  tensor — the new set never reached the operator. Fixed by storing the
+  build-time ratios in the cache and comparing by value.
+- **(M2) Graphs** — the four §24.1 dec. 8 visualizations inside the manager.
+  **SHIPPED 2026-07-27** (`PropertyCharts.tsx`, plain SVG, no dependency;
+  categorical palette validated for CVD on the Werkbank surface).
+- **(M3) Project semantics** — embed/reference per `embedInProject`,
+  missing-set preflight lock, "add embedded set to library" affordance,
+  band-exceeded preflight note (dec. 7).
+
+**Deferred.** Tetragonal model class (needs the §22 6th-constant kernel).
+Strength-law fields in the format. Any signed/verified catalog machinery.
+Purchasable-pack storefront anything — the format flag is the only hook.

@@ -1561,6 +1561,8 @@ function StepProperties() {
       setSnapVoxel: s.setSnapVoxel,
       compositeSkin: s.compositeSkin,
       setCompositeSkin: s.setCompositeSkin,
+      anisotropicInfill: s.anisotropicInfill,
+      setAnisotropicInfill: s.setAnisotropicInfill,
     }))
   );
   const wall = s.perimeters * s.lineWidth;
@@ -1656,12 +1658,9 @@ function StepProperties() {
         <div className="group">
           <div className="g-label">
             <span>Infill pattern</span>
+            <b>Cubic</b>
+            <InfoTip help={PROP_HELP.pattern} />
           </div>
-          <select value={s.pattern} onChange={(e) => s.setPattern(e.target.value as PatternKey)}>
-            <option value="gyroid">Gyroid</option>
-            <option value="cubic">Cubic</option>
-            <option value="grid">Grid</option>
-          </select>
         </div>
         <div className="group">
           <div className="g-label">
@@ -1751,6 +1750,15 @@ function StepProperties() {
             onChange={(e) => s.setCompositeSkin(e.target.checked)}
           />
           <span>Composite skin (blend part-wall cells)</span>
+        </label>
+        <label className="rowcheck">
+          <input
+            type="checkbox"
+            checked={s.anisotropicInfill}
+            onChange={(e) => s.setAnisotropicInfill(e.target.checked)}
+          />
+          <span>Anisotropic infill (measured, layer-plane vs Z)</span>
+          <InfoTip help={PROP_HELP.anisotropic} />
         </label>
         <div className="dim small">
           {s.voxelInfo

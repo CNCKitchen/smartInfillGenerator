@@ -54,7 +54,25 @@ import type {
   SolveStats,
   VoxelInfo,
 } from "./types";
-import { DEFAULT_CURVES, DEFAULT_MATERIALS, RESOLUTIONS, RESULT_FIELDS } from "./types";
+import {
+  DEFAULT_CURVES,
+  DEFAULT_MATERIALS,
+  migratePattern,
+  RESOLUTIONS,
+  RESULT_FIELDS,
+} from "./types";
+import {
+  BUILTIN_CUBIC,
+  describeMerge,
+  isPhysicalRatios,
+  loadPropsLibrary,
+  mergeImport,
+  parseFilaprops,
+  savePropsLibrary,
+  uniqueSetName,
+  type InfillPropertySet,
+  type TiRatiosData,
+} from "./infillProps";
 import { shrinkFromPhysics, ROOM_TEMP_C } from "./materials";
 import { fitCylinderFromSelection } from "./cylinderFit";
 import { CONTOUR_BANDS, CONTOUR_BANDS_MIN, CONTOUR_BANDS_MAX, jet, bandHexColors } from "./viewer/colormaps";
@@ -112,11 +130,7 @@ interface PersistedSettings {
 function loadSettings(): PersistedSettings {
   const fallback: PersistedSettings = {
     materials: DEFAULT_MATERIALS.map((m) => ({ ...m })),
-    curves: {
-      gyroid: { ...DEFAULT_CURVES.gyroid },
-      cubic: { ...DEFAULT_CURVES.cubic },
-      grid: { ...DEFAULT_CURVES.grid },
-    },
+    curves: { cubic: { ...DEFAULT_CURVES.cubic } },
     levels: { ...DEFAULT_LEVELS, manual: [...DEFAULT_LEVELS.manual] },
   };
   try {
@@ -167,7 +181,8 @@ function loadSettings(): PersistedSettings {
         });
       if (!fallback.materials.length) fallback.materials = DEFAULT_MATERIALS.map((m) => ({ ...m }));
     }
-    for (const k of ["gyroid", "cubic", "grid"] as PatternKey[]) {
+    // Retired patterns in a stored settings blob are ignored (DESIGN §22).
+    for (const k of ["cubic"] as PatternKey[]) {
       const c = p.curves?.[k];
       if (c && typeof c.coeff === "number" && typeof c.exponent === "number") {
         fallback.curves[k] = { coeff: c.coeff, exponent: c.exponent };
@@ -410,6 +425,38 @@ function saveSettings(
 
 const initialSettings = loadSettings();
 
+// ---- infill property library (DESIGN §24) ----
+// Loaded after the legacy settings so a pre-§24 user-calibrated curve can be
+// migrated into a user set instead of silently reverting.
+const initialLibrary = loadPropsLibrary(initialSettings.curves.cubic);
+
+/** The active property set, or null when the session runs on "project
+ *  values" — a loaded pre-§24 project whose curve matches no library set. */
+function activePropertySet(st: {
+  propertySets: InfillPropertySet[];
+  activeSetId: string | null;
+}): InfillPropertySet | null {
+  return st.activeSetId
+    ? (st.propertySets.find((s) => s.id === st.activeSetId) ?? null)
+    : null;
+}
+
+/** TI constants an as-printed solve should carry (DESIGN §24.1 dec. 3):
+ *  the active set's ratios, or the built-in cubic's when the session runs on
+ *  project values — exactly what pre-§24 projects ran with. `undefined` when
+ *  the anisotropic model is off (isotropic path, ratios ignored anyway). */
+function activeTiRatios(st: AppState): TiRatiosData | undefined {
+  if (!st.anisotropicInfill) return undefined;
+  return { ...(activePropertySet(st) ?? BUILTIN_CUBIC).ratios };
+}
+
+/** The legacy `curves` field mirrors the active set's magnitude law so every
+ *  pre-§24 consumer (solve calls, project save, the optimizer's EvalLaw) keeps
+ *  reading the right values without knowing sets exist. */
+function mirrorCurves(s: InfillPropertySet): Record<PatternKey, PatternCurve> {
+  return { cubic: { ...s.curve } };
+}
+
 // ---- display-unit preference (per-user UI pref, NOT in the project file) ----
 // See docs/units-design.md §5: lives in localStorage, identical across projects;
 // later moves to the user account when accounts land.
@@ -524,7 +571,17 @@ interface AppState {
   // physics
   material: Material;
   materials: Material[];
+  /** Legacy mirror of the ACTIVE property set's magnitude law (see
+   *  `mirrorCurves`) — kept so pre-§24 consumers and the project format stay
+   *  unchanged. Never edit directly; it follows `activeSetId`. */
   curves: Record<PatternKey, PatternCurve>;
+  /** Infill property library (DESIGN §24): built-in first, then user/imported
+   *  sets. Persisted per browser (built-in injected, not stored). */
+  propertySets: InfillPropertySet[];
+  /** Active set driving solves; null = "project values" (a loaded pre-§24
+   *  project whose curve matches no library set — built-in ratios apply). */
+  activeSetId: string | null;
+  propsManagerOpen: boolean;
   resolution: ResolutionKey | "custom";
   /** Cell size h in mm when resolution = "custom" (0 = not yet chosen —
    *  initialized from the current grid on first selection). */
@@ -546,6 +603,8 @@ interface AppState {
    *  of rounding the skin to whole voxel layers — thin walls stay
    *  representable on coarse grids. Off = legacy whole-layer skin. */
   compositeSkin: boolean;
+  /** Model sparse infill as transversely isotropic (DESIGN §22). */
+  anisotropicInfill: boolean;
   /** What "Solve once" analyzes: the print, the CAD-ideal solid, or the FDM
    *  build simulation (inherent-strain warp + bed peel). */
   analyzeMode: "printed" | "solid" | "buildsim";
@@ -972,8 +1031,24 @@ interface AppState {
   addMaterial(): void;
   removeMaterial(index: number): void;
   resetMaterials(): void;
-  setCurve(pattern: PatternKey, c: PatternCurve): void;
-  resetCurves(): void;
+  // ---- infill property library (DESIGN §24) ----
+  openPropsManager(open: boolean): void;
+  /** Switch the set driving solves — a physics edit: results go stale. */
+  setActivePropertySet(id: string): void;
+  /** Duplicate-to-edit (§24.1 dec. 6): copy any set into a user-owned one. */
+  duplicatePropertySet(id: string): void;
+  /** Edit a USER set (built-in/imported are read-only). Physics fields on the
+   *  active set mark results stale; renames don't. */
+  updatePropertySet(
+    id: string,
+    patch: Partial<
+      Pick<InfillPropertySet, "name" | "pattern" | "curve" | "ratios" | "calibratedBand" | "provenance">
+    >
+  ): void;
+  /** Remove a non-built-in, non-active set. */
+  deletePropertySet(id: string): void;
+  /** Merge a .filaprops payload into the library; returns the notice text. */
+  importPropertySets(text: string): string;
   openSettings(open: boolean): void;
   openLoadSteps(open: boolean): void;
   openImprint(open: boolean): void;
@@ -992,6 +1067,7 @@ interface AppState {
   setPrintInfill(v: number): void;
   setSnapVoxel(on: boolean): void;
   setCompositeSkin(on: boolean): void;
+  setAnisotropicInfill(on: boolean): void;
   setAnalyzeMode(m: "printed" | "solid" | "buildsim"): void;
   setAnalysisType(t: "static" | "modal"): void;
   setModalModeCount(n: number): void;
@@ -2741,6 +2817,8 @@ async function solveAllSteps(set: SetState, get: () => AppState) {
           lineWidth: st0.lineWidth,
           topBottomLayers: st0.topBottomLayers,
           layerHeight: st0.layerHeight,
+          anisotropic: st0.anisotropicInfill,
+          tiRatios: activeTiRatios(st0),
         });
         stats = out.stats;
         printedSummary = {
@@ -3156,6 +3234,7 @@ function collectSettings(s: AppState) {
     printInfill: s.printInfill,
     snapVoxel: s.snapVoxel,
     compositeSkin: s.compositeSkin,
+    anisotropicInfill: s.anisotropicInfill,
     smoothStress: s.smoothStress,
     materialStress: s.materialStress,
     analyzeMode: s.analyzeMode,
@@ -3307,11 +3386,19 @@ export const useStore = create<AppState>((set, get) => ({
   activeLoadStepId: initialStep.id,
   material: initialSettings.materials[0],
   materials: initialSettings.materials,
-  curves: initialSettings.curves,
+  // Mirror of the active set's curve (§24); falls back to the legacy value
+  // only in the null-active "project values" state.
+  curves: (() => {
+    const act = initialLibrary.sets.find((s) => s.id === initialLibrary.activeSetId);
+    return act ? mirrorCurves(act) : initialSettings.curves;
+  })(),
+  propertySets: initialLibrary.sets,
+  activeSetId: initialLibrary.activeSetId,
+  propsManagerOpen: false,
   resolution: "preview",
   customH: 0,
   budget: 30,
-  pattern: "gyroid",
+  pattern: "cubic",
   perimeters: 2,
   lineWidth: 0.45,
   topBottomLayers: 5,
@@ -3319,6 +3406,7 @@ export const useStore = create<AppState>((set, get) => ({
   printInfill: 25,
   snapVoxel: true,
   compositeSkin: true,
+  anisotropicInfill: true,
   analyzeMode: "printed",
   analysisType: "static",
   modalModeCount: 6,
@@ -4312,20 +4400,103 @@ export const useStore = create<AppState>((set, get) => ({
     get().setMaterial(sel);
   },
 
-  setCurve(pattern, c) {
-    const curves = { ...get().curves, [pattern]: c };
-    set({ curves });
-    saveSettings(get().materials, curves, get().levelSettings);
+  openPropsManager(open) {
+    set({ propsManagerOpen: open });
   },
 
-  resetCurves() {
-    const curves = {
-      gyroid: { ...DEFAULT_CURVES.gyroid },
-      cubic: { ...DEFAULT_CURVES.cubic },
-      grid: { ...DEFAULT_CURVES.grid },
+  setActivePropertySet(id) {
+    const st = get();
+    if (id === st.activeSetId) return;
+    const s = st.propertySets.find((x) => x.id === id);
+    if (!s) return;
+    const curves = mirrorCurves(s);
+    // Same class of change as the anisotropic toggle: the infill material
+    // model moved under every existing result.
+    set({ activeSetId: id, curves, printedStats: null });
+    savePropsLibrary(st.propertySets, id);
+    saveSettings(st.materials, curves, st.levelSettings);
+    markResultsStale(set, get, "print", "opt");
+  },
+
+  duplicatePropertySet(id) {
+    const st = get();
+    const src = st.propertySets.find((x) => x.id === id);
+    if (!src) return;
+    const dup: InfillPropertySet = {
+      ...src,
+      id: crypto.randomUUID(),
+      version: 1,
+      name: uniqueSetName(`${src.name} (copy)`, st.propertySets),
+      curve: { ...src.curve },
+      ratios: { ...src.ratios },
+      calibratedBand: [...src.calibratedBand],
+      provenance: { ...src.provenance },
+      // The copy is the user's — editable, embeddable, theirs to license.
+      embedInProject: true,
+      origin: "user",
     };
-    set({ curves });
-    saveSettings(get().materials, curves, get().levelSettings);
+    const sets = [...st.propertySets, dup];
+    set({ propertySets: sets });
+    savePropsLibrary(sets, st.activeSetId);
+  },
+
+  updatePropertySet(id, patch) {
+    const st = get();
+    const i = st.propertySets.findIndex((x) => x.id === id);
+    if (i < 0 || st.propertySets[i].origin !== "user") return;
+    const merged: InfillPropertySet = {
+      ...st.propertySets[i],
+      ...patch,
+      curve: { ...(patch.curve ?? st.propertySets[i].curve) },
+      ratios: { ...(patch.ratios ?? st.propertySets[i].ratios) },
+    };
+    if (!isPhysicalRatios(merged.ratios)) {
+      set({
+        notice:
+          "Those ratios are not a physically valid material (the stiffness tensor loses positive definiteness) — change rejected.",
+      });
+      return;
+    }
+    const sets = st.propertySets.slice();
+    sets[i] = merged;
+    const isActive = st.activeSetId === id;
+    const physicsChanged = "curve" in patch || "ratios" in patch;
+    const curves = isActive ? mirrorCurves(merged) : st.curves;
+    set({
+      propertySets: sets,
+      curves,
+      ...(isActive && physicsChanged ? { printedStats: null } : {}),
+    });
+    savePropsLibrary(sets, st.activeSetId);
+    if (isActive) saveSettings(st.materials, curves, st.levelSettings);
+    if (isActive && physicsChanged) markResultsStale(set, get, "print", "opt");
+  },
+
+  deletePropertySet(id) {
+    const st = get();
+    const s = st.propertySets.find((x) => x.id === id);
+    if (!s || s.origin === "builtin" || st.activeSetId === id) return;
+    const sets = st.propertySets.filter((x) => x.id !== id);
+    set({ propertySets: sets });
+    savePropsLibrary(sets, st.activeSetId);
+  },
+
+  importPropertySets(text) {
+    const st = get();
+    const { sets: incoming, errors } = parseFilaprops(text);
+    const { library, report } = mergeImport(st.propertySets, incoming);
+    set({ propertySets: library });
+    savePropsLibrary(library, st.activeSetId);
+    // The ACTIVE set may have been replaced by a newer version — the physics
+    // under existing results moved, same as switching sets.
+    const act = st.activeSetId ? library.find((x) => x.id === st.activeSetId) : null;
+    if (act && report.replaced.includes(act.name)) {
+      const curves = mirrorCurves(act);
+      set({ curves, printedStats: null });
+      saveSettings(st.materials, curves, st.levelSettings);
+      markResultsStale(set, get, "print", "opt");
+    }
+    return describeMerge(report, errors);
   },
 
   openSettings(open) {
@@ -4451,6 +4622,11 @@ export const useStore = create<AppState>((set, get) => ({
     invalidateGrid(set, get);
     void pushSnap(get);
   },
+  setAnisotropicInfill(on) {
+    // Changes the material model, so any as-printed result is stale.
+    set({ anisotropicInfill: on, printedStats: null });
+  },
+
   setCompositeSkin(on) {
     set({ compositeSkin: on, printedStats: null });
     // The grid survives (classification is per-solve); results and the
@@ -5003,6 +5179,8 @@ export const useStore = create<AppState>((set, get) => ({
           lineWidth: st0.lineWidth,
           topBottomLayers: st0.topBottomLayers,
           layerHeight: st0.layerHeight,
+          anisotropic: st0.anisotropicInfill,
+          tiRatios: activeTiRatios(st0),
         });
         stats = out.stats;
         displacements = out.displacements;
@@ -6379,6 +6557,17 @@ export const useStore = create<AppState>((set, get) => ({
       // Load steps remap their override keys onto the re-id'd BCs (above);
       // pre-feature files synthesize a single default step.
       const loadSteps = deserializeLoadSteps(bcs, mf.loadSteps);
+      // §24: the project carries the VALUES it ran with. If they match the
+      // active library set, that set stays active; otherwise the session runs
+      // on "project values" (activeSetId null → built-in ratios, exactly what
+      // pre-§24 projects used). Not persisted — opening an old project must
+      // not overwrite the user's library selection.
+      const projCurve = st.curves?.cubic ?? { ...DEFAULT_CURVES.cubic };
+      const actSet = activePropertySet(get());
+      const setMatchesProject =
+        !!actSet &&
+        actSet.curve.coeff === projCurve.coeff &&
+        actSet.curve.exponent === projCurve.exponent;
       set({
         fileName: mf.fileName,
         model,
@@ -6387,11 +6576,17 @@ export const useStore = create<AppState>((set, get) => ({
         segSource: st.segSource,
         material: st.material,
         materials: st.materials,
-        curves: st.curves,
+        // A project saved before §22 may name a retired pattern (gyroid /
+        // grid) and carry curves for it. Both are migrated to cubic rather
+        // than rejected — the geometry and BCs are still perfectly good, and
+        // the alternative is an unopenable file. The result banner below says
+        // so; it must not swap the material model silently.
+        curves: { cubic: projCurve },
+        activeSetId: setMatchesProject ? get().activeSetId : null,
         levelSettings: st.levelSettings,
         resolution: st.resolution,
         customH: st.customH,
-        pattern: st.pattern,
+        pattern: migratePattern(st.pattern),
         perimeters: st.perimeters,
         lineWidth: st.lineWidth,
         topBottomLayers: st.topBottomLayers,
@@ -6399,6 +6594,9 @@ export const useStore = create<AppState>((set, get) => ({
         printInfill: st.printInfill,
         snapVoxel: st.snapVoxel,
         compositeSkin: st.compositeSkin,
+        // Pre-§22 projects have no flag; they were solved isotropic, so
+        // default OFF on load rather than silently changing their results.
+        anisotropicInfill: st.anisotropicInfill ?? false,
         smoothStress: st.smoothStress,
         materialStress: st.materialStress,
         analyzeMode: st.analyzeMode,

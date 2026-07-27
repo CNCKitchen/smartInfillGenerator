@@ -170,6 +170,29 @@ pub fn cell_field_eigen(
     eigen: [f64; 3],
     kind: FieldKind,
 ) -> Vec<f32> {
+    cell_field_ti(grid, u, e0, nu, eps, None, eigen, kind)
+}
+
+/// [`cell_field_eigen`] with a transverse-isotropic infill share (DESIGN §22).
+///
+/// `ti` is `(infill material factors, ratios)`. When `None` this is the
+/// original isotropic evaluation, arithmetic unchanged.
+///
+/// STRESS MUST FOLLOW STIFFNESS. If the solve ran with a TI overlay and the
+/// stress is read back with the isotropic law, every stress and every safety
+/// factor is wrong while the solve itself converges perfectly — so the TI
+/// eps field has to reach here, not just the solver.
+#[allow(clippy::too_many_arguments)]
+pub fn cell_field_ti(
+    grid: &VoxelGrid,
+    u: &[f32],
+    e0: f64,
+    nu: f64,
+    eps: &[f32],
+    ti: Option<(&[f32], &crate::ti::TiRatios)>,
+    eigen: [f64; 3],
+    kind: FieldKind,
+) -> Vec<f32> {
     let (nx, ny, nz) = (grid.nx, grid.ny, grid.nz);
     let (mx, my) = (nx + 1, ny + 1);
     let inv4h = 1.0 / (4.0 * grid.h);
@@ -178,7 +201,8 @@ pub fn cell_field_eigen(
         for cy in 0..ny {
             for cx in 0..nx {
                 let ci = (cz * ny + cy) * nx + cx;
-                if eps[ci] <= 0.0 {
+                let fi = ti.map_or(0.0, |(f, _)| f[ci] as f64);
+                if eps[ci] <= 0.0 && fi <= 0.0 {
                     continue;
                 }
                 // Strain at the cell center.
@@ -226,16 +250,35 @@ pub fn cell_field_eigen(
                         (2.0 / 3.0 * dev2).sqrt()
                     }
                     _ => {
-                        let e = e0 * eps[ci] as f64;
-                        let lam = e * nu / ((1.0 + nu) * (1.0 - 2.0 * nu));
-                        let mu = e / (2.0 * (1.0 + nu));
-                        let tr = exx + eyy + ezz;
-                        let sxx = lam * tr + 2.0 * mu * exx;
-                        let syy = lam * tr + 2.0 * mu * eyy;
-                        let szz = lam * tr + 2.0 * mu * ezz;
-                        let sxy = mu * gxy;
-                        let syz = mu * gyz;
-                        let szx = mu * gzx;
+                        let (sxx, syy, szz, sxy, syz, szx) = match ti {
+                            // Same Voigt blend the element kernel uses, so the
+                            // stress is the one the solve actually produced.
+                            Some((_, ratios)) => {
+                                let s = crate::ti::blended_stress(
+                                    e0,
+                                    nu,
+                                    eps[ci] as f64,
+                                    fi,
+                                    ratios,
+                                    [exx, eyy, ezz, gxy, gyz, gzx],
+                                );
+                                (s[0], s[1], s[2], s[3], s[4], s[5])
+                            }
+                            None => {
+                                let e = e0 * eps[ci] as f64;
+                                let lam = e * nu / ((1.0 + nu) * (1.0 - 2.0 * nu));
+                                let mu = e / (2.0 * (1.0 + nu));
+                                let tr = exx + eyy + ezz;
+                                (
+                                    lam * tr + 2.0 * mu * exx,
+                                    lam * tr + 2.0 * mu * eyy,
+                                    lam * tr + 2.0 * mu * ezz,
+                                    mu * gxy,
+                                    mu * gyz,
+                                    mu * gzx,
+                                )
+                            }
+                        };
                         match kind {
                             FieldKind::Sxx => sxx,
                             FieldKind::Syy => syy,

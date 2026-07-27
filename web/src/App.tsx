@@ -9,6 +9,7 @@ import { Inspector } from "./ui/Inspector";
 import { StatusStrip } from "./ui/StatusStrip";
 import { ViewportChips } from "./ui/ViewportChips";
 import { SettingsModal } from "./ui/Settings";
+import { PropertyManagerModal } from "./ui/PropertyManager";
 import { UnitsModal } from "./ui/UnitsModal";
 import { ImportUnitsModal } from "./ui/ImportUnitsModal";
 import { LoadStepsModal } from "./ui/LoadSteps";
@@ -78,6 +79,7 @@ export function App() {
       </div>
       <StatusStrip />
       <SettingsModal />
+      <PropertyManagerModal />
       <UnitsModal />
       <ImportUnitsModal />
       <LoadStepsModal />

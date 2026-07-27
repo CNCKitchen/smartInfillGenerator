@@ -34,6 +34,7 @@ pub mod solve;
 pub mod strength;
 pub mod stress;
 pub mod threemf;
+pub mod ti;
 pub mod voxel;
 pub mod zip;
 

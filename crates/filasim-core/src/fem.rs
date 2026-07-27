@@ -45,7 +45,11 @@ pub fn ke_hex(e: f64, nu: f64, h: f64) -> [[f64; 24]; 24] {
 /// uniform coarsening does not apply, so the brick KE is integrated directly.
 /// `hv = [h, h, h]` reproduces [`ke_hex`] exactly.
 pub fn ke_hex_aniso(e: f64, nu: f64, hv: [f64; 3]) -> [[f64; 24]; 24] {
-    let [hx, hy, hz] = hv;
+    ke_hex_c(&iso_stiffness(e, nu), hv)
+}
+
+/// Isotropic 6×6 stiffness (engineering strain order xx yy zz xy yz zx).
+pub fn iso_stiffness(e: f64, nu: f64) -> [[f64; 6]; 6] {
     let lam = e * nu / ((1.0 + nu) * (1.0 - 2.0 * nu));
     let mu = e / (2.0 * (1.0 + nu));
     let mut c = [[0.0f64; 6]; 6];
@@ -56,7 +60,17 @@ pub fn ke_hex_aniso(e: f64, nu: f64, hv: [f64; 3]) -> [[f64; 24]; 24] {
         c[i][i] = lam + 2.0 * mu;
         c[i + 3][i + 3] = mu;
     }
+    c
+}
 
+/// Element stiffness matrix for an ARBITRARY material tensor `c` on a
+/// rectangular brick `hv`. The generalization that lets a cell carry a
+/// transverse-isotropic infill tensor (DESIGN §22) instead of an isotropic one:
+/// the BᵀCB integration below never assumed `c` was isotropic, only the
+/// construction of `c` did. Strain order is engineering xx yy zz xy yz zx —
+/// `c` must be given in the same order (see [`crate::ti`]).
+pub fn ke_hex_c(c: &[[f64; 6]; 6], hv: [f64; 3]) -> [[f64; 24]; 24] {
+    let [hx, hy, hz] = hv;
     let g = 1.0 / 3.0f64.sqrt();
     let mut ke = [[0.0f64; 24]; 24];
     let detj_w = hx * hy * hz / 8.0; // |J| * gauss weight (w=1)

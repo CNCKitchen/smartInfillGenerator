@@ -607,6 +607,14 @@ export interface PrintedOptions {
   /** Solid top/bottom shells: layers × layer height; 0 = none. */
   topBottomLayers: number;
   layerHeight: number;
+  /** Model sparse infill as transversely isotropic (DESIGN §22): stiffer in
+   *  the layer plane than along Z, from the measured cubic tensor. False =
+   *  the pre-§22 isotropic kernel, bit-for-bit. */
+  anisotropic: boolean;
+  /** The active infill property set's five TI constants (DESIGN §24).
+   *  Omitted = the frozen built-in cubic, bit-for-bit. Ignored when
+   *  `anisotropic` is false. */
+  tiRatios?: { ezEp: number; gzEp: number; nuP: number; nuPz: number };
 }
 
 /** solve() stats plus the as-printed extras. */

@@ -17,7 +17,8 @@ use filasim_core::solve::{
     active_nodes, pad_for_levels, solve_nodes_cached, SolveSettings, Solution, SolverCache,
 };
 use filasim_core::stress::{
-    cell_field_eigen, material_factor, recover_nodal, recover_nodal_where, FieldKind,
+    cell_field_eigen, cell_field_ti, material_factor, recover_nodal, recover_nodal_where,
+    FieldKind,
 };
 use filasim_core::threemf::{export_orca_3mf, export_stl_zip, import_3mf, weld};
 use filasim_core::voxel::VoxelGrid;
@@ -325,6 +326,33 @@ struct PrintedOpts {
     /// (open-top showpieces print sparse right to the surface).
     top_bottom_layers: u32,
     layer_height: f64,
+    /// Model sparse infill as TRANSVERSELY ISOTROPIC (DESIGN §22) instead of
+    /// isotropic: stiffer in the layer plane than along the build axis, from
+    /// the measured cubic tensor. Defaults FALSE so a caller that predates
+    /// §22 keeps the old physics; the web app sends it explicitly.
+    anisotropic: bool,
+    /// The five independent TI constants of the ACTIVE infill property set
+    /// (DESIGN §24) — `Gxy` and `ν_zp` stay derived, same anti-inconsistency
+    /// rule as [`filasim_core::ti::TiRatios`]. `None` (callers predating §24,
+    /// incl. the smoke suite's plain `anisotropic: true`) = the frozen
+    /// built-in cubic, bit-for-bit. Ignored when `anisotropic` is false.
+    ti_ratios: Option<TiRatiosOpt>,
+}
+
+/// JSON mirror of [`filasim_core::ti::TiRatios`] for [`PrintedOpts`].
+#[derive(serde::Deserialize, Clone, Copy)]
+#[serde(rename_all = "camelCase")]
+struct TiRatiosOpt {
+    ez_ep: f64,
+    gz_ep: f64,
+    nu_p: f64,
+    nu_pz: f64,
+}
+
+impl From<TiRatiosOpt> for filasim_core::ti::TiRatios {
+    fn from(r: TiRatiosOpt) -> Self {
+        Self { ez_ep: r.ez_ep, gz_ep: r.gz_ep, nu_p: r.nu_p, nu_pz: r.nu_pz }
+    }
 }
 
 impl Default for PrintedOpts {
@@ -337,6 +365,8 @@ impl Default for PrintedOpts {
             line_width: 0.45,
             top_bottom_layers: 5,
             layer_height: 0.2,
+            anisotropic: false,
+            ti_ratios: None,
         }
     }
 }
@@ -633,6 +663,11 @@ pub struct Model {
     /// None = plain solid solve (grid.scale), Some = binned-infill field.
     /// Stress evaluation must use the same eps as the solve.
     solution_eps: Option<Vec<f32>>,
+    /// TI infill weights of the stored solution (DESIGN §22), `Some` only when
+    /// the solve ran anisotropic. Travels WITH `solution_eps`: the stress and
+    /// safety-factor readout must use the same material the solve used, so any
+    /// path that clears one must clear the other.
+    solution_ti: Option<(Vec<f32>, filasim_core::ti::TiRatios)>,
     /// The optimized design's stiffness field (`solution_eps` at optimize time),
     /// kept ACROSS load-step changes so `solve_optimized` can re-evaluate the one
     /// design under every load step (DESIGN §13). `solution_eps` is reset by BC
@@ -939,6 +974,7 @@ impl Model {
             solver_cache: None,
             solution: None,
             solution_eps: None,
+            solution_ti: None,
             opt_eps: None,
             results: std::collections::HashMap::new(),
             opt: None,
@@ -1100,6 +1136,7 @@ impl Model {
         self.solver_cache = None;
         self.solution = None;
         self.solution_eps = None;
+        self.solution_ti = None;
         self.opt = None;
         self.results.clear(); // geometry moved — stashed results no longer align
         self.sweep = None;
@@ -1223,6 +1260,7 @@ impl Model {
             self.grid = None;
             self.solution = None;
             self.solution_eps = None;
+        self.solution_ti = None;
             self.opt = None;
         }
     }
@@ -1234,6 +1272,7 @@ impl Model {
             self.composite_skin = on;
             self.solution = None;
             self.solution_eps = None;
+        self.solution_ti = None;
             self.opt = None;
             // Skin/design split changes → the optimized stiffness field (same
             // cell count, different values) is stale; the length guard in
@@ -1567,7 +1606,8 @@ impl Model {
         })
         .to_string();
         self.solution = Some(sol);
-        self.solution_eps = None; // plain solid solve: eps = grid.scale
+        self.solution_eps = None;
+        self.solution_ti = None; // plain solid solve: eps = grid.scale
         Ok(out)
     }
 
@@ -1736,6 +1776,7 @@ impl Model {
         .to_string();
         self.solution = Some(sol);
         self.solution_eps = None;
+        self.solution_ti = None;
         Ok(out)
     }
 
@@ -1779,6 +1820,7 @@ impl Model {
         let max = sol.max_displacement();
         self.solution = Some(sol);
         self.solution_eps = None;
+        self.solution_ti = None;
         Ok(serde_json::json!({ "maxDisplacement": max }).to_string())
     }
 
@@ -1892,15 +1934,51 @@ impl Model {
         if !report.ok {
             return Err(err("model is under-constrained — run check() for details"));
         }
-        let eps =
-            filasim_core::simp::build_eps(grid, &skin, &design, &skin_frac, &x, eval_exp, eval_coeff);
+        // DESIGN §22: sparse infill is transversely isotropic. `eps` splits
+        // into a solid (skin) share and an infill share carrying the measured
+        // tensor; summed, the two reproduce the isotropic field exactly, so
+        // `anisotropic: false` is the old kernel bit-for-bit. §24: the active
+        // property set's constants ride in when the web app sends them; a
+        // non-SPD user set is refused HERE — an indefinite K makes CG diverge
+        // on the first real part, which no unit test would ever see.
+        let ti_ratios = opts
+            .anisotropic
+            .then(|| opts.ti_ratios.map_or(filasim_core::ti::CUBIC, Into::into));
+        if let Some(r) = &ti_ratios {
+            if !r.is_physical() {
+                return Err(err(
+                    "the active infill property set is not a physically valid material \
+                     (its stiffness tensor is not positive definite) — fix its ratios in \
+                     the Property Manager",
+                ));
+            }
+        }
+        let settings = filasim_core::SolveSettings { ti: ti_ratios, ..self.settings };
+        let (eps, eps_infill) = match ti_ratios {
+            Some(_) => {
+                let (a, b) = filasim_core::eps::build_eps_ti(
+                    grid, &skin, &design, &skin_frac, &x, eval_exp, eval_coeff,
+                );
+                (a, Some(b))
+            }
+            None => (
+                filasim_core::simp::build_eps(
+                    grid, &skin, &design, &skin_frac, &x, eval_exp, eval_coeff,
+                ),
+                None,
+            ),
+        };
+        let eps_field = match &eps_infill {
+            Some(i) => filasim_core::eps::EpsField::ti(eps.clone(), i.clone()),
+            None => eps.clone().into(),
+        };
         let (sol, _compliance) = filasim_core::simp::solve_with_eps_cached(
             &mut self.solver_cache,
             grid,
             *levels,
             &asm.problem,
-            &self.settings,
-            eps.clone(),
+            &settings,
+            eps_field,
         )
         .map_err(err)?;
         // Mass at these print settings: solid skin + interior at the ratio;
@@ -1942,7 +2020,23 @@ impl Model {
         })
         .to_string();
         self.solution = Some(sol);
-        self.solution_eps = Some(eps);
+        // `solution_eps` stores the TOTAL material share (solid + infill), not
+        // the solid share, so every readout that predates §22 — the stashed
+        // result roster, the orientation sweep, the SF floor — keeps seeing a
+        // well-posed isotropic-equivalent field instead of half of one. The
+        // TI-aware stress path subtracts `solution_ti` back out to recover the
+        // solid share. Storing the split here instead would silently delete
+        // the infill from every legacy consumer.
+        self.solution_eps = Some(match &eps_infill {
+            Some(i) => eps.iter().zip(i).map(|(a, b)| a + b).collect(),
+            None => eps,
+        });
+        // The ratios that actually ran (not always CUBIC since §24) — the
+        // stress/SF readback must use the same tensor as the element kernel.
+        self.solution_ti = match (eps_infill, ti_ratios) {
+            (Some(i), Some(r)) => Some((i, r)),
+            _ => None,
+        };
         Ok(out)
     }
 
@@ -2194,6 +2288,7 @@ impl Model {
         .to_string();
         self.solution = Some(sol);
         self.solution_eps = Some(eps);
+        self.solution_ti = None;
         Ok(out)
     }
 
@@ -2349,6 +2444,7 @@ impl Model {
         );
         self.solution = None;
         self.solution_eps = Some(eps);
+        self.solution_ti = None;
         // A restored design is evaluable under every load step too (DESIGN §13).
         self.opt_eps = self.solution_eps.clone();
         self.opt = Some(OptOutput {
@@ -3118,6 +3214,40 @@ impl Model {
         } else {
             eps
         };
+        // DESIGN §22: the infill share of a TI solve, normalized the SAME way
+        // as `factor` so the two blend consistently. `None` for every isotropic
+        // solve, which is every path except `solve_printed(anisotropic)`.
+        let ti_occ_free;
+        let ti_factor: Option<(&[f32], &filasim_core::ti::TiRatios)> = match &self.solution_ti {
+            Some((ti_eps, ratios)) if ti_eps.len() == grid.cell_count() => {
+                let f: &[f32] = if self.material_stress {
+                    ti_occ_free = material_factor(grid, ti_eps);
+                    &ti_occ_free
+                } else {
+                    ti_eps
+                };
+                Some((f, ratios))
+            }
+            _ => None,
+        };
+        // `factor` is the TOTAL material share (see solve_printed). The stress
+        // blend needs the two shares separately, so recover solid = total −
+        // infill; the SF ALLOWABLE keeps using the total, which is what the
+        // pre-§22 single-field code meant all along.
+        let solid_owned;
+        let (stress_factor, ti): (&[f32], Option<(&[f32], &filasim_core::ti::TiRatios)>) =
+            match ti_factor {
+                Some((f, ratios)) => {
+                    solid_owned = factor
+                        .iter()
+                        .zip(f)
+                        .map(|(t, i)| (t - i).max(0.0))
+                        .collect::<Vec<f32>>();
+                    (&solid_owned, Some((f, ratios)))
+                }
+                None => (factor, None),
+            };
+        let mat: &[f32] = factor;
         // Safety factors: allowable = strength × the SAME relative factor as
         // the stiffness (Gibson–Ashby, first order; the skin carries full
         // strength). "sfm" checks the material against σ_vM; "sfz" checks
@@ -3126,11 +3256,11 @@ impl Model {
         // along the layer plane: (⟨σzz⟩₊/Sᵗᶻ)² + (τ/Sˢᶻ)² = 1/SF²;
         // "sf" is the per-cell worst of both. All capped at SF_CAP.
         let sf_material = || -> Vec<f32> {
-            let mut c = cell_field_eigen(
-                grid, &sol.u, self.settings.e0, self.settings.nu, factor, eigen, FieldKind::VonMises,
+            let mut c = cell_field_ti(
+                grid, &sol.u, self.settings.e0, self.settings.nu, stress_factor, ti, eigen, FieldKind::VonMises,
             );
             for (i, v) in c.iter_mut().enumerate() {
-                let allow = self.strength as f32 * factor[i];
+                let allow = self.strength as f32 * mat[i];
                 *v = (allow / v.max(1e-9)).min(SF_CAP);
             }
             c
@@ -3138,15 +3268,15 @@ impl Model {
         let sf_layer = || -> Result<Vec<f32>, JsValue> {
             let field = |name: &str| -> Result<Vec<f32>, JsValue> {
                 let k = FieldKind::parse(name).ok_or_else(|| err("stress field missing"))?;
-                Ok(cell_field_eigen(grid, &sol.u, self.settings.e0, self.settings.nu, factor, eigen, k))
+                Ok(cell_field_ti(grid, &sol.u, self.settings.e0, self.settings.nu, stress_factor, ti, eigen, k))
             };
             let mut c = field("szz")?;
             let tyz = field("syz")?;
             let tzx = field("szx")?;
             let ss = self.shear_strength_z_eff() as f32;
             for i in 0..c.len() {
-                let allow_t = (self.strength_z as f32 * factor[i]).max(1e-9);
-                let allow_s = (ss * factor[i]).max(1e-9);
+                let allow_t = (self.strength_z as f32 * mat[i]).max(1e-9);
+                let allow_s = (ss * mat[i]).max(1e-9);
                 let sn = (c[i] / allow_t).max(0.0); // tension only
                 let tau2 = (tyz[i] * tyz[i] + tzx[i] * tzx[i]) / (allow_s * allow_s);
                 let q = sn * sn + tau2;
@@ -3186,7 +3316,7 @@ impl Model {
             "sfx" => criterion(sf_worst()?, self),
             _ => {
                 let k = FieldKind::parse(kind).ok_or_else(|| err("unknown result field"))?;
-                cell_field_eigen(grid, &sol.u, self.settings.e0, self.settings.nu, factor, eigen, k)
+                cell_field_ti(grid, &sol.u, self.settings.e0, self.settings.nu, stress_factor, ti, eigen, k)
             }
         })
     }
@@ -4055,6 +4185,7 @@ impl Model {
             };
             self.solution = Some(sol);
             self.solution_eps = Some(eps);
+        self.solution_ti = None;
         }
         Ok(serde_json::json!({
             "worst": worst_json,

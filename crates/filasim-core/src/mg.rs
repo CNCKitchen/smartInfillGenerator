@@ -78,6 +78,28 @@ const OFF_TO_LOCAL: [[[usize; 2]; 2]; 2] = {
     m
 };
 
+/// Transverse-isotropic infill overlay (DESIGN §22.4).
+///
+/// When present, a cell's stiffness is the Voigt blend of two DIFFERENT
+/// tensors — `eps[c]·KE_solid + ti.eps[c]·KE_infill` — instead of one tensor
+/// scaled by one number. `Level.eps` becomes the SOLID (skin) weight and this
+/// carries the infill weight; a pure-infill cell therefore has `Level.eps == 0`
+/// and is still active, which is why every "is this cell live" test has to go
+/// through [`Level::cell_active`] rather than reading `eps` directly.
+///
+/// `None` is not an optimization of "isotropic infill" — it is the untouched
+/// original code path, so a project with no TI data is bit-identical to before.
+struct TiOverlay {
+    ke: [[f32; 24]; 24],
+    ke64: [[f64; 24]; 24],
+    /// Per-cell infill weight `occ·(1−skin_frac)·rel(ρ)`.
+    eps: Vec<f32>,
+    /// Normalized tensor (`Ep = 1`), kept for the same reason `e0`/`nu` are:
+    /// a semicoarsened brick level must RE-INTEGRATE its KE, because a brick's
+    /// KE is not a scalar multiple of a cube's.
+    c_unit: [[f64; 6]; 6],
+}
+
 pub struct Level {
     pub nx: usize,
     pub ny: usize,
@@ -101,7 +123,12 @@ pub struct Level {
     ke: [[f32; 24]; 24],
     ke64: [[f64; 24]; 24],
     /// Per-cell stiffness factor; exactly 0.0 = cell skipped entirely.
+    /// With a [`TiOverlay`] present this is only the SOLID share — use
+    /// [`Level::cell_active`], never `eps[ci] > 0.0`, to test liveness.
     pub eps: Vec<f32>,
+    /// Transverse-isotropic infill (DESIGN §22). `None` = the original
+    /// single-tensor kernel, unchanged.
+    ti: Option<TiOverlay>,
     /// Non-void cells grouped into contiguous z-slab ranges for two-phase
     /// parallel scatter: even-indexed slabs run concurrently (phase A), then
     /// odd (phase B). Every slab spans ≥1 whole z-plane of cells, so two
@@ -142,9 +169,42 @@ pub struct Level {
     pi_w: Vec<f32>,
 }
 
+impl TiOverlay {
+    /// Integrate the infill reference element for cell size `hv`. `c_unit` is
+    /// normalized to `Ep = 1`, so it is scaled by `e0` here and the per-cell
+    /// weight then carries `rel(ρ)` — the same split as the isotropic path,
+    /// where `ke_hex(e0, …)` is scaled by `eps`.
+    fn new(c_unit: &[[f64; 6]; 6], hv: [f64; 3], e0: f64, eps: Vec<f32>) -> Self {
+        let mut c = *c_unit;
+        for row in c.iter_mut() {
+            for v in row.iter_mut() {
+                *v *= e0;
+            }
+        }
+        let ke64 = crate::fem::ke_hex_c(&c, hv);
+        let mut ke = [[0f32; 24]; 24];
+        for i in 0..24 {
+            for j in 0..24 {
+                ke[i][j] = ke64[i][j] as f32;
+            }
+        }
+        Self { ke, ke64, eps, c_unit: *c_unit }
+    }
+}
+
 impl Level {
     pub fn node_count(&self) -> usize {
         self.mx * self.my * self.mz
+    }
+
+    /// Does this cell carry ANY stiffness? With a TI overlay a pure-infill
+    /// cell has `eps == 0` but is fully active, so this — not `eps[ci] > 0.0`
+    /// — is the void test everywhere (slabs, live blocks, active DOFs,
+    /// diagonal assembly). Getting this wrong deletes the infill from the
+    /// structure while leaving a solve that still converges.
+    #[inline]
+    fn cell_active(&self, ci: usize) -> bool {
+        self.eps[ci] > 0.0 || self.ti.as_ref().is_some_and(|t| t.eps[ci] > 0.0)
     }
 
     pub fn ndof(&self) -> usize {
@@ -178,7 +238,31 @@ impl Level {
     ) -> Self {
         // Isotropic entry point (the finest level is always a cube grid).
         let ke64 = crate::fem::ke_hex(e0, nu, h);
-        Self::new_aniso(nx, ny, nz, [h; 3], e0, nu, eps, ke64, fixed, springs, rigid, [false; 3])
+        Self::new_aniso(nx, ny, nz, [h; 3], e0, nu, eps, ke64, fixed, springs, rigid, [false; 3], None)
+    }
+
+    /// As [`Level::new`], plus a transverse-isotropic infill overlay
+    /// (DESIGN §22): `eps` is the SOLID (skin) weight, `eps_infill` the infill
+    /// weight, and `c_unit` the normalized (`Ep = 1`) infill tensor.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_ti(
+        nx: usize,
+        ny: usize,
+        nz: usize,
+        h: f64,
+        eps: Vec<f32>,
+        eps_infill: Vec<f32>,
+        c_unit: [[f64; 6]; 6],
+        e0: f64,
+        nu: f64,
+        fixed: &[bool],
+        springs: Vec<(u32, [f64; 3], f64)>,
+        rigid: Vec<RigidGroup>,
+    ) -> Self {
+        assert_eq!(eps.len(), eps_infill.len());
+        let ke64 = crate::fem::ke_hex(e0, nu, h);
+        let ti = Some(TiOverlay::new(&c_unit, [h; 3], e0, eps_infill));
+        Self::new_aniso(nx, ny, nz, [h; 3], e0, nu, eps, ke64, fixed, springs, rigid, [false; 3], ti)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -195,9 +279,11 @@ impl Level {
         springs: Vec<(u32, [f64; 3], f64)>,
         rigid: Vec<RigidGroup>,
         from_parent: [bool; 3],
+        ti: Option<TiOverlay>,
     ) -> Self {
         let h = hv[0];
         assert_eq!(eps.len(), nx * ny * nz);
+        debug_assert!(ti.as_ref().is_none_or(|t| t.eps.len() == eps.len()));
         let (mx, my, mz) = (nx + 1, ny + 1, nz + 1);
         let ndof = 3 * mx * my * mz;
         assert_eq!(fixed.len(), ndof);
@@ -224,6 +310,7 @@ impl Level {
             ke,
             ke64,
             eps,
+            ti,
             slabs: Vec::new(),
             constrained: vec![false; ndof],
             live: Vec::new(),
@@ -316,6 +403,14 @@ impl Level {
             self.hv[2] * step[2] as f64,
         ];
         let ke64 = crate::fem::ke_hex_aniso(self.e0, self.nu, hv);
+        // The TI overlay cascades the SAME way: its weight field is child-
+        // averaged and its reference element re-integrated for the (possibly
+        // brick) coarse cell — the two tensors must stay on the same geometry
+        // or the coarse operator stops approximating the fine one.
+        let ti = self.ti.as_ref().map(|t| {
+            let te = average_coarse_eps(&t.eps, self.nx, self.ny, self.nz, c);
+            TiOverlay::new(&t.c_unit, hv, self.e0, te)
+        });
         // Inject fine Dirichlet flags at coincident nodes (step·X, step·Y, step·Z).
         let (mx, my, mz) = (nx + 1, ny + 1, nz + 1);
         let mut fixed = vec![false; 3 * mx * my * mz];
@@ -349,7 +444,9 @@ impl Level {
         // Rigid couplings are NOT coarsened (DESIGN §16: MG pass-through) — the
         // fine-level smoother handles the stiff local constraint, the coarse
         // grids reduce only the smooth global error.
-        Self::new_aniso(nx, ny, nz, hv, self.e0, self.nu, eps, ke64, &fixed, springs, Vec::new(), c)
+        Self::new_aniso(
+            nx, ny, nz, hv, self.e0, self.nu, eps, ke64, &fixed, springs, Vec::new(), c, ti,
+        )
     }
 
     /// Cut the active cells into z-slabs balanced by active-cell count (cuts
@@ -360,9 +457,8 @@ impl Level {
         let plane_cells = self.nx * self.ny;
         let mut plane = vec![0usize; self.nz];
         for (cz, cnt) in plane.iter_mut().enumerate() {
-            *cnt = self.eps[cz * plane_cells..(cz + 1) * plane_cells]
-                .iter()
-                .filter(|&&e| e > 0.0)
+            *cnt = (cz * plane_cells..(cz + 1) * plane_cells)
+                .filter(|&i| self.cell_active(i))
                 .count();
         }
         let total: usize = plane.iter().sum();
@@ -377,7 +473,7 @@ impl Level {
         let mut acc = 0usize;
         for cz in 0..self.nz {
             for i in cz * plane_cells..(cz + 1) * plane_cells {
-                if self.eps[i] > 0.0 {
+                if self.cell_active(i) {
                     cur.push(i as u32);
                 }
             }
@@ -423,7 +519,10 @@ impl Level {
                                 continue;
                             }
                             let (cx, cy, cz) = (x - dx, y - dy, z - dz);
-                            if cx < nx && cy < ny && cz < nz && self.eps[(cz * ny + cy) * nx + cx] > 0.0
+                            if cx < nx
+                                && cy < ny
+                                && cz < nz
+                                && self.cell_active((cz * ny + cy) * nx + cx)
                             {
                                 *l = true;
                                 break 'block;
@@ -452,7 +551,7 @@ impl Level {
                                 let (cx, cy, cz) = (x - dx, y - dy, z - dz);
                                 if cx < self.nx && cy < self.ny && cz < self.nz {
                                     let ci = (cz * self.ny + cy) * self.nx + cx;
-                                    if self.eps[ci] > 0.0 {
+                                    if self.cell_active(ci) {
                                         active = true;
                                     }
                                 }
@@ -497,6 +596,10 @@ impl Level {
         let (nx, ny, nz) = (self.nx, self.ny, self.nz);
         let (mx, my) = (self.mx, self.my);
         let eps = &self.eps;
+        // TI: the diagonal is the weighted sum of BOTH tensors' diagonals,
+        // matching the two-KE matvec exactly (an approximate diagonal would
+        // still converge, just slower — but a WRONG one hides real errors).
+        let ti_blocks = self.ti.as_ref().map(|t| (ke_diag_blocks(&t.ke64), &t.eps));
         let constrained = &self.constrained;
         par::chunks_mut_indexed(&mut dinv, 6 * NODE_CHUNK, |off, chunk| {
             let n0 = off / 6;
@@ -517,15 +620,27 @@ impl Level {
                             if cx >= nx || cy >= ny || cz >= nz {
                                 continue;
                             }
-                            let e = eps[(cz * ny + cy) * nx + cx];
-                            if e <= 0.0 {
+                            let ci = (cz * ny + cy) * nx + cx;
+                            let e = eps[ci];
+                            let ei = ti_blocks.as_ref().map_or(0.0, |(_, te)| te[ci]);
+                            if e <= 0.0 && ei <= 0.0 {
                                 continue;
                             }
                             any = true;
                             let l = OFF_TO_LOCAL[dx][dy][dz];
-                            for r in 0..3 {
-                                for c in 0..3 {
-                                    acc[r][c] += e as f64 * blocks[l][r][c];
+                            if e > 0.0 {
+                                for r in 0..3 {
+                                    for c in 0..3 {
+                                        acc[r][c] += e as f64 * blocks[l][r][c];
+                                    }
+                                }
+                            }
+                            if ei > 0.0 {
+                                let (tb, _) = ti_blocks.as_ref().unwrap();
+                                for r in 0..3 {
+                                    for c in 0..3 {
+                                        acc[r][c] += ei as f64 * tb[l][r][c];
+                                    }
                                 }
                             }
                         }
@@ -574,12 +689,50 @@ impl Level {
         self.dinv = dinv;
     }
 
-    /// One cell's scatter-add contribution to y = K x.
+    /// One cell's full contribution to `y = K x`: solid tensor, plus the TI
+    /// infill tensor when an overlay is present.
+    ///
+    /// Cost is bounded by the cell partition, not doubled: almost every cell
+    /// is pure — skin (`ei == 0`) or pure infill (`e == 0`) — and only the
+    /// composite-skin band pays for both. The zero test costs one compare
+    /// against the 576 FMAs it skips.
+    ///
     /// # Safety
     /// Concurrent callers must not target cells sharing nodes (color rule);
     /// sequential callers are always fine.
     #[inline(always)]
-    unsafe fn apply_cell<const COLUMN: bool>(&self, ci: usize, e: f32, x: &[f32], ys: &UnsafeSlice<f32>) {
+    unsafe fn apply_cell_both<const COLUMN: bool>(
+        &self,
+        ci: usize,
+        x: &[f32],
+        ys: &UnsafeSlice<f32>,
+    ) {
+        let e = self.eps[ci];
+        if e > 0.0 {
+            unsafe { self.apply_cell::<COLUMN>(ci, e, &self.ke, x, ys) };
+        }
+        if let Some(t) = &self.ti {
+            let ei = t.eps[ci];
+            if ei > 0.0 {
+                unsafe { self.apply_cell::<COLUMN>(ci, ei, &t.ke, x, ys) };
+            }
+        }
+    }
+
+    /// One cell's scatter-add contribution to y = K x for ONE reference
+    /// element matrix.
+    /// # Safety
+    /// Concurrent callers must not target cells sharing nodes (color rule);
+    /// sequential callers are always fine.
+    #[inline(always)]
+    unsafe fn apply_cell<const COLUMN: bool>(
+        &self,
+        ci: usize,
+        e: f32,
+        ke: &[[f32; 24]; 24],
+        x: &[f32],
+        ys: &UnsafeSlice<f32>,
+    ) {
         let (nx, ny) = (self.nx, self.ny);
         let (mx, my) = (self.mx, self.my);
         let cx = ci % nx;
@@ -600,7 +753,7 @@ impl Level {
         if COLUMN {
             for j in 0..24 {
                 let xj = xl[j];
-                let row = &self.ke[j];
+                let row = &ke[j];
                 for i in 0..24 {
                     yl[i] += row[i] * xj;
                 }
@@ -610,7 +763,7 @@ impl Level {
             }
         } else {
             for i in 0..24 {
-                let row = &self.ke[i];
+                let row = &ke[i];
                 let mut s = 0f32;
                 for j in 0..24 {
                     s += row[j] * xl[j];
@@ -648,16 +801,17 @@ impl Level {
                 // SAFETY: same-phase slabs are ≥2 cells apart in z.
                 par::for_each(&slabs, |slab| {
                     for &ci in slab.iter() {
-                        unsafe { self.apply_cell::<COLUMN>(ci as usize, self.eps[ci as usize], x, &ys) };
+                        // SAFETY: same-phase slabs are ≥2 cells apart in z.
+                        unsafe { self.apply_cell_both::<COLUMN>(ci as usize, x, &ys) };
                     }
                 });
             }
             // Sequential: no races possible — one natural-order pass.
             #[cfg(not(feature = "parallel"))]
-            for (ci, &e) in self.eps.iter().enumerate() {
-                if e > 0.0 {
+            for ci in 0..self.eps.len() {
+                if self.cell_active(ci) {
                     // SAFETY: sequential.
-                    unsafe { self.apply_cell::<COLUMN>(ci, e, x, &ys) };
+                    unsafe { self.apply_cell_both::<COLUMN>(ci, x, &ys) };
                 }
             }
         }
@@ -678,11 +832,43 @@ impl Level {
         self.mask_live_f32(y);
     }
 
+    /// f64 twin of `apply_cell_both` (outer-CG operator), on caller-supplied
+    /// exact stiffness fields.
+    /// # Safety
+    /// Same disjoint-scatter rule as `apply_cell`.
+    #[inline(always)]
+    unsafe fn apply_cell64_both<const COLUMN: bool>(
+        &self,
+        ci: usize,
+        eps: &[f32],
+        ti_eps: Option<&[f32]>,
+        x: &[f64],
+        ys: &UnsafeSlice<f64>,
+    ) {
+        let e = eps[ci];
+        if e > 0.0 {
+            unsafe { self.apply_cell64::<COLUMN>(ci, e as f64, &self.ke64, x, ys) };
+        }
+        if let (Some(t), Some(te)) = (&self.ti, ti_eps) {
+            let ei = te[ci];
+            if ei > 0.0 {
+                unsafe { self.apply_cell64::<COLUMN>(ci, ei as f64, &t.ke64, x, ys) };
+            }
+        }
+    }
+
     /// f64 twin of `apply_cell` (outer-CG operator).
     /// # Safety
     /// Same disjoint-scatter rule as `apply_cell`.
     #[inline(always)]
-    unsafe fn apply_cell64<const COLUMN: bool>(&self, ci: usize, e: f64, x: &[f64], ys: &UnsafeSlice<f64>) {
+    unsafe fn apply_cell64<const COLUMN: bool>(
+        &self,
+        ci: usize,
+        e: f64,
+        ke: &[[f64; 24]; 24],
+        x: &[f64],
+        ys: &UnsafeSlice<f64>,
+    ) {
         let (nx, ny) = (self.nx, self.ny);
         let (mx, my) = (self.mx, self.my);
         let cx = ci % nx;
@@ -702,7 +888,7 @@ impl Level {
         if COLUMN {
             for j in 0..24 {
                 let xj = xl[j];
-                let row = &self.ke64[j];
+                let row = &ke[j];
                 for i in 0..24 {
                     yl[i] += row[i] * xj;
                 }
@@ -712,7 +898,7 @@ impl Level {
             }
         } else {
             for i in 0..24 {
-                let row = &self.ke64[i];
+                let row = &ke[i];
                 let mut s = 0f64;
                 for j in 0..24 {
                     s += row[j] * xl[j];
@@ -731,21 +917,31 @@ impl Level {
     /// y = K x in f64 (used by the outer CG; the cancellation in K·u near
     /// equilibrium exceeds f32 precision, which caps attainable accuracy).
     pub fn apply64(&self, x: &[f64], y: &mut [f64]) {
-        self.apply64_eps(&self.eps, x, y);
+        let ti_eps = self.ti.as_ref().map(|t| t.eps.as_slice());
+        self.apply64_eps(&self.eps, ti_eps, x, y);
     }
 
-    /// `apply64` with an explicit per-cell stiffness field: the outer CG runs
+    /// `apply64` with explicit per-cell stiffness fields: the outer CG runs
     /// on the EXACT eps while the level hierarchy (preconditioner only) may
-    /// hold contrast-clamped values. `eps` must share this level's void set.
-    pub fn apply64_eps(&self, eps: &[f32], x: &[f64], y: &mut [f64]) {
+    /// hold contrast-clamped values. Both must share this level's void set.
+    /// `ti_eps` must be `Some` exactly when this level has a TI overlay —
+    /// passing `None` to a TI level would silently solve the skin alone.
+    pub fn apply64_eps(&self, eps: &[f32], ti_eps: Option<&[f32]>, x: &[f64], y: &mut [f64]) {
+        debug_assert_eq!(ti_eps.is_some(), self.ti.is_some());
         if KERNEL_COLUMN {
-            self.apply64_k::<true>(eps, x, y)
+            self.apply64_k::<true>(eps, ti_eps, x, y)
         } else {
-            self.apply64_k::<false>(eps, x, y)
+            self.apply64_k::<false>(eps, ti_eps, x, y)
         }
     }
 
-    fn apply64_k<const COLUMN: bool>(&self, eps: &[f32], x: &[f64], y: &mut [f64]) {
+    fn apply64_k<const COLUMN: bool>(
+        &self,
+        eps: &[f32],
+        ti_eps: Option<&[f32]>,
+        x: &[f64],
+        y: &mut [f64],
+    ) {
         debug_assert_eq!(x.len(), self.ndof());
         debug_assert_eq!(y.len(), self.ndof());
         debug_assert_eq!(eps.len(), self.eps.len());
@@ -758,17 +954,16 @@ impl Level {
                 // SAFETY: same-phase slabs are ≥2 cells apart in z.
                 par::for_each(&slabs, |slab| {
                     for &ci in slab.iter() {
-                        unsafe {
-                            self.apply_cell64::<COLUMN>(ci as usize, eps[ci as usize] as f64, x, &ys)
-                        };
+                        // SAFETY: same-phase slabs are ≥2 cells apart in z.
+                        unsafe { self.apply_cell64_both::<COLUMN>(ci as usize, eps, ti_eps, x, &ys) };
                     }
                 });
             }
             #[cfg(not(feature = "parallel"))]
-            for (ci, &e) in eps.iter().enumerate() {
-                if e > 0.0 {
+            for ci in 0..eps.len() {
+                if eps[ci] > 0.0 || ti_eps.is_some_and(|t| t[ci] > 0.0) {
                     // SAFETY: sequential.
-                    unsafe { self.apply_cell64::<COLUMN>(ci, e as f64, x, &ys) };
+                    unsafe { self.apply_cell64_both::<COLUMN>(ci, eps, ti_eps, x, &ys) };
                 }
             }
         }
@@ -1290,6 +1485,9 @@ pub struct MgSolver {
     /// the same answer, and bounding the up-to-1e6:1 boundary-sliver contrast
     /// is what keeps the V-cycle effective on voxelized parts.
     eps_exact: Vec<f32>,
+    /// EXACT finest-level TI infill weights, the overlay's twin of
+    /// `eps_exact`. `Some` exactly when the finest level has a TI overlay.
+    ti_eps_exact: Option<Vec<f32>>,
     /// Relative residual after each CG iteration of the LAST solve (element 0
     /// is the initial residual) — convergence-plot material, refreshed per call.
     pub last_trace: Vec<f32>,
@@ -1315,7 +1513,15 @@ impl MgSolver {
     /// Coarsen while dimensions stay even and at least 2 cells per axis.
     pub fn new(mut finest: Level, max_levels: usize) -> Self {
         let eps_exact = finest.eps.clone();
-        if clamp_pc_eps(&mut finest.eps) {
+        let ti_eps_exact = finest.ti.as_ref().map(|t| t.eps.clone());
+        // Both fields take the floor independently. A pure-infill cell keeps
+        // `eps == 0` (the clamp never lifts a zero), so flooring the solid
+        // share cannot invent skin where there is none.
+        let mut changed = clamp_pc_eps(&mut finest.eps);
+        if let Some(t) = finest.ti.as_mut() {
+            changed |= clamp_pc_eps(&mut t.eps);
+        }
+        if changed {
             finest.build_dinv();
             finest.refresh_lmax();
         }
@@ -1342,7 +1548,7 @@ impl MgSolver {
             d: levels.iter().map(|l| vec![0f32; l.ndof()]).collect(),
             coarse_scratch: std::array::from_fn(|_| vec![0f32; coarse_n]),
         };
-        Self { levels, ws, eps_exact, last_trace: Vec::new() }
+        Self { levels, ws, eps_exact, ti_eps_exact, last_trace: Vec::new() }
     }
 
     /// The exact (unclamped) finest-level eps this solver was last given.
@@ -1350,21 +1556,61 @@ impl MgSolver {
         &self.eps_exact
     }
 
+    /// The exact finest-level TI infill weights, `Some` iff this solver was
+    /// built with a TI overlay (DESIGN §22).
+    pub fn ti_eps_exact(&self) -> Option<&[f32]> {
+        self.ti_eps_exact.as_deref()
+    }
+
     /// Update per-cell stiffness factors in place (same void/solid topology!)
     /// and refresh the smoother diagonals down the hierarchy. Cheap compared
     /// to rebuilding levels — the optimization loop calls this every iteration.
     pub fn update_eps(&mut self, eps: Vec<f32>) {
+        assert!(
+            self.ti_eps_exact.is_none(),
+            "a TI solver must be updated through update_eps_ti — update_eps \
+             would leave the infill weights frozen at their initial values"
+        );
+        self.update_eps_fields(eps, None);
+    }
+
+    /// [`Self::update_eps`] for a TI solver (DESIGN §22): both weight fields
+    /// change together every optimizer iteration.
+    pub fn update_eps_ti(&mut self, eps: Vec<f32>, eps_infill: Vec<f32>) {
+        assert!(
+            self.ti_eps_exact.is_some(),
+            "update_eps_ti called on a solver built without a TI overlay"
+        );
+        self.update_eps_fields(eps, Some(eps_infill));
+    }
+
+    fn update_eps_fields(&mut self, eps: Vec<f32>, eps_infill: Option<Vec<f32>>) {
         debug_assert_eq!(eps.len(), self.levels[0].eps.len());
         self.eps_exact = eps.clone();
         self.levels[0].eps = eps;
         clamp_pc_eps(&mut self.levels[0].eps);
+        if let Some(ei) = eps_infill {
+            debug_assert_eq!(ei.len(), self.levels[0].eps.len());
+            self.ti_eps_exact = Some(ei.clone());
+            let t = self.levels[0].ti.as_mut().expect("TI overlay checked by caller");
+            t.eps = ei;
+            clamp_pc_eps(&mut t.eps);
+        }
         self.levels[0].build_dinv();
         self.levels[0].refresh_lmax();
         for l in 1..self.levels.len() {
             let f = &self.levels[l - 1];
             // Replay the SAME per-axis coarsening the hierarchy was built with.
-            let coarse = average_coarse_eps(&f.eps, f.nx, f.ny, f.nz, self.levels[l].from_parent);
+            let from_parent = self.levels[l].from_parent;
+            let coarse = average_coarse_eps(&f.eps, f.nx, f.ny, f.nz, from_parent);
+            let coarse_ti = f
+                .ti
+                .as_ref()
+                .map(|t| average_coarse_eps(&t.eps, f.nx, f.ny, f.nz, from_parent));
             self.levels[l].eps = coarse;
+            if let (Some(t), Some(ct)) = (self.levels[l].ti.as_mut(), coarse_ti) {
+                t.eps = ct;
+            }
             self.levels[l].build_dinv();
             self.levels[l].refresh_lmax();
         }
@@ -1387,7 +1633,7 @@ impl MgSolver {
     /// the modal eigensolver projects with — includes penalty springs and masks
     /// constrained DOFs.
     pub fn apply_k(&self, x: &[f64], y: &mut [f64]) {
-        self.levels[0].apply64_eps(&self.eps_exact, x, y);
+        self.levels[0].apply64_eps(&self.eps_exact, self.ti_eps_exact.as_deref(), x, y);
     }
 
     /// Mixed-precision MGCG: outer CG loop and operator in f64 (so attainable
@@ -1428,7 +1674,7 @@ impl MgSolver {
         }
         // r = b - A u0
         let mut r = vec![0f64; n];
-        self.levels[0].apply64_eps(&self.eps_exact, u, &mut r);
+        self.levels[0].apply64_eps(&self.eps_exact, self.ti_eps_exact.as_deref(), u, &mut r);
         for i in 0..n {
             r[i] = b[i] - r[i];
         }
@@ -1456,7 +1702,7 @@ impl MgSolver {
                 return SolveStats { iterations: it, rel_residual: res, converged: false };
             }
             {
-                self.levels[0].apply64_eps(&self.eps_exact, &p, &mut q);
+                self.levels[0].apply64_eps(&self.eps_exact, self.ti_eps_exact.as_deref(), &p, &mut q);
             }
             let pq = par::dot64_live(&p, &q, lv, lb);
             if !pq.is_finite() || pq <= 0.0 {

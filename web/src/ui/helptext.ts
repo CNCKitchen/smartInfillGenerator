@@ -67,7 +67,25 @@ export const PROP_HELP: Record<string, HelpContent> = {
     title: "Infill pattern & density",
     text: [
       "The uniform print that “Solve as printed” analyzes, and the starting point the optimizer's budget follows.",
-      "Density enters the analysis through the pattern's E(ρ) curve — the calibrated stiffness-vs-density law. The curves are editable in ⚙ Settings; their accuracy is the accuracy of every as-printed number.",
+      "Density enters the analysis through the pattern's E(ρ) curve — the calibrated stiffness-vs-density law of the active infill property set (⚙ Settings → Infill properties); its accuracy is the accuracy of every as-printed number.",
+    ],
+  },
+  pattern: {
+    title: "Why cubic only",
+    text: [
+      "Sparse infill is analyzed as transversely isotropic: stiff in the layer plane, softer along the build axis, measured from the real sliced toolpath rather than assumed.",
+      "Cubic is the pattern that model fits. Its anisotropy holds to within measurement noise across 20–70 % density, and two independent consistency checks on the measured tensor agree to 0.06 %.",
+      "Grid and rectilinear are not merely uncalibrated — they are tetragonal, a different material class, and this model mispredicts their in-plane shear by 28× to 86×. Gyroid's ratios swing ±32 % across the density band. Offering them would mean reporting numbers we know are wrong.",
+      "Solid regions still print rectilinear or concentric (set below) — there the material is dense and none of this applies.",
+    ],
+  },
+  anisotropic: {
+    title: "Anisotropic infill",
+    text: [
+      "Sparse infill is not equally stiff in every direction: it is stiffer within a layer than across the layers, because the bond between layers is weaker than the bead itself.",
+      "With this on, the analysis uses the measured cubic tensor — about 0.80× the in-plane stiffness along the build axis, and shear moduli that are not tied to E and ν. The numbers come from homogenizing the real sliced toolpath, not from an assumed formula.",
+      "Off gives the older isotropic model, which treats infill as equally stiff in all directions. Use it to compare with earlier results — it reads the part stiffer than it is along Z.",
+      "Walls and solid shells are unaffected either way: dense material really is isotropic.",
     ],
   },
   resolution: {

@@ -13,14 +13,6 @@ import {
   unitLabel,
   type QuantityKind,
 } from "../units";
-import type { PatternKey } from "../types";
-
-const PATTERN_LABEL: Record<PatternKey, string> = {
-  gyroid: "Gyroid",
-  cubic: "Cubic",
-  grid: "Grid",
-};
-
 export function SettingsModal() {
   const s = useStore(
     useShallow((s) => ({
@@ -32,8 +24,10 @@ export function SettingsModal() {
       addMaterial: s.addMaterial,
       resetMaterials: s.resetMaterials,
       curves: s.curves,
-      setCurve: s.setCurve,
-      resetCurves: s.resetCurves,
+      propertySets: s.propertySets,
+      activeSetId: s.activeSetId,
+      setActivePropertySet: s.setActivePropertySet,
+      openPropsManager: s.openPropsManager,
       levelSettings: s.levelSettings,
       updateLevelSettings: s.updateLevelSettings,
       unitRev: s.unitRev,
@@ -243,70 +237,39 @@ export function SettingsModal() {
           <button onClick={() => s.resetMaterials()}>Reset defaults</button>
         </div>
 
-        <h3>Infill stiffness curves</h3>
+        <h3>Infill properties</h3>
         <div className="dim small">
-          E(ρ) = c · E₀ · ρⁿ per pattern (Gibson–Ashby). Used by the optimizer and the
-          verification solves — calibrate c and n against measured stiffness-vs-density data.
+          The active property set models the sparse infill: its E(ρ) = c · E₀ · ρⁿ magnitude
+          law drives the optimizer and the verification solves, its anisotropy ratios the
+          as-printed solve. Inspect, compare, calibrate, import and export sets in the property
+          manager.
         </div>
-        <table className="settingstable">
-          <thead>
-            <tr>
-              <th>Pattern</th>
-              <th>c</th>
-              <th>n</th>
-              <th className="dim">E(20%)</th>
-              <th className="dim">E(50%)</th>
-            </tr>
-          </thead>
-          <tbody>
-            {(Object.keys(PATTERN_LABEL) as PatternKey[]).map((p) => {
-              const c = s.curves[p];
-              const rel = (rho: number) =>
-                `${(100 * Math.min(1, c.coeff * Math.pow(rho, c.exponent))).toFixed(1)}%`;
-              return (
-                <tr key={p}>
-                  <td>{PATTERN_LABEL[p]}</td>
-                  <td>
-                    <NumInput
-                      value={c.coeff}
-                      min={0.05}
-                      max={2}
-                      step={0.05}
-                      onCommit={(v) =>
-                        s.setCurve(p, {
-                          ...c,
-                          coeff: Math.min(2, Math.max(0.05, v)),
-                        })
-                      }
-                    />
-                  </td>
-                  <td>
-                    <NumInput
-                      value={c.exponent}
-                      min={1}
-                      max={3.5}
-                      step={0.05}
-                      onCommit={(v) =>
-                        s.setCurve(p, {
-                          ...c,
-                          exponent: Math.min(3.5, Math.max(1, v)),
-                        })
-                      }
-                    />
-                  </td>
-                  <td className="dim">{rel(0.2)}</td>
-                  <td className="dim">{rel(0.5)}</td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-        <div className="toolrow">
-          <button onClick={() => s.resetCurves()}>Reset curves</button>
+        <div className="row">
+          <select
+            value={s.activeSetId ?? "__project"}
+            onChange={(e) => {
+              if (e.target.value !== "__project") s.setActivePropertySet(e.target.value);
+            }}
+          >
+            {s.activeSetId === null && (
+              <option value="__project">Project values (from the loaded file)</option>
+            )}
+            {s.propertySets.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.name} — {p.pattern}
+              </option>
+            ))}
+          </select>
+          <button onClick={() => s.openPropsManager(true)}>Manage…</button>
         </div>
         <div className="hint">
-          Changed curves apply to the next optimization run. E(ρ) values are relative to the solid
-          material; the table shows the resulting stiffness at 20% and 50% infill.
+          {(() => {
+            const act = s.propertySets.find((p) => p.id === s.activeSetId);
+            const c = act?.curve ?? s.curves.cubic;
+            const rel = (rho: number) =>
+              `${(100 * Math.min(1, c.coeff * Math.pow(rho, c.exponent))).toFixed(1)}%`;
+            return `E(20%) ${rel(0.2)} · E(50%) ${rel(0.5)} relative to solid — a changed set applies to the next run.`;
+          })()}
         </div>
 
         <h3>Density levels</h3>
