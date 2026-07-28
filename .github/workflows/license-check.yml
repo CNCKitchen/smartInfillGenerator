@@ -7,8 +7,10 @@
 #  - Rust: cargo-deny against the allowlist in deny.toml (all features, so the
 #    optional step/parallel trees used by the wasm production build are covered)
 #  - npm: license-checker against the same allowlist (full tree, dev included;
-#    CC-BY-4.0 is data-only — caniuse-lite; the private root package is
-#    excluded because license-checker reports `private: true` as UNLICENSED)
+#    CC-BY-4.0 is data-only — caniuse-lite; BlueOak-1.0.0 is OSI-approved
+#    permissive — tar/chownr et al. inside the wasm-pack dev tooling; the
+#    private root package is excluded because license-checker reports
+#    `private: true` as UNLICENSED)
 #
 # meshstep is AGPL-3.0-only but is OUR OWN package (same copyright holder, same
 # CLA, dual-licensed on the same terms), so it does not break the commercial
@@ -49,6 +51,6 @@ jobs:
         run: >-
           npx --yes license-checker --excludePrivatePackages
           --excludePackages "meshstep@0.1.1"
-          --onlyAllow "MIT;Apache-2.0;BSD-2-Clause;BSD-3-Clause;ISC;0BSD;Zlib;CC0-1.0;MPL-2.0;Unicode-3.0;Unlicense;CC-BY-4.0"
+          --onlyAllow "MIT;Apache-2.0;BSD-2-Clause;BSD-3-Clause;ISC;0BSD;Zlib;CC0-1.0;MPL-2.0;Unicode-3.0;Unlicense;CC-BY-4.0;BlueOak-1.0.0"
           --summary
         working-directory: web
