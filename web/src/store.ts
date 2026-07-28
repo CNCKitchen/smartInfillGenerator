@@ -22,12 +22,14 @@ import {
   isStepName,
   stepImporter,
   stepImportNotices,
+  type AssemblyTreeNode,
   type StepMeshPayload,
   type StepTessOpts,
 } from "./engine/StepImporter";
 import {
   cadTriangleColors,
   composeTransform,
+  computeFeatureEdges,
   exactCylinderForSelection,
   IDENTITY_TRANSFORM,
   selectionFaceIds,
@@ -38,6 +40,7 @@ import {
   type StepFaceInfo,
   type StepManifestInfo,
 } from "./engine/stepSelection";
+import { buildBinaryStl, connectedBodies, isIdentityTransform } from "./engine/assembly";
 import { ENVELOPE_STEP, FieldServer, isEnvelope, resultIsSolidBody } from "./engine/FieldServer";
 import type {
   Bc,
@@ -50,6 +53,7 @@ import type {
   Material,
   PatternCurve,
   PatternKey,
+  ReactionDisplay,
   ResolutionKey,
   SolveStats,
   VoxelInfo,
@@ -587,7 +591,7 @@ interface AppState {
    *  initialized from the current grid on first selection). */
   customH: number;
   // print properties (step 3 · Properties) — shared by the as-printed
-  // verify solve, the optimizer's skin model, and the 3MF export
+  // Analyze solve, the optimizer's skin model, and the 3MF export
   pattern: PatternKey;
   perimeters: number;
   lineWidth: number; // mm
@@ -608,7 +612,7 @@ interface AppState {
   /** What "Solve once" analyzes: the print, the CAD-ideal solid, or the FDM
    *  build simulation (inherent-strain warp + bed peel). */
   analyzeMode: "printed" | "solid" | "buildsim";
-  /** Verify-tab analysis type: a static linear solve, or a modal (natural-
+  /** Analyze-tab analysis type: a static linear solve, or a modal (natural-
    *  frequency) analysis. Orthogonal to `analyzeMode` (printed vs solid stiffness
    *  applies to both). */
   analysisType: "static" | "modal";
@@ -854,8 +858,23 @@ interface AppState {
         /** Exact CAD border segments (IMPORT frame; transformed by `toWorld`
          *  on every push — the viewport feature-edge overlay). */
         featureEdges: Float32Array;
+        /** Dense CAD face id per feature-edge segment — via face→solid this
+         *  filters the overlay per body (deferred suppression) instantly. */
+        featureEdgeFaces: Uint32Array;
       })
     | null;
+  /** Assembly component list (multi-body STEP / STL / 3MF): one row per body,
+   *  empty for single-body models. Row order matches the assembly cache's
+   *  body labels; `active` bodies are analyzed, inactive ones are hidden and
+   *  excluded (they reload the engine with a filtered mesh). */
+  bodies: AssemblyBody[];
+  /** STEP assembly hierarchy over the `bodies` indices (dense solid ids);
+   *  null = flat list (STL/3MF, or a STEP without a product tree). */
+  bodyTree: AssemblyTreeNode | null;
+  /** Component toggles not yet applied to the engine. The rebuild is
+   *  expensive, so it is DEFERRED to leaving the Model step — until then
+   *  suppressed bodies are only hidden in the viewport. */
+  bodiesPending: boolean;
   /** Densities of the extracted modifier regions (for the region list). */
   regionInfos: { density: number }[];
   regionVisible: boolean[];
@@ -872,6 +891,12 @@ interface AppState {
   resultSurface: "stl" | "voxel";
   /** Min/max of the active stress/strain field, for the legend. */
   fieldRange: { min: number; max: number } | null;
+  /** Per-support reactions of the "reaction" result view (legend table +
+   *  viewport arrows); null in every other view. */
+  reactionForces: ReactionDisplay[] | null;
+  /** `deformScale` before the reaction view forced it to 0 (undeformed),
+   *  restored when the user leaves the view; null = no snapshot pending. */
+  reactionPrevDeform: number | null;
   /** User override of the color scale (null = auto). */
   legendMin: number | null;
   legendMax: number | null;
@@ -907,6 +932,21 @@ interface AppState {
   setSegAngle(angle: number): Promise<void>;
   /** Switch the surface-patch source (crease angle vs CAD faces). */
   setSegSource(src: "angle" | "cad"): Promise<void>;
+  /** Component list: include/exclude one assembly body from the analysis.
+   *  Instant (viewport-only hide) — the engine rebuild is deferred to
+   *  leaving the Model step (applyPendingBodies). */
+  setBodyActive(index: number, on: boolean): void;
+  /** Batch include/exclude (group toggles, suppress/unsuppress all). */
+  setBodiesActive(indexes: number[], on: boolean): void;
+  /** Apply deferred component toggles: reload the engine with the pending
+   *  mask (results reset, BCs on hidden bodies pause). No-op without pending
+   *  changes. Returns false — and applies nothing — when EVERY body is
+   *  suppressed (nothing left to analyze). */
+  applyPendingBodies(): boolean;
+  /** Component list row hover → tint that body in the viewport (null clears). */
+  setBodyHover(index: number | null): void;
+  /** Hierarchy hover: tint several bodies at once (a subassembly's set). */
+  setBodyHoverIds(indexes: number[] | null): void;
   setTool(tool: Tool): void;
   /** Print-orientation tools (Model step): rotate 90° about a world axis,
    *  or place the clicked face on the build plate (face normal → −Z). */
@@ -1150,7 +1190,7 @@ interface AppState {
    *  re-verify with the standard As-Printed solve (§20 dec. 1 / dec. 9). */
   applySettingsWinner(): Promise<void>;
   setSettingsSfTarget(v: number): void;
-  /** Constrained modal analysis (Verify tab): compute `modalModeCount` natural
+  /** Constrained modal analysis (Analyze tab): compute `modalModeCount` natural
    *  frequencies + mode shapes on the FIRST load case's supports, surfacing each
    *  mode as a switchable result-case. */
   runModal(): Promise<void>;
@@ -1191,7 +1231,7 @@ export interface LogLine {
   msg: string;
 }
 
-/** Dock data of the last as-printed verify solve. */
+/** Dock data of the last as-printed Analyze solve. */
 export interface PrintedSummary {
   massGrams: number;
   massSolidGrams: number;
@@ -1345,6 +1385,22 @@ const fieldServer = new FieldServer(session);
  *  writer (`fieldRange`) and the only scene-event caller; the server picks
  *  the fetch path and drops results the user has navigated away from. */
 function pushScalarField(set: SetState, get: () => AppState): Promise<void> {
+  // Reaction view ⇄ exaggeration handshake (centralized here so every path
+  // that moves `resultField` — the dropdown, solve resets, project restore —
+  // keeps the pair consistent): entering "reaction" snapshots the deformation
+  // exaggeration and drops it to 0 (arrows sit on the true geometry; the
+  // control stays editable), leaving restores the snapshot.
+  {
+    const s = get();
+    if (s.resultField === "reaction" && s.reactionPrevDeform === null) {
+      set({ reactionPrevDeform: s.deformScale });
+      s.setDeformScale(0);
+    } else if (s.resultField !== "reaction" && s.reactionPrevDeform !== null) {
+      const prev = s.reactionPrevDeform;
+      set({ reactionPrevDeform: null });
+      s.setDeformScale(prev);
+    }
+  }
   return fieldServer.pushActiveField(
     () => {
       const s = get();
@@ -1364,6 +1420,33 @@ function pushScalarField(set: SetState, get: () => AppState): Promise<void> {
       peelMap: (positions, values, max) => sceneEvents.onPeelMap?.(positions, values, max),
       dispComponent: (comp) => sceneEvents.onDispComponent?.(comp),
       sectionVolume: (data) => sceneEvents.onSectionVolume?.(data),
+      reactionForces: (list) => {
+        if (!list) {
+          if (get().reactionForces) set({ reactionForces: null });
+          sceneEvents.onReactionForces?.(null);
+          return;
+        }
+        // The engine reports reactions index-aligned to the LAST `setBcs`
+        // push — rebuild the same filtered array (`pushBcs`) to map each
+        // entry back to its Bc for labels/colors/face tint.
+        const pushed = effectiveBcs(get().bcs, activeStep(get())).filter((b) => !b.bodyOff);
+        const items: ReactionDisplay[] = [];
+        list.forEach((r, i) => {
+          const bc = pushed[i];
+          if (!r || !bc) return;
+          items.push({
+            bcId: bc.id,
+            name: bc.name?.trim() || bc.kind,
+            kind: bc.kind,
+            tris: bc.tris,
+            force: r.force,
+            moment: r.moment,
+            centroid: r.centroid,
+          });
+        });
+        set({ reactionForces: items });
+        sceneEvents.onReactionForces?.(items);
+      },
       log: (msg) => appendLog(set, msg),
     }
   );
@@ -1548,6 +1631,14 @@ async function transformModel(set: SetState, get: () => AppState, r: number[]) {
           ),
         }
       : si;
+    // The assembly cache's reference frame follows the same pose — inactive
+    // bodies must reappear assembly-relative to the moved part.
+    if (assemblyCache) {
+      assemblyCache.toWorld = composeTransform(
+        [1, 0, 0, 0, 1, 0, 0, 0, 1, ...seat],
+        composeTransform([...r, ...t], assemblyCache.toWorld)
+      );
+    }
     set({ model: { ...get().model!, positions: out.positions, bbox }, bcs, stepInfo });
     invalidateResults(set, get);
     invalidateGrid(set, get);
@@ -1769,6 +1860,15 @@ export interface SceneEvents {
   onFeatureEdges?: (on: boolean) => void;
   /** Per-triangle CAD base colors (linear RGB, 3/tri) or null for plain grey. */
   onCadColors?: (triColors: Float32Array | null) => void;
+  /** Component-list hover: tint an assembly body's triangles (null clears). */
+  onBodyHighlight?: (tris: Uint32Array | null) => void;
+  /** Deferred component suppression: display tris to hide WITHOUT an engine
+   *  rebuild (collapsed to zero area in the viewport). Null shows all. */
+  onHiddenBodies?: (tris: Uint32Array | null) => void;
+  /** Hover ghost of SUPPRESSED components (their triangles are collapsed or
+   *  absent in the display mesh): a world-pose soup rendered as a translucent
+   *  amber overlay. Null clears. */
+  onBodyGhost?: (positions: Float32Array | null) => void;
   /** Exact CAD topology for the viewport (STEP): world-space border segments
    *  + per-triangle CAD face ids (shading groups). Nulls = STL dihedral. */
   onCadEdges?: (segments: Float32Array | null, faceOfTri: Uint32Array | null) => void;
@@ -1806,6 +1906,10 @@ export interface SceneEvents {
   /** Volumetric section payload for the capped section view (null clears —
    *  the cap falls back to its plain cut color). */
   onSectionVolume?: (data: SectionVolume | null) => void;
+  /** Reaction-forces result view: per-support resultant arrows + callouts on
+   *  the (undeformed) part, support faces tinted in their kind colors. Null
+   *  clears the view (any other result field). */
+  onReactionForces?: (items: ReactionDisplay[] | null) => void;
   /** Color the deformed view by a displacement quantity: -1 = |u| magnitude,
    *  0/1/2 = signed X/Y/Z component (computed from the displacement buffer). */
   onDispComponent?: (comp: number) => void;
@@ -1923,7 +2027,541 @@ function pushBcGlyphs(get: () => AppState, activeBcId?: string | null) {
 }
 
 async function pushBcs(get: () => AppState) {
-  await engine.setBcs(effectiveBcs(get().bcs, activeStep(get())));
+  // BCs paused on a hidden assembly body carry no triangles — the engine
+  // treats an empty selection as an error at solve, so they never push.
+  await engine.setBcs(effectiveBcs(get().bcs, activeStep(get())).filter((b) => !b.bodyOff));
+}
+
+// ---- assembly component list (multi-body activate / deactivate) ----
+
+/** One row of the component list. */
+export interface AssemblyBody {
+  name: string;
+  active: boolean;
+  /** STEP open-shell body — voxelization of it is untrustworthy. */
+  open: boolean;
+  /** SOURCE-mesh triangle count (import tris / STL facets). */
+  triCount: number;
+}
+
+interface AssemblyCacheStep {
+  /** Full import mesh, IMPORT frame (copies — loadMesh transfers the originals). */
+  positions: Float32Array;
+  indices: Uint32Array;
+  faceOfTri: Uint32Array; // dense
+  solidOfTri: Uint32Array; // dense
+  solidEntityIds: Uint32Array;
+  bytes: ArrayBuffer; // original STEP file (each reload transfers a copy)
+  faceColorIdx: Int32Array | null;
+  palette: [number, number, number][] | null;
+  openSolids: number[];
+}
+
+/** Everything a body toggle needs to rebuild the engine mesh. The engine has
+ *  no exclusion API and drops per-solid info after load, so the FULL source
+ *  model is cached here and each toggle reloads a JS-side-filtered mesh.
+ *  Kept OUTSIDE the zustand state — multi-MB typed arrays have no business
+ *  in React re-render diffs. */
+interface AssemblyCache {
+  kind: "step" | "mesh";
+  /** Original file name (extension decides the reload path's parser). */
+  name: string;
+  step: AssemblyCacheStep | null;
+  /** STL/3MF only: full source soup in the REFERENCE pose (the pose when the
+   *  cache was built); `toWorld` composes reference → current world so later
+   *  rebuilds place inactive bodies assembly-relative to the moved part. */
+  origSoup: Float32Array | null;
+  toWorld: number[];
+  /** Body label per FULL source tri (STEP: dense solid id; STL: connected
+   *  component in first-tri order). */
+  bodyOfSrc: Uint32Array;
+  bodyCount: number;
+  activeMask: boolean[];
+  /** Current DISPLAY tri → FULL source tri (the engine's working soup is a
+   *  parent-contiguous refinement of what was loaded — recovered per load). */
+  srcOfDisp: Uint32Array;
+}
+
+let assemblyCache: AssemblyCache | null = null;
+
+/** Filter the cached STEP import arrays to the active solids. Returns the
+ *  kept FULL source tri ids (in order) and fresh transfer-safe arrays. */
+function filterStepTris(step: AssemblyCacheStep, mask: boolean[]) {
+  const keep: number[] = [];
+  for (let i = 0; i < step.solidOfTri.length; i++) if (mask[step.solidOfTri[i]]) keep.push(i);
+  const fi = new Uint32Array(keep.length * 3);
+  const ff = new Uint32Array(keep.length);
+  const fs = new Uint32Array(keep.length);
+  keep.forEach((t, j) => {
+    fi[3 * j] = step.indices[3 * t];
+    fi[3 * j + 1] = step.indices[3 * t + 1];
+    fi[3 * j + 2] = step.indices[3 * t + 2];
+    ff[j] = step.faceOfTri[t];
+    fs[j] = step.solidOfTri[t];
+  });
+  return { keep, fi, ff, fs };
+}
+
+/** Rebuild the display→source map for the CURRENT engine mesh from the
+ *  engine's own refinement parent map (exact — the old geometric walk broke
+ *  on refined meshes and mislabeled most of the model). `keep` maps filtered
+ *  source index → full source id (null = identity). */
+async function rebuildSrcOfDisp(keep: number[] | null): Promise<Uint32Array> {
+  const parents = await engine.refinementParents();
+  if (!keep) return parents;
+  const out = new Uint32Array(parents.length);
+  for (let t = 0; t < parents.length; t++) out[t] = keep[parents[t]];
+  return out;
+}
+
+/** Dense CAD face id → dense solid id (every BREP face belongs to exactly
+ *  one solid). Lazily built per import. */
+const faceToSolidCache = new WeakMap<AssemblyCacheStep, Uint32Array>();
+function faceToSolidOf(step: AssemblyCacheStep): Uint32Array {
+  const hit = faceToSolidCache.get(step);
+  if (hit) return hit;
+  let maxFace = 0;
+  for (const f of step.faceOfTri) if (f > maxFace) maxFace = f;
+  const out = new Uint32Array(maxFace + 1);
+  for (let i = 0; i < step.faceOfTri.length; i++) out[step.faceOfTri[i]] = step.solidOfTri[i];
+  faceToSolidCache.set(step, out);
+  return out;
+}
+
+/** Visit every DISPLAY tri with its dense body id. STEP models map through
+ *  the CAD-face segmentation (display tri → face → solid) — EXACT under any
+ *  display refinement. The display→source centroid walk is the mesh-model
+ *  fallback only: on big refined imports it can stall and mislabel most of
+ *  the model (a body hover then lit up the whole assembly). */
+function forEachDisplayBody(
+  cache: AssemblyCache,
+  get: () => AppState,
+  fn: (t: number, body: number) => void
+) {
+  const si = get().stepInfo;
+  if (cache.kind === "step" && si) {
+    const f2s = faceToSolidOf(cache.step!);
+    const cad = si.cadPatchIds;
+    for (let t = 0; t < cad.length; t++) fn(t, f2s[cad[t]]);
+    return;
+  }
+  for (let t = 0; t < cache.srcOfDisp.length; t++) fn(t, cache.bodyOfSrc[cache.srcOfDisp[t]]);
+}
+
+/** World-pose triangle soup of the given bodies from the CACHED source
+ *  geometry — the hover ghost for suppressed components, whose triangles are
+ *  collapsed (pending) or absent (applied) in the display mesh. */
+function bodyGhostSoup(
+  cache: AssemblyCache,
+  get: () => AppState,
+  ids: Set<number>
+): Float32Array | null {
+  let soup: Float32Array;
+  let toWorld: number[];
+  if (cache.kind === "step") {
+    const st = cache.step!;
+    const idx: number[] = [];
+    for (let t = 0; t < st.solidOfTri.length; t++) if (ids.has(st.solidOfTri[t])) idx.push(t);
+    if (idx.length === 0) return null;
+    soup = new Float32Array(idx.length * 9);
+    idx.forEach((t, j) => {
+      for (let v = 0; v < 3; v++) {
+        const i = st.indices[3 * t + v];
+        soup.set(st.positions.subarray(3 * i, 3 * i + 3), 9 * j + 3 * v);
+      }
+    });
+    toWorld = get().stepInfo?.toWorld ?? cache.toWorld;
+  } else {
+    const src = cache.origSoup!;
+    const idx: number[] = [];
+    for (let i = 0; i < cache.bodyOfSrc.length; i++) if (ids.has(cache.bodyOfSrc[i])) idx.push(i);
+    if (idx.length === 0) return null;
+    soup = new Float32Array(idx.length * 9);
+    idx.forEach((t, j) => soup.set(src.subarray(9 * t, 9 * t + 9), 9 * j));
+    toWorld = cache.toWorld;
+  }
+  return isIdentityTransform(toWorld) ? soup : transformPoints(toWorld, soup);
+}
+
+/** DISPLAY tris of every body that is INACTIVE in `mask` — the set the
+ *  viewport collapses while a suppression is pending (deferred rebuild). */
+function hiddenDisplayTris(
+  cache: AssemblyCache,
+  get: () => AppState,
+  mask: boolean[]
+): Uint32Array | null {
+  const out: number[] = [];
+  forEachDisplayBody(cache, get, (t, body) => {
+    if (!mask[body]) out.push(t);
+  });
+  return out.length ? Uint32Array.from(out) : null;
+}
+
+/** Push the viewport state of a PENDING (not yet applied) component mask:
+ *  collapse the suppressed bodies' display tris and filter their feature
+ *  edges out of the overlay — all without touching the engine. A body
+ *  pending UN-suppression only returns visually once the rebuild runs (its
+ *  triangles aren't in the display mesh yet). */
+async function pushPendingHide(get: () => AppState) {
+  const cache = assemblyCache;
+  if (!cache) return;
+  const mask = get().bodies.map((b) => b.active);
+  sceneEvents.onHiddenBodies?.(hiddenDisplayTris(cache, get, mask));
+  const anyHidden = mask.some((a) => !a);
+  const si = get().stepInfo;
+  if (si && cache.kind === "step") {
+    let segs = si.featureEdges;
+    if (anyHidden && segs.length > 0) {
+      // Segment → face → solid: precomputed labels, no geometry matching.
+      const f2s = faceToSolidOf(cache.step!);
+      const segF = si.featureEdgeFaces;
+      const keep: number[] = [];
+      for (let s = 0; s < segF.length; s++) if (mask[f2s[segF[s]]]) keep.push(s);
+      const f = new Float32Array(keep.length * 6);
+      keep.forEach((s, j) => f.set(si.featureEdges.subarray(6 * s, 6 * s + 6), 6 * j));
+      segs = f;
+    }
+    sceneEvents.onCadEdges?.(
+      segs.length > 0 ? transformPoints(si.toWorld, segs) : null,
+      si.cadPatchIds
+    );
+    return;
+  }
+  if (cache.kind === "mesh") {
+    // STL/3MF: the dihedral edge overlay runs on the original soup — refetch
+    // it and drop the suppressed bodies' triangles.
+    try {
+      const src = await engine.originalPositions();
+      // Soup tri j ↔ full source id: the engine holds the APPLIED active set.
+      const applied: number[] = [];
+      for (let i = 0; i < cache.bodyOfSrc.length; i++) {
+        if (cache.activeMask[cache.bodyOfSrc[i]]) applied.push(i);
+      }
+      let soup = src;
+      if (anyHidden && applied.length * 9 === src.length) {
+        const keep: number[] = [];
+        for (let j = 0; j < applied.length; j++) {
+          if (mask[cache.bodyOfSrc[applied[j]]]) keep.push(j);
+        }
+        soup = new Float32Array(keep.length * 9);
+        keep.forEach((j, k) => soup.set(src.subarray(9 * j, 9 * j + 9), 9 * k));
+      }
+      sceneEvents.onOriginalMesh?.(soup);
+    } catch {
+      // model swapped mid-fetch — the next load pushes fresh topology
+    }
+  }
+}
+
+/** Build the assembly cache + component rows for a freshly loaded model.
+ *  Single-body models clear the cache (nothing to toggle). Runs AFTER the
+ *  load path finished all transforms — the walk needs the current pose. */
+async function initAssembly(
+  set: SetState,
+  get: () => AppState,
+  src:
+    | {
+        kind: "step";
+        name: string;
+        step: AssemblyCacheStep;
+        names: (string | null)[];
+        tree?: AssemblyTreeNode | null;
+        mask?: boolean[];
+      }
+    | { kind: "mesh"; name: string }
+): Promise<void> {
+  const model = get().model;
+  if (!model) return;
+  try {
+    if (src.kind === "step") {
+      const bodyCount = src.step.solidEntityIds.length;
+      if (bodyCount < 2) {
+        assemblyCache = null;
+        set({ bodies: [], bodyTree: null, bodiesPending: false });
+        return;
+      }
+      const mask = src.mask ?? new Array(bodyCount).fill(true);
+      const keep = mask.every(Boolean) ? null : filterStepTris(src.step, mask).keep;
+      const counts = new Array<number>(bodyCount).fill(0);
+      for (const s of src.step.solidOfTri) counts[s]++;
+      const open = new Set(src.step.openSolids);
+      assemblyCache = {
+        kind: "step",
+        name: src.name,
+        step: src.step,
+        origSoup: null,
+        toWorld: get().stepInfo?.toWorld.slice() ?? IDENTITY_TRANSFORM.slice(),
+        bodyOfSrc: src.step.solidOfTri,
+        bodyCount,
+        activeMask: mask,
+        srcOfDisp: await rebuildSrcOfDisp(keep),
+      };
+      // The hierarchy is only worth a tree view when it actually groups
+      // something — a lone root with flat bodies renders as the plain list.
+      const tree = src.tree && src.tree.children.length > 0 ? src.tree : null;
+      set({
+        bodies: mask.map((active, i) => ({
+          name: src.names[i]?.trim() || `Body ${i + 1}`,
+          active,
+          open: open.has(i),
+          triCount: counts[i],
+        })),
+        bodyTree: tree,
+        bodiesPending: false,
+      });
+    } else {
+      const soup = await engine.originalPositions();
+      const { bodyOfTri, count } = connectedBodies(soup);
+      if (count < 2) {
+        assemblyCache = null;
+        set({ bodies: [], bodyTree: null, bodiesPending: false });
+        return;
+      }
+      const counts = new Array<number>(count).fill(0);
+      for (const b of bodyOfTri) counts[b]++;
+      assemblyCache = {
+        kind: "mesh",
+        name: src.name,
+        step: null,
+        origSoup: soup,
+        toWorld: IDENTITY_TRANSFORM.slice(),
+        bodyOfSrc: bodyOfTri,
+        bodyCount: count,
+        activeMask: new Array(count).fill(true),
+        srcOfDisp: await rebuildSrcOfDisp(null),
+      };
+      set({
+        bodies: counts.map((triCount, i) => ({
+          name: `Body ${i + 1}`,
+          active: true,
+          open: false,
+          triCount,
+        })),
+        bodyTree: null,
+        bodiesPending: false,
+      });
+    }
+    if (get().bodies.length > 1) {
+      set({
+        notice:
+          [
+            get().notice,
+            "Multiple bodies found — the Components list (step 1) picks which are analyzed.",
+          ]
+            .filter(Boolean)
+            .join(" ") || null,
+      });
+    }
+  } catch (e) {
+    // The list is an aid, not a load blocker — a failed body scan just means
+    // no component list for this model.
+    assemblyCache = null;
+    set({ bodies: [], bodyTree: null, bodiesPending: false });
+    appendLog(set, `Component scan failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+/** Reload the engine with the given active-body mask: filter the cached
+ *  source model, reload, re-seat on the plate, remap BC selections through
+ *  source-tri identity (pausing those on hidden bodies), and invalidate
+ *  everything grid/result-shaped. The viewport keeps the current pose. */
+async function applyActiveSet(set: SetState, get: () => AppState, mask: boolean[]) {
+  const cache = assemblyCache;
+  if (!cache || get().busy) return;
+  set({ busy: "Rebuilding active part set…", error: null, notice: null });
+  try {
+    // 1. Current BC selections → FULL source-tri identity (survives reloads).
+    const bcsSrc = get().bcs.map((bc) => {
+      if (bc.kind === "accel") return { bc, src: null as Uint32Array | null };
+      if (bc.bodyOff && bc.origTris) return { bc, src: bc.origTris };
+      const ids = new Set<number>();
+      for (const t of bc.tris) if (t < cache.srcOfDisp.length) ids.add(cache.srcOfDisp[t]);
+      return { bc, src: Uint32Array.from(ids) };
+    });
+    // 2. Filter + reload.
+    const cleanName = cache.name.replace(/\.(stl|3mf|step|stp)$/i, "");
+    let keep: number[];
+    let reply: LoadedModelData;
+    let filteredStep: { fi: Uint32Array; ff: Uint32Array } | null = null;
+    if (cache.kind === "step") {
+      const st = cache.step!;
+      const f = filterStepTris(st, mask);
+      keep = f.keep;
+      filteredStep = { fi: f.fi, ff: f.ff };
+      reply = await engine.loadMesh(
+        st.positions.slice(),
+        f.fi.slice(),
+        f.ff.slice(),
+        f.fs,
+        st.bytes.slice(0),
+        cleanName
+      );
+      // Import frame → the part's current world pose.
+      const toWorld = get().stepInfo?.toWorld ?? IDENTITY_TRANSFORM;
+      if (!isIdentityTransform(toWorld)) {
+        const out = await engine.transform(toWorld);
+        reply = { ...reply, positions: out.positions, bbox: out.bbox as LoadedModel["bbox"] };
+      }
+    } else {
+      keep = [];
+      for (let i = 0; i < cache.bodyOfSrc.length; i++) if (mask[cache.bodyOfSrc[i]]) keep.push(i);
+      const world = isIdentityTransform(cache.toWorld)
+        ? cache.origSoup!
+        : transformPoints(cache.toWorld, cache.origSoup!);
+      const bytes = buildBinaryStl(world, keep);
+      reply = await engine.load(bytes, `${cleanName}.stl`);
+    }
+    // 3. Re-seat the active set on the build plate (mirrors every import).
+    const cx = (reply.bbox[0] + reply.bbox[3]) / 2;
+    const cy = (reply.bbox[1] + reply.bbox[4]) / 2;
+    const dz = reply.bbox[2];
+    let seat: [number, number, number] = [0, 0, 0];
+    if (Math.abs(cx) > 1e-6 || Math.abs(cy) > 1e-6 || Math.abs(dz) > 1e-6) {
+      const out = await engine.transform([1, 0, 0, 0, 1, 0, 0, 0, 1, -cx, -cy, -dz]);
+      reply = { ...reply, positions: out.positions, bbox: out.bbox as LoadedModel["bbox"] };
+      seat = [-cx, -cy, -dz];
+    }
+    const seatM = [1, 0, 0, 0, 1, 0, 0, 0, 1, ...seat];
+    cache.toWorld = composeTransform(seatM, cache.toWorld);
+    cache.activeMask = mask;
+    // 4. Re-push the session's physics/grid/display settings (a fresh Model
+    //    starts at engine defaults — mirror loadFile).
+    const m = get().material;
+    await engine.setMaterial(m.e0, m.nu, m.density, m.strength, m.strengthZ, m.shearStrengthZ);
+    await pushResolution(get);
+    await engine.setSnapWall(get().snapVoxel ? get().perimeters * get().lineWidth : 0);
+    await engine.setCompositeSkin(get().compositeSkin);
+    await engine.setSmoothStress(get().smoothStress);
+    await engine.setMaterialStress(get().materialStress);
+    await engine.setLayerShear(get().layerShear);
+    // 5. Segmentation source: the reply's patches are the load default (CAD
+    //    faces for STEP, engine crease default otherwise) — restore the
+    //    session's choice.
+    let patchIds = reply.patchIds;
+    let patchCount = reply.patchCount;
+    const cadPatchIds = cache.kind === "step" ? reply.patchIds.slice() : null;
+    if (get().segSource === "angle") {
+      const p = await engine.resegment(get().segAngle);
+      patchIds = p.patchIds;
+      patchCount = p.patchCount;
+    }
+    const model: LoadedModel = {
+      positions: reply.positions,
+      patchIds,
+      patchCount,
+      triCount: reply.triCount,
+      bbox: reply.bbox as LoadedModel["bbox"],
+      hasCadFaces: reply.hasCadFaces,
+    };
+    // 6. Fresh display→source map for the filtered mesh.
+    cache.srcOfDisp = await rebuildSrcOfDisp(keep);
+    const dispOfSrc = new Map<number, number[]>();
+    for (let t = 0; t < cache.srcOfDisp.length; t++) {
+      const s = cache.srcOfDisp[t];
+      let list = dispOfSrc.get(s);
+      if (!list) {
+        list = [];
+        dispOfSrc.set(s, list);
+      }
+      list.push(t);
+    }
+    // 7. Remap BCs; selections whose body went hidden pause (kept in source
+    //    ids), returning selections un-pause. Seat moves CG/cylinder points
+    //    like every other pose change.
+    let paused = 0;
+    const movePt = (p: [number, number, number]): [number, number, number] => [
+      p[0] + seat[0],
+      p[1] + seat[1],
+      p[2] + seat[2],
+    ];
+    const bcs: Bc[] = bcsSrc.map(({ bc, src }) => {
+      let next: Bc = { ...bc };
+      if (src && (bc.tris.length > 0 || bc.origTris)) {
+        const tris: number[] = [];
+        for (const s of src) {
+          const list = dispOfSrc.get(s);
+          if (list) tris.push(...list);
+        }
+        if (tris.length === 0 && src.length > 0) {
+          if (!bc.bodyOff) paused++;
+          next = { ...next, tris: new Uint32Array(0), bodyOff: true, origTris: src };
+        } else {
+          next = {
+            ...next,
+            tris: Uint32Array.from(tris.sort((a, b) => a - b)),
+            bodyOff: undefined,
+            origTris: undefined,
+          };
+        }
+      }
+      if (next.kind === "mass" && next.point) next = { ...next, point: movePt(next.point) };
+      if (next.cyl?.ok) {
+        next = { ...next, cyl: { ...next.cyl, point: movePt(next.cyl.point) } };
+      }
+      return next;
+    });
+    // 8. STEP provenance follows the filtered mesh: fresh CAD segmentation,
+    //    filtered feature edges (import frame), re-baked colors; the durable
+    //    face-entity table is unchanged (dense ids pass through the filter).
+    let stepInfo = get().stepInfo;
+    if (stepInfo && cache.kind === "step" && cadPatchIds && filteredStep) {
+      const st = cache.step!;
+      const fe = computeFeatureEdges(st.positions, filteredStep.fi, filteredStep.ff);
+      stepInfo = {
+        ...stepInfo,
+        cadPatchIds,
+        toWorld: composeTransform(seatM, stepInfo.toWorld),
+        cadTriColors: cadTriangleColors(cadPatchIds, st.faceColorIdx, st.palette),
+        featureEdges: fe.segments,
+        featureEdgeFaces: fe.segFace,
+      };
+    }
+    const rows = get().bodies.map((b, i) => ({ ...b, active: mask[i] }));
+    const activeCount = mask.filter(Boolean).length;
+    const openActive =
+      cache.kind === "step" && cache.step!.openSolids.some((d) => mask[d]);
+    set({
+      model,
+      stepInfo,
+      bcs,
+      bodies: rows,
+      bodiesPending: false,
+      busy: null,
+      notice:
+        [
+          reply.bodyCount > 1
+            ? activeCount > 1
+              ? `The ${activeCount} active bodies don't all touch — separate bodies only fuse where gaps are smaller than the voxel size.`
+              : "The active body has disconnected parts — they only fuse where gaps are smaller than the voxel size."
+            : null,
+          openActive
+            ? "An active body is an open (sheet) body — filaSim needs closed solids, check the part carefully."
+            : null,
+          paused > 0
+            ? `${paused} condition${paused > 1 ? "s" : ""} sit on hidden bodies — paused until those bodies return.`
+            : null,
+        ]
+          .filter(Boolean)
+          .join(" ") || null,
+    });
+    // 9. Everything downstream of the mesh is stale.
+    invalidateResults(set, get);
+    invalidateGrid(set, get);
+    sceneEvents.onBodyHighlight?.(null);
+    sceneEvents.onBodyGhost?.(null);
+    sceneEvents.onModelLoaded?.(model);
+    sceneEvents.onCadColors?.(get().cadColors ? (stepInfo?.cadTriColors ?? null) : null);
+    void pushEdgeTopology(get);
+    pushBcGlyphs(get);
+    if (get().symOn) get().centerSymmetry();
+    await pushBcs(get);
+    appendLog(
+      set,
+      `Active parts: ${activeCount}/${cache.bodyCount} — ${model.triCount.toLocaleString()} display triangles`
+    );
+  } catch (e) {
+    set({ busy: null, error: e instanceof Error ? e.message : String(e) });
+  }
 }
 
 /** Throw away a just-created condition that never got any surfaces when the
@@ -2287,7 +2925,7 @@ function invalidateResults(set: (p: Partial<AppState>) => void, get: () => AppSt
 /** Clear the LIVE result + deformed view (stats, hasResult, the deformed scene)
  *  WITHOUT dropping the stashed roster — used when switching workspaces so one
  *  workspace's output can't masquerade as the other's (Build Sim warp leaking
- *  into Verify, etc.). Roster results stay re-selectable. */
+ *  into Analyze, etc.). Roster results stay re-selectable. */
 function clearLiveResultView(set: (p: Partial<AppState>) => void, get: () => AppState) {
   set({
     check: null,
@@ -3287,6 +3925,12 @@ interface ProjectManifest {
    *  + file hash of the embedded model. OPTIONAL & additive like loadSteps —
    *  absent for STL/3MF projects and files saved before this feature. */
   step?: StepManifestInfo | null;
+  /** Assembly component list, STEP only: solid ENTITY ids of the ACTIVE
+   *  bodies when some are deactivated (absent = all active). The embedded
+   *  .step holds the full assembly, so reopen must re-apply this filter —
+   *  the saved BC triangle indices belong to the FILTERED mesh. OPTIONAL &
+   *  additive. (STL/3MF projects embed the already-filtered mesh instead.) */
+  activeBodies?: number[] | null;
   /** `faceIds` (STEP entity record numbers) is set when the selection is
    *  exactly a union of CAD faces — the durable identity that survives a
    *  meshStep upgrade; `tris` stays authoritative while the version matches
@@ -3490,6 +4134,9 @@ export const useStore = create<AppState>((set, get) => ({
   askImportUnit: initialImportPrefs.ask,
   pendingImport: null,
   stepInfo: null,
+  bodies: [],
+  bodyTree: null,
+  bodiesPending: false,
   regionInfos: [],
   regionVisible: [],
   densityThreshold: 0,
@@ -3497,6 +4144,8 @@ export const useStore = create<AppState>((set, get) => ({
   resultField: "u",
   resultSurface: "stl",
   fieldRange: null,
+  reactionForces: null,
+  reactionPrevDeform: null,
   legendMin: null,
   legendMax: null,
   showExtremes: false,
@@ -3509,7 +4158,16 @@ export const useStore = create<AppState>((set, get) => ({
 
   setActiveStep(n) {
     const maxStep = get().appMode === "buildsim" ? 4 : 6;
-    set({ activeStep: Math.min(maxStep, Math.max(1, Math.round(n))) });
+    const target = Math.min(maxStep, Math.max(1, Math.round(n)));
+    // Deferred component toggles apply on LEAVING the Model step — one
+    // rebuild for the whole batch instead of one per checkbox.
+    if (get().activeStep === 1 && target !== 1 && get().bodiesPending) {
+      if (!get().applyPendingBodies()) {
+        set({ error: "All components are suppressed — unsuppress at least one to continue." });
+        return;
+      }
+    }
+    set({ activeStep: target });
     // The symmetry plane is an Optimize-step editing aid — hide it elsewhere.
     pushSymmetry(get);
   },
@@ -3529,6 +4187,9 @@ export const useStore = create<AppState>((set, get) => ({
       let stepNotices: string[] = [];
       let model: LoadedModelData;
       let stepInfo: AppState["stepInfo"] = null;
+      let stepCache: AssemblyCacheStep | null = null;
+      let stepBodyNames: (string | null)[] = [];
+      let stepTree: AssemblyTreeNode | null = null;
       if (isStepName(name)) {
         // STEP tessellates in the meshStep worker (DESIGN §18); the engine
         // gets the finished mesh + CAD-face ids, plus the ORIGINAL bytes so
@@ -3541,6 +4202,21 @@ export const useStore = create<AppState>((set, get) => ({
             `${imp.stats.solids} solid${imp.stats.solids === 1 ? "" : "s"}, deviation ${imp.opts.surfaceDeviation} mm, max edge ${imp.opts.maxEdge} mm`
         );
         set({ busy: "Segmenting…" });
+        // Copies for the assembly cache — loadMesh TRANSFERS its arguments,
+        // and a body toggle later needs the full source model back.
+        stepCache = {
+          positions: imp.positions.slice(),
+          indices: imp.indices.slice(),
+          faceOfTri: imp.faceOfTri.slice(),
+          solidOfTri: imp.solidOfTri.slice(),
+          solidEntityIds: imp.solidEntityIds,
+          bytes: bytes.slice(0),
+          faceColorIdx: imp.faceColorIdx,
+          palette: imp.palette,
+          openSolids: imp.openSolids,
+        };
+        stepBodyNames = imp.solidNames;
+        stepTree = imp.structure;
         model = await engine.loadMesh(
           imp.positions,
           imp.indices,
@@ -3563,6 +4239,7 @@ export const useStore = create<AppState>((set, get) => ({
           toWorld: IDENTITY_TRANSFORM.slice(),
           cadTriColors: cadTriangleColors(cadPatchIds, imp.faceColorIdx, imp.palette),
           featureEdges: imp.featureEdges,
+          featureEdgeFaces: imp.featureEdgeFaces,
         };
       } else {
         model = await engine.load(bytes, cleanName);
@@ -3631,6 +4308,9 @@ export const useStore = create<AppState>((set, get) => ({
         voxelInfo: null,
         voxelMeshReady: false,
         autoScale: 1,
+        bodies: [],
+        bodyTree: null,
+        bodiesPending: false,
         regionInfos: [],
         regionVisible: [],
         densityThreshold: 0,
@@ -3673,6 +4353,15 @@ export const useStore = create<AppState>((set, get) => ({
       void pushEdgeTopology(get);
       sceneEvents.onViewState?.("setup", get().deformScale);
       pushSymmetry(get); // hide a previous model's symmetry plane
+      // Assembly component list (multi-body models) — needs the final pose,
+      // so it runs after every load-time transform.
+      await initAssembly(
+        set,
+        get,
+        stepCache
+          ? { kind: "step", name, step: stepCache, names: stepBodyNames, tree: stepTree }
+          : { kind: "mesh", name }
+      );
       const [bx, by, bz] = [
         model.bbox[3] - model.bbox[0],
         model.bbox[4] - model.bbox[1],
@@ -3746,6 +4435,70 @@ export const useStore = create<AppState>((set, get) => ({
     } catch (e) {
       set({ busy: null, error: e instanceof Error ? e.message : String(e) });
     }
+  },
+
+  setBodyActive(index, on) {
+    get().setBodiesActive([index], on);
+  },
+
+  setBodiesActive(indexes, on) {
+    const cache = assemblyCache;
+    if (!cache || get().busy) return;
+    const rows = get().bodies;
+    const idx = new Set(indexes.filter((i) => rows[i] && rows[i].active !== on));
+    if (idx.size === 0) return;
+    const next = rows.map((b, i) => (idx.has(i) ? { ...b, active: on } : b));
+    const mask = next.map((b) => b.active);
+    // DEFERRED: no engine rebuild here (it is expensive) — just hide the
+    // suppressed bodies in the viewport. applyPendingBodies runs the real
+    // rebuild when the user leaves the Model step.
+    sceneEvents.onBodyHighlight?.(null);
+    sceneEvents.onBodyGhost?.(null);
+    set({
+      bodies: next,
+      bodiesPending: mask.some((a, i) => a !== cache.activeMask[i]),
+    });
+    void pushPendingHide(get);
+  },
+
+  applyPendingBodies() {
+    const cache = assemblyCache;
+    if (!cache || !get().bodiesPending) return true;
+    const mask = get().bodies.map((b) => b.active);
+    if (!mask.some(Boolean)) return false; // nothing left to analyze
+    set({ bodiesPending: false });
+    // Fire-and-forget: the busy overlay covers the rebuild; the fresh mesh
+    // replaces the collapsed-triangle preview when it lands.
+    void applyActiveSet(set, get, mask);
+    return true;
+  },
+
+  setBodyHover(index) {
+    get().setBodyHoverIds(index === null ? null : [index]);
+  },
+
+  setBodyHoverIds(indexes) {
+    const cache = assemblyCache;
+    if (!cache || !indexes || indexes.length === 0) {
+      sceneEvents.onBodyHighlight?.(null);
+      sceneEvents.onBodyGhost?.(null);
+      return;
+    }
+    const rows = get().bodies;
+    // Active bodies tint in place; SUPPRESSED ones (collapsed or absent in
+    // the display mesh) show as a translucent ghost from the cached source.
+    const active = new Set(indexes.filter((i) => rows[i]?.active));
+    const ghost = new Set(indexes.filter((i) => rows[i] && !rows[i].active));
+    if (active.size > 0) {
+      const tris: number[] = [];
+      forEachDisplayBody(cache, get, (t, body) => {
+        if (active.has(body)) tris.push(t);
+      });
+      sceneEvents.onBodyHighlight?.(tris.length ? Uint32Array.from(tris) : null);
+    } else {
+      sceneEvents.onBodyHighlight?.(null);
+    }
+    sceneEvents.onBodyGhost?.(ghost.size > 0 ? bodyGhostSoup(cache, get, ghost) : null);
   },
 
   setTool(tool) {
@@ -3972,8 +4725,9 @@ export const useStore = create<AppState>((set, get) => ({
     set({
       bcs: get().bcs.map((b) => {
         if (b.id !== id) return b;
-        if (cylPatch) return { ...b, ...cylPatch };
-        const next: Bc = { ...b, tris };
+        // A manual selection edit ends any "paused on hidden body" state.
+        if (cylPatch) return { ...b, ...cylPatch, bodyOff: undefined, origTris: undefined };
+        const next: Bc = { ...b, tris, bodyOff: undefined, origTris: undefined };
         // A direction-mode force that still auto-tracks re-aims along the new
         // selection's average normal (magnitude preserved).
         if (b.kind === "force" && b.forceMode === "direction" && b.forceDirAuto !== false) {
@@ -4638,7 +5392,7 @@ export const useStore = create<AppState>((set, get) => ({
   setAppMode(m) {
     if (m === get().appMode) return;
     // Results are workspace-specific: clear the live result + deformed view so
-    // Build Sim's warp can't show (or mark Verify "done") in the other workspace.
+    // Build Sim's warp can't show (or mark Analyze "done") in the other workspace.
     clearLiveResultView(set, get);
     // Build Sim has a 4-station rail; clamp the carriage when switching in.
     const maxStep = m === "buildsim" ? 4 : 6;
@@ -6440,15 +7194,26 @@ export const useStore = create<AppState>((set, get) => ({
         step: s.stepInfo
           ? { meshstepVersion: s.stepInfo.meshstepVersion, opts: s.stepInfo.opts, sha256: s.stepInfo.sha256 }
           : undefined,
-        bcs: s.bcs.map((b) => ({
-          ...b,
-          tris: Array.from(b.tris),
-          // Whole-CAD-face selections additionally carry their entity ids —
-          // the identity that survives a meshStep upgrade (DESIGN §18 M2).
-          faceIds: s.stepInfo
-            ? selectionFaceIds(b.tris, s.stepInfo.cadPatchIds, s.stepInfo.faceEntityIds)
+        activeBodies:
+          assemblyCache?.kind === "step" && assemblyCache.activeMask.some((a) => !a)
+            ? assemblyCache.activeMask.flatMap((a, d) =>
+                a ? [assemblyCache!.step!.solidEntityIds[d]] : []
+              )
             : undefined,
-        })),
+        bcs: s.bcs.map((b) => {
+          // Session-only assembly fields: origTris is a typed array (JSON-
+          // hostile) and a paused BC reopens as a plain empty selection.
+          const { origTris: _ot, bodyOff: _bo, ...rest } = b;
+          return {
+            ...rest,
+            tris: Array.from(b.tris),
+            // Whole-CAD-face selections additionally carry their entity ids —
+            // the identity that survives a meshStep upgrade (DESIGN §18 M2).
+            faceIds: s.stepInfo
+              ? selectionFaceIds(b.tris, s.stepInfo.cadPatchIds, s.stepInfo.faceEntityIds)
+              : undefined,
+          };
+        }),
         loadSteps: serializeLoadSteps(s.bcs, s.loadSteps),
         optSummary: s.optSummary,
         optMinSf: s.optMinSf,
@@ -6492,15 +7257,52 @@ export const useStore = create<AppState>((set, get) => ({
       let mi: LoadedModelData;
       let stepInfo: AppState["stepInfo"] = null;
       let stepStale = false;
+      let stepCache: AssemblyCacheStep | null = null;
+      let stepBodyNames: (string | null)[] = [];
+      let stepTree: AssemblyTreeNode | null = null;
+      let stepMask: boolean[] | undefined;
       if (opened.stepModel) {
         const { bytes: stepBytes, name: stepName } = opened.stepModel;
         const imp = await importStepWithProgress(stepBytes, set, mf.step?.opts);
         set({ busy: "Opening project…" });
+        // Copies for the assembly cache — loadMesh transfers its arguments.
+        stepCache = {
+          positions: imp.positions.slice(),
+          indices: imp.indices.slice(),
+          faceOfTri: imp.faceOfTri.slice(),
+          solidOfTri: imp.solidOfTri.slice(),
+          solidEntityIds: imp.solidEntityIds,
+          bytes: stepBytes.slice(0),
+          faceColorIdx: imp.faceColorIdx,
+          palette: imp.palette,
+          openSolids: imp.openSolids,
+        };
+        stepBodyNames = imp.solidNames;
+        stepTree = imp.structure;
+        // Saved active-body filter (entity ids): the manifest's BC triangle
+        // indices belong to the FILTERED mesh, so re-apply it before load.
+        let loadArrays = {
+          indices: imp.indices,
+          faceOfTri: imp.faceOfTri,
+          solidOfTri: imp.solidOfTri,
+        };
+        let filtered: { fi: Uint32Array; ff: Uint32Array } | null = null;
+        if (Array.isArray(mf.activeBodies) && mf.activeBodies.length > 0) {
+          const activeSet = new Set(mf.activeBodies);
+          stepMask = Array.from(imp.solidEntityIds, (e) => activeSet.has(e));
+          if (stepMask.some((a) => !a) && stepMask.some(Boolean)) {
+            const f = filterStepTris(stepCache, stepMask);
+            filtered = { fi: f.fi, ff: f.ff };
+            loadArrays = { indices: f.fi.slice(), faceOfTri: f.ff.slice(), solidOfTri: f.fs };
+          } else {
+            stepMask = undefined;
+          }
+        }
         mi = await engine.loadMesh(
           imp.positions,
-          imp.indices,
-          imp.faceOfTri,
-          imp.solidOfTri,
+          loadArrays.indices,
+          loadArrays.faceOfTri,
+          loadArrays.solidOfTri,
           stepBytes,
           stepName
         );
@@ -6513,8 +7315,15 @@ export const useStore = create<AppState>((set, get) => ({
           faceEntityIds: imp.faceEntityIds,
           faces: imp.faces,
           toWorld: IDENTITY_TRANSFORM.slice(),
-          cadTriColors: cadTriangleColors(cadPatchIds, imp.faceColorIdx, imp.palette),
-          featureEdges: imp.featureEdges,
+          cadTriColors: filtered
+            ? cadTriangleColors(cadPatchIds, stepCache.faceColorIdx, stepCache.palette)
+            : cadTriangleColors(cadPatchIds, imp.faceColorIdx, imp.palette),
+          ...(filtered
+            ? (() => {
+                const fe = computeFeatureEdges(stepCache!.positions, filtered.fi, filtered.ff);
+                return { featureEdges: fe.segments, featureEdgeFaces: fe.segFace };
+              })()
+            : { featureEdges: imp.featureEdges, featureEdgeFaces: imp.featureEdgeFaces }),
         };
         // Hash mismatch "cannot happen" (the bytes embed verbatim) — treat it
         // like a version change rather than trusting stale indices.
@@ -6685,6 +7494,24 @@ export const useStore = create<AppState>((set, get) => ({
       sceneEvents.onCadColors?.(get().cadColors ? (stepInfo?.cadTriColors ?? null) : null);
       void pushEdgeTopology(get);
       pushBcGlyphs(get, null);
+      // Assembly component list — after the saved orientation replay so the
+      // display→source walk sees the final pose. STEP re-applies the saved
+      // active-body mask; STL/3MF projects embed the already-filtered mesh.
+      set({ bodies: [], bodyTree: null, bodiesPending: false });
+      await initAssembly(
+        set,
+        get,
+        stepCache
+          ? {
+              kind: "step",
+              name: mf.fileName,
+              step: stepCache,
+              names: stepBodyNames,
+              tree: stepTree,
+              mask: stepMask,
+            }
+          : { kind: "mesh", name: mf.fileName }
+      );
       // Phase 2: restore the design + result buffers into the engine. On a
       // stale STEP tessellation the design/results were computed on a mesh
       // that no longer exists — restoring them would silently mis-map, so

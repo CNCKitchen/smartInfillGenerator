@@ -1088,6 +1088,15 @@ impl Model {
         out
     }
 
+    /// ORIGINAL (as-imported) triangle index per working-mesh triangle — the
+    /// display-refinement parent map (identity when no refinement ran). The
+    /// exact display→source identity assembly bookkeeping needs; JS must not
+    /// reconstruct it geometrically (the refinement's triangle order is an
+    /// implementation detail no walk should depend on).
+    pub fn refinement_parents(&self) -> Vec<u32> {
+        self.parents.clone()
+    }
+
     /// Patch id per triangle.
     pub fn patch_ids(&self) -> Vec<u32> {
         self.seg.patch_of_tri.clone()
@@ -3359,6 +3368,69 @@ impl Model {
             }
         }
         Ok(out)
+    }
+
+    /// Support reaction forces + moments of the current ANALYSIS solution:
+    /// a JSON array with one entry per current BC, in `bcs` order — `null`
+    /// for loads, else `{ force:[N;3], moment:[N·mm;3], centroid:[mm;3],
+    /// nodes }`. Sign convention: the force the support exerts ON the part,
+    /// so summed over all supports it balances the applied loads. Fixed
+    /// supports recover `R = K·u − f` with the eps/TI blend the solve used;
+    /// penalty supports report their exact spring force (see
+    /// `filasim_core::reaction`). Build-sim solutions live on a coarser grid
+    /// and are rejected. Self-weight at fixed-patch nodes uses the occupancy
+    /// vfrac — exact for solid solves; for graded-infill solves the (small)
+    /// difference only shifts the self-weight share of the cells touching a
+    /// fixed patch.
+    pub fn reaction_forces(&self) -> Result<String, JsValue> {
+        let sol =
+            self.solution.as_ref().ok_or_else(|| err("no solution — run Solve or Optimize"))?;
+        let (grid, _) = self.grid.as_ref().ok_or_else(|| err("no grid"))?;
+        if sol.mx != grid.nx + 1 || sol.my != grid.ny + 1 || sol.mz != grid.nz + 1 {
+            return Err(err("reaction forces need an analysis solve on the current grid"));
+        }
+        let asm =
+            assemble(&self.mesh, grid, &self.bcs, self.body_arg(&grid.scale), &self.settings)
+                .map_err(err)?;
+        // `solution_eps` stores the TOTAL material share (see solve_printed);
+        // recover the solid share by subtracting the TI infill weights, the
+        // same split the stress readback does.
+        let total: &[f32] = self.solution_eps.as_deref().unwrap_or(&grid.scale);
+        let solid_owned;
+        let (eps_solid, ti): (&[f32], Option<(&[f32], &filasim_core::ti::TiRatios)>) =
+            match &self.solution_ti {
+                Some((ti_eps, ratios)) if ti_eps.len() == grid.cell_count() => {
+                    solid_owned = total
+                        .iter()
+                        .zip(ti_eps)
+                        .map(|(t, i)| (t - i).max(0.0))
+                        .collect::<Vec<f32>>();
+                    (&solid_owned, Some((ti_eps.as_slice(), ratios)))
+                }
+                _ => (total, None),
+            };
+        let reactions = filasim_core::reaction::support_reactions(
+            grid,
+            &self.bcs,
+            &asm,
+            &sol.u,
+            eps_solid,
+            ti,
+            &self.settings,
+        );
+        let items: Vec<serde_json::Value> = reactions
+            .iter()
+            .map(|r| match r {
+                Some(r) => serde_json::json!({
+                    "force": r.force,
+                    "moment": r.moment,
+                    "centroid": r.centroid,
+                    "nodes": r.nodes,
+                }),
+                None => serde_json::Value::Null,
+            })
+            .collect();
+        Ok(serde_json::Value::Array(items).to_string())
     }
 
     /// The exclusion a `…x` criterion field greys, or empty for every other

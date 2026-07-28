@@ -37,6 +37,15 @@ export const MODEL_HELP: Record<string, HelpContent> = {
       "Rescale here instead of re-importing; the bounding box in the status bar confirms the size.",
     ],
   },
+  components: {
+    title: "Components",
+    text: [
+      "Multi-body files (STEP assemblies, multi-shell STL/3MF) list every body here — STEP assemblies as their CAD hierarchy, with subassembly checkboxes toggling the whole group. Only checked bodies are analyzed — typically the printed part, with screws, bearings and other hardware suppressed (Suppress all, then re-enable the parts to analyze).",
+      "Suppressed bodies are hidden and contribute nothing: no stiffness, no mass, no load path. Active bodies merge into ONE printed part — they fuse where they touch, and a warning appears if they don't.",
+      "A ×N badge marks a part placed N times in the assembly — all copies toggle and highlight together.",
+      "Toggling is instant; the expensive rebuild (re-seat on the plate, results reset) runs ONCE when you leave this step. Loads and supports on a suppressed body pause and come back with it.",
+    ],
+  },
 };
 
 // ---------------- 3 · Properties ----------------
@@ -98,9 +107,9 @@ export const PROP_HELP: Record<string, HelpContent> = {
   },
 };
 
-// ---------------- 4 · Verify ----------------
+// ---------------- 4 · Analyze ----------------
 
-export const VERIFY_HELP: Record<string, HelpContent> = {
+export const ANALYZE_HELP: Record<string, HelpContent> = {
   analysis: {
     title: "Analysis type",
     text: [

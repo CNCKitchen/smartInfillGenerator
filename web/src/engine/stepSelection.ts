@@ -177,6 +177,51 @@ export function cadTriangleColors(
   return out;
 }
 
+// ---- CAD feature edges (viewport overlay) ----
+
+/** EXACT CAD face-border segments (xyz pairs) of a conforming indexed mesh:
+ *  every edge whose two triangles belong to DIFFERENT CAD faces. Shared by
+ *  the import worker (full model) and the assembly active-set rebuild
+ *  (filtered model) — the engine's display refinement is non-conforming
+ *  (T-junctions), so edges must come from the import mesh, never be
+ *  re-derived from the working mesh. `segFace` carries one of the two dense
+ *  face ids per segment — through face→solid it filters the overlay per
+ *  body instantly (deferred suppression) without any geometry matching. */
+export function computeFeatureEdges(
+  positions: Float32Array,
+  indices: Uint32Array,
+  faceOfTri: Uint32Array
+): { segments: Float32Array; segFace: Uint32Array } {
+  // key = minV·2^26 + maxV — safe for meshes up to 67M welded vertices.
+  const edges = new Map<number, { va: number; vb: number; face: number; border: boolean }>();
+  for (let t = 0; t < faceOfTri.length; t++) {
+    for (let e = 0; e < 3; e++) {
+      const va = indices[3 * t + e];
+      const vb = indices[3 * t + ((e + 1) % 3)];
+      if (va === vb) continue;
+      const key = Math.min(va, vb) * 67108864 + Math.max(va, vb);
+      const ent = edges.get(key);
+      if (!ent) edges.set(key, { va, vb, face: faceOfTri[t], border: false });
+      else if (faceOfTri[t] !== ent.face) ent.border = true;
+    }
+  }
+  const segs: number[] = [];
+  const segFace: number[] = [];
+  for (const ent of edges.values()) {
+    if (!ent.border) continue;
+    segs.push(
+      positions[3 * ent.va],
+      positions[3 * ent.va + 1],
+      positions[3 * ent.va + 2],
+      positions[3 * ent.vb],
+      positions[3 * ent.vb + 1],
+      positions[3 * ent.vb + 2]
+    );
+    segFace.push(ent.face);
+  }
+  return { segments: Float32Array.from(segs), segFace: Uint32Array.from(segFace) };
+}
+
 // ---- rigid-transform bookkeeping (import frame → current world) ----
 
 /** Compose 12-value rigid transforms (row-major 3×3 + translation), applying

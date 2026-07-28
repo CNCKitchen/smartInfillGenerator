@@ -25,10 +25,11 @@ import { fmtDisp, fmtLen, lenUnit, rampCss } from "./fmt";
 import { BC_HELP, bcLabel, KIND_DOT, KIND_LABEL, SUPPORT_KINDS } from "./bcmeta";
 import { HelpTip, InfoTip } from "./HelpTip";
 import { Section } from "./Section";
-import { BUILD_HELP, EXPORT_HELP, MODEL_HELP, OPT_HELP, PROP_HELP, VERIFY_HELP } from "./helptext";
+import { ANALYZE_HELP, BUILD_HELP, EXPORT_HELP, MODEL_HELP, OPT_HELP, PROP_HELP } from "./helptext";
 import { SettingsOptimizer } from "./SettingsOptimizer";
 import { ValidateOrientation } from "./ValidateOrientation";
 import { isCylindricalSelection, selectionCadArea } from "../engine/stepSelection";
+import type { AssemblyTreeNode } from "../engine/StepImporter";
 import {
   format,
   unitLabel,
@@ -52,7 +53,7 @@ const HEAD: Record<number, { title: string; sub: string }> = {
   1: { title: "Model", sub: "Drop an STL, 3MF, or STEP — units are mm." },
   2: { title: "Boundary conditions", sub: "Where the part is held, how it is loaded." },
   3: { title: "Properties", sub: "Material, print settings, analysis grid." },
-  4: { title: "Verify setup", sub: "Check constraints, then analyze the print or the solid." },
+  4: { title: "Analyze", sub: "Static deflection, stress & safety — or the part's natural frequencies." },
   5: { title: "Optimization", sub: "Infill density where the loads need it — and the best print orientation." },
   6: { title: "View & export", sub: "Inspect the result, hand off to the slicer." },
 };
@@ -204,7 +205,7 @@ export function StepPanel() {
           {step === 1 && <StepModel />}
           {step === 2 && <StepBcs />}
           {step === 3 && <StepProperties />}
-          {step === 4 && <StepVerify />}
+          {step === 4 && <StepAnalyze />}
           {step === 5 && <StepOptimize />}
           {step === 6 && <StepExport />}
         </>
@@ -259,6 +260,7 @@ function StepModel() {
       ) : (
         <div className="dim drophint">…or drop a file into the viewport. STL units set on import.</div>
       )}
+      {s.model && <AssemblyComponents />}
       {s.model && (
         <>
           <div className="group">
@@ -321,6 +323,202 @@ function StepModel() {
         Static linear analysis on a voxel grid — all computation stays in your browser.
       </div>
     </>
+  );
+}
+
+/** All body indices in a hierarchy node's subtree. */
+function subtreeBodies(node: AssemblyTreeNode, out: number[] = []): number[] {
+  out.push(...node.bodies);
+  for (const c of node.children) subtreeBodies(c, out);
+  return out;
+}
+
+/** One body row of the component list (flat list AND tree leaves). `mult` is
+ *  the assembly occurrence count — the body's triangles cover ALL its placed
+ *  copies, so hover/suppress always affect every copy together. */
+function BodyRow({ index, depth, mult }: { index: number; depth: number; mult: number }) {
+  const s = useStore(
+    useShallow((s) => ({
+      body: s.bodies[index],
+      busy: s.busy,
+      setBodiesActive: s.setBodiesActive,
+      setBodyHoverIds: s.setBodyHoverIds,
+    }))
+  );
+  const b = s.body;
+  if (!b) return null;
+  return (
+    <label
+      className={b.active ? "bodyrow" : "bodyrow off"}
+      style={depth > 0 ? { paddingLeft: 6 + depth * 14 } : undefined}
+      onMouseEnter={() => s.setBodyHoverIds([index])}
+      title={b.active ? "Included in the analysis" : "Suppressed — hidden and excluded from the analysis"}
+    >
+      <input
+        type="checkbox"
+        checked={b.active}
+        disabled={!!s.busy}
+        onChange={(e) => s.setBodiesActive([index], e.target.checked)}
+      />
+      <span className="bodyname">{b.name}</span>
+      {mult > 1 && (
+        <span
+          className="bodymult"
+          title={`Placed ${mult}× in the assembly — all copies toggle and highlight together`}
+        >
+          ×{mult}
+        </span>
+      )}
+      {b.open && (
+        <span
+          className="bodyopen"
+          title="Open (sheet) body — filaSim needs closed solids, voxelization of this body is untrustworthy"
+        >
+          ⚠
+        </span>
+      )}
+      <span className="dim bodytris">{b.triCount.toLocaleString()}</span>
+    </label>
+  );
+}
+
+/** A subassembly group: caret + tri-state checkbox + name. Hovering
+ *  highlights every body below it; the checkbox toggles them all. */
+function GroupRow({ node, depth, mult }: { node: AssemblyTreeNode; depth: number; mult: number }) {
+  const s = useStore(
+    useShallow((s) => ({
+      bodies: s.bodies,
+      busy: s.busy,
+      setBodiesActive: s.setBodiesActive,
+      setBodyHoverIds: s.setBodyHoverIds,
+    }))
+  );
+  const [open, setOpen] = useState(false);
+  const ids = useMemo(() => subtreeBodies(node), [node]);
+  const activeCount = ids.filter((i) => s.bodies[i]?.active).length;
+  const all = activeCount === ids.length;
+  const none = activeCount === 0;
+  return (
+    <>
+      <div
+        className={none ? "bodyrow bodygroup off" : "bodyrow bodygroup"}
+        style={depth > 0 ? { paddingLeft: 6 + depth * 14 } : undefined}
+        onMouseEnter={() => s.setBodyHoverIds(ids)}
+      >
+        <button
+          className="bodycaret"
+          onClick={() => setOpen(!open)}
+          title={open ? "Collapse" : "Expand"}
+        >
+          {open ? "▾" : "▸"}
+        </button>
+        <input
+          type="checkbox"
+          checked={all}
+          ref={(el) => {
+            if (el) el.indeterminate = !all && !none;
+          }}
+          disabled={!!s.busy}
+          onChange={() => s.setBodiesActive(ids, !all)}
+          title="Toggle every component in this group"
+        />
+        <span className="bodyname" onClick={() => setOpen(!open)}>
+          {node.name || "Subassembly"}
+        </span>
+        {mult > 1 && (
+          <span className="bodymult" title={`Placed ${mult}× in the assembly`}>
+            ×{mult}
+          </span>
+        )}
+        <span className="dim bodytris">
+          {activeCount}/{ids.length}
+        </span>
+      </div>
+      {open && <TreeChildren node={node} depth={depth + 1} mult={mult} />}
+    </>
+  );
+}
+
+/** A node's contents: its own bodies, then its child groups. A child that is
+ *  just one body with no substructure renders as a plain body row. */
+function TreeChildren({ node, depth, mult }: { node: AssemblyTreeNode; depth: number; mult: number }) {
+  return (
+    <>
+      {node.bodies.map((id) => (
+        <BodyRow key={`b${id}`} index={id} depth={depth} mult={mult} />
+      ))}
+      {node.children.map((c, i) =>
+        c.children.length === 0 && c.bodies.length === 1 ? (
+          <BodyRow key={`b${c.bodies[0]}`} index={c.bodies[0]} depth={depth} mult={mult * c.occurrences} />
+        ) : (
+          <GroupRow key={`g${depth}-${i}`} node={c} depth={depth} mult={mult * c.occurrences} />
+        )
+      )}
+    </>
+  );
+}
+
+/** Assembly component list (multi-body models): the STEP product hierarchy
+ *  (or a flat list) with include-in-analysis checkboxes. Hovering highlights
+ *  in the viewport; toggles only hide bodies — the expensive engine rebuild
+ *  is deferred until the user leaves the Model step. */
+function AssemblyComponents() {
+  const s = useStore(
+    useShallow((s) => ({
+      bodies: s.bodies,
+      bodyTree: s.bodyTree,
+      bodiesPending: s.bodiesPending,
+      busy: s.busy,
+      setBodiesActive: s.setBodiesActive,
+      setBodyHoverIds: s.setBodyHoverIds,
+    }))
+  );
+  if (s.bodies.length < 2) return null;
+  const activeCount = s.bodies.filter((b) => b.active).length;
+  const all = s.bodies.map((_, i) => i);
+  return (
+    <div className="group" onMouseLeave={() => s.setBodyHoverIds(null)}>
+      <div className="g-label">
+        <span>Components</span>
+        <b>
+          {activeCount}/{s.bodies.length} analyzed
+        </b>
+        <InfoTip help={MODEL_HELP.components} />
+      </div>
+      <div className="toolrow">
+        <button
+          disabled={!!s.busy || activeCount === 0}
+          onClick={() => s.setBodiesActive(all, false)}
+          title="Suppress every component — then re-enable just the parts to analyze"
+        >
+          Suppress all
+        </button>
+        <button
+          disabled={!!s.busy || activeCount === s.bodies.length}
+          onClick={() => s.setBodiesActive(all, true)}
+          title="Bring every component back into the analysis"
+        >
+          Unsuppress all
+        </button>
+      </div>
+      <div className="bodylist">
+        {s.bodyTree ? (
+          <TreeChildren node={s.bodyTree} depth={0} mult={1} />
+        ) : (
+          s.bodies.map((_, i) => <BodyRow key={i} index={i} depth={0} mult={1} />)
+        )}
+      </div>
+      {s.bodiesPending && (
+        <div className="dim small bodypending">
+          Changes apply when you leave this step — one rebuild for the whole batch. Unsuppressed
+          bodies reappear then.
+        </div>
+      )}
+      <div className="dim small">
+        Suppressed bodies are hidden and excluded from the analysis. Active bodies analyze as one
+        part — they fuse where they touch.
+      </div>
+    </div>
   );
 }
 
@@ -546,6 +744,29 @@ function LoadStepPanel() {
   );
 }
 
+/** Headline value of a load for a collapsed row header — the effective
+ *  (step-aware) magnitude in the display unit. Null for kinds without one
+ *  (supports), which keep showing their selection size. */
+function bcHeaderValue(bc: Bc, step?: LoadStep): string | null {
+  const ov = step?.overrides[bc.id];
+  const mag = (v: [number, number, number] | undefined) => (v ? Math.hypot(v[0], v[1], v[2]) : 0);
+  switch (bc.kind) {
+    case "force":
+    case "bearing":
+      return format(mag(ov?.force ?? bc.force), "force");
+    case "moment":
+      return format(mag(ov?.moment ?? bc.moment), "moment");
+    case "pressure":
+      return format(ov?.pressure ?? bc.pressure ?? 0, "pressure");
+    case "accel":
+      return format(mag(ov?.accel ?? bc.accel), "acceleration");
+    case "mass":
+      return format(bc.massGrams ?? 0, "mass");
+    default:
+      return null;
+  }
+}
+
 function BcRow({ bc }: { bc: Bc }) {
   const s = useStore(
     useShallow((s) => ({
@@ -567,12 +788,21 @@ function BcRow({ bc }: { bc: Bc }) {
   const step =
     s.loadSteps.length > 1 ? s.loadSteps.find((ls) => ls.id === s.activeLoadStepId) : undefined;
   const off = step ? step.overrides[bc.id]?.active === false : false;
+  // Only the ACTIVE condition shows its editor — inactive rows collapse to
+  // their header line, so a part with many supports/loads stays scannable.
+  // Clicking a row activates (= expands) it, same gesture as before. Collapsed
+  // loads show their value where the tris count sat; expanded rows keep the
+  // count (selection feedback while picking, the editor shows the value).
+  const headerVal = active ? null : bcHeaderValue(bc, step);
   return (
     <div
       className={`bc${active ? " active" : ""}${off ? " off" : ""}`}
       onClick={() => s.setActiveBc(active ? null : bc.id)}
     >
       <div className="bchead">
+        <span className="bccaret" aria-hidden="true">
+          {active ? "▾" : "▸"}
+        </span>
         <span className="dot" style={{ background: KIND_DOT[bc.kind] }} />
         <input
           className="bcnameinput"
@@ -583,10 +813,21 @@ function BcRow({ bc }: { bc: Bc }) {
           title="Rename this condition"
         />
         {off && <span className="bcoff">off</span>}
+        {bc.bodyOff && (
+          <span className="bcoff" title="Its body is deactivated in the Components list (step 1) — the condition returns with the body">
+            hidden body
+          </span>
+        )}
         {bc.kind === "accel" ? (
-          <span className="dim">whole part</span>
+          <span className="dim">{headerVal ?? "whole part"}</span>
         ) : (
-          <span className="dim">{bc.tris.length ? `${bc.tris.length} tris` : "select…"}</span>
+          <span className="dim">
+            {bc.tris.length
+              ? headerVal ?? `${bc.tris.length} tris`
+              : bc.bodyOff
+                ? "paused"
+                : "select…"}
+          </span>
         )}
         {bc.kind !== "accel" && bc.tris.length > 0 && (
           <button
@@ -610,19 +851,19 @@ function BcRow({ bc }: { bc: Bc }) {
           ×
         </button>
       </div>
-      {bc.kind === "force" && (
+      {active && bc.kind === "force" && (
         <>
           <ForceEditor bc={bc} step={step} />
           <CylindricalBearingHint bc={bc} />
         </>
       )}
-      {bc.kind === "bearing" && <BearingEditor bc={bc} step={step} />}
-      {bc.kind === "moment" && <MomentEditor bc={bc} step={step} />}
-      {bc.kind === "accel" && <AccelEditor bc={bc} step={step} />}
-      {bc.kind === "mass" && <MassEditor bc={bc} step={step} />}
-      {bc.kind === "displacement" && <DisplacementEditor bc={bc} />}
-      {bc.kind === "cylindrical" && <CylindricalEditor bc={bc} />}
-      {bc.kind === "pressure" && (
+      {active && bc.kind === "bearing" && <BearingEditor bc={bc} step={step} />}
+      {active && bc.kind === "moment" && <MomentEditor bc={bc} step={step} />}
+      {active && bc.kind === "accel" && <AccelEditor bc={bc} step={step} />}
+      {active && bc.kind === "mass" && <MassEditor bc={bc} step={step} />}
+      {active && bc.kind === "displacement" && <DisplacementEditor bc={bc} />}
+      {active && bc.kind === "cylindrical" && <CylindricalEditor bc={bc} />}
+      {active && bc.kind === "pressure" && (
         <div onClick={(e) => e.stopPropagation()}>
           <div className="bcparams">
             <label>
@@ -641,7 +882,7 @@ function BcRow({ bc }: { bc: Bc }) {
           <PressureAreaReadout bc={bc} step={step ?? null} />
         </div>
       )}
-      {bc.kind === "elastic" && (
+      {active && bc.kind === "elastic" && (
         <div onClick={(e) => e.stopPropagation()}>
           <div className="bcparams">
             <label>
@@ -1795,9 +2036,9 @@ function StepProperties() {
   );
 }
 
-// ---------------- 4 · Verify setup ----------------
+// ---------------- 4 · Analyze ----------------
 
-function StepVerify() {
+function StepAnalyze() {
   const s = useStore(
     useShallow((s) => ({
       analyzeMode: s.analyzeMode,
@@ -1829,7 +2070,7 @@ function StepVerify() {
       <div className="group">
         <div className="g-label">
           <span>Analysis</span>
-          <InfoTip help={VERIFY_HELP.analysis} />
+          <InfoTip help={ANALYZE_HELP.analysis} />
         </div>
         <div className="seg">
           <button
@@ -1851,7 +2092,7 @@ function StepVerify() {
       <div className="group">
         <div className="g-label">
           <span>Stiffness</span>
-          <InfoTip help={VERIFY_HELP.stiffness} />
+          <InfoTip help={ANALYZE_HELP.stiffness} />
         </div>
         <div className="seg">
           <button
@@ -1905,7 +2146,7 @@ function StepVerify() {
       )}
       <div className="g-label">
         <span>Run</span>
-        <InfoTip help={VERIFY_HELP.run} />
+        <InfoTip help={ANALYZE_HELP.run} />
       </div>
       <div className="toolrow" style={{ marginTop: -6 }}>
         <button onClick={() => void s.runCheck()} disabled={!!s.busy}>

@@ -14,6 +14,7 @@ import type {
   Op,
   CriterionSfResult,
   OrientationSweepResult,
+  ReactionForce,
   SectionVolume,
   SettingsSweepOptions,
   SettingsSweepProgress,
@@ -159,6 +160,13 @@ export class EngineClient {
    *  the conforming mesh viewport edge detection runs on. */
   originalPositions(): Promise<Float32Array> {
     return this.call({ op: "originalPositions" });
+  }
+
+  /** ORIGINAL tri index per working-mesh tri (display-refinement parents;
+   *  identity when unrefined) — the exact display→source identity the
+   *  assembly bookkeeping (BC remap, body membership) is built on. */
+  refinementParents(): Promise<Uint32Array> {
+    return this.call({ op: "refinementParents" });
   }
 
   /** Switch surface patches to the STEP file's exact BREP faces. No-op (returns
@@ -442,6 +450,12 @@ export class EngineClient {
   /** Stress/strain scalar per surface vertex (kind: vm|sxx|...|gzx). */
   resultField(kind: string): Promise<Float32Array> {
     return this.call({ op: "resultField", kind });
+  }
+
+  /** Support reactions of the live analysis solution, in `setBcs` push order
+   *  (`null` entries are loads). Read-only — no solve, nothing invalidated. */
+  reactionForces(): Promise<(ReactionForce | null)[]> {
+    return this.call({ op: "reactionForces" });
   }
 
   /** Volumetric section payload (nodal field over the full solution grid +

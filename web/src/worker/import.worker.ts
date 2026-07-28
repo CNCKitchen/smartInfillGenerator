@@ -16,11 +16,83 @@ import {
   type ImportProgress,
 } from "meshstep";
 import type {
+  AssemblyTreeNode,
   StepImportRequest,
   StepImportWorkerMessage,
   StepMeshPayload,
 } from "../engine/StepImporter";
-import type { StepFaceInfo } from "../engine/stepSelection";
+import { computeFeatureEdges, type StepFaceInfo } from "../engine/stepSelection";
+
+/** Structural view of meshStep's PartNode tree (not re-exported by the
+ *  package index) — only the fields the name walk reads. */
+interface PartNodeLike {
+  name: string;
+  occurrences?: number;
+  bodies: { id: number; name: string }[];
+  children: PartNodeLike[];
+}
+
+/** meshStep's product tree (solid ENTITY ids) → the payload's dense-id tree.
+ *  Nodes with no meshed solid anywhere below them are pruned; solids the
+ *  product graph missed are appended to the root so every list row has a
+ *  home in the hierarchy. Null when there is no tree or nothing survives. */
+function toDenseTree(
+  root: PartNodeLike | undefined,
+  entityToDense: Map<number, number>,
+  denseCount: number
+): AssemblyTreeNode | null {
+  if (!root) return null;
+  const walk = (n: PartNodeLike): AssemblyTreeNode | null => {
+    const bodies: number[] = [];
+    for (const b of n.bodies ?? []) {
+      const d = entityToDense.get(b.id);
+      if (d !== undefined && !bodies.includes(d)) bodies.push(d);
+    }
+    const children: AssemblyTreeNode[] = [];
+    for (const c of n.children ?? []) {
+      const t = walk(c);
+      if (t) children.push(t);
+    }
+    if (bodies.length === 0 && children.length === 0) return null;
+    return { name: (n.name || "").trim(), occurrences: n.occurrences ?? 1, bodies, children };
+  };
+  const tree = walk(root);
+  if (!tree) return null;
+  const seen = new Set<number>();
+  const collect = (n: AssemblyTreeNode) => {
+    for (const d of n.bodies) seen.add(d);
+    for (const c of n.children) collect(c);
+  };
+  collect(tree);
+  for (let d = 0; d < denseCount; d++) if (!seen.has(d)) tree.bodies.push(d);
+  return tree;
+}
+
+/** Solid ENTITY id → component name from the STEP product structure. CAD
+ *  exports (Fusion etc.) name the PART meaningfully ("tension_knob") but its
+ *  bodies generically ("Body1"), so a generic body name defers to the owning
+ *  part's name; a part with several real bodies keeps "part · body". */
+function collectSolidNames(root: PartNodeLike | undefined): Map<number, string> {
+  const out = new Map<number, string>();
+  const generic = /^body\s*\d*$/i;
+  const walk = (node: PartNodeLike) => {
+    const nodeName = (node.name || "").trim();
+    const bodies = node.bodies ?? [];
+    for (const b of bodies) {
+      const bodyName = (b.name || "").trim();
+      let name: string;
+      if (!bodyName || (generic.test(bodyName) && nodeName)) {
+        name = bodies.length > 1 && bodyName ? `${nodeName} · ${bodyName}` : nodeName || bodyName;
+      } else {
+        name = bodyName;
+      }
+      if (name && !out.has(b.id)) out.set(b.id, name);
+    }
+    for (const c of node.children ?? []) walk(c);
+  };
+  if (root) walk(root);
+  return out;
+}
 
 /** Densify sparse STEP entity record numbers into 0..n-1 indices. The engine
  *  sizes patch arrays as max-id+1 (`cad_segmentation`), so raw entity numbers
@@ -140,38 +212,22 @@ self.onmessage = async (ev: MessageEvent<StepImportRequest>) => {
     // triangles belong to DIFFERENT CAD faces, taken from meshStep's
     // original welded mesh — it is conforming, so adjacency is exact. The
     // engine's display refinement is non-conforming (T-junctions), which is
-    // why the overlay must NOT be derived from the working mesh.
+    // why the overlay must NOT be derived from the working mesh. Shared with
+    // the assembly active-set rebuild (filtered model) in the store.
     const positions = new Float32Array(r.mesh.positions); // f64 mm → f32 for GPU/wasm
-    const featureEdges = (() => {
-      const idx = r.mesh.indices;
-      const fot = r.faceOfTri;
-      // key = minV·2^26 + maxV — safe for meshes up to 67M welded vertices.
-      const edges = new Map<number, { va: number; vb: number; face: number; border: boolean }>();
-      for (let t = 0; t < fot.length; t++) {
-        for (let e = 0; e < 3; e++) {
-          const va = idx[3 * t + e];
-          const vb = idx[3 * t + ((e + 1) % 3)];
-          if (va === vb) continue;
-          const key = Math.min(va, vb) * 67108864 + Math.max(va, vb);
-          const ent = edges.get(key);
-          if (!ent) edges.set(key, { va, vb, face: fot[t], border: false });
-          else if (fot[t] !== ent.face) ent.border = true;
-        }
-      }
-      const segs: number[] = [];
-      for (const ent of edges.values()) {
-        if (!ent.border) continue;
-        segs.push(
-          positions[3 * ent.va],
-          positions[3 * ent.va + 1],
-          positions[3 * ent.va + 2],
-          positions[3 * ent.vb],
-          positions[3 * ent.vb + 1],
-          positions[3 * ent.vb + 2]
-        );
-      }
-      return Float32Array.from(segs);
-    })();
+    const { segments: featureEdges, segFace: featureEdgeFaces } = computeFeatureEdges(
+      positions,
+      r.mesh.indices,
+      face.dense
+    );
+    // Component names for the assembly list, per dense solid id.
+    const structRoot = (r as unknown as { structure?: PartNodeLike }).structure;
+    const nameByEntity = collectSolidNames(structRoot);
+    const solidNames = Array.from(solid.table, (entity) => nameByEntity.get(entity) ?? null);
+    // Assembly hierarchy (dense solid ids) for the component list.
+    const entityToDense = new Map<number, number>();
+    solid.table.forEach((entity, d) => entityToDense.set(entity, d));
+    const structure = toDenseTree(structRoot, entityToDense, solid.table.length);
     const payload: StepMeshPayload = {
       positions,
       indices: r.mesh.indices,
@@ -180,10 +236,13 @@ self.onmessage = async (ev: MessageEvent<StepImportRequest>) => {
       faceEntityIds: face.table,
       solidEntityIds: solid.table,
       openSolids,
+      solidNames,
+      structure,
       faces,
       palette,
       faceColorIdx,
       featureEdges,
+      featureEdgeFaces,
       diagnostics: r.diagnostics,
       stats: r.stats,
       units: r.units,
@@ -199,6 +258,7 @@ self.onmessage = async (ev: MessageEvent<StepImportRequest>) => {
       payload.faceEntityIds.buffer,
       payload.solidEntityIds.buffer,
       payload.featureEdges.buffer,
+      payload.featureEdgeFaces.buffer,
     ]);
   } catch (e) {
     post({ id, ok: false, error: e instanceof Error ? e.message : String(e) });

@@ -370,6 +370,12 @@ export function ViewportChips() {
                   </option>
                 ))}
               </optgroup>
+              {/* Not a contour: per-support resultant arrows + a table in the
+                  legend; entering it shows the part undeformed (exaggeration
+                  0, still editable). */}
+              <optgroup label="Reactions">
+                <option value="reaction">Reaction forces (supports)</option>
+              </optgroup>
             </select>
           )}
         </div>

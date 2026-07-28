@@ -9,7 +9,7 @@ is just serving `web/dist`. Two targets deploy from `master` on every push:
 | Target            | Workflow                                   | URL                                            | Base path             |
 | ----------------- | ------------------------------------------ | ---------------------------------------------- | --------------------- |
 | Cloudflare Worker | `.github/workflows/deploy-cloudflare.yml`  | https://infeall.com                            | `/`                   |
-| GitHub Pages      | `.github/workflows/deploy.yml`             | https://cnckitchen.github.io/smartInfillGenerator | `/smartInfillGenerator/` |
+| GitHub Pages      | `.github/workflows/deploy.yml`             | https://cnckitchen.github.io/filaSim           | `/filaSim/`           |
 
 The two builds differ only by Vite `base` (root domain vs. project sub-path), so
 they cannot share one artifact. Drop `deploy.yml` if GitHub Pages is no longer

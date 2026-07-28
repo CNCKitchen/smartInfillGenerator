@@ -27,7 +27,7 @@
 //! store adapts it through the narrow `FieldSink` and stays the only writer.
 
 import { engine } from "./EngineClient";
-import type { SectionVolume } from "./EngineProtocol";
+import type { ReactionForce, SectionVolume } from "./EngineProtocol";
 import type { EngineSession } from "./EngineSession";
 
 /** Sentinel `loadStepId` for the envelope pseudo-step (DESIGN §13): the worst
@@ -101,6 +101,10 @@ export interface FieldSink {
   /** `sceneEvents.onSectionVolume` — volumetric payload for the capped
    *  section (null = no volume for this display: envelope/peel/off). */
   sectionVolume(data: SectionVolume | null): void;
+  /** Per-support reactions of the "reaction" result view, in `setBcs` push
+   *  order (`null` entries are loads) — the store maps them back to its `Bc`
+   *  roster. Null clears the view (any other field is active). */
+  reactionForces(list: (ReactionForce | null)[] | null): void;
   /** Optional log line (interior-extreme advisories). */
   log?(msg: string): void;
 }
@@ -178,6 +182,25 @@ export class FieldServer {
       return;
     }
     const kind = s.resultField;
+    // Reaction forces: not a contour — per-support resultant arrows + a table.
+    // The part stays neutral (support faces tinted scene-side), so every
+    // scalar/peel/section payload is cleared and only the reaction list flows.
+    if (kind === "reaction") {
+      sink.peelMap(null, null, 0);
+      sink.scalarField(null);
+      sink.sectionVolume(null);
+      let list: (ReactionForce | null)[];
+      try {
+        list = await engine.reactionForces();
+      } catch {
+        list = []; // no matching analysis solution (e.g. build-sim result)
+      }
+      if (!sameField(kind)(read())) return;
+      sink.reactionForces(list);
+      return;
+    }
+    // Any other field: drop a previous reaction view's arrows/table.
+    sink.reactionForces(null);
     // Displacement fields are colored client-side from the displacement buffer:
     // |u| magnitude (-1) or a signed X/Y/Z component (0/1/2). No engine fetch.
     // Build-sim bed-peel: shown as a flat heatmap lying ON the plate (visible
@@ -308,6 +331,13 @@ export class FieldServer {
     // engine solution to slice, so the section cap falls back to its plain cut
     // color.
     sink.sectionVolume(null);
+    // Reactions belong to ONE solved step; an envelope has none — clear the
+    // view (and show nothing rather than the last-activated step's reactions).
+    sink.reactionForces(null);
+    if (field === "reaction") {
+      sink.scalarField(null);
+      return;
+    }
     const values = await this.computeEnvelopeField(read, kind, field);
     // Bail if the user moved on (switched result or field) during the reduction.
     if (!sameEnvelope(kind, field)(read())) return;

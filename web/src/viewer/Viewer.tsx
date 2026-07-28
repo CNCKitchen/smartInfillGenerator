@@ -14,6 +14,7 @@ import {
   convertToCanonical,
   type QuantityKind,
 } from "../units";
+import { KIND_DOT } from "../ui/bcmeta";
 
 function union(a: Uint32Array, b: Uint32Array): Uint32Array {
   const s = new Set<number>(a as unknown as number[]);
@@ -111,6 +112,9 @@ export function Viewer() {
     sceneEvents.onSmoothShading = (on) => scene.setSmoothShading(on);
     sceneEvents.onFeatureEdges = (on) => scene.setFeatureEdges(on);
     sceneEvents.onCadColors = (c) => scene.setCadColors(c);
+    sceneEvents.onBodyHighlight = (tris) => scene.setBodyHighlight(tris);
+    sceneEvents.onHiddenBodies = (tris) => scene.setHiddenBodyTris(tris);
+    sceneEvents.onBodyGhost = (p) => scene.setBodyGhost(p);
     sceneEvents.onCadEdges = (seg, faceIds) => scene.setFeatureEdgeSegments(seg, faceIds);
     sceneEvents.onOriginalMesh = (p) => scene.setOriginalMesh(p);
     sceneEvents.onEdgeAngle = (deg) => scene.setEdgeAngle(deg);
@@ -124,6 +128,7 @@ export function Viewer() {
     sceneEvents.onScalarField = (v, flip, signed, range) =>
       scene.setScalarField(v, flip ?? false, signed ?? false, range ?? null);
     sceneEvents.onSectionVolume = (data) => scene.setSectionVolume(data);
+    sceneEvents.onReactionForces = (items) => scene.setReactionForces(items);
     sceneEvents.onDispComponent = (comp) => scene.setDispComponent(comp);
     sceneEvents.onVoxelResult = (p, d, e, ed) => scene.setVoxelResult(p, d, e, ed);
     sceneEvents.onResultSurface = (s) => scene.setResultSurface(s);
@@ -171,7 +176,7 @@ export function Viewer() {
     const scene = sceneRef.current;
     if (!scene) return;
     let fmt: ((v: number) => string) | null = null;
-    if (viewMode === "deformed") {
+    if (viewMode === "deformed" && resultField !== "reaction") {
       const isDisp =
         resultField === "u" || resultField === "ux" || resultField === "uy" || resultField === "uz";
       if (isDisp) {
@@ -393,6 +398,7 @@ function Legend() {
   const setMaterialStress = useStore((s) => s.setMaterialStress);
   const results = useStore((s) => s.results);
   const activeResultId = useStore((s) => s.activeResultId);
+  const reactionForces = useStore((s) => s.reactionForces);
   // Re-render the legend (labels + bounds) whenever the unit selection changes.
   useStore((s) => s.unitRev);
 
@@ -409,6 +415,80 @@ function Legend() {
       !!activeEntry && results.filter((r) => r.kind === activeEntry.kind).length > 1;
     const total = autoScale * deformScale;
     const totalLabel = total >= 9.5 ? `×${Math.round(total)}` : `×${total.toFixed(1)}`;
+    const exaggerationLine = (
+      <div className="legendnote">
+        exaggerated{" "}
+        <EditableBound
+          value={total}
+          display={totalLabel}
+          hint="total ×, 0 = undeformed"
+          kind={null}
+          onCommit={(v) =>
+            setDeformScale(Math.min(10, Math.max(0, v / Math.max(autoScale, 1e-9))))
+          }
+        />
+        {deformScale === 0 ? " (undeformed)" : ""}
+      </div>
+    );
+    // Reaction forces: no contour — a per-support table (|F| + components,
+    // |M| + components) replaces the gradient bar. Arrows carry the picture.
+    if (resultField === "reaction") {
+      const num = (v: number, kind: QuantityKind) => {
+        const d = convertFromCanonical(v, kind);
+        return Math.abs(d) >= 100 ? d.toFixed(0) : Number(d.toPrecision(3)).toString();
+      };
+      return (
+        <div className="legend legendreaction">
+          <div className="legendtitle">Reaction forces</div>
+          {(!reactionForces || reactionForces.length === 0) && (
+            <div className="legendnote">
+              no support reactions — this result has no solved analysis step on the current mesh
+            </div>
+          )}
+          {reactionForces?.map((r) => (
+            <div className="reactionrow" key={r.bcId}>
+              <div className="reactionname">
+                <span className="reactiondot" style={{ background: KIND_DOT[r.kind] }} />
+                {r.name}
+              </div>
+              <table className="reactiontable">
+                <thead>
+                  <tr>
+                    <th></th>
+                    <th>total</th>
+                    <th>X</th>
+                    <th>Y</th>
+                    <th>Z</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>F ({unitLabel("force")})</td>
+                    <td>{num(Math.hypot(...r.force), "force")}</td>
+                    <td>{num(r.force[0], "force")}</td>
+                    <td>{num(r.force[1], "force")}</td>
+                    <td>{num(r.force[2], "force")}</td>
+                  </tr>
+                  <tr>
+                    <td>M ({unitLabel("moment")})</td>
+                    <td>{num(Math.hypot(...r.moment), "moment")}</td>
+                    <td>{num(r.moment[0], "moment")}</td>
+                    <td>{num(r.moment[1], "moment")}</td>
+                    <td>{num(r.moment[2], "moment")}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          ))}
+          {reactionForces && reactionForces.length > 0 && (
+            <div className="legendnote">
+              force each support exerts on the part · moment about the support centroid
+            </div>
+          )}
+          {exaggerationLine}
+        </div>
+      );
+    }
     const def = RESULT_FIELDS.find((f) => f.value === resultField);
     const isDispComp = resultField === "ux" || resultField === "uy" || resultField === "uz";
     // Build-sim bed-peel reaction fields (engine-fetched, in newtons) — not in
@@ -541,19 +621,7 @@ function Legend() {
         {isDispComp && (
           <div className="legendnote">signed component — red = +, blue = −</div>
         )}
-        <div className="legendnote">
-          exaggerated{" "}
-          <EditableBound
-            value={total}
-            display={totalLabel}
-            hint="total ×, 0 = undeformed"
-            kind={null}
-            onCommit={(v) =>
-              setDeformScale(Math.min(10, Math.max(0, v / Math.max(autoScale, 1e-9))))
-            }
-          />
-          {deformScale === 0 ? " (undeformed)" : ""}
-        </div>
+        {exaggerationLine}
         <CalloutHelp />
       </div>
     );

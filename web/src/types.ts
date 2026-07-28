@@ -112,6 +112,16 @@ export interface Bc {
   /** Mass coupling (mass only); default "deformable" (load-only). "rigid"
    *  (stiffens the mounting face) is a later milestone — schema-ready now. */
   behavior?: "deformable" | "rigid";
+  // --- Assembly component list (multi-body models): a BC whose selection sat
+  //     entirely on a body that got DEACTIVATED is kept but dormant. ---
+  /** True while the selection's body is deactivated: `tris` is empty, the BC
+   *  is skipped by the solver push, and `origTris` remembers the selection.
+   *  Cleared (and tris restored) when the body comes back. */
+  bodyOff?: boolean;
+  /** The dormant selection in SOURCE-mesh triangle ids (stable across the
+   *  active-set reloads, unlike display-tri indices). Session-only — stripped
+   *  from project saves. */
+  origTris?: Uint32Array;
 }
 
 /** Per-load-step override of a single BC (see DESIGN §13). Absent fields
@@ -315,7 +325,7 @@ export type ResolutionKey = keyof typeof RESOLUTIONS;
 export interface ResultFieldDef {
   value: string;
   label: string;
-  unit: "mm" | "MPa" | "";
+  unit: "mm" | "MPa" | "N" | "";
 }
 
 export const RESULT_FIELDS: ResultFieldDef[] = [
@@ -348,4 +358,22 @@ export const RESULT_FIELDS: ResultFieldDef[] = [
   { value: "gxy", label: "Shear γxy", unit: "" },
   { value: "gyz", label: "Shear γyz", unit: "" },
   { value: "gzx", label: "Shear γzx", unit: "" },
+  // Not a contour: per-support resultant arrows + a table (see FieldServer's
+  // "reaction" branch). Entering it drops the deformation exaggeration to 0.
+  { value: "reaction", label: "Reaction forces", unit: "N" },
 ];
+
+/** One support's reaction resultant, mapped back to its `Bc` for display:
+ *  arrows + callouts in the viewport, the table in the legend. Force is the
+ *  force the support exerts ON the part (Σ over supports balances the loads);
+ *  moment is about `centroid` (N·mm). */
+export interface ReactionDisplay {
+  bcId: string;
+  name: string;
+  kind: BcKind;
+  /** The support's triangle selection (face tint + arrow anchoring). */
+  tris: Uint32Array;
+  force: [number, number, number];
+  moment: [number, number, number];
+  centroid: [number, number, number];
+}

@@ -152,6 +152,13 @@ pub struct Assembled {
     pub problem: NodeProblem,
     /// Nodes attached to each BC, in input order (for visualization/debug).
     pub bc_nodes: Vec<Vec<u32>>,
+    /// Range into `problem.springs` contributed by each BC, in input order —
+    /// lets reaction recovery attribute a penalty spring back to its support.
+    pub bc_springs: Vec<std::ops::Range<usize>>,
+    /// Range into `problem.forces` contributed by each BC, in input order.
+    /// Body-load (self-weight) forces are appended after all BCs and belong to
+    /// none of these ranges.
+    pub bc_forces: Vec<std::ops::Range<usize>>,
     /// Per-BC constraint directions contributed to the rigid-body check.
     constraints: Vec<ConstraintDir>,
     load_nodes: Vec<u32>,
@@ -186,6 +193,8 @@ pub fn assemble(
 
     let mut problem = NodeProblem::default();
     let mut bc_nodes: Vec<Vec<u32>> = Vec::with_capacity(bcs.len());
+    let mut bc_springs: Vec<std::ops::Range<usize>> = Vec::with_capacity(bcs.len());
+    let mut bc_forces: Vec<std::ops::Range<usize>> = Vec::with_capacity(bcs.len());
     let mut constraints: Vec<ConstraintDir> = Vec::new();
     let mut load_nodes: Vec<u32> = Vec::new();
 
@@ -198,6 +207,7 @@ pub fn assemble(
         // margin). The sub-mesh/BVH are reused below for per-node normals.
         let (nodes, sub_mesh, sub_bvh) =
             attach_selection(mesh, grid, &boundary, bi, &sel, attach_d2, &node_pos)?;
+        let (s0, f0) = (problem.springs.len(), problem.forces.len());
 
         match &bc.kind {
             BcKind::Fixed => {
@@ -404,6 +414,8 @@ pub fn assemble(
             }
         }
         bc_nodes.push(nodes);
+        bc_springs.push(s0..problem.springs.len());
+        bc_forces.push(f0..problem.forces.len());
     }
 
     // Self-weight: inertial body force per cell, lumped to its 8 nodes and
@@ -455,7 +467,7 @@ pub fn assemble(
         }
     }
 
-    Ok(Assembled { problem, bc_nodes, constraints, load_nodes })
+    Ok(Assembled { problem, bc_nodes, bc_springs, bc_forces, constraints, load_nodes })
 }
 
 /// Boundary nodes attached to one triangle selection: build a mini-BVH over just

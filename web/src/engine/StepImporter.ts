@@ -27,6 +27,20 @@ export interface StepImportRequest {
   opts?: StepTessOpts;
 }
 
+/** STEP product-structure tree over the DENSE solid ids — the assembly
+ *  hierarchy behind the component list. Nodes whose subtree contains no
+ *  meshed solid are pruned; solids the product graph doesn't reach land on
+ *  the root. A part placed N times in the assembly is ONE node with
+ *  `occurrences: N` — its solids' triangles cover every copy, so hiding or
+ *  highlighting a body always affects all its instances together. */
+export interface AssemblyTreeNode {
+  name: string;
+  occurrences: number;
+  /** DENSE solid ids whose geometry lives directly in this node. */
+  bodies: number[];
+  children: AssemblyTreeNode[];
+}
+
 /** The converted mesh, engine- and persistence-ready. `faceOfTri`/
  *  `solidOfTri` are DENSE indices (what the wasm boundary needs);
  *  `faceEntityIds`/`solidEntityIds` map them back to the STEP file's own
@@ -42,6 +56,13 @@ export interface StepMeshPayload {
   /** Dense solid indices of open-by-design (OPEN_SHELL) bodies. Any entry ⇒
    *  the winding-number voxelization cannot be trusted — hard warning. */
   openSolids: number[];
+  /** Component name per DENSE solid id, from the STEP product structure
+   *  (body name, falling back to the owning part's name); null = unnamed.
+   *  Drives the assembly component list. */
+  solidNames: (string | null)[];
+  /** Assembly hierarchy over the dense solid ids (see AssemblyTreeNode);
+   *  null when the file has no product structure worth showing. */
+  structure: AssemblyTreeNode | null;
   /** Per-face metadata (surface class, analytic identity, area, normal),
    *  dense-indexed like `faceEntityIds`; null when assembly instances carry
    *  placements (part-local geometry would be ambiguous in world space) —
@@ -58,6 +79,9 @@ export interface StepMeshPayload {
    *  engine's display refinement is non-conforming (T-junctions), so edges
    *  must come from HERE, never be re-derived from the working mesh. */
   featureEdges: Float32Array;
+  /** Dense CAD face id per feature-edge segment (see computeFeatureEdges) —
+   *  filters the overlay per body for the deferred-suppression preview. */
+  featureEdgeFaces: Uint32Array;
   diagnostics: ImportDiagnostics;
   stats: MeshResult["stats"];
   /** Display-only unit label from the file; coordinates are always mm. */

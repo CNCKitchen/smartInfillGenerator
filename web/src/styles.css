@@ -887,6 +887,97 @@ button.linkbtn {
 
 /* boundary-condition rows */
 
+/* Assembly component list (multi-body models, Model step) */
+.bodylist {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 220px;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  background: var(--panel);
+  padding: 3px;
+}
+
+.bodyrow {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 3px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+  min-width: 0;
+}
+
+.bodyrow:hover {
+  background: rgba(255, 178, 36, 0.18);
+}
+
+.bodyrow.off .bodyname {
+  opacity: 0.45;
+  text-decoration: line-through;
+}
+
+.bodyrow input[type="checkbox"] {
+  flex: none;
+}
+
+.bodyname {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.bodyopen {
+  flex: none;
+  color: #c07a0a;
+}
+
+/* Hierarchy groups (STEP subassemblies) */
+.bodygroup {
+  font-weight: 600;
+}
+
+.bodygroup .bodyname {
+  cursor: pointer;
+}
+
+.bodycaret {
+  flex: none;
+  width: 16px;
+  padding: 0;
+  margin: 0;
+  border: none;
+  background: none;
+  color: var(--dim);
+  font-size: 10px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.bodymult {
+  flex: none;
+  font-size: 10px;
+  font-family: var(--mono);
+  color: var(--dim);
+  border: 1px solid rgba(107, 114, 128, 0.4);
+  border-radius: 3px;
+  padding: 0 3px;
+}
+
+.bodypending {
+  color: #c07a0a;
+}
+
+.bodytris {
+  margin-left: auto;
+  flex: none;
+  font-size: 11px;
+  font-family: var(--mono);
+}
+
 .bc {
   border: 1px solid var(--line);
   border-radius: var(--r);
@@ -907,6 +998,16 @@ button.linkbtn {
   display: flex;
   align-items: center;
   gap: 7px;
+}
+
+/* fold caret — only the active condition shows its editor, the rest collapse
+   to their header line so a long support/load list stays short */
+.bccaret {
+  flex: none;
+  width: 10px;
+  font-size: 9px;
+  line-height: 1;
+  color: var(--dim);
 }
 
 .bcname {
@@ -1697,6 +1798,64 @@ button.linkbtn {
 .legend .legendreset,
 .legend .legendcheck {
   pointer-events: auto;
+}
+
+/* Reaction-forces legend: per-support table instead of a gradient bar. Wider
+   than the gradient legend, so it starts below the viewport-chips row instead
+   of sliding under it. */
+.legendreaction {
+  top: 52px;
+  max-height: calc(60vh - 42px);
+  overflow-y: auto;
+  pointer-events: auto;
+}
+
+.reactionrow {
+  margin: 4px 0 6px;
+}
+
+.reactionname {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--ink);
+  margin-bottom: 2px;
+}
+
+.reactiondot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+}
+
+.reactiontable {
+  border-collapse: collapse;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--ink);
+}
+
+.reactiontable th {
+  font-weight: 400;
+  color: var(--dim);
+  text-align: right;
+  padding: 0 0 1px 8px;
+}
+
+.reactiontable td {
+  text-align: right;
+  padding: 0 0 0 8px;
+  white-space: nowrap;
+}
+
+.reactiontable td:first-child,
+.reactiontable th:first-child {
+  text-align: left;
+  padding-left: 0;
+  color: var(--dim);
 }
 
 .legendcheck {

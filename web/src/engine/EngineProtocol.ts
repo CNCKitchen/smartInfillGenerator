@@ -74,6 +74,9 @@ export interface EngineRequests {
   useCadFaces: Empty;
   /** Original (pre-refinement, pose-followed) soup — viewport edge source. */
   originalPositions: Empty;
+  /** ORIGINAL tri index per working-mesh tri (display-refinement parents,
+   *  identity when unrefined) — the assembly display→source identity. */
+  refinementParents: Empty;
   setMaterial: { e0: number; nu: number; density: number; strength: number; strengthZ: number; shearStrengthZ?: number };
   setResolution: { cells: number };
   setVoxelSize: { h: number };
@@ -156,6 +159,8 @@ export interface EngineRequests {
   settingsSweep: { opts: SettingsSweepOptions };
   /** Criterion SF of the LIVE result (read-only — no solve, no invalidation). */
   criterionSf: { measure: "material" | "layer" | "both" };
+  /** Support reactions of the live analysis solution (read-only). */
+  reactionForces: Empty;
 }
 
 export type Op = keyof EngineRequests;
@@ -209,6 +214,7 @@ export interface EngineResponses {
   resegment: PatchUpdate;
   useCadFaces: PatchUpdate;
   originalPositions: Float32Array;
+  refinementParents: Uint32Array;
   setMaterial: void;
   setResolution: void;
   setVoxelSize: void;
@@ -278,6 +284,21 @@ export interface EngineResponses {
   setLayerShear: void;
   settingsSweep: SettingsSweepResult;
   criterionSf: CriterionSfResult;
+  reactionForces: (ReactionForce | null)[];
+}
+
+/** One support's reaction (`reactionForces`), in `setBcs` push order — `null`
+ *  entries are loads. Sign convention: the force the support exerts ON the
+ *  part, so summed over all supports it balances the applied loads. */
+export interface ReactionForce {
+  /** Resultant force (N). */
+  force: [number, number, number];
+  /** Resultant moment about `centroid` (N·mm). */
+  moment: [number, number, number];
+  /** Mean attached-node position (mm) — the arrow anchor. */
+  centroid: [number, number, number];
+  /** Attached node count (diagnostic). */
+  nodes: number;
 }
 
 /** Orientation-sweep result: two n×n grids of min layer-adhesion SF (pitch

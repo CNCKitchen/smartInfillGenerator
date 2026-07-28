@@ -5,7 +5,7 @@ import { useEffect, useRef, useState } from "react";
 import { useShallow } from "zustand/shallow";
 import { useStore } from "../store";
 
-const GITHUB_URL = "https://github.com/CNCKitchen/smartInfillGenerator";
+const GITHUB_URL = "https://github.com/CNCKitchen/filaSim";
 
 export function TopBar() {
   const s = useStore(

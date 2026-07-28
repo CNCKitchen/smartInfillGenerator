@@ -7,7 +7,7 @@
 
 import { useStore } from "../store";
 
-const GITHUB_URL = "https://github.com/CNCKitchen/smartInfillGenerator";
+const GITHUB_URL = "https://github.com/CNCKitchen/filaSim";
 
 export function Disclaimer() {
   const open = useStore((s) => s.disclaimerOpen);
@@ -51,7 +51,7 @@ export function Disclaimer() {
             Everything runs locally in your browser — your models never leave your machine. The
             code is fully open source (AGPL-3.0):{" "}
             <a href={GITHUB_URL} target="_blank" rel="noopener noreferrer">
-              github.com/CNCKitchen/smartInfillGenerator
+              github.com/CNCKitchen/filaSim
             </a>
           </li>
         </ul>

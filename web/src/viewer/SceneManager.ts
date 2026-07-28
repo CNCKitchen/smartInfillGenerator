@@ -11,7 +11,7 @@
 
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
-import type { Bc, LoadedModel } from "../types";
+import type { Bc, LoadedModel, ReactionDisplay } from "../types";
 import type { Tool, ViewMode } from "../store";
 import { ramp } from "./colormaps";
 import type { OptRegion } from "../engine/EngineClient";
@@ -130,6 +130,12 @@ export class SceneManager {
   /** Triangle-mesh wireframe overlay (inspect the input mesh) + its toggle. */
   private wireframeOn = false;
   private wireframeLines: THREE.LineSegments | null = null;
+  /** Display tris of components suppressed but not yet applied (the engine
+   *  rebuild is deferred to leaving the Model step) — collapsed to zero area
+   *  so they neither render nor raycast. Cleared by the next setModel. */
+  private hiddenBodyTris: Uint32Array | null = null;
+  /** Hover ghost of a suppressed component (translucent amber overlay). */
+  private bodyGhost: THREE.Mesh | null = null;
   // ---- meshstep-viewer parity (DESIGN §18 M4 / viewport) ----
   /** Camera-following key light — orbiting never leaves the part unlit. */
   private headlight: THREE.DirectionalLight | null = null;
@@ -196,6 +202,13 @@ export class SceneManager {
   /** Loads/fixtures belong to the structural workspace — the Build Sim
    *  workspace disables them wholesale (its physics has no applied loads). */
   private bcMarkersEnabled = true;
+
+  /** Reaction-force arrows (deformed view, "reaction" result field): one
+   *  resultant arrow per support, length ∝ magnitude. Independent of
+   *  `bcMarkers` — that group is setup-view only. */
+  private reactionMarkers = new THREE.Group();
+  private reactionDisposables: { dispose(): void }[] = [];
+  private reactions: ReactionDisplay[] | null = null;
 
   // Axis gizmo (inset, bottom-right)
   private gizmoScene = new THREE.Scene();
@@ -384,6 +397,7 @@ export class SceneManager {
     this.scene.add(grid);
 
     this.scene.add(this.bcMarkers);
+    this.scene.add(this.reactionMarkers);
     this.scene.add(this.results.voxelGroup);
     this.scene.add(this.results.buildGroup);
     this.buildGizmo();
@@ -454,6 +468,7 @@ export class SceneManager {
       (this.featureEdgeLines.material as THREE.Material).dispose();
     }
     for (const d of this.pickArrowDisposables) d.dispose();
+    for (const d of this.reactionDisposables) d.dispose();
     this.sectionField.dispose();
     this.renderer?.dispose();
   }
@@ -617,7 +632,12 @@ export class SceneManager {
    *  layer normal (part frame) points up (+Z). Null restores the true pose.
    *  Purely visual — engine state, results and picking stay untouched. */
   setOrientationPreview(dir: [number, number, number] | null) {
-    const objs: THREE.Object3D[] = [this.bcMarkers, this.results.voxelGroup, this.results.buildGroup];
+    const objs: THREE.Object3D[] = [
+      this.bcMarkers,
+      this.reactionMarkers,
+      this.results.voxelGroup,
+      this.results.buildGroup,
+    ];
     if (this.mesh) objs.push(this.mesh);
     if (this.wireframeLines) objs.push(this.wireframeLines);
     if (this.featureEdgeLines) objs.push(this.featureEdgeLines);
@@ -652,6 +672,12 @@ export class SceneManager {
       this.geometry = null;
     }
     this.triCount = model.triCount;
+    this.hiddenBodyTris = null; // fresh mesh — any deferred suppression was applied
+    this.setBodyGhost(null);
+    // Reactions belong to the previous model's solution.
+    this.reactions = null;
+    this.colorMgr.setReactionMode(false);
+    this.rebuildReactionMarkers();
     this.basePositions = new Float32Array(model.positions);
     this.colors = new Float32Array(this.triCount * 9);
     this.results.displacements = null;
@@ -778,6 +804,7 @@ export class SceneManager {
     this.geometry.computeBoundingBox();
     this.geometry.computeBoundingSphere();
     this.basePositions = new Float32Array(positions);
+    this.applyHiddenBodyTris(); // deferred suppression follows the new pose
     this.partBbox = bbox;
     const [lx, ly, lz, hx, hy, hz] = bbox;
     this.bboxDiag = Math.hypot(hx - lx, hy - ly, hz - lz) || this.bboxDiag;
@@ -834,7 +861,11 @@ export class SceneManager {
 
   /** (Re)build the wireframe overlay from the current model geometry. Every
    *  triangle edge is drawn (THREE.WireframeGeometry, not EdgesGeometry) so
-   *  the actual triangulation shows, not just the silhouette creases. */
+   *  the actual triangulation shows, not just the silhouette creases.
+   *  LAZY: while the overlay is toggled off, the old lines are just dropped —
+   *  WireframeGeometry over a million-triangle mesh is far too slow to
+   *  rebuild for something invisible (it made every suppress toggle lag);
+   *  setWireframe builds it on demand. */
   private buildWireframe() {
     if (this.wireframeLines) {
       this.scene.remove(this.wireframeLines);
@@ -842,7 +873,7 @@ export class SceneManager {
       (this.wireframeLines.material as THREE.Material).dispose();
       this.wireframeLines = null;
     }
-    if (!this.geometry) return;
+    if (!this.geometry || !this.wireframeOn) return;
     const wf = new THREE.WireframeGeometry(this.geometry);
     const mat = new THREE.LineBasicMaterial({
       color: 0x334155,
@@ -1082,6 +1113,71 @@ export class SceneManager {
   setCadColors(triColors: Float32Array | null) {
     this.colorMgr.setBaseColors(triColors);
     this.colorMgr.repaint();
+  }
+
+  /** Highlight an assembly body's triangles (component-list hover); null clears. */
+  setBodyHighlight(tris: Uint32Array | null) {
+    this.colorMgr.setBodyHighlight(tris);
+  }
+
+  /** Hover ghost of a SUPPRESSED component: a world-pose soup rendered as a
+   *  translucent amber overlay (its triangles are collapsed or absent in the
+   *  display mesh, so the color repaint can't show it). Null clears. */
+  setBodyGhost(positions: Float32Array | null) {
+    if (this.bodyGhost) {
+      this.scene.remove(this.bodyGhost);
+      this.bodyGhost.geometry.dispose();
+      (this.bodyGhost.material as THREE.Material).dispose();
+      this.bodyGhost = null;
+    }
+    if (!positions || positions.length === 0) return;
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    geo.computeVertexNormals();
+    const mat = new THREE.MeshStandardMaterial({
+      color: 0xffb224, // the hover amber — same signal as the active-body tint
+      transparent: true,
+      opacity: 0.45,
+      depthWrite: false,
+      metalness: 0.05,
+      roughness: 0.72,
+      side: THREE.DoubleSide,
+    });
+    this.bodyGhost = new THREE.Mesh(geo, mat);
+    this.scene.add(this.bodyGhost);
+  }
+
+  /** Deferred component suppression (Model step): hide the given DISPLAY
+   *  triangles without an engine rebuild by collapsing them to zero area —
+   *  they neither render nor raycast. Null restores everything. */
+  setHiddenBodyTris(tris: Uint32Array | null) {
+    this.hiddenBodyTris = tris && tris.length > 0 ? tris : null;
+    this.applyHiddenBodyTris();
+    if (this.wireframeLines) this.buildWireframe();
+  }
+
+  /** Rewrite the position attribute from basePositions, collapsing every
+   *  hidden triangle onto its first vertex (zero area ⇒ invisible). */
+  private applyHiddenBodyTris() {
+    if (!this.geometry || !this.basePositions) return;
+    const attr = this.geometry.getAttribute("position") as THREE.BufferAttribute;
+    const arr = attr.array as Float32Array;
+    arr.set(this.basePositions);
+    if (this.hiddenBodyTris) {
+      for (const t of this.hiddenBodyTris) {
+        const o = 9 * t;
+        if (o + 8 >= arr.length) continue;
+        for (let v = 1; v < 3; v++) {
+          arr[o + 3 * v] = arr[o];
+          arr[o + 3 * v + 1] = arr[o + 1];
+          arr[o + 3 * v + 2] = arr[o + 2];
+        }
+      }
+    }
+    attr.needsUpdate = true;
+    // No bounds recompute: collapsing moves vertices onto other base-mesh
+    // points, so the existing bounding sphere stays valid (and recomputing
+    // it over millions of floats per toggle is exactly the lag to avoid).
   }
 
   /** Force arrows + classic support triangles (4-sided cones read as ▽). */
@@ -1590,6 +1686,74 @@ export class SceneManager {
     this.bcMarkers.visible = this.bcMarkersEnabled && this.viewMode === "setup";
     // Load value labels ride with the glyphs (setup view only).
     this.callouts.setBcCalloutsVisible(this.bcMarkers.visible);
+    // Reaction arrows belong to the deformed view's "reaction" result field.
+    const reactOn = this.viewMode === "deformed" && this.reactions !== null;
+    this.reactionMarkers.visible = reactOn;
+    this.callouts.setReactionCalloutsVisible(reactOn);
+  }
+
+  /** Reaction-forces result view: one resultant arrow per support (length ∝
+   *  magnitude, kind color, name + |F| callout) + neutral part with tinted
+   *  support faces (ColorManager reaction mode). Null clears the view. */
+  setReactionForces(items: ReactionDisplay[] | null) {
+    this.reactions = items;
+    this.colorMgr.setReactionMode(items !== null);
+    this.rebuildReactionMarkers();
+    this.refreshView();
+  }
+
+  private rebuildReactionMarkers() {
+    for (const d of this.reactionDisposables) d.dispose();
+    this.reactionDisposables = [];
+    this.reactionMarkers.clear();
+    const items = this.reactions ?? [];
+    const callouts: BcCalloutItem[] = [];
+    let maxMag = 0;
+    for (const it of items) maxMag = Math.max(maxMag, Math.hypot(...it.force));
+    for (const it of items) {
+      const anchor = new THREE.Vector3(...it.centroid);
+      const f = new THREE.Vector3(...it.force);
+      const mag = f.length();
+      const col = BC_COLORS[it.kind] ?? new THREE.Color(0x888888);
+      const label = `${it.name} · ${mag >= 9.95 ? mag.toFixed(0) : mag.toFixed(2)} N`;
+      if (mag <= 1e-9 || maxMag <= 0) {
+        // Unloaded support: no arrow, but the label still reports the 0.
+        callouts.push({ id: it.bcId, world: anchor, text: label, color: `#${col.getHexString()}`, ghost: false });
+        continue;
+      }
+      const dir = f.clone().multiplyScalar(1 / mag);
+      // Length ∝ magnitude: the largest reaction gets the standard load-arrow
+      // length, the rest scale linearly with a 30 % floor so a small reaction
+      // stays visible next to a dominant one.
+      const len = this.bboxDiag * 0.18 * Math.max(mag / maxMag, 0.3);
+      // Same construction as the load arrows (rebuildBcMarkers): a shaded
+      // shaft + cone stays readable end-on where ArrowHelper's line vanishes.
+      const mat = new THREE.MeshStandardMaterial({ color: col.clone(), roughness: 0.45, metalness: 0.05 });
+      const shaftLen = len * 0.72;
+      const shaftGeo = new THREE.CylinderGeometry(len * 0.025, len * 0.025, shaftLen, 10);
+      const headGeo = new THREE.ConeGeometry(len * 0.07, len * 0.28, 14);
+      this.reactionDisposables.push(mat, shaftGeo, headGeo);
+      const g = new THREE.Group();
+      const shaft = new THREE.Mesh(shaftGeo, mat);
+      shaft.position.y = shaftLen / 2;
+      const head = new THREE.Mesh(headGeo, mat);
+      head.position.y = shaftLen + len * 0.14;
+      g.add(shaft, head);
+      g.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir);
+      // Keep the WHOLE arrow outside the part (mirrors the load-arrow rule):
+      // pointing out of the surface → tail on the support; pointing into it →
+      // head on the support with the shaft trailing outward.
+      const n = it.tris.length ? this.selectionNormal(it.tris) : null;
+      const outward = n ? f.dot(n) >= 0 : true;
+      g.position.copy(outward ? anchor : anchor.clone().sub(dir.clone().multiplyScalar(len)));
+      this.reactionMarkers.add(g);
+      // Label at the arrow's outer (off-surface) end so it never covers the
+      // support patch.
+      const outer = anchor.clone().add(dir.clone().multiplyScalar(outward ? len : -len));
+      callouts.push({ id: it.bcId, world: outer, text: label, color: `#${col.getHexString()}`, ghost: false });
+    }
+    this.callouts.setReactionCallouts(callouts);
+    this.updateMarkerVisibility();
   }
 
   private selectionCentroid(tris: Uint32Array): THREE.Vector3 {
@@ -2868,6 +3032,8 @@ export class SceneManager {
       if (this.featureEdgeLines) this.featureEdgeLines.visible = false;
       this.bcMarkers.visible = false;
       this.callouts.setBcCalloutsVisible(false);
+      this.reactionMarkers.visible = false;
+      this.callouts.setReactionCalloutsVisible(false);
       return;
     }
     this.results.buildGroup.visible = false;

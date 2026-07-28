@@ -120,6 +120,10 @@ export class CalloutManager {
   // ---- load value labels (setup view) drawn callout-style ----
   private bcEls: { world: THREE.Vector3; dot: HTMLDivElement; chip: HTMLDivElement; line: SVGLineElement }[] = [];
   private bcVisible = true;
+  // Reaction-force labels (deformed view) — an independent set so BC-glyph
+  // rebuilds (setup view) and reaction rebuilds never clobber each other.
+  private reactionEls: { world: THREE.Vector3; dot: HTMLDivElement; chip: HTMLDivElement; line: SVGLineElement }[] = [];
+  private reactionVisible = false;
 
   constructor(private readonly host: CalloutHost) {}
 
@@ -182,6 +186,7 @@ export class CalloutManager {
     this.parent?.removeEventListener("pointerdown", this.onAnnoDownCapture, true);
     this.clearCallouts();
     this.clearBcCallouts();
+    this.clearReactionCallouts();
     this.annoSvg?.remove();
     this.annoRectEl?.remove();
     if (this.extremeEls) for (const el of Object.values(this.extremeEls)) el.remove();
@@ -415,6 +420,22 @@ export class CalloutManager {
    *  the BC set changes; `projectBcCallouts` places them every frame. */
   setBcCallouts(items: BcCalloutItem[]) {
     this.clearBcCallouts();
+    this.buildCalloutEls(items, this.bcEls);
+    this.projectBcCallouts();
+  }
+
+  /** Replace the reaction-force labels (deformed view) — same construction as
+   *  the load labels, kept in an independent set. */
+  setReactionCallouts(items: BcCalloutItem[]) {
+    this.clearReactionCallouts();
+    this.buildCalloutEls(items, this.reactionEls);
+    this.projectBcCallouts();
+  }
+
+  private buildCalloutEls(
+    items: BcCalloutItem[],
+    into: { world: THREE.Vector3; dot: HTMLDivElement; chip: HTMLDivElement; line: SVGLineElement }[]
+  ) {
     if (!this.parent || !this.annoSvg) return;
     for (const it of items) {
       const dot = document.createElement("div");
@@ -433,9 +454,8 @@ export class CalloutManager {
       }
       this.annoSvg.appendChild(line);
       this.parent.append(dot, chip);
-      this.bcEls.push({ world: it.world, dot, chip, line });
+      into.push({ world: it.world, dot, chip, line });
     }
-    this.projectBcCallouts();
   }
 
   /** Show/hide the load labels (they belong to the setup view, like the load
@@ -445,18 +465,33 @@ export class CalloutManager {
     this.projectBcCallouts();
   }
 
-  /** Project the load labels to screen pixels + place their DOM. Called every
-   *  frame from the render tick (the camera may have moved). Chip offset
-   *  below-right of the dot (matching the result extremes), leader line between. */
+  /** Show/hide the reaction labels (deformed view, reaction field active). */
+  setReactionCalloutsVisible(on: boolean) {
+    this.reactionVisible = on;
+    this.projectBcCallouts();
+  }
+
+  /** Project the load + reaction labels to screen pixels + place their DOM.
+   *  Called every frame from the render tick (the camera may have moved). Chip
+   *  offset below-right of the dot (matching the result extremes), leader line
+   *  between. */
   projectBcCallouts() {
-    if (!this.bcEls.length) return;
-    if (!this.bcVisible) {
-      for (const e of this.bcEls) e.dot.style.display = e.chip.style.display = e.line.style.display = "none";
+    this.projectCalloutList(this.bcEls, this.bcVisible);
+    this.projectCalloutList(this.reactionEls, this.reactionVisible);
+  }
+
+  private projectCalloutList(
+    els: { world: THREE.Vector3; dot: HTMLDivElement; chip: HTMLDivElement; line: SVGLineElement }[],
+    visible: boolean
+  ) {
+    if (!els.length) return;
+    if (!visible) {
+      for (const e of els) e.dot.style.display = e.chip.style.display = e.line.style.display = "none";
       return;
     }
     const { w, h } = this.host.viewSize();
     const cam = this.host.camera();
-    for (const e of this.bcEls) {
+    for (const e of els) {
       const v = this.extremeScratch.copy(e.world).project(cam);
       if (v.z < -1 || v.z > 1) {
         e.dot.style.display = e.chip.style.display = e.line.style.display = "none";
@@ -485,6 +520,15 @@ export class CalloutManager {
       e.line.remove();
     }
     this.bcEls.length = 0;
+  }
+
+  clearReactionCallouts() {
+    for (const e of this.reactionEls) {
+      e.dot.remove();
+      e.chip.remove();
+      e.line.remove();
+    }
+    this.reactionEls.length = 0;
   }
 
   // ---------- min/max markers ----------

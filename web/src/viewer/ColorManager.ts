@@ -36,6 +36,10 @@ export const BC_COLORS: Record<string, THREE.Color> = {
   mass: new THREE.Color(0x0f766e),
 };
 
+/** Support kinds — the BCs the reaction view tints (mirror of the UI's
+ *  SUPPORT_KINDS in bcmeta.ts; kept local to avoid a viewer → ui import). */
+const SUPPORT_KIND_SET = new Set(["fixed", "frictionless", "displacement", "cylindrical", "elastic"]);
+
 /** Row-center y coordinates of the two-row LUT (see makeLut): row 0 is the
  *  colormap, row 1 a flat neutral grey for MASKED samples (NaN values —
  *  e.g. cells excluded from the orientation score, DESIGN §15). Sampling at
@@ -153,6 +157,10 @@ export class ColorManager {
    *  X/Y/Z component. Only consulted on the displacement fallback (a scalar
    *  stress/strain field, when present, always takes precedence). */
   private dispComponent = -1;
+  /** Reaction-forces result view: the deformed surface stays NEUTRAL with the
+   *  support faces tinted in their kind colors (arrows/callouts carry the
+   *  data) — no contour, no displacement jet. */
+  private reactionMode = false;
   /** Last auto range reported for a displacement component — de-dupes the
    *  store writes that feed the legend. */
   private lastDispRange: { min: number; max: number } | null = null;
@@ -162,6 +170,9 @@ export class ColorManager {
    *  the flat BASE_COLOR — the STEP file's CAD face/body colors (DESIGN §18
    *  M4). BC tints and hover still paint over them. */
   private baseTriColors: Float32Array | null = null;
+  /** Assembly-body hover (component list): tint an arbitrary triangle set.
+   *  Coarser + rarer than the patch hover, so a full repaint is fine. */
+  private bodyTris: Set<number> | null = null;
   private readonly _baseCol = new THREE.Color();
   private hoverPatch: number | null = null;
   /** Set by repaint() (full color rewrite), cleared after the next render. While
@@ -169,6 +180,7 @@ export class ColorManager {
    *  pending full rewrite (three uploads partially whenever updateRanges is set). */
   private colorsDirtyFull = false;
   private _hoverCol = new THREE.Color();
+  private _bodyCol = new THREE.Color();
 
   constructor(private readonly host: ColorHost) {}
 
@@ -204,6 +216,14 @@ export class ColorManager {
   /** Install / clear the per-triangle CAD base colors (null = plain grey). */
   setBaseColors(triColors: Float32Array | null) {
     this.baseTriColors = triColors;
+  }
+
+  /** Highlight a whole assembly body (component-list hover); null clears.
+   *  Repaints in full — body hover comes from panel rows, not per-frame. */
+  setBodyHighlight(tris: ArrayLike<number> | null) {
+    if (tris === null && this.bodyTris === null) return;
+    this.bodyTris = tris === null ? null : new Set(Array.from(tris));
+    this.repaint();
   }
 
   /** Base color of a triangle (CAD color when present, else the grey). The
@@ -284,6 +304,14 @@ export class ColorManager {
     this.legendRange = { min, max };
   }
 
+  /** Enter/leave the reaction-forces coloring (see `reactionMode`). Returns
+   *  false when unchanged. */
+  setReactionMode(on: boolean): boolean {
+    if (this.reactionMode === on) return false;
+    this.reactionMode = on;
+    return true;
+  }
+
   /** Recompute the full per-triangle color buffer. */
   repaint() {
     const colors = this.host.colors();
@@ -291,7 +319,11 @@ export class ColorManager {
     if (!colors || !geometry) return;
     const triCount = this.host.triCount();
     const triColor: (THREE.Color | null)[] = new Array(triCount).fill(null);
+    // Reaction view: only the SUPPORT faces tint (loads are inputs, not
+    // reactions — their glyphs are hidden there too).
+    const supportsOnly = this.reactionMode && this.host.viewMode() === "deformed";
     for (const bc of this.host.bcs()) {
+      if (supportsOnly && !SUPPORT_KIND_SET.has(bc.kind)) continue;
       const col = BC_COLORS[bc.kind] ?? new THREE.Color(0x888888);
       const isActive = bc.id === this.host.activeBcId();
       const c = isActive ? col.clone().lerp(new THREE.Color(0xffffff), 0.25) : col;
@@ -302,6 +334,12 @@ export class ColorManager {
     const hoverSet = hover ? new Set(hover) : null;
     for (let t = 0; t < triCount; t++) {
       let c = triColor[t] ?? this.baseColorOf(t);
+      if (this.bodyTris?.has(t)) {
+        // Tint the hovered body only — everything else keeps its active color
+        // mode (CAD colors / grey) untouched. Written immediately, so the
+        // reused scratch is safe.
+        c = this._bodyCol.copy(c).lerp(HOVER_TINT, 0.7);
+      }
       if (hoverSet?.has(t)) {
         c = triColor[t] ? triColor[t]!.clone().lerp(HOVER_TINT, 0.65) : HOVER_TINT;
       }
@@ -324,6 +362,14 @@ export class ColorManager {
    *  kept current by repaint(). */
   setHover(patch: number | null) {
     if (patch === this.hoverPatch) return;
+    // With a body highlight active the partial restore below would wipe the
+    // body tint off the previously-hovered patch — repaint in full instead
+    // (rare combination: panel-row hover + viewport hover at once).
+    if (this.bodyTris) {
+      this.hoverPatch = patch;
+      this.repaint();
+      return;
+    }
     const prev = this.hoverPatch;
     this.hoverPatch = patch;
     const colors = this.host.colors();
@@ -458,6 +504,18 @@ export class ColorManager {
   private colorVoxelResult() {
     const vr = this.host.voxRes()!;
     const uvAttr = vr.geo.getAttribute("uv") as THREE.BufferAttribute;
+    if (this.reactionMode) {
+      // Reaction view on the voxel surface: neutral hull (mask-row grey — the
+      // hull has no per-BC triangle mapping to tint), arrows carry the data.
+      for (let i = 0; i * 2 < vr.uvs.length; i++) {
+        vr.uvs[2 * i] = 0.5;
+        vr.uvs[2 * i + 1] = LUT_ROW_MASK;
+      }
+      uvAttr.array.set(vr.uvs);
+      uvAttr.needsUpdate = true;
+      this.host.clearExtremes();
+      return;
+    }
     const sf = this.scalarField;
     if (sf && sf.values.length * 2 === vr.uvs.length) {
       const lo = this.legendRange.min ?? sf.min;
@@ -493,6 +551,14 @@ export class ColorManager {
       return;
     }
     const displacements = this.host.displacements();
+    if (this.host.viewMode() === "deformed" && this.reactionMode) {
+      // Reaction view: neutral part + tinted support faces (repaint filters
+      // to supports); the arrows/callouts/legend table carry the numbers.
+      this.setSurfaceMaterialMode("none");
+      this.host.clearExtremes();
+      this.repaint();
+      return;
+    }
     if (this.host.viewMode() === "deformed" && displacements) {
       const sf = this.scalarField;
       if (sf && sf.values.length * 2 === uvs.length) {

@@ -10,6 +10,17 @@ compatibility or simulation results; patch releases are fixes only.
 ## [Unreleased]
 
 ### Added
+- **Reaction forces result view**: a new "Reaction forces" entry in the results
+  field picker shows the resultant force each support exerts on the part —
+  magnitude + X/Y/Z components plus the reaction moment about the support
+  centroid in a legend table, and one arrow per support on the model (kind
+  color, length ∝ magnitude with a visibility floor, name + |F| callout,
+  support faces tinted). Fixed supports recover `R = K·u − f` exactly (same
+  matrix-free machinery as the build-sim bed reaction, TI-blend aware); penalty
+  supports (frictionless / displacement / cylindrical / elastic) report their
+  exact spring force, so Σ R balances the applied loads (unit-tested). Entering
+  the view sets the deformation exaggeration to 0 (undeformed, still editable)
+  and leaving restores the previous value.
 - **Cylindrical support**: pick a bore or shaft seat and hold it in its own
   frame — radial, tangential and axial each free or fixed. The selection is
   fitted to a cylinder (same check and CAD-exact axis as the bearing load) and
@@ -43,6 +54,14 @@ compatibility or simulation results; patch releases are fixes only.
   Interior extremes are taken over FULL cells only (occupancy ≈ 1) — boundary
   cut cells belong to the surface plot and their centers can lie outside the
   mesh.
+
+### Changed
+- Support/load rows in the Boundary-conditions step are now collapsible: only
+  the active (highlighted) condition shows its editor, the rest fold to their
+  one-line header — a part with many conditions no longer scrolls the panel.
+  Clicking a row expands it, same gesture that highlighted it before. Collapsed
+  loads show their effective (load-step-aware) value — |F|, |M|, p, |a|, mass —
+  in place of the triangle count; supports keep the selection size.
 
 ### Performance
 - **Solver: 1.5–2.5× faster with bit-identical results.** Every quality metric in
@@ -131,5 +150,5 @@ First versioned release. Everything below is the state of the project at this po
 - 3MF import and export, including colored 3MF with discrete filament bands
   for Orca/Bambu slicers.
 
-[Unreleased]: https://github.com/CNCKitchen/smartInfillGenerator/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/CNCKitchen/smartInfillGenerator/releases/tag/v0.1.0
+[Unreleased]: https://github.com/CNCKitchen/filaSim/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/CNCKitchen/filaSim/releases/tag/v0.1.0

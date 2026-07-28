@@ -161,6 +161,11 @@ self.onmessage = async (ev: MessageEvent<EngineWorkerRequest>) => {
         reply(msg, op, [op.buffer]);
         return;
       }
+      case "refinementParents": {
+        const rp = requireModel().refinement_parents();
+        reply(msg, rp, [rp.buffer]);
+        return;
+      }
       case "useCadFaces": {
         requireModel().use_cad_faces();
         const patchIds = requireModel().patch_ids();
@@ -538,6 +543,10 @@ self.onmessage = async (ev: MessageEvent<EngineWorkerRequest>) => {
       case "resultField": {
         const values = requireModel().result_field(msg.kind);
         reply(msg, values, [values.buffer]);
+        return;
+      }
+      case "reactionForces": {
+        reply(msg, JSON.parse(requireModel().reaction_forces()));
         return;
       }
       case "peelField": {
