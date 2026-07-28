@@ -1,28 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
 
-import { useEffect, useRef, useState } from "react";
 import { useShallow } from "zustand/shallow";
 import { useStore } from "../store";
 import { NumInput } from "./NumInput";
-import { UnitInput } from "./UnitInput";
-import {
-  convertFromCanonical,
-  convertToCanonical,
-  unitDef,
-  unitLabel,
-  type QuantityKind,
-} from "../units";
+import { format } from "../units";
+import { isIsotropic } from "../types";
 export function SettingsModal() {
   const s = useStore(
     useShallow((s) => ({
       settingsOpen: s.settingsOpen,
       openSettings: s.openSettings,
       materials: s.materials,
-      updateMaterial: s.updateMaterial,
-      removeMaterial: s.removeMaterial,
-      addMaterial: s.addMaterial,
-      resetMaterials: s.resetMaterials,
+      material: s.material,
+      openMaterialsManager: s.openMaterialsManager,
       curves: s.curves,
       propertySets: s.propertySets,
       activeSetId: s.activeSetId,
@@ -47,193 +38,20 @@ export function SettingsModal() {
 
         <h3>Materials</h3>
         <div className="dim small">
-          E, σₜ (in-layer tensile strength), σₜᶻ (layer adhesion — tension across the layers,
-          typically 50–80% of σₜ) and τᶻ (interlayer shear — sliding along the layer plane;
-          blank = 0.6·σₜᶻ until measured) in MPa, ρ in g/cm³. The strengths drive the
-          safety-factor plots; the worst-case factor uses whichever limit governs. Tg and CTE (optional) derive
-          the build-sim shrink from physics and enable its temperature ladder; blank = the raw
-          Shrink % path. Editing the material in use invalidates current results. Saved in this
-          browser.
+          FDM (printed) and isotropic (machined, cast, resin prints) materials live in one
+          library — every value, the process switch and the stress–strain charts are in the
+          material manager. Editing the material in use invalidates current results. Saved in
+          this browser.
         </div>
-        <table className="settingstable">
-          <thead>
-            <tr>
-              <th>Name</th>
-              <th>E ({unitLabel("modulus")})</th>
-              <th>ν</th>
-              <th>ρ ({unitLabel("density")})</th>
-              <th>σₜ ({unitLabel("stress")})</th>
-              <th>σₜᶻ ({unitLabel("stress")})</th>
-              <th title="Interlayer SHEAR strength — sliding along the layer plane (τ = √(σyz²+σzx²)); the second axis of the layer-adhesion safety factor. Blank = 0.6·σₜᶻ until a measured value is entered">τᶻ ({unitLabel("stress")})</th>
-              <th title="Build-sim yield stress — enables the elastic–perfectly-plastic step so the released warp responds to infill density (0 = pure-elastic, density-blind)">σy ({unitLabel("stress")})</th>
-              <th title="Build-sim IN-PLANE (XY) process shrink — the dominant warp driver (inherent strain). Used only when Tg/CTE are blank">Shrink % (XY)</th>
-              <th title="Build-sim THROUGH-LAYER (Z) process shrink — transverse isotropy; usually less than in-plane. Used only when Tg/CTE are blank">Shrink % (Z)</th>
-              <th title="Build-sim locking temperature in °C: Tg (amorphous) / ~Tc (semi-crystalline). With a CTE, the shrink derives from physics (CTE × lock→room) and the temperature ladder turns on; blank = raw shrink (legacy)">Tg (°C)</th>
-              <th title="Build-sim effective printed-part CTE, in-plane (XY), in ppm/°C; blank = raw shrink (legacy)">CTE (ppm/°C)</th>
-              <th title="Build-sim through-layer (Z) CTE in ppm/°C; blank = isotropic (= XY)">CTE Z (ppm/°C)</th>
-              <th />
-            </tr>
-          </thead>
-          <tbody>
-            {s.materials.map((m, i) => (
-              <tr key={i}>
-                <td>
-                  <input
-                    type="text"
-                    value={m.name}
-                    onChange={(e) => s.updateMaterial(i, { ...m, name: e.target.value })}
-                  />
-                </td>
-                <td>
-                  <UnitInput
-                    value={m.e0}
-                    kind="modulus"
-                    min={10}
-                    step={50}
-                    onCommit={(v) =>
-                      s.updateMaterial(i, { ...m, e0: Math.max(10, v) })
-                    }
-                  />
-                </td>
-                <td>
-                  <NumInput
-                    value={m.nu}
-                    min={0}
-                    max={0.49}
-                    step={0.01}
-                    onCommit={(v) =>
-                      s.updateMaterial(i, {
-                        ...m,
-                        nu: Math.min(0.49, Math.max(0, v)),
-                      })
-                    }
-                  />
-                </td>
-                <td>
-                  <UnitInput
-                    value={m.density}
-                    kind="density"
-                    min={0.1}
-                    step={0.01}
-                    onCommit={(v) =>
-                      s.updateMaterial(i, { ...m, density: Math.max(0.1, v) })
-                    }
-                  />
-                </td>
-                <td>
-                  <UnitInput
-                    value={m.strength}
-                    kind="stress"
-                    min={1}
-                    step={1}
-                    onCommit={(v) =>
-                      s.updateMaterial(i, { ...m, strength: Math.max(1, v) })
-                    }
-                  />
-                </td>
-                <td>
-                  <UnitInput
-                    value={m.strengthZ}
-                    kind="stress"
-                    min={1}
-                    step={1}
-                    onCommit={(v) =>
-                      s.updateMaterial(i, { ...m, strengthZ: Math.max(1, v) })
-                    }
-                  />
-                </td>
-                <td>
-                  <OptUnitInput
-                    value={m.shearStrengthZ}
-                    kind="stress"
-                    min={1}
-                    step={1}
-                    placeholder={autoShearLabel(m.strengthZ)}
-                    onCommit={(v) =>
-                      s.updateMaterial(i, {
-                        ...m,
-                        shearStrengthZ: v == null ? undefined : Math.max(1, v),
-                      })
-                    }
-                  />
-                </td>
-                <td>
-                  <UnitInput
-                    value={m.yieldStrength ?? 0}
-                    kind="stress"
-                    min={0}
-                    step={1}
-                    onCommit={(v) =>
-                      s.updateMaterial(i, { ...m, yieldStrength: Math.max(0, v) })
-                    }
-                  />
-                </td>
-                <td>
-                  <NumInput
-                    value={m.shrink * 100}
-                    min={0}
-                    step={0.1}
-                    onCommit={(v) =>
-                      s.updateMaterial(i, { ...m, shrink: Math.max(0, v) / 100 })
-                    }
-                  />
-                </td>
-                <td>
-                  <NumInput
-                    value={(m.shrinkZ ?? m.shrink) * 100}
-                    min={0}
-                    step={0.1}
-                    onCommit={(v) =>
-                      s.updateMaterial(i, { ...m, shrinkZ: Math.max(0, v) / 100 })
-                    }
-                  />
-                </td>
-                <td>
-                  <OptNumInput
-                    value={m.tLock}
-                    min={0}
-                    step={5}
-                    onCommit={(v) =>
-                      s.updateMaterial(i, { ...m, tLock: v == null ? undefined : Math.max(0, v) })
-                    }
-                  />
-                </td>
-                <td>
-                  <OptNumInput
-                    value={ppm(m.cte)}
-                    min={0}
-                    step={1}
-                    onCommit={(v) =>
-                      s.updateMaterial(i, { ...m, cte: v == null ? undefined : Math.max(0, v) / 1e6 })
-                    }
-                  />
-                </td>
-                <td>
-                  <OptNumInput
-                    value={ppm(m.cteZ)}
-                    min={0}
-                    step={1}
-                    onCommit={(v) =>
-                      s.updateMaterial(i, { ...m, cteZ: v == null ? undefined : Math.max(0, v) / 1e6 })
-                    }
-                  />
-                </td>
-                <td>
-                  <button
-                    className="x"
-                    disabled={s.materials.length <= 1}
-                    onClick={() => s.removeMaterial(i)}
-                  >
-                    ×
-                  </button>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-        <div className="toolrow">
-          <button onClick={() => s.addMaterial()}>+ Add material</button>
-          <button onClick={() => s.resetMaterials()}>Reset defaults</button>
+        <div className="row">
+          <button onClick={() => s.openMaterialsManager(true)}>Manage materials…</button>
+          <span className="dim small">
+            {`${s.materials.length} materials — in use: ${s.material.name} (E = ${format(s.material.e0, "modulus")}, ${
+              isIsotropic(s.material)
+                ? `σy = ${format(s.material.yieldStrength, "stress")}`
+                : `σₜ = ${format(s.material.strength, "stress")}`
+            }).`}
+          </span>
         </div>
 
         <h3>Infill properties</h3>
@@ -320,96 +138,3 @@ export function SettingsModal() {
     </div>
   );
 }
-
-/** 1/°C → ppm/°C for display, rounded so 96e-6 shows as 96, not 96.00000000000001. */
-function ppm(v: number | undefined): number | undefined {
-  return v == null ? undefined : +(v * 1e6).toFixed(3);
-}
-
-/** NumInput variant for OPTIONAL fields: an empty box means "unset" and
- *  commits `undefined` (on blur, so mid-edit clearing doesn't unset). */
-/** Placeholder for a blank τᶻ field: the derived 0.6·σₜᶻ default, in the
- *  active display unit, marked "auto" so a blank is visibly not zero. */
-function autoShearLabel(strengthZ: number): string {
-  const u = unitDef("stress");
-  return `${convertFromCanonical(0.6 * strengthZ, "stress").toFixed(u.decimals)} auto`;
-}
-
-/** OptNumInput with unit conversion on the boundary (see UnitInput): edits in
- *  the display unit, commits canonical, blank commits undefined. */
-function OptUnitInput({
-  value,
-  kind,
-  onCommit,
-  min,
-  max,
-  step,
-  ...rest
-}: {
-  value: number | undefined;
-  kind: QuantityKind;
-  onCommit: (canonical: number | undefined) => void;
-  min?: number;
-  max?: number;
-  step?: number;
-} & Omit<
-  React.InputHTMLAttributes<HTMLInputElement>,
-  "value" | "onChange" | "type" | "min" | "max" | "step"
->) {
-  const u = unitDef(kind);
-  const toDisp = (v: number | undefined) =>
-    v == null ? undefined : convertFromCanonical(v, kind);
-  const disp = value == null ? undefined : Number(convertFromCanonical(value, kind).toFixed(u.decimals));
-  return (
-    <OptNumInput
-      value={disp}
-      min={toDisp(min)}
-      max={toDisp(max)}
-      step={step != null ? convertFromCanonical(step, kind) : undefined}
-      onCommit={(v) => onCommit(v == null ? undefined : convertToCanonical(v, kind))}
-      {...rest}
-    />
-  );
-}
-
-function OptNumInput({
-  value,
-  onCommit,
-  ...rest
-}: {
-  value: number | undefined;
-  onCommit: (v: number | undefined) => void;
-} & Omit<React.InputHTMLAttributes<HTMLInputElement>, "value" | "onChange" | "type">) {
-  const [text, setText] = useState<string>(value == null ? "" : String(value));
-  const focused = useRef(false);
-  useEffect(() => {
-    if (!focused.current) setText(value == null ? "" : String(value));
-  }, [value]);
-  return (
-    <input
-      type="number"
-      value={text}
-      placeholder="—"
-      onFocus={() => {
-        focused.current = true;
-      }}
-      onChange={(e) => {
-        setText(e.target.value);
-        const n = Number(e.target.value);
-        if (e.target.value !== "" && Number.isFinite(n)) onCommit(n);
-      }}
-      onBlur={(e) => {
-        focused.current = false;
-        const raw = e.target.value.trim();
-        if (raw === "") onCommit(undefined);
-        else {
-          const n = Number(raw);
-          if (Number.isFinite(n)) onCommit(n);
-        }
-        setText(value == null ? "" : String(value));
-      }}
-      {...rest}
-    />
-  );
-}
-

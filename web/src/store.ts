@@ -61,7 +61,10 @@ import type {
 import {
   DEFAULT_CURVES,
   DEFAULT_MATERIALS,
+  isIsotropic,
+  isotropicMaterial,
   migratePattern,
+  normalizeMaterial,
   RESOLUTIONS,
   RESULT_FIELDS,
 } from "./types";
@@ -129,6 +132,11 @@ interface PersistedSettings {
   materials: Material[];
   curves: Record<PatternKey, PatternCurve>;
   levels: LevelSettings;
+  /** One-shot upgrade marker: saves written before the isotropic-materials
+   *  feature lack it, and loading such a save appends the isotropic
+   *  built-ins once. Present ⇒ the user's list is theirs (deleting every
+   *  isotropic material sticks). */
+  seededIsotropic?: boolean;
 }
 
 function loadSettings(): PersistedSettings {
@@ -147,8 +155,9 @@ function loadSettings(): PersistedSettings {
         .map((m) => {
           // Pre-strength saves: default to the PLA-ish 50 MPa.
           const strength = typeof m.strength === "number" && m.strength > 0 ? m.strength : 50;
-          return {
+          return normalizeMaterial({
             name: String(m.name),
+            process: m.process === "isotropic" ? "isotropic" : undefined,
             e0: m.e0,
             nu: m.nu,
             density: m.density,
@@ -181,9 +190,28 @@ function loadSettings(): PersistedSettings {
             tLock: typeof m.tLock === "number" ? m.tLock : undefined,
             cte: typeof m.cte === "number" && m.cte > 0 ? m.cte : undefined,
             cteZ: typeof m.cteZ === "number" && m.cteZ > 0 ? m.cteZ : undefined,
-          };
+            // Stress–strain / plasticity fields (chart-only; dormant for solves).
+            ultimateStrength:
+              typeof m.ultimateStrength === "number" && m.ultimateStrength > 0
+                ? m.ultimateStrength
+                : undefined,
+            tangentModulus:
+              typeof m.tangentModulus === "number" && m.tangentModulus > 0
+                ? m.tangentModulus
+                : undefined,
+            strainAtRupture:
+              typeof m.strainAtRupture === "number" && m.strainAtRupture > 0
+                ? m.strainAtRupture
+                : undefined,
+          });
         });
       if (!fallback.materials.length) fallback.materials = DEFAULT_MATERIALS.map((m) => ({ ...m }));
+      // Saves predating isotropic materials: append the new built-ins once.
+      if (p.seededIsotropic !== true && !fallback.materials.some((m) => isIsotropic(m))) {
+        fallback.materials.push(
+          ...DEFAULT_MATERIALS.filter((m) => isIsotropic(m)).map((m) => ({ ...m }))
+        );
+      }
     }
     // Retired patterns in a stored settings blob are ignored (DESIGN §22).
     for (const k of ["cubic"] as PatternKey[]) {
@@ -421,7 +449,10 @@ function saveSettings(
   levels: LevelSettings
 ) {
   try {
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify({ materials, curves, levels }));
+    localStorage.setItem(
+      SETTINGS_KEY,
+      JSON.stringify({ materials, curves, levels, seededIsotropic: true })
+    );
   } catch {
     // storage full/blocked: settings just won't persist
   }
@@ -586,6 +617,9 @@ interface AppState {
    *  project whose curve matches no library set — built-in ratios apply). */
   activeSetId: string | null;
   propsManagerOpen: boolean;
+  /** Material manager modal (the material-library surface — Settings keeps
+   *  only the entry button). */
+  materialsManagerOpen: boolean;
   resolution: ResolutionKey | "custom";
   /** Cell size h in mm when resolution = "custom" (0 = not yet chosen —
    *  initialized from the current grid on first selection). */
@@ -1068,9 +1102,13 @@ interface AppState {
   setStepWeight(stepId: string, weight: number): void;
   setMaterial(m: Material): void;
   updateMaterial(index: number, m: Material): void;
-  addMaterial(): void;
+  addMaterial(process?: "fdm" | "isotropic"): void;
   removeMaterial(index: number): void;
   resetMaterials(): void;
+  /** Copy a material into a new editable entry ("<name> (copy)"). */
+  duplicateMaterial(index: number): void;
+  /** Material manager modal (list + detail + stress–strain charts). */
+  openMaterialsManager(open: boolean): void;
   // ---- infill property library (DESIGN §24) ----
   openPropsManager(open: boolean): void;
   /** Switch the set driving solves — a physics edit: results go stale. */
@@ -2429,7 +2467,9 @@ async function applyActiveSet(set: SetState, get: () => AppState, mask: boolean[
     const m = get().material;
     await engine.setMaterial(m.e0, m.nu, m.density, m.strength, m.strengthZ, m.shearStrengthZ);
     await pushResolution(get);
-    await engine.setSnapWall(get().snapVoxel ? get().perimeters * get().lineWidth : 0);
+    await engine.setSnapWall(
+      get().snapVoxel && !isIsotropic(m) ? get().perimeters * get().lineWidth : 0
+    );
     await engine.setCompositeSkin(get().compositeSkin);
     await engine.setSmoothStress(get().smoothStress);
     await engine.setMaterialStress(get().materialStress);
@@ -2799,7 +2839,9 @@ async function pushResolution(get: () => AppState) {
 async function pushSnap(get: () => AppState) {
   const s = get();
   if (!s.model) return; // nothing loaded yet — loadFile pushes the snap
-  await engine.setSnapWall(s.snapVoxel ? s.perimeters * s.lineWidth : 0);
+  await engine.setSnapWall(
+    s.snapVoxel && !isIsotropic(s.material) ? s.perimeters * s.lineWidth : 0
+  );
 }
 
 /** (Re)build the Mesh-view voxel hull: full, or voxel-true cut by the
@@ -4039,6 +4081,7 @@ export const useStore = create<AppState>((set, get) => ({
   propertySets: initialLibrary.sets,
   activeSetId: initialLibrary.activeSetId,
   propsManagerOpen: false,
+  materialsManagerOpen: false,
   resolution: "preview",
   customH: 0,
   budget: 30,
@@ -4272,7 +4315,9 @@ export const useStore = create<AppState>((set, get) => ({
       // A fresh wasm Model defaults to snap off; push the current setting.
       // (Inline, not pushSnap: the store's `model` isn't set yet.)
       await engine.setSnapWall(
-        get().snapVoxel ? get().perimeters * get().lineWidth : 0
+        get().snapVoxel && !isIsotropic(get().material)
+          ? get().perimeters * get().lineWidth
+          : 0
       );
       await engine.setCompositeSkin(get().compositeSkin);
       await engine.setSmoothStress(get().smoothStress);
@@ -5110,29 +5155,47 @@ export const useStore = create<AppState>((set, get) => ({
   },
 
   setMaterial(m) {
+    m = normalizeMaterial(m);
     set({ material: m });
+    // Isotropic material ⇒ no print stack: the analyze toggle and the
+    // graded/binary optimizer modes are structurally gone, not just hidden.
+    // (FDM→FDM keeps whatever the user had; FDM can still run Part Topo.)
+    if (isIsotropic(m)) {
+      if (get().analyzeMode !== "solid") set({ analyzeMode: "solid" });
+      if (get().optMode !== "solid") get().setOptMode("solid");
+      if (get().appMode === "buildsim") get().setAppMode("optimize");
+      if (get().sfMeasure !== "material") set({ sfMeasure: "material" });
+      // The worst-case / layer SF views don't exist for isotropic — land the
+      // field picker on the pure material criterion instead.
+      const rf = get().resultField;
+      if (rf === "sf" || rf === "sfz") set({ resultField: "sfm" });
+      else if (rf === "sfx" || rf === "sfzx") set({ resultField: "sfmx" });
+    }
     markResultsStale(set, get, "material");
     void engine.setMaterial(m.e0, m.nu, m.density, m.strength, m.strengthZ, m.shearStrengthZ);
+    void engine.setSnapWall(
+      get().snapVoxel && !isIsotropic(m) ? get().perimeters * get().lineWidth : 0
+    );
   },
 
   updateMaterial(index, m) {
+    m = normalizeMaterial(m);
     const mats = get().materials.slice();
     const wasSelected = mats[index]?.name === get().material.name;
     mats[index] = m;
     set({ materials: mats });
     saveSettings(mats, get().curves, get().levelSettings);
     if (wasSelected) {
-      set({ material: m });
-      markResultsStale(set, get, "material");
-      void engine.setMaterial(m.e0, m.nu, m.density, m.strength, m.strengthZ, m.shearStrengthZ);
+      get().setMaterial(m);
     }
   },
 
-  addMaterial() {
-    const mats = [
-      ...get().materials,
-      { name: "Custom", e0: 2000, nu: 0.35, density: 1.2, strength: 40, strengthZ: 28, shrink: 0.005, shrinkZ: 0.0025, yieldStrength: 36 },
-    ];
+  addMaterial(process) {
+    const custom: Material =
+      process === "isotropic"
+        ? isotropicMaterial({ name: "Custom (isotropic)", e0: 70000, nu: 0.33, density: 2.7, yieldStrength: 100, ultimateStrength: 120, tangentModulus: 700, strainAtRupture: 0.1, cte: 23e-6 })
+        : { name: "Custom", e0: 2000, nu: 0.35, density: 1.2, strength: 40, strengthZ: 28, shrink: 0.005, shrinkZ: 0.0025, yieldStrength: 36 };
+    const mats = [...get().materials, custom];
     set({ materials: mats });
     saveSettings(mats, get().curves, get().levelSettings);
   },
@@ -5152,6 +5215,18 @@ export const useStore = create<AppState>((set, get) => ({
     saveSettings(mats, get().curves, get().levelSettings);
     const sel = mats.find((m) => m.name === get().material.name) ?? mats[0];
     get().setMaterial(sel);
+  },
+
+  duplicateMaterial(index) {
+    const src = get().materials[index];
+    if (!src) return;
+    const mats = [...get().materials, { ...src, name: `${src.name} (copy)` }];
+    set({ materials: mats });
+    saveSettings(mats, get().curves, get().levelSettings);
+  },
+
+  openMaterialsManager(open) {
+    set({ materialsManagerOpen: open });
   },
 
   openPropsManager(open) {
@@ -5391,6 +5466,8 @@ export const useStore = create<AppState>((set, get) => ({
   },
   setAppMode(m) {
     if (m === get().appMode) return;
+    // Build Sim is an FDM workspace — an isotropic part has no build to simulate.
+    if (m === "buildsim" && isIsotropic(get().material)) return;
     // Results are workspace-specific: clear the live result + deformed view so
     // Build Sim's warp can't show (or mark Analyze "done") in the other workspace.
     clearLiveResultView(set, get);
@@ -5458,6 +5535,8 @@ export const useStore = create<AppState>((set, get) => ({
     set({ buildChamberTemp: Math.min(150, Math.max(0, v)) });
   },
   setAnalyzeMode(m) {
+    // Isotropic material: there is no print stack, "solid" is the only physics.
+    if (isIsotropic(get().material) && m !== "solid") return;
     set({ analyzeMode: m });
   },
   setAnalysisType(t) {
@@ -5619,11 +5698,15 @@ export const useStore = create<AppState>((set, get) => ({
     markResultsStale(set, get, "opt");
   },
   setSfMeasure(m) {
+    // Isotropic material: layer adhesion does not exist as a failure mode.
+    if (isIsotropic(get().material) && m !== "material") return;
     set({ sfMeasure: m });
     markResultsStale(set, get, "opt");
   },
 
   setOptMode(m) {
+    // Isotropic material: graded/binary are infill modes — Part Topo only.
+    if (isIsotropic(get().material) && m !== "solid") return;
     set({ optMode: m });
     // Solid topology has no "match uniform stiffness" goal — force budget goal.
     if (m === "solid" && get().goal === "match") set({ goal: "budget" });
@@ -6858,8 +6941,10 @@ export const useStore = create<AppState>((set, get) => ({
           symmetry: st.symOn ? [...st.symNormal, st.symC] : null,
           topBottomLayers: st.topBottomLayers,
           layerHeight: st.layerHeight,
-          // Auto = 4× line width (a robustly printable smallest rib); 0 disables.
-          minMemberMm: st.minMemberMm ?? 4 * st.lineWidth,
+          // Auto = 4× line width (a robustly printable smallest rib); for an
+          // isotropic material there is no line width — a fixed 2 mm smallest
+          // machinable/printable member instead. 0 disables.
+          minMemberMm: st.minMemberMm ?? (isIsotropic(st.material) ? 2 : 4 * st.lineWidth),
         },
         (p, density, skelPositions, skelIndices, skelDensity) => {
           // Buffer-less phase push: narrate the silent pipeline stage and bail —
@@ -7377,14 +7462,19 @@ export const useStore = create<AppState>((set, get) => ({
         !!actSet &&
         actSet.curve.coeff === projCurve.coeff &&
         actSet.curve.exponent === projCurve.exponent;
+      // Isotropic material ⇒ its derived internals are re-derived from yield
+      // and the print-stack modes are structurally pinned to "solid" (the
+      // saved values could predate the pin or be hand-edited).
+      const projMat = normalizeMaterial(st.material);
+      const projIso = isIsotropic(projMat);
       set({
         fileName: mf.fileName,
         model,
         stepInfo,
         segAngle: st.segAngle,
         segSource: st.segSource,
-        material: st.material,
-        materials: st.materials,
+        material: projMat,
+        materials: st.materials.map(normalizeMaterial),
         // A project saved before §22 may name a retired pattern (gyroid /
         // grid) and carry curves for it. Both are migrated to cubic rather
         // than rejected — the geometry and BCs are still perfectly good, and
@@ -7408,7 +7498,7 @@ export const useStore = create<AppState>((set, get) => ({
         anisotropicInfill: st.anisotropicInfill ?? false,
         smoothStress: st.smoothStress,
         materialStress: st.materialStress,
-        analyzeMode: st.analyzeMode,
+        analyzeMode: projIso ? "solid" : st.analyzeMode,
         // Pre-temperature-ladder projects lack the temps (and older files may
         // carry a now-removed `buildMaterial` preset id — silently ignored;
         // the ONE Properties material drives the build sim).
@@ -7421,11 +7511,11 @@ export const useStore = create<AppState>((set, get) => ({
         goal: st.goal,
         // Additive fields (absent in files saved before the strength goal).
         sfTarget: st.sfTarget ?? 2,
-        sfMeasure: st.sfMeasure ?? "both",
+        sfMeasure: projIso ? "material" : (st.sfMeasure ?? "both"),
         // Additive (DESIGN §20; absent in files saved before the settings
         // optimizer) — the landscape itself is never saved, only its target.
         settingsSfTarget: st.settingsSfTarget ?? 2,
-        optMode: st.optMode,
+        optMode: projIso ? "solid" : st.optMode,
         retainBc: st.retainBc,
         selfSupport: st.selfSupport,
         overhangDeg: st.overhangDeg,
@@ -7465,7 +7555,7 @@ export const useStore = create<AppState>((set, get) => ({
       const m = get().material;
       await engine.setMaterial(m.e0, m.nu, m.density, m.strength, m.strengthZ, m.shearStrengthZ);
       await pushResolution(get);
-      await engine.setSnapWall(st.snapVoxel ? st.perimeters * st.lineWidth : 0);
+      await engine.setSnapWall(st.snapVoxel && !projIso ? st.perimeters * st.lineWidth : 0);
       await engine.setCompositeSkin(st.compositeSkin);
       await engine.setSmoothStress(st.smoothStress);
       // Session display setting, not part of the project manifest.

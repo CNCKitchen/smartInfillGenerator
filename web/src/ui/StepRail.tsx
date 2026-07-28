@@ -7,6 +7,7 @@
 
 import { useShallow } from "zustand/shallow";
 import { useStore } from "../store";
+import { isIsotropic } from "../types";
 import { SUPPORT_KINDS } from "./bcmeta";
 
 const OPTIMIZE_STEPS: { n: number; label: string; title: string }[] = [
@@ -36,12 +37,22 @@ export function StepRail() {
       hasResult: s.hasResult,
       optSummary: s.optSummary,
       appMode: s.appMode,
+      material: s.material,
       activeStep: s.activeStep,
       setActiveStep: s.setActiveStep,
     }))
   );
   const buildsim = s.appMode === "buildsim";
-  const STEPS = buildsim ? BUILDSIM_STEPS : OPTIMIZE_STEPS;
+  let STEPS = buildsim ? BUILDSIM_STEPS : OPTIMIZE_STEPS;
+  if (!buildsim && isIsotropic(s.material)) {
+    STEPS = STEPS.map((st) =>
+      st.n === 3
+        ? { ...st, title: "3 · Properties — material, analysis grid" }
+        : st.n === 5
+          ? { ...st, title: "5 · Optimization — part topology" }
+          : st
+    );
+  }
   const hasSupport = s.bcs.some((b) => SUPPORT_KINDS.includes(b.kind) && b.tris.length > 0);
   const hasLoad = s.bcs.some((b) => {
     if (SUPPORT_KINDS.includes(b.kind)) return false;

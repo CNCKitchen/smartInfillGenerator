@@ -10,6 +10,42 @@ compatibility or simulation results; patch releases are fixes only.
 ## [Unreleased]
 
 ### Added
+- **Material Manager**: materials get the same library surface as infill
+  properties — a modal (⚙ Settings → Materials, or the Properties step's
+  "edit" link) with a material list, a grouped detail panel and a chart band.
+  FDM and isotropic materials live in one list; a per-material process
+  selector switches the kind (FDM → isotropic seeds yield from σₜ; isotropic
+  → FDM reseeds printed-part defaults instead of leaking derived internals).
+  The old two 14/10-column Settings tables (which forced horizontal
+  scrolling) are replaced by grouped label-over-input fields. Charts, plain
+  SVG in the PropertyCharts idiom: a **stress–strain curve** (the pure
+  bilinear idealization — elastic slope E to σy, then slope Eₜ straight to
+  the rupture strain εᵣ, which ends the x-axis; yield dot, rupture ×, dashed
+  layer-adhesion level σₜᶻ for FDM, crosshair tooltip, up to 4 comparison
+  overlays; σᵤ is informational, readout only), per-row-normalized property
+  bars (E, σ, ρ, E/ρ, σ/ρ), FDM layer anisotropy bars (σₜ / σₜᶻ / τᶻ) and a
+  numeric readout table. The stress–strain fields σᵤ/Eₜ/εᵣ now apply to FDM
+  materials too (chart-only), and the FDM built-ins ship with typical
+  printed-part hardening/rupture values. New store actions `duplicateMaterial` and
+  `openMaterialsManager`.
+- **Isotropic materials** (machined metal, cast parts, resin prints): materials
+  now carry a `process` — FDM or isotropic. Built-ins added: Steel (mild,
+  S235), Aluminum 6061-T6 and Resin (SLA, standard). An isotropic material has
+  no build direction, so the entire print stack disappears rather than being
+  special-cased: no infill/pattern/walls/shells controls, no printed-vs-solid
+  toggle (always solved fully dense at E₀), no build-sim workspace, no
+  orientation sweep, no print-settings optimizer, and no slicer 3MF export.
+  The safety factor runs against **yield** (von Mises); the layer-adhesion
+  criterion structurally cannot govern (σz = σy, τz = σy/√3) and its SF views
+  are hidden. Optimization becomes classic part topology optimization (the
+  existing Part Topo mode — linear E=ρ evaluation, SIMP p=3, load/support
+  cells frozen), with the optimized-shape STL as the export; min member size
+  defaults to 2 mm instead of 4× line width. Isotropic materials also store
+  ultimate strength, tangent modulus and strain at rupture — dormant fields
+  reserved for a future plasticity model. The material editor in ⚙ Settings
+  gains a separate isotropic table; the Properties dropdown groups the two
+  families. Existing saves are upgraded in place (legacy materials default to
+  FDM; the isotropic built-ins are seeded once).
 - **Reaction forces result view**: a new "Reaction forces" entry in the results
   field picker shows the resultant force each support exerts on the part —
   magnitude + X/Y/Z components plus the reaction moment about the support

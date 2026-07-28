@@ -3076,3 +3076,40 @@ button.linkbtn {
 .readouttable tr.sel td {
   font-weight: 600;
 }
+
+/* ---------------- material manager ---------------- */
+
+/* Grouped label-over-input fields — replaces the old 14-column Settings
+   tables that forced horizontal scrolling. */
+.matfields {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px 12px;
+}
+
+.matfield {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.matfield .flabel {
+  font-size: 11px;
+  color: var(--dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.matfield input {
+  width: 100%;
+  min-width: 0;
+}
+
+.procswitch {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}

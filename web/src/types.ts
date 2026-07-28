@@ -213,8 +213,19 @@ export interface LoadedModel {
   hasCadFaces: boolean;
 }
 
+/** Manufacturing process a material models. `fdm` is a layered extrusion
+ *  print — walls, infill, layer adhesion, build direction all apply.
+ *  `isotropic` is bulk material with no build direction (machined metal,
+ *  cast parts, SLA resin prints): the entire print stack — infill, walls,
+ *  shells, build-sim, orientation — does not exist for it, and the solve
+ *  always uses the fully-dense isotropic tensor. Absent (legacy saves)
+ *  means `fdm`. */
+export type MaterialProcess = "fdm" | "isotropic";
+
 export interface Material {
   name: string;
+  /** Absent = "fdm" (every material predating the field was FDM). */
+  process?: MaterialProcess;
   e0: number; // MPa
   nu: number;
   density: number; // g/cm³
@@ -256,13 +267,90 @@ export interface Material {
   cte?: number;
   /** Build-sim: through-layer (Z) CTE in 1/°C; unset = isotropic (= cte). */
   cteZ?: number;
+  /** Ultimate tensile strength in MPa. Informational — shown in the material
+   *  manager's readout (the chart draws the pure bilinear E → σy → Eₜ line);
+   *  dormant for solves, kept for a future plasticity model. */
+  ultimateStrength?: number;
+  /** Bilinear-hardening tangent modulus in MPa (post-yield slope). Shapes
+   *  the stress–strain chart; dormant for solves until plasticity lands. */
+  tangentModulus?: number;
+  /** Engineering strain at rupture (0.12 = 12 %). Shapes the stress–strain
+   *  chart; dormant for solves until plasticity lands. */
+  strainAtRupture?: number;
+}
+
+/** True when the material has no build direction — machined/cast/SLA. The
+ *  print stack (infill, walls, shells, build-sim, orientation, slicer
+ *  export) is gated off this everywhere. */
+export function isIsotropic(m: Pick<Material, "process">): boolean {
+  return m.process === "isotropic";
+}
+
+/** Re-derive the internal strength fields of an isotropic material from its
+ *  yield strength so the unmodified dual-criterion SF engine stays honest:
+ *  σₜ = σz = σᵧ makes von Mises govern, and τz = σᵧ/√3 (the von Mises shear
+ *  limit) means the "layer adhesion" criterion can never be the limiting
+ *  one. FDM materials pass through untouched. Call after ANY material edit
+ *  or load — it is idempotent. */
+export function normalizeMaterial(m: Material): Material {
+  if (!isIsotropic(m)) return m;
+  return {
+    ...m,
+    strength: m.yieldStrength,
+    strengthZ: m.yieldStrength,
+    shearStrengthZ: m.yieldStrength / Math.sqrt(3),
+    shrink: 0,
+    shrinkZ: 0,
+    cteZ: undefined,
+  };
+}
+
+/** Constructor for built-in/new isotropic materials: the user-facing fields
+ *  in, the derived internals filled by `normalizeMaterial`. */
+export function isotropicMaterial(m: {
+  name: string;
+  e0: number;
+  nu: number;
+  density: number;
+  yieldStrength: number;
+  ultimateStrength: number;
+  tangentModulus: number;
+  strainAtRupture: number;
+  cte: number;
+}): Material {
+  return normalizeMaterial({
+    name: m.name,
+    process: "isotropic",
+    e0: m.e0,
+    nu: m.nu,
+    density: m.density,
+    strength: m.yieldStrength,
+    strengthZ: m.yieldStrength,
+    shrink: 0,
+    shrinkZ: 0,
+    yieldStrength: m.yieldStrength,
+    ultimateStrength: m.ultimateStrength,
+    tangentModulus: m.tangentModulus,
+    strainAtRupture: m.strainAtRupture,
+    cte: m.cte,
+  });
 }
 
 export const DEFAULT_MATERIALS: Material[] = [
-  { name: "PLA", e0: 3500, nu: 0.35, density: 1.24, strength: 50, strengthZ: 35, shrink: 0.004, shrinkZ: 0.002, yieldStrength: 45, tLock: 60, cte: 96e-6 },
-  { name: "PETG", e0: 2100, nu: 0.37, density: 1.27, strength: 45, strengthZ: 34, shrink: 0.004, shrinkZ: 0.002, yieldStrength: 40, tLock: 80, cte: 68e-6 },
-  { name: "ABS", e0: 2250, nu: 0.37, density: 1.05, strength: 38, strengthZ: 25, shrink: 0.008, shrinkZ: 0.004, yieldStrength: 33, tLock: 100, cte: 88e-6 },
-  { name: "ASA", e0: 2400, nu: 0.37, density: 1.07, strength: 43, strengthZ: 29, shrink: 0.006, shrinkZ: 0.003, yieldStrength: 38, tLock: 100, cte: 90e-6 },
+  // FDM: tangentModulus/strainAtRupture are chart-only (bilinear hardening
+  // σy → σₜ, rupture ε from printed-part datasheets; XY, conservative).
+  { name: "PLA", e0: 3500, nu: 0.35, density: 1.24, strength: 50, strengthZ: 35, shrink: 0.004, shrinkZ: 0.002, yieldStrength: 45, tLock: 60, cte: 96e-6, tangentModulus: 400, strainAtRupture: 0.025 },
+  { name: "PETG", e0: 2100, nu: 0.37, density: 1.27, strength: 45, strengthZ: 34, shrink: 0.004, shrinkZ: 0.002, yieldStrength: 40, tLock: 80, cte: 68e-6, tangentModulus: 120, strainAtRupture: 0.06 },
+  { name: "ABS", e0: 2250, nu: 0.37, density: 1.05, strength: 38, strengthZ: 25, shrink: 0.008, shrinkZ: 0.004, yieldStrength: 33, tLock: 100, cte: 88e-6, tangentModulus: 140, strainAtRupture: 0.05 },
+  { name: "ASA", e0: 2400, nu: 0.37, density: 1.07, strength: 43, strengthZ: 29, shrink: 0.006, shrinkZ: 0.003, yieldStrength: 38, tLock: 100, cte: 90e-6, tangentModulus: 200, strainAtRupture: 0.04 },
+  // Isotropic (no build direction): SF runs against YIELD for these — a steel
+  // bracket at 90 % of ultimate is already bent. Values: S235/A36-class mild
+  // steel, 6061-T6 datasheet, post-cured standard SLA resin. Tangent moduli
+  // are conventional bilinear-model values (≈E/100 for the metals); all
+  // plasticity fields are dormant until a plasticity model ships.
+  isotropicMaterial({ name: "Steel (mild, S235)", e0: 210000, nu: 0.30, density: 7.85, yieldStrength: 235, ultimateStrength: 360, tangentModulus: 2100, strainAtRupture: 0.24, cte: 12e-6 }),
+  isotropicMaterial({ name: "Aluminum 6061-T6", e0: 69000, nu: 0.33, density: 2.70, yieldStrength: 276, ultimateStrength: 310, tangentModulus: 690, strainAtRupture: 0.12, cte: 23e-6 }),
+  isotropicMaterial({ name: "Resin (SLA, standard)", e0: 2800, nu: 0.35, density: 1.18, yieldStrength: 60, ultimateStrength: 65, tangentModulus: 30, strainAtRupture: 0.06, cte: 85e-6 }),
 ];
 
 /** Sparse-infill patterns the solver can model (DESIGN §22).

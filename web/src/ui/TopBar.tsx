@@ -4,6 +4,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useShallow } from "zustand/shallow";
 import { useStore } from "../store";
+import { isIsotropic } from "../types";
 
 const GITHUB_URL = "https://github.com/CNCKitchen/filaSim";
 
@@ -13,6 +14,7 @@ export function TopBar() {
       model: s.model,
       fileName: s.fileName,
       busy: s.busy,
+      material: s.material,
       appMode: s.appMode,
       setAppMode: s.setAppMode,
       openSettings: s.openSettings,
@@ -54,16 +56,20 @@ export function TopBar() {
         <b>filaSim</b>
         <span>CNC Kitchen · browser FEA</span>
       </div>
-      <label className="workspace" title="Switch workspace">
-        <select
-          value={s.appMode}
-          onChange={(e) => s.setAppMode(e.target.value as "optimize" | "buildsim")}
-          disabled={!!s.busy}
-        >
-          <option value="optimize">Simulate &amp; Optimize</option>
-          <option value="buildsim">Build Simulation</option>
-        </select>
-      </label>
+      {/* An isotropic material has no build to simulate — the workspace
+          selector collapses to its only valid entry and hides. */}
+      {!isIsotropic(s.material) && (
+        <label className="workspace" title="Switch workspace">
+          <select
+            value={s.appMode}
+            onChange={(e) => s.setAppMode(e.target.value as "optimize" | "buildsim")}
+            disabled={!!s.busy}
+          >
+            <option value="optimize">Simulate &amp; Optimize</option>
+            <option value="buildsim">Build Simulation</option>
+          </select>
+        </label>
+      )}
       <div className="grow" />
       <input
         ref={openRef}

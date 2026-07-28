@@ -19,7 +19,7 @@ import {
 } from "../store";
 import { NumInput } from "./NumInput";
 import { UnitInput } from "./UnitInput";
-import { RESULT_FIELDS, type Bc, type ForceMode, type LoadStep, type PatternKey } from "../types";
+import { isIsotropic, RESULT_FIELDS, type Bc, type ForceMode, type LoadStep, type PatternKey } from "../types";
 import { shrinkFromPhysics, ROOM_TEMP_C } from "../materials";
 import { fmtDisp, fmtLen, lenUnit, rampCss } from "./fmt";
 import { BC_HELP, bcLabel, KIND_DOT, KIND_LABEL, SUPPORT_KINDS } from "./bcmeta";
@@ -144,6 +144,7 @@ export function StepPanel() {
       model: s.model,
       activeStep: s.activeStep,
       appMode: s.appMode,
+      material: s.material,
       // re-render the whole panel subtree (all unit-bearing inputs/readouts) on
       // a unit change — saves wiring unitRev into every sub-editor.
       unitRev: s.unitRev,
@@ -184,7 +185,15 @@ export function StepPanel() {
     };
   }, []);
 
-  const head = (buildsim ? BUILD_HEAD : HEAD)[step];
+  let head = (buildsim ? BUILD_HEAD : HEAD)[step];
+  // Isotropic material: the print-flavored copy would promise the wrong thing.
+  if (!buildsim && isIsotropic(s.material)) {
+    if (step === 3) head = { title: "Properties", sub: "Material and the analysis grid." };
+    else if (step === 5)
+      head = { title: "Optimization", sub: "Part topology — remove material where the loads don't need it." };
+    else if (step === 6)
+      head = { title: "View & export", sub: "Inspect the result, export the optimized shape." };
+  }
   return (
     <section className="panel" data-bcsection={!buildsim && step === 2 ? true : undefined}>
       <div className="p-head">
@@ -1782,7 +1791,7 @@ function StepProperties() {
       material: s.material,
       materials: s.materials,
       setMaterial: s.setMaterial,
-      openSettings: s.openSettings,
+      openMaterialsManager: s.openMaterialsManager,
       setPerimeters: s.setPerimeters,
       setLineWidth: s.setLineWidth,
       topBottomLayers: s.topBottomLayers,
@@ -1812,6 +1821,9 @@ function StepProperties() {
   );
   const wall = s.perimeters * s.lineWidth;
   const k = s.voxelInfo ? Math.max(1, Math.round(wall / s.voxelInfo.h)) : null;
+  const iso = isIsotropic(s.material);
+  const fdmMats = s.materials.filter((m) => !isIsotropic(m));
+  const isoMats = s.materials.filter((m) => isIsotropic(m));
   return (
     <>
       <div className="group">
@@ -1826,19 +1838,38 @@ function StepProperties() {
             if (m) s.setMaterial(m);
           }}
         >
-          {s.materials.map((m) => (
-            <option key={m.name}>{m.name}</option>
-          ))}
+          <optgroup label="FDM (printed)">
+            {fdmMats.map((m) => (
+              <option key={m.name}>{m.name}</option>
+            ))}
+          </optgroup>
+          <optgroup label="Isotropic (machined / cast / resin)">
+            {isoMats.map((m) => (
+              <option key={m.name}>{m.name}</option>
+            ))}
+          </optgroup>
         </select>
         <div className="dim small">
           E = {format(s.material.e0, "modulus")} · ν = {s.material.nu} · ρ ={" "}
-          {format(s.material.density, "density")} · σₜ = {format(s.material.strength, "stress")} —{" "}
-          <a className="link" onClick={() => s.openSettings(true)}>
+          {format(s.material.density, "density")} ·{" "}
+          {iso
+            ? `σy = ${format(s.material.yieldStrength, "stress")}`
+            : `σₜ = ${format(s.material.strength, "stress")}`}{" "}
+          —{" "}
+          <a className="link" onClick={() => s.openMaterialsManager(true)}>
             edit
           </a>
         </div>
+        {iso && (
+          <div className="dim small">
+            Isotropic material — no build direction: the part is analyzed fully dense, and
+            infill, walls and shells do not apply.
+          </div>
+        )}
       </div>
 
+      {!iso && (
+      <>
       <div className="duo">
         <div className="group">
           <div className="g-label">
@@ -1940,6 +1971,8 @@ function StepProperties() {
         </div>
       </div>
       <div className="dim small">The uniform print that "Solve as printed" analyzes.</div>
+      </>
+      )}
 
       <div className="group">
         <div className="g-label">
@@ -1984,50 +2017,56 @@ function StepProperties() {
                   {tooFine &&
                     " Too fine — past the 4M-cell cap; the engine will coarsen to fit."}
                   {tooCoarse && " Very coarse — expect blocky geometry and rough numbers."}
-                  {!tooFine && !tooCoarse && cells > 0 && s.customH > wall + 1e-9 && (
+                  {!iso && !tooFine && !tooCoarse && cells > 0 && s.customH > wall + 1e-9 && (
                     <>
                       {" "}
                       Coarser than the {format(wall, "length")} wall — composite skin keeps the
                       stiffness honest, but the geometry stays blocky.
                     </>
                   )}
-                  {s.snapVoxel && " Voxel snap may still adjust h to wall/k."}
+                  {!iso && s.snapVoxel && " Voxel snap may still adjust h to wall/k."}
                 </div>
               </>
             );
           })()}
-        <label className="rowcheck">
-          <input
-            type="checkbox"
-            checked={s.snapVoxel}
-            onChange={(e) => s.setSnapVoxel(e.target.checked)}
-          />
-          <span>Snap voxel size to the wall (h = wall/k)</span>
-        </label>
-        <label className="rowcheck">
-          <input
-            type="checkbox"
-            checked={s.compositeSkin}
-            onChange={(e) => s.setCompositeSkin(e.target.checked)}
-          />
-          <span>Composite skin (blend part-wall cells)</span>
-        </label>
-        <label className="rowcheck">
-          <input
-            type="checkbox"
-            checked={s.anisotropicInfill}
-            onChange={(e) => s.setAnisotropicInfill(e.target.checked)}
-          />
-          <span>Anisotropic infill (measured, layer-plane vs Z)</span>
-          <InfoTip help={PROP_HELP.anisotropic} />
-        </label>
+        {!iso && (
+          <>
+            <label className="rowcheck">
+              <input
+                type="checkbox"
+                checked={s.snapVoxel}
+                onChange={(e) => s.setSnapVoxel(e.target.checked)}
+              />
+              <span>Snap voxel size to the wall (h = wall/k)</span>
+            </label>
+            <label className="rowcheck">
+              <input
+                type="checkbox"
+                checked={s.compositeSkin}
+                onChange={(e) => s.setCompositeSkin(e.target.checked)}
+              />
+              <span>Composite skin (blend part-wall cells)</span>
+            </label>
+            <label className="rowcheck">
+              <input
+                type="checkbox"
+                checked={s.anisotropicInfill}
+                onChange={(e) => s.setAnisotropicInfill(e.target.checked)}
+              />
+              <span>Anisotropic infill (measured, layer-plane vs Z)</span>
+              <InfoTip help={PROP_HELP.anisotropic} />
+            </label>
+          </>
+        )}
         <div className="dim small">
           {s.voxelInfo
-            ? s.compositeSkin
-              ? `Grid h = ${format(s.voxelInfo.h, "length")} — the ${format(wall, "length")} skin spans ${(wall / s.voxelInfo.h).toFixed(2)} cell layers; partially covered cells get a blended wall + infill stiffness.`
-              : `Grid h = ${format(s.voxelInfo.h, "length")} — the ${format(wall, "length")} skin is ${k} cell layer${k === 1 ? "" : "s"} thick.`
+            ? iso
+              ? `Grid h = ${format(s.voxelInfo.h, "length")}.`
+              : s.compositeSkin
+                ? `Grid h = ${format(s.voxelInfo.h, "length")} — the ${format(wall, "length")} skin spans ${(wall / s.voxelInfo.h).toFixed(2)} cell layers; partially covered cells get a blended wall + infill stiffness.`
+                : `Grid h = ${format(s.voxelInfo.h, "length")} — the ${format(wall, "length")} skin is ${k} cell layer${k === 1 ? "" : "s"} thick.`
             : "Grid size is computed at the next check/solve/optimize."}
-          {!s.compositeSkin && s.snapVoxel && k === 1 && (
+          {!iso && !s.compositeSkin && s.snapVoxel && k === 1 && (
             <> Single-layer skin is coarse — raise the resolution for printed-mode accuracy.</>
           )}
         </div>
@@ -2041,6 +2080,7 @@ function StepProperties() {
 function StepAnalyze() {
   const s = useStore(
     useShallow((s) => ({
+      material: s.material,
       analyzeMode: s.analyzeMode,
       setAnalyzeMode: s.setAnalyzeMode,
       analysisType: s.analysisType,
@@ -2089,33 +2129,39 @@ function StepAnalyze() {
           </button>
         </div>
       </div>
-      <div className="group">
-        <div className="g-label">
-          <span>Stiffness</span>
-          <InfoTip help={ANALYZE_HELP.stiffness} />
+      {!isIsotropic(s.material) ? (
+        <div className="group">
+          <div className="g-label">
+            <span>Stiffness</span>
+            <InfoTip help={ANALYZE_HELP.stiffness} />
+          </div>
+          <div className="seg">
+            <button
+              className={s.analyzeMode === "printed" ? "on" : ""}
+              onClick={() => s.setAnalyzeMode("printed")}
+              title="Skin solid, interior at the uniform infill from Properties — through your calibrated E(ρ) curve"
+            >
+              As printed
+            </button>
+            <button
+              className={s.analyzeMode === "solid" ? "on" : ""}
+              onClick={() => s.setAnalyzeMode("solid")}
+              title="Fully dense E₀ everywhere — the CAD-ideal reference"
+            >
+              Solid material
+            </button>
+          </div>
+          <div className="dim small">
+            {s.analyzeMode === "printed"
+              ? `Skin ${s.perimeters} × ${format(s.lineWidth, "length")} at 100%, interior ${s.printInfill}% ${s.pattern}.`
+              : "Fully dense E₀ everywhere — the CAD-ideal reference."}
+          </div>
         </div>
-        <div className="seg">
-          <button
-            className={s.analyzeMode === "printed" ? "on" : ""}
-            onClick={() => s.setAnalyzeMode("printed")}
-            title="Skin solid, interior at the uniform infill from Properties — through your calibrated E(ρ) curve"
-          >
-            As printed
-          </button>
-          <button
-            className={s.analyzeMode === "solid" ? "on" : ""}
-            onClick={() => s.setAnalyzeMode("solid")}
-            title="Fully dense E₀ everywhere — the CAD-ideal reference"
-          >
-            Solid material
-          </button>
-        </div>
+      ) : (
         <div className="dim small">
-          {s.analyzeMode === "printed"
-            ? `Skin ${s.perimeters} × ${format(s.lineWidth, "length")} at 100%, interior ${s.printInfill}% ${s.pattern}.`
-            : "Fully dense E₀ everywhere — the CAD-ideal reference."}
+          Isotropic material — solved fully dense at E₀ (there is no printed variant).
         </div>
-      </div>
+      )}
       {modal && (
         <div className="group">
           <div className="g-label">
@@ -2425,6 +2471,7 @@ function LevelsGroup() {
 function StepOptimize() {
   const s = useStore(
     useShallow((s) => ({
+      material: s.material,
       optMode: s.optMode,
       goal: s.goal,
       setGoal: s.setGoal,
@@ -2466,6 +2513,9 @@ function StepOptimize() {
     }))
   );
   const solid = s.optMode === "solid";
+  // Isotropic material ⇒ Part Topo is the only mode (the store pins optMode)
+  // — the mode selector and the layer-adhesion SF measures disappear.
+  const iso = isIsotropic(s.material);
   // Folded "Constraints" still has to report itself — the badge is what is
   // actually switched on, in the order the controls appear.
   const cons = [
@@ -2531,33 +2581,37 @@ function StepOptimize() {
               step={0.1}
               onCommit={(v) => s.setSfTarget(v)}
             />
-            <div className="g-label" style={{ marginTop: 2 }}>
-              <span>Measured against</span>
-              <InfoTip help={OPT_HELP.sfMeasure} />
-            </div>
-            <div className="seg">
-              <button
-                className={s.sfMeasure === "both" ? "on" : ""}
-                onClick={() => s.setSfMeasure("both")}
-                title="Worst of material and layer-adhesion safety factor per cell — matches the SF plot"
-              >
-                Material + layers
-              </button>
-              <button
-                className={s.sfMeasure === "material" ? "on" : ""}
-                onClick={() => s.setSfMeasure("material")}
-                title="Von Mises stress vs the in-plane tensile strength"
-              >
-                Material
-              </button>
-              <button
-                className={s.sfMeasure === "layer" ? "on" : ""}
-                onClick={() => s.setSfMeasure("layer")}
-                title="Layer adhesion: tension across the layers + interlayer shear (how FDM parts usually fail)"
-              >
-                Layers
-              </button>
-            </div>
+            {!iso && (
+              <>
+                <div className="g-label" style={{ marginTop: 2 }}>
+                  <span>Measured against</span>
+                  <InfoTip help={OPT_HELP.sfMeasure} />
+                </div>
+                <div className="seg">
+                  <button
+                    className={s.sfMeasure === "both" ? "on" : ""}
+                    onClick={() => s.setSfMeasure("both")}
+                    title="Worst of material and layer-adhesion safety factor per cell — matches the SF plot"
+                  >
+                    Material + layers
+                  </button>
+                  <button
+                    className={s.sfMeasure === "material" ? "on" : ""}
+                    onClick={() => s.setSfMeasure("material")}
+                    title="Von Mises stress vs the in-plane tensile strength"
+                  >
+                    Material
+                  </button>
+                  <button
+                    className={s.sfMeasure === "layer" ? "on" : ""}
+                    onClick={() => s.setSfMeasure("layer")}
+                    title="Layer adhesion: tension across the layers + interlayer shear (how FDM parts usually fail)"
+                  >
+                    Layers
+                  </button>
+                </div>
+              </>
+            )}
           </div>
         ) : (
           <div className="group">
@@ -2594,35 +2648,42 @@ function StepOptimize() {
           </div>
         )}
 
-        <div className="group">
-          <div className="g-label">
-            <span>Mode</span>
-            <InfoTip help={OPT_HELP.mode} />
+        {!iso ? (
+          <div className="group">
+            <div className="g-label">
+              <span>Mode</span>
+              <InfoTip help={OPT_HELP.mode} />
+            </div>
+            <div className="seg">
+              <button
+                className={s.optMode === "graded" ? "on" : ""}
+                onClick={() => s.setOptMode("graded")}
+                title="Several discrete infill densities, placed from the optimized field"
+              >
+                Graded
+              </button>
+              <button
+                className={s.optMode === "binary" ? "on" : ""}
+                onClick={() => s.setOptMode("binary")}
+                title="Hollow or solid: interior is either the printability floor or 100% dense"
+              >
+                Binary
+              </button>
+              <button
+                className={s.optMode === "solid" ? "on" : ""}
+                onClick={() => s.setOptMode("solid")}
+                title="Topology optimization: REMOVE material to make a new lightweight shape (no infill, no walls — the kept material prints solid)"
+              >
+                Part Topo
+              </button>
+            </div>
           </div>
-          <div className="seg">
-            <button
-              className={s.optMode === "graded" ? "on" : ""}
-              onClick={() => s.setOptMode("graded")}
-              title="Several discrete infill densities, placed from the optimized field"
-            >
-              Graded
-            </button>
-            <button
-              className={s.optMode === "binary" ? "on" : ""}
-              onClick={() => s.setOptMode("binary")}
-              title="Hollow or solid: interior is either the printability floor or 100% dense"
-            >
-              Binary
-            </button>
-            <button
-              className={s.optMode === "solid" ? "on" : ""}
-              onClick={() => s.setOptMode("solid")}
-              title="Topology optimization: REMOVE material to make a new lightweight shape (no infill, no walls — the kept material prints solid)"
-            >
-              Part Topo
-            </button>
+        ) : (
+          <div className="dim small">
+            Part topology optimization — material is removed to form a new lightweight shape;
+            export it as an STL from step 6.
           </div>
-        </div>
+        )}
 
         {s.optMode === "binary" && (
           <div className="group">
@@ -2736,14 +2797,14 @@ function StepOptimize() {
               <span>Minimum member size</span>
               <b>
                 {s.minMemberMm == null
-                  ? `auto · ${format(4 * s.lineWidth, "length")}`
+                  ? `auto · ${format(iso ? 2 : 4 * s.lineWidth, "length")}`
                   : unitLabel("length")}
               </b>
               <InfoTip help={OPT_HELP.minMember} />
             </div>
             <div className="toolrow">
               <UnitInput
-                value={s.minMemberMm ?? 4 * s.lineWidth}
+                value={s.minMemberMm ?? (iso ? 2 : 4 * s.lineWidth)}
                 kind="length"
                 step={0.1}
                 min={0}
@@ -2753,7 +2814,7 @@ function StepOptimize() {
               <button
                 className={s.minMemberMm == null ? "tight on" : "tight"}
                 onClick={() => s.setMinMemberMm(null)}
-                title="Back to auto (4× line width)"
+                title={iso ? "Back to auto (2 mm smallest member)" : "Back to auto (4× line width)"}
               >
                 auto
               </button>
@@ -2762,7 +2823,7 @@ function StepOptimize() {
               // Only the two states the tip can't cover, because they depend on
               // this part's grid: the filter switched off, and a mesh too coarse
               // to hold the size that was asked for.
-              const eff = s.minMemberMm ?? 4 * s.lineWidth;
+              const eff = s.minMemberMm ?? (iso ? 2 : 4 * s.lineWidth);
               const h = s.voxelInfo?.h ?? 0;
               const capped = h > 0 && eff / (2 * h) > 8;
               if (eff > 1e-9 && !capped) return null;
@@ -2804,9 +2865,10 @@ function StepOptimize() {
           print?" — so it sits with the other optimizers, above the orientation
           sweep it often sends the user to when layer adhesion binds. Both stay
           folded until asked for: they answer different questions than the
-          infill run this station is named after. */}
-      <SettingsOptimizer />
-      <ValidateOrientation />
+          infill run this station is named after. Both are FDM questions —
+          an isotropic part has no print settings and no build direction. */}
+      {!iso && <SettingsOptimizer />}
+      {!iso && <ValidateOrientation />}
     </>
   );
 }
@@ -2816,6 +2878,7 @@ function StepOptimize() {
 function StepExport() {
   const s = useStore(
     useShallow((s) => ({
+      material: s.material,
       hasResult: s.hasResult,
       optSummary: s.optSummary,
       results: s.results,
@@ -2845,8 +2908,16 @@ function StepExport() {
       {!s.hasResult && !s.optSummary && (
         <div className="hint">
           Nothing to show yet — run <b>Solve once</b> (step 4) for the Results view or{" "}
-          <b>Optimize infill</b> (step 5) for density regions. View modes sit at the top of the
-          viewport, the section plane at its bottom left.
+          {isIsotropic(s.material) ? (
+            <>
+              <b>Optimize shape</b> (step 5) for the topology-optimized part.
+            </>
+          ) : (
+            <>
+              <b>Optimize infill</b> (step 5) for density regions.
+            </>
+          )}{" "}
+          View modes sit at the top of the viewport, the section plane at its bottom left.
         </div>
       )}
       {s.viewMode === "mesh" && (
@@ -2939,7 +3010,8 @@ function StepExport() {
           <div className="warnbanner">
             ⚠ <b>Settings changed since this optimization.</b> The mesh, loads, material, or an
             optimization input was edited — this result and export are out of date. Re-run{" "}
-            <b>Optimize infill</b> (step 5) before exporting.
+            <b>{isIsotropic(s.material) ? "Optimize shape" : "Optimize infill"}</b> (step 5)
+            before exporting.
           </div>
         ) : null;
       })()}

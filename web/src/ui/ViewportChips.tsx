@@ -8,7 +8,7 @@
 import { useShallow } from "zustand/shallow";
 import { resultIsSolidBody } from "../engine/FieldServer";
 import { useStore, resultStale, type ViewMode, type ResultKind } from "../store";
-import { RESULT_FIELDS } from "../types";
+import { isIsotropic, RESULT_FIELDS } from "../types";
 import { format } from "../units";
 
 function ViewBtn({ mode, label }: { mode: ViewMode; label: string }) {
@@ -66,6 +66,7 @@ export function ViewportChips() {
       flipSection: s.flipSection,
       setSectionAxis: s.setSectionAxis,
       unitRev: s.unitRev,
+      material: s.material,
     }))
   );
   if (!s.model) return null;
@@ -341,21 +342,35 @@ export function ViewportChips() {
                   </option>
                 ))}
               </optgroup>
-              <optgroup label="Safety factor">
-                <option value="sf">Safety factor — worst case</option>
-                <option value="sfm">Safety factor — material σₜ/σᵥᴹ</option>
-                <option value="sfz">Safety factor — layer adhesion</option>
-              </optgroup>
+              {isIsotropic(s.material) ? (
+                /* Isotropic: one criterion — von Mises vs yield. The layer-
+                   adhesion SF does not exist as a failure mode. */
+                <optgroup label="Safety factor">
+                  <option value="sfm">Safety factor — σy/σᵥᴹ</option>
+                </optgroup>
+              ) : (
+                <optgroup label="Safety factor">
+                  <option value="sf">Safety factor — worst case</option>
+                  <option value="sfm">Safety factor — material σₜ/σᵥᴹ</option>
+                  <option value="sfz">Safety factor — layer adhesion</option>
+                </optgroup>
+              )}
               {/* DESIGN §20 dec. 7: the CRITERION's view of the same fields —
                   smoothed exactly as the optimizers evaluate it, with the
                   singularity zone around rigid supports greyed out. Plot these
                   to see the number the SF goal and the settings optimizer
                   chase; the plain fields above never hide or smooth anything. */}
-              <optgroup label="Safety factor · criterion">
-                <option value="sfx">Criterion SF — worst case</option>
-                <option value="sfmx">Criterion SF — material</option>
-                <option value="sfzx">Criterion SF — layer adhesion</option>
-              </optgroup>
+              {isIsotropic(s.material) ? (
+                <optgroup label="Safety factor · criterion">
+                  <option value="sfmx">Criterion SF</option>
+                </optgroup>
+              ) : (
+                <optgroup label="Safety factor · criterion">
+                  <option value="sfx">Criterion SF — worst case</option>
+                  <option value="sfmx">Criterion SF — material</option>
+                  <option value="sfzx">Criterion SF — layer adhesion</option>
+                </optgroup>
+              )}
               <optgroup label="Stress (MPa)">
                 {RESULT_FIELDS.filter((f) => f.unit === "MPa").map((f) => (
                   <option key={f.value} value={f.value}>

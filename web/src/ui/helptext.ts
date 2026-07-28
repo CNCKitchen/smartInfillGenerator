@@ -55,7 +55,8 @@ export const PROP_HELP: Record<string, HelpContent> = {
     title: "Material",
     text: [
       "Sets the stiffness, density and strength every result is computed from — including the layer-adhesion strengths used for the safety factor.",
-      "The presets are typical values for the filament class. Measured your own? Edit them in ⚙ Settings; the whole analysis follows.",
+      "The presets are typical values for the filament class. Measured your own? Open the material manager (the \"edit\" link below, or ⚙ Settings) — every value, the FDM/isotropic switch and the stress–strain charts live there; the whole analysis follows.",
+      "Isotropic materials (machined metal, cast parts, resin prints) have no build direction: the part is analyzed fully dense, the print settings below disappear, and the safety factor runs against yield. Optimization becomes classic part topology — material removal, exported as an STL.",
     ],
   },
   walls: {
