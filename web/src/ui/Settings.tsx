@@ -26,7 +26,6 @@ export function SettingsModal() {
       curves: s.curves,
       propertySets: s.propertySets,
       activeSetId: s.activeSetId,
-      setActivePropertySet: s.setActivePropertySet,
       openPropsManager: s.openPropsManager,
       levelSettings: s.levelSettings,
       updateLevelSettings: s.updateLevelSettings,
@@ -239,37 +238,20 @@ export function SettingsModal() {
 
         <h3>Infill properties</h3>
         <div className="dim small">
-          The active property set models the sparse infill: its E(ρ) = c · E₀ · ρⁿ magnitude
-          law drives the optimizer and the verification solves, its anisotropy ratios the
-          as-printed solve. Inspect, compare, calibrate, import and export sets in the property
-          manager.
+          The infill is chosen on the Properties step; its property set (E(ρ) law + anisotropy
+          ratios) is managed here.
         </div>
         <div className="row">
-          <select
-            value={s.activeSetId ?? "__project"}
-            onChange={(e) => {
-              if (e.target.value !== "__project") s.setActivePropertySet(e.target.value);
-            }}
-          >
-            {s.activeSetId === null && (
-              <option value="__project">Project values (from the loaded file)</option>
-            )}
-            {s.propertySets.map((p) => (
-              <option key={p.id} value={p.id}>
-                {p.name} — {p.pattern}
-              </option>
-            ))}
-          </select>
-          <button onClick={() => s.openPropsManager(true)}>Manage…</button>
-        </div>
-        <div className="hint">
-          {(() => {
-            const act = s.propertySets.find((p) => p.id === s.activeSetId);
-            const c = act?.curve ?? s.curves.cubic;
-            const rel = (rho: number) =>
-              `${(100 * Math.min(1, c.coeff * Math.pow(rho, c.exponent))).toFixed(1)}%`;
-            return `E(20%) ${rel(0.2)} · E(50%) ${rel(0.5)} relative to solid — a changed set applies to the next run.`;
-          })()}
+          <button onClick={() => s.openPropsManager(true)}>Manage infill properties…</button>
+          <span className="dim small">
+            {(() => {
+              const act = s.propertySets.find((p) => p.id === s.activeSetId);
+              const c = act?.curve ?? s.curves.cubic;
+              const rel = (rho: number) =>
+                `${(100 * Math.min(1, c.coeff * Math.pow(rho, c.exponent))).toFixed(1)}%`;
+              return `In use: ${act ? act.name : "project values"} — E(20%) ${rel(0.2)} · E(50%) ${rel(0.5)}.`;
+            })()}
+          </span>
         </div>
 
         <h3>Density levels</h3>

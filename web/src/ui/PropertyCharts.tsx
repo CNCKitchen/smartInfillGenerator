@@ -41,20 +41,16 @@ const DIR_LABEL: Record<Direction, string> = {
 
 const DIR_SHORT: Record<Direction, string> = { ep: "Ep", ez: "Ez", gz: "Gz", gxy: "Gxy" };
 
-/** Sets drawn in the overlay: the first palette-many in library order, plus
- *  the selected one (overflow color) when it sits beyond them. */
-function overlaySets(sets: InfillPropertySet[], selectedId: string) {
-  const shown = sets.slice(0, SERIES.length).map((s, i) => ({ s, color: SERIES[i] as string }));
-  if (!shown.some((e) => e.s.id === selectedId)) {
-    const sel = sets.find((x) => x.id === selectedId);
-    if (sel) shown.push({ s: sel, color: SERIES_OVERFLOW });
-  }
-  return shown;
-}
-
 function colorOf(sets: InfillPropertySet[], id: string): string {
   const i = sets.findIndex((s) => s.id === id);
   return i >= 0 && i < SERIES.length ? SERIES[i] : SERIES_OVERFLOW;
+}
+
+/** One entry per drawn series — the selected set, plus the comparison set
+ *  when one is chosen (color follows the ENTITY: library-order slot). */
+interface Entry {
+  s: InfillPropertySet;
+  color: string;
 }
 
 /** Directional Young's modulus of a TI solid, Ep = 1; θ from the BUILD AXIS.
@@ -87,7 +83,19 @@ export function PropertyCharts(props: {
   const [dir, setDir] = useState<Direction>("ep");
   const [logLog, setLogLog] = useState(false);
   const [polarPct, setPolarPct] = useState(30);
+  const [compareId, setCompareId] = useState<string>("");
   const sel = props.sets.find((s) => s.id === props.selectedId) ?? props.sets[0];
+  const cmp =
+    compareId && compareId !== sel.id ? props.sets.find((s) => s.id === compareId) : undefined;
+
+  const entries: Entry[] = [{ s: sel, color: colorOf(props.sets, sel.id) }];
+  if (cmp) {
+    let c = colorOf(props.sets, cmp.id);
+    // Two entities may share the overflow color — never let the comparison
+    // become indistinguishable from the selection.
+    if (c === entries[0].color) c = SERIES_OVERFLOW;
+    entries.push({ s: cmp, color: c });
+  }
 
   return (
     <div className="propscharts">
@@ -107,6 +115,19 @@ export function PropertyCharts(props: {
           <input type="checkbox" checked={logLog} onChange={(e) => setLogLog(e.target.checked)} />
           log–log
         </label>
+        <span className="dim small" style={{ marginLeft: 14 }}>
+          Compare with
+        </span>
+        <select value={cmp ? compareId : ""} onChange={(e) => setCompareId(e.target.value)}>
+          <option value="">none</option>
+          {props.sets
+            .filter((p) => p.id !== sel.id)
+            .map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.name}
+              </option>
+            ))}
+        </select>
         <span className="dim small" style={{ marginLeft: "auto" }}>
           Polar at
         </span>
@@ -118,22 +139,16 @@ export function PropertyCharts(props: {
           value={polarPct}
           onChange={(e) => setPolarPct(Number(e.target.value))}
         />
-        <span className="small mono">{polarPct}%</span>
+        <span className="small num">{polarPct}%</span>
       </div>
 
       <div className="chartrow">
-        <CurveChart
-          sets={props.sets}
-          selectedId={props.selectedId}
-          dir={dir}
-          logLog={logLog}
-          onSelect={props.onSelect}
-        />
-        <PolarChart set={sel} color={colorOf(props.sets, sel.id)} rho={polarPct / 100} />
+        <CurveChart entries={entries} dir={dir} logLog={logLog} onSelect={props.onSelect} />
+        <PolarChart entries={entries} rho={polarPct / 100} />
       </div>
       <div className="chartrow">
-        <RatioBars sets={props.sets} selectedId={props.selectedId} />
-        <ReadoutTable sets={props.sets} selectedId={props.selectedId} dir={dir} />
+        <RatioBars entries={entries} />
+        <ReadoutTable entries={entries} />
       </div>
     </div>
   );
@@ -142,18 +157,17 @@ export function PropertyCharts(props: {
 // ---- (a) stiffness vs density ----
 
 function CurveChart(props: {
-  sets: InfillPropertySet[];
-  selectedId: string;
+  entries: Entry[];
   dir: Direction;
   logLog: boolean;
   onSelect: (id: string) => void;
 }) {
   const W = 460;
-  const H = 250;
+  const H = 225;
   const M = { l: 44, r: 18, t: 8, b: 26 };
   const [tip, setTip] = useState<Tip | null>(null);
   const svgRef = useRef<SVGSVGElement>(null);
-  const shown = overlaySets(props.sets, props.selectedId);
+  const shown = props.entries;
 
   const RHO_MIN = 0.05;
   const E_MIN = 1e-3; // log floor: 0.1% of solid
@@ -195,7 +209,7 @@ function CurveChart(props: {
       };
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [props.sets, props.selectedId, props.dir, props.logLog]);
+  }, [props.entries, props.dir, props.logLog]);
 
   const yTicks = props.logLog ? [0.001, 0.01, 0.1, 1] : [0.25, 0.5, 0.75, 1];
   const xTicks = props.logLog ? [0.05, 0.1, 0.2, 0.5, 1] : [0.2, 0.4, 0.6, 0.8, 1];
@@ -254,18 +268,19 @@ function CurveChart(props: {
           ))}
           <line x1={M.l} x2={W - M.r} y1={H - M.b} y2={H - M.b} stroke={AXIS} />
           <line x1={M.l} x2={M.l} y1={M.t} y2={H - M.b} stroke={AXIS} />
-          {paths.map((p) => {
-            const em = p.s.id === props.selectedId;
-            const w = em ? 2.5 : 2;
-            const op = em ? 1 : 0.75;
-            return (
-              <g key={p.s.id} strokeWidth={w} opacity={op} fill="none" stroke={p.color}>
-                {p.below && <path d={p.below} strokeDasharray="4 4" />}
-                {p.inside && <path d={p.inside} />}
-                {p.above && <path d={p.above} strokeDasharray="4 4" />}
-              </g>
-            );
-          })}
+          {paths.map((p, i) => (
+            <g
+              key={p.s.id}
+              strokeWidth={i === 0 ? 2.5 : 2}
+              opacity={i === 0 ? 1 : 0.85}
+              fill="none"
+              stroke={p.color}
+            >
+              {p.below && <path d={p.below} strokeDasharray="4 4" />}
+              {p.inside && <path d={p.inside} />}
+              {p.above && <path d={p.above} strokeDasharray="4 4" />}
+            </g>
+          ))}
           {tip?.rho !== undefined && (
             <line
               x1={x(tip.rho)}
@@ -280,19 +295,17 @@ function CurveChart(props: {
         {tip && <ChartTip tip={tip} />}
       </div>
       <div className="chartlegend">
-        {shown.map(({ s, color }) => (
+        {shown.map(({ s, color }, i) => (
           <button
             key={s.id}
-            className={`legenditem${s.id === props.selectedId ? " sel" : ""}`}
+            className={`legenditem${i === 0 ? " sel" : ""}`}
+            title={i === 0 ? undefined : "Click to inspect this set"}
             onClick={() => props.onSelect(s.id)}
           >
             <span className="chipdot" style={{ background: color }} />
             {s.name}
           </button>
         ))}
-        {props.sets.length > SERIES.length && (
-          <span className="dim small">first {SERIES.length} + selection shown</span>
-        )}
       </div>
     </div>
   );
@@ -300,38 +313,41 @@ function CurveChart(props: {
 
 // ---- (b) directional polar section ----
 
-function PolarChart(props: { set: InfillPropertySet; color: string; rho: number }) {
-  const SZ = 250;
+function PolarChart(props: { entries: Entry[]; rho: number }) {
+  const SZ = 225;
   const cx = SZ / 2;
   const cy = SZ / 2 + 4;
-  const R = SZ / 2 - 30;
+  const R = SZ / 2 - 28;
   const [tip, setTip] = useState<Tip | null>(null);
   const svgRef = useRef<SVGSVGElement>(null);
+  const prim = props.entries[0];
 
-  const ep = relStiffness(props.set, props.rho, "ep"); // isotropic reference = magnitude law
-  // Radius scale: the largest directional modulus fills the plot.
+  const ep = relStiffness(prim.s, props.rho, "ep"); // isotropic reference = magnitude law
+  // Radius scale: the largest directional modulus of any drawn set fills the plot.
   const maxE = useMemo(() => {
     let m = 0;
-    for (let i = 0; i <= 90; i++) m = Math.max(m, eTheta(props.set, (i * Math.PI) / 180));
-    return m * ep;
-  }, [props.set, ep]);
+    for (const { s } of props.entries) {
+      const e = relStiffness(s, props.rho, "ep");
+      for (let i = 0; i <= 90; i++) m = Math.max(m, e * eTheta(s, (i * Math.PI) / 180));
+    }
+    return m;
+  }, [props.entries, props.rho]);
   const r = (e: number) => (R * e) / Math.max(maxE, 1e-12);
 
-  const path = useMemo(() => {
-    let d = "";
-    for (let i = 0; i <= 360; i += 2) {
-      const th = (i * Math.PI) / 180;
-      // θ measured from the build axis (screen vertical): x = sin, y = -cos.
-      const rr = r(ep * eTheta(props.set, th));
-      const px = cx + rr * Math.sin(th);
-      const py = cy - rr * Math.cos(th);
-      d += `${i ? "L" : "M"}${px.toFixed(1)},${py.toFixed(1)}`;
-    }
-    return d + "Z";
+  const paths = useMemo(() => {
+    return props.entries.map(({ s, color }) => {
+      const e0 = relStiffness(s, props.rho, "ep");
+      let d = "";
+      for (let i = 0; i <= 360; i += 2) {
+        const th = (i * Math.PI) / 180;
+        // θ measured from the build axis (screen vertical): x = sin, y = -cos.
+        const rr = r(e0 * eTheta(s, th));
+        d += `${i ? "L" : "M"}${(cx + rr * Math.sin(th)).toFixed(1)},${(cy - rr * Math.cos(th)).toFixed(1)}`;
+      }
+      return { color, d: d + "Z" };
+    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [props.set, props.rho, ep, maxE]);
-
-  const ez = ep * props.set.ratios.ezEp;
+  }, [props.entries, props.rho, maxE]);
 
   const onMove = (ev: React.MouseEvent) => {
     const rect = svgRef.current?.getBoundingClientRect();
@@ -339,14 +355,15 @@ function PolarChart(props: { set: InfillPropertySet; color: string; rho: number 
     const dx = ev.clientX - rect.left - cx;
     const dy = ev.clientY - rect.top - cy;
     const th = Math.atan2(Math.abs(dx), -dy); // 0 = build axis, symmetric
-    const deg = (th * 180) / Math.PI;
-    const e = ep * eTheta(props.set, th);
     setTip({
       x: Math.min(ev.clientX - rect.left + 10, SZ - 130),
       y: 10,
       lines: [
-        { text: `${deg.toFixed(0)}° from build axis` },
-        { color: props.color, text: `E/E₀ = ${pctFmt(e)}` },
+        { text: `${((th * 180) / Math.PI).toFixed(0)}° from build axis` },
+        ...props.entries.map(({ s, color }) => ({
+          color,
+          text: `${pctFmt(relStiffness(s, props.rho, "ep") * eTheta(s, th))}`,
+        })),
       ],
     });
   };
@@ -355,7 +372,7 @@ function PolarChart(props: { set: InfillPropertySet; color: string; rho: number 
     <div className="chartcard">
       <div className="charttitle">
         Directional stiffness at {Math.round(100 * props.rho)}%{" "}
-        <span className="dim">· dashed = isotropic model</span>
+        <span className="dim">· dashed circle = isotropic model</span>
       </div>
       <div className="chartplot">
         <svg
@@ -368,19 +385,24 @@ function PolarChart(props: { set: InfillPropertySet; color: string; rho: number 
           <line x1={cx - R - 6} x2={cx + R + 6} y1={cy} y2={cy} stroke={GRID} />
           <line x1={cx} x2={cx} y1={cy - R - 6} y2={cy + R + 6} stroke={GRID} />
           <circle cx={cx} cy={cy} r={r(ep)} fill="none" stroke={AXIS} strokeDasharray="4 4" />
-          <path d={path} fill={props.color} fillOpacity={0.12} stroke={props.color} strokeWidth={2} />
+          {paths.map((p, i) => (
+            <path
+              key={i}
+              d={p.d}
+              fill={i === 0 ? p.color : "none"}
+              fillOpacity={i === 0 ? 0.12 : undefined}
+              stroke={p.color}
+              strokeWidth={2}
+            />
+          ))}
           <text x={cx + R + 6} y={cy + 14} textAnchor="end" className="ticktext">
             layer plane · Ep {pctFmt(ep)}
           </text>
           <text x={cx} y={cy - R - 10} textAnchor="middle" className="ticktext">
-            build axis · Ez {pctFmt(ez)}
+            build axis · Ez {pctFmt(ep * prim.s.ratios.ezEp)}
           </text>
         </svg>
         {tip && <ChartTip tip={tip} />}
-      </div>
-      <div className="dim small">
-        θ sweeps loading direction from the build axis into the layer plane; the dashed circle is
-        what the isotropic model assumes at this density.
       </div>
     </div>
   );
@@ -397,8 +419,8 @@ const RATIO_ROWS = [
   { key: "nuZp", label: "νzp", get: (s: InfillPropertySet) => nuZp(s.ratios) },
 ] as const;
 
-function RatioBars(props: { sets: InfillPropertySet[]; selectedId: string }) {
-  const shown = overlaySets(props.sets, props.selectedId);
+function RatioBars(props: { entries: Entry[] }) {
+  const shown = props.entries;
   const W = 460;
   const LAB = 58;
   const BAR = 9;
@@ -429,7 +451,7 @@ function RatioBars(props: { sets: InfillPropertySet[]; selectedId: string }) {
                     height={BAR}
                     rx={2}
                     fill={color}
-                    opacity={s.id === props.selectedId ? 1 : 0.75}
+                    opacity={si === 0 ? 1 : 0.85}
                   >
                     <title>{`${s.name} — ${row.label} = ${v.toFixed(4)}`}</title>
                   </rect>
@@ -448,8 +470,8 @@ function RatioBars(props: { sets: InfillPropertySet[]; selectedId: string }) {
 
 // ---- (d) reference-density readout ----
 
-function ReadoutTable(props: { sets: InfillPropertySet[]; selectedId: string; dir: Direction }) {
-  const shown = overlaySets(props.sets, props.selectedId);
+function ReadoutTable(props: { entries: Entry[] }) {
+  const shown = props.entries;
   const RHOS = [0.2, 0.5];
   const DIRS: Direction[] = ["ep", "ez", "gz"];
   return (
@@ -471,14 +493,14 @@ function ReadoutTable(props: { sets: InfillPropertySet[]; selectedId: string; di
           </tr>
         </thead>
         <tbody>
-          {shown.map(({ s, color }) => (
-            <tr key={s.id} className={s.id === props.selectedId ? "sel" : undefined}>
+          {shown.map(({ s, color }, i) => (
+            <tr key={s.id} className={i === 0 ? "sel" : undefined}>
               <td>
                 <span className="chipdot" style={{ background: color }} /> {s.name}
               </td>
               {RHOS.map((rho) =>
                 DIRS.map((d) => (
-                  <td key={`${rho}${d}`} className="mono">
+                  <td key={`${rho}${d}`} className="num">
                     {pctFmt(relStiffness(s, rho, d))}
                   </td>
                 ))

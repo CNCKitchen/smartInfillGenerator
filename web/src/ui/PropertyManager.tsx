@@ -6,7 +6,7 @@
 // `.filaprops`. Entered from ⚙ Settings → Infill properties. Graphs land in
 // §24 M2; this is the M1 list + detail surface.
 
-import { useRef, useState } from "react";
+import { Fragment, useRef, useState } from "react";
 import { useShallow } from "zustand/shallow";
 import { useStore } from "../store";
 import { NumInput } from "./NumInput";
@@ -56,7 +56,6 @@ export function PropertyManagerModal() {
       openPropsManager: s.openPropsManager,
       propertySets: s.propertySets,
       activeSetId: s.activeSetId,
-      setActivePropertySet: s.setActivePropertySet,
       duplicatePropertySet: s.duplicatePropertySet,
       updatePropertySet: s.updatePropertySet,
       deletePropertySet: s.deletePropertySet,
@@ -92,15 +91,14 @@ export function PropertyManagerModal() {
     <div className="modalback" onClick={() => s.openPropsManager(false)}>
       <div className="modal wide propsmodal" onClick={(e) => e.stopPropagation()}>
         <div className="modalhead">
-          <h2>Infill properties</h2>
+          <h2
+            title="One set = one pattern calibration: the E(ρ) = c · E₀ · ρⁿ magnitude law plus the anisotropy ratios (normalized to the in-plane modulus Ep). Built-in and imported sets are read-only — duplicate one to calibrate your own. The infill in use is chosen on the Properties step."
+          >
+            Infill properties
+          </h2>
           <button className="x" onClick={() => s.openPropsManager(false)}>
             ×
           </button>
-        </div>
-        <div className="dim small">
-          One set = one pattern calibration: the E(ρ) = c · E₀ · ρⁿ magnitude law plus the
-          anisotropy ratios (normalized to the in-plane modulus Ep). Built-in and imported sets
-          are read-only — duplicate one to calibrate your own. The active set drives the solves.
         </div>
 
         <div className="propsbody">
@@ -114,7 +112,7 @@ export function PropertyManagerModal() {
                 <span className="name">{p.name}</span>
                 <span className="dim small">
                   {p.pattern} · {ORIGIN_LABEL[p.origin]}
-                  {p.id === s.activeSetId ? " · ACTIVE" : ""}
+                  {p.id === s.activeSetId ? " · in use" : ""}
                 </span>
               </button>
             ))}
@@ -222,7 +220,7 @@ export function PropertyManagerModal() {
               </tbody>
             </table>
 
-            <h3>Magnitude law E(ρ) = c · E₀ · ρⁿ</h3>
+            <div className="sectiontitle">Magnitude law E(ρ) = c · E₀ · ρⁿ</div>
             <table className="settingstable">
               <thead>
                 <tr>
@@ -266,7 +264,7 @@ export function PropertyManagerModal() {
               </tbody>
             </table>
 
-            <h3>Anisotropy ratios (Ep = 1)</h3>
+            <div className="sectiontitle">Anisotropy ratios (Ep = 1)</div>
             <table className="settingstable">
               <thead>
                 <tr>
@@ -302,51 +300,44 @@ export function PropertyManagerModal() {
                 </tr>
               </tbody>
             </table>
-            <div className="hint">
-              Stiffness relative to solid at 20% / 50% infill — in-plane Ep{" "}
-              {pct(relStiffness(sel, 0.2, "ep"))} / {pct(relStiffness(sel, 0.5, "ep"))}, build-axis
-              Ez {pct(relStiffness(sel, 0.2, "ez"))} / {pct(relStiffness(sel, 0.5, "ez"))},
-              through-layer shear Gz {pct(relStiffness(sel, 0.2, "gz"))} /{" "}
-              {pct(relStiffness(sel, 0.5, "gz"))}.
-            </div>
-
-            <h3>Provenance</h3>
+            <div className="sectiontitle">Provenance</div>
             <table className="settingstable">
               <tbody>
                 {(
                   [
-                    ["author", "Author"],
-                    ["calibratedOn", "Calibrated on"],
-                    ["date", "Date"],
-                    ["license", "License"],
+                    [
+                      ["author", "Author"],
+                      ["date", "Date"],
+                    ],
+                    [
+                      ["calibratedOn", "Calibrated on"],
+                      ["license", "License"],
+                    ],
                   ] as const
-                ).map(([k, label]) => (
-                  <tr key={k}>
-                    <td className="dim">{label}</td>
-                    <td>
-                      {editable ? (
-                        <input
-                          type="text"
-                          value={sel.provenance[k] ?? ""}
-                          onChange={(e) => setProv(k, e.target.value)}
-                        />
-                      ) : (
-                        (sel.provenance[k] ?? "—")
-                      )}
-                    </td>
+                ).map((row, ri) => (
+                  <tr key={ri}>
+                    {row.map(([k, label]) => (
+                      <Fragment key={k}>
+                        <td className="dim">{label}</td>
+                        <td>
+                          {editable ? (
+                            <input
+                              type="text"
+                              value={sel.provenance[k] ?? ""}
+                              onChange={(e) => setProv(k, e.target.value)}
+                            />
+                          ) : (
+                            (sel.provenance[k] ?? "—")
+                          )}
+                        </td>
+                      </Fragment>
+                    ))}
                   </tr>
                 ))}
               </tbody>
             </table>
 
             <div className="toolrow">
-              <button
-                disabled={isActive}
-                title={isActive ? "Already the active set" : "Use this set for solves — existing results go stale"}
-                onClick={() => s.setActivePropertySet(sel.id)}
-              >
-                Set active
-              </button>
               <button onClick={() => s.duplicatePropertySet(sel.id)}>Duplicate</button>
               <button
                 onClick={() =>
@@ -361,7 +352,7 @@ export function PropertyManagerModal() {
                   sel.origin === "builtin"
                     ? "The built-in set cannot be deleted"
                     : isActive
-                      ? "Switch the active set first"
+                      ? "This set is in use — choose another infill on the Properties step first"
                       : undefined
                 }
                 onClick={() => {

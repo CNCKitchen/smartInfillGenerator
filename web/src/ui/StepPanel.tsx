@@ -1550,6 +1550,10 @@ function StepProperties() {
       setLayerHeight: s.setLayerHeight,
       pattern: s.pattern,
       setPattern: s.setPattern,
+      propertySets: s.propertySets,
+      activeSetId: s.activeSetId,
+      setActivePropertySet: s.setActivePropertySet,
+      openPropsManager: s.openPropsManager,
       printInfill: s.printInfill,
       setPrintInfill: s.setPrintInfill,
       resolution: s.resolution,
@@ -1658,9 +1662,25 @@ function StepProperties() {
         <div className="group">
           <div className="g-label">
             <span>Infill pattern</span>
-            <b>Cubic</b>
             <InfoTip help={PROP_HELP.pattern} />
           </div>
+          {/* The infill choice IS the property-set choice (DESIGN §24): the
+              library is managed in ⚙ Settings → Manage, chosen here. */}
+          <select
+            value={s.activeSetId ?? "__project"}
+            onChange={(e) => {
+              if (e.target.value === "__manage") s.openPropsManager(true);
+              else if (e.target.value !== "__project") s.setActivePropertySet(e.target.value);
+            }}
+          >
+            {s.activeSetId === null && <option value="__project">Project values</option>}
+            {s.propertySets.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.pattern} — {p.name}
+              </option>
+            ))}
+            <option value="__manage">Manage properties…</option>
+          </select>
         </div>
         <div className="group">
           <div className="g-label">

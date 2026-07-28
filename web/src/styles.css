@@ -2720,7 +2720,22 @@ button.linkbtn {
 
 .mono {
   font-family: var(--mono);
+}
+
+/* Aligned numerals in the UI font — B612 Mono gives decimal points a full
+   character cell, which reads oddly in dense number tables. */
+.num {
   font-variant-numeric: tabular-nums;
+}
+
+.sectiontitle {
+  font-family: var(--cond);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--dim);
+  margin-top: 4px;
 }
 
 .propsbody {
@@ -2765,7 +2780,7 @@ button.linkbtn {
   min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 6px;
 }
 
 .propsdetail h3 {
@@ -2782,10 +2797,10 @@ button.linkbtn {
 
 .propscharts {
   border-top: 1px solid var(--line);
-  padding-top: 10px;
+  padding-top: 8px;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 8px;
 }
 
 .chartcontrols {
@@ -2821,10 +2836,10 @@ button.linkbtn {
   min-width: 0;
   border: 1px solid var(--line);
   border-radius: 4px;
-  padding: 8px 10px;
+  padding: 6px 10px;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 3px;
 }
 
 .chartcard:last-child {
@@ -2841,9 +2856,11 @@ button.linkbtn {
   position: relative;
 }
 
+/* Chart labels use the UI face with tabular numerals — B612 Mono's
+   full-cell decimal point reads as a gap ("0. 803") in dense labels. */
 .ticktext {
-  font-family: var(--mono);
-  font-size: 9.5px;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
   fill: var(--dim);
 }
 
