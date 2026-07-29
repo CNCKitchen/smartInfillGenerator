@@ -35,25 +35,69 @@ pub struct ModalConfig {
     /// Converged when the relative residual `‖KX−θMX‖/‖KX‖` of every requested
     /// mode falls below this.
     pub tol: f64,
+    /// Alternative stop: converged when the requested eigenvalues stop moving
+    /// by this much relatively, iteration to iteration. The eigenVALUES settle
+    /// well before the eigenVECTOR residual (see the modal design note §12a),
+    /// so for a frequency readout this is what actually fires — 4-figure
+    /// agreement is far more than a display needs.
+    ///
+    /// A *gradient* consumer needs more: a finite-difference check of the
+    /// eigenvalue sensitivity resolves changes near this tolerance, so
+    /// `freq::tests` drives it to 1e-12 to keep convergence noise out of the
+    /// comparison. The optimizer itself runs the default (its own move limits
+    /// and density filter absorb far more noise than this).
+    pub eig_tol: f64,
 }
 
 impl ModalConfig {
     pub fn new(num_modes: usize) -> Self {
-        Self { num_modes, max_iters: 300, tol: 1e-3 }
+        Self { num_modes, max_iters: 300, tol: 1e-3, eig_tol: 1e-4 }
     }
 }
 
 pub struct ModalResult {
     /// Natural frequencies (Hz), ascending, length = resolved mode count.
     pub freqs_hz: Vec<f64>,
-    /// Mode shapes (M-normalized nodal displacement, f32, on the padded node
-    /// grid — same layout as `Solution::u`), one per frequency.
-    pub shapes: Vec<Vec<f32>>,
+    /// Mode shapes (M-normalized nodal displacement on the padded node grid —
+    /// same layout as `Solution::u`), one per frequency. `f64` because the
+    /// frequency-objective sensitivity is a difference of two comparable terms
+    /// (`φᵀK'φ − λ·φᵀM'φ`) and cancels digits; the display path downcasts.
+    pub shapes: Vec<Vec<f64>>,
+    /// Eigenvalues `λ = ω²` of the returned modes ((rad/s)²), ascending. The
+    /// frequency-objective sensitivity works in λ (where the Rayleigh quotient
+    /// is linear in `K`), not in Hz — see `simp::eigen_sensitivity`.
+    pub lambdas: Vec<f64>,
     /// LOBPCG iterations run.
     pub outer_iters: usize,
     /// Total multigrid V-cycles (the dominant cost; the headline to watch).
     pub total_inner_iters: usize,
     pub converged: bool,
+}
+
+/// A converged LOBPCG subspace, kept to warm-start the NEXT analysis of a
+/// slightly different design (the frequency-objective optimizer re-analyzes
+/// every outer iteration, and consecutive designs differ by one move-limited
+/// OC step). Opaque: the caller only stores it and hands it back.
+///
+/// Reuse is only valid while the free-DOF layout is unchanged — same grid, same
+/// constraints, same void pattern. Only the stiffness/mass VALUES may move.
+/// `analyze_warm` checks `nf` and silently cold-starts on a mismatch, so a stale
+/// block costs time, never correctness.
+#[derive(Clone)]
+pub struct ModalBlock {
+    /// The full `p`-column block on the compact free DOFs — guard columns
+    /// included, since they carry the subspace above the requested modes and
+    /// are what keeps a clustered spectrum converging fast.
+    cols: Vec<Vec<f64>>,
+    /// Free-DOF count at capture time; the reuse guard.
+    nf: usize,
+}
+
+impl ModalBlock {
+    /// Number of columns retained (requested modes + guard).
+    pub fn width(&self) -> usize {
+        self.cols.len()
+    }
 }
 
 /// Lumped, density-scaled mass diagonal (length = ndof) for the finest level.
@@ -510,8 +554,34 @@ pub fn analyze(
     density: f64,
     extra_mass: &[(u32, f64)],
     cfg: &ModalConfig,
-    mut on_progress: impl FnMut(usize, usize, &[f64]),
+    on_progress: impl FnMut(usize, usize, &[f64]),
 ) -> Result<ModalResult, SolveError> {
+    analyze_warm(solver, vfrac, density, extra_mass, cfg, None, on_progress).map(|(r, _)| r)
+}
+
+/// [`analyze`] with an optional warm start, returning the converged subspace for
+/// the next call.
+///
+/// `start` is a block from a PREVIOUS analysis of a nearby design. Cold-starting
+/// costs ~60-70 LOBPCG iterations on a real part (see the modal design note
+/// §12b); a warm block that is already nearly invariant converges in a handful,
+/// which is what makes re-analyzing inside an optimizer loop affordable. The
+/// block is re-M-orthonormalized against the CURRENT mass before use, so a mass
+/// change between calls is handled; only the free-DOF layout must match.
+///
+/// Missing / surplus columns are tolerated: extra columns are dropped, and a
+/// short block is topped up with the same deterministic random vectors a cold
+/// start would use, so changing the mode count mid-sequence degrades gracefully
+/// instead of failing.
+pub fn analyze_warm(
+    solver: &mut MgSolver,
+    vfrac: &[f32],
+    density: f64,
+    extra_mass: &[(u32, f64)],
+    cfg: &ModalConfig,
+    start: Option<&ModalBlock>,
+    mut on_progress: impl FnMut(usize, usize, &[f64]),
+) -> Result<(ModalResult, ModalBlock), SolveError> {
     let n = solver.levels[0].ndof();
     let m = lumped_mass(solver, vfrac, density, extra_mass);
     let free_dofs = m.iter().filter(|&&mi| mi > 0.0).count();
@@ -551,10 +621,20 @@ pub fn analyze(
     }
 
     // X: current eigenvector block (M-orthonormal, compact); KX = K·X.
+    // Warm columns first (previous design's converged subspace), then the
+    // deterministic random fill — so a short or absent block still yields
+    // exactly `p` columns, and a cold start is bit-identical to before.
+    let warm: &[Vec<f64>] = match start {
+        Some(b) if b.nf == nf => &b.cols,
+        _ => &[],
+    };
     let mut x: Vec<Vec<f64>> = (0..p)
-        .map(|j| {
-            let v = random_vec(n, &constrained, j as u32 + 1);
-            free_idx.iter().map(|&i| v[i]).collect()
+        .map(|j| match warm.get(j) {
+            Some(c) => c.clone(),
+            None => {
+                let v = random_vec(n, &constrained, j as u32 + 1);
+                free_idx.iter().map(|&i| v[i]).collect()
+            }
         })
         .collect();
     m_orthonormalize(&mut x, &mc);
@@ -575,7 +655,6 @@ pub fn analyze(
     // moving, not only when the residual is tiny. 4-figure relative frequency
     // agreement is far more than enough (the model is uncalibrated anyway).
     let mut prev_theta = vec![f64::INFINITY; num_modes];
-    const EIG_TOL: f64 = 1e-4;
     // Preconditioner strength: a short multigrid solve (this many V-cycles), not
     // a single V-cycle. The bottleneck is the per-ITERATION scalar Rayleigh–Ritz
     // work, so a stronger preconditioner (a few cheap V-cycles) that cuts the
@@ -636,7 +715,7 @@ pub fn analyze(
                 eig_change.max((theta[k] - prev_theta[k]).abs() / theta[k].abs().max(1e-30));
         }
         prev_theta.copy_from_slice(&theta[..num_modes]);
-        if max_rel < cfg.tol || (it >= 2 && eig_change < EIG_TOL) {
+        if max_rel < cfg.tol || (it >= 2 && eig_change < cfg.eig_tol) {
             converged = true;
             break;
         }
@@ -682,17 +761,25 @@ pub fn analyze(
         scatter(&free_idx, xc, &mut full);
         x_full.push(full);
     }
-    let x = x_full;
 
     let mut freqs_hz = Vec::with_capacity(num_modes);
+    let mut lambdas = Vec::with_capacity(num_modes);
     let mut shapes = Vec::with_capacity(num_modes);
     for k in 0..num_modes {
         // λ = ω²; clamp tiny negatives (round-off / near-rigid modes) to 0.
         let lambda = theta[k].max(0.0);
         freqs_hz.push(lambda.sqrt() / TAU);
-        shapes.push(x[k].iter().map(|&v| v as f32).collect());
+        lambdas.push(lambda);
+        shapes.push(std::mem::take(&mut x_full[k]));
     }
-    Ok(ModalResult { freqs_hz, shapes, outer_iters: iters, total_inner_iters, converged })
+    // The compact block (guard columns included) becomes the next call's warm
+    // start; it is M-orthonormal in the CURRENT mass, which is the right basis
+    // for a design one move-limit step away.
+    let block = ModalBlock { cols: x, nf };
+    Ok((
+        ModalResult { freqs_hz, lambdas, shapes, outer_iters: iters, total_inner_iters, converged },
+        block,
+    ))
 }
 
 #[cfg(test)]
@@ -965,6 +1052,134 @@ mod tests {
         assert!(
             (0.55..1.9).contains(&r),
             "free-free f1={flex:.0} Hz vs theory {theory:.0} Hz (ratio {r:.2}) out of band"
+        );
+    }
+
+    /// M0 go/no-go for the frequency objective (DESIGN §26): re-analyzing a
+    /// design that moved by one move-limited OC step must be much cheaper than
+    /// a cold analysis, or maximizing f1 inside the optimizer loop is not
+    /// affordable in a browser. Mimics the optimizer exactly — same design
+    /// split, same `build_eps`/`build_vfrac`, same ±0.1 move limit — and runs a
+    /// cold and a warm analysis at each step so the two are directly comparable
+    /// on identical designs.
+    ///
+    /// Also a CORRECTNESS test: warm and cold must land on the same
+    /// frequencies. A warm start that quietly converged to the wrong subspace
+    /// (e.g. locking onto a stale mode after a crossing) would show up here.
+    ///
+    /// `cargo test -p filasim-core --lib --release warm_start_beats_cold -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn warm_start_beats_cold_on_a_moving_design() {
+        use crate::simp::{build_eps, build_vfrac, design_split, LoadSet, OptimizeParams};
+
+        let s = SolveSettings { e0: 2400.0, nu: 0.35, ..Default::default() };
+        let density = 1.24e-9;
+        let (nxc, nthick, h) = (60usize, 10usize, 1.0);
+        let raw = beam(nxc, nthick, nthick, h);
+        let (grid, levels) = pad_for_levels(&raw, s.max_levels);
+        let active = active_nodes(&grid);
+        let (mx, my, mz) = (grid.nx + 1, grid.ny + 1, grid.nz + 1);
+        let mut fixed = Vec::new();
+        for z in 0..mz {
+            for y in 0..my {
+                let n = (z * my + y) * mx;
+                if active[n] {
+                    fixed.push(n as u32);
+                }
+            }
+        }
+        let problem =
+            NodeProblem { fixed, springs: Vec::new(), forces: Vec::new(), rigid: Vec::new() };
+
+        let params = OptimizeParams::default();
+        let split = design_split(&grid, &params, &problem, &LoadSet::default());
+        let (skin, design, skin_frac) = (split.skin, split.design, split.skin_frac);
+        let mut x = vec![0.25f64; design.len()];
+        let mk_eps = |x: &[f64]| {
+            build_eps(&grid, &skin, &design, &skin_frac, x, params.exponent, params.coeff)
+        };
+        let mk_vf = |x: &[f64]| build_vfrac(&grid, &design, &skin_frac, x);
+
+        let mut cache = SolverCache::build(&grid, levels, &problem, &s, mk_eps(&x));
+        let cfg = ModalConfig::new(4); // p = 4 + guard 3 = 7 columns
+        eprintln!(
+            "grid {}x{}x{} = {} cells, {} design cells, block p=7",
+            grid.nx,
+            grid.ny,
+            grid.nz,
+            grid.cell_count(),
+            design.len()
+        );
+
+        // Seed the warm chain with one cold analysis (what iteration 0 pays).
+        let (seed, mut block) =
+            analyze_warm(&mut cache.solver, &mk_vf(&x), density, &[], &cfg, None, |_, _, _| {})
+                .unwrap();
+        eprintln!(
+            "iter  0  COLD {:>4} V-cycles ({:>3} iters)  f1 = {:8.2} Hz   [seed]",
+            seed.total_inner_iters, seed.outer_iters, seed.freqs_hz[0]
+        );
+
+        let (mut cold_total, mut warm_total) = (0usize, 0usize);
+        for it in 1..=6 {
+            // One move-limited OC-sized step: a deterministic, spatially smooth
+            // ±0.1 perturbation — the scale of change the optimizer actually
+            // makes between iterations.
+            for (k, xv) in x.iter_mut().enumerate() {
+                let c = design[k] as usize;
+                let (cx, cy) = ((c % grid.nx) as f64, ((c / grid.nx) % grid.ny) as f64);
+                let d = 0.1 * ((0.21 * cx + 0.37 * cy + 0.9 * it as f64).sin());
+                *xv = (*xv + d).clamp(params.floor, params.cap);
+            }
+            cache.solver.update_eps(mk_eps(&x));
+            let vf = mk_vf(&x);
+
+            let (cold, _) =
+                analyze_warm(&mut cache.solver, &vf, density, &[], &cfg, None, |_, _, _| {}).unwrap();
+            let (warm, next) =
+                analyze_warm(&mut cache.solver, &vf, density, &[], &cfg, Some(&block), |_, _, _| {})
+                    .unwrap();
+            block = next;
+            cold_total += cold.total_inner_iters;
+            warm_total += warm.total_inner_iters;
+
+            eprintln!(
+                "iter {:>2}  COLD {:>4} V-cycles ({:>3} iters)  f1 = {:8.2} Hz   \
+                 WARM {:>4} V-cycles ({:>3} iters)  f1 = {:8.2} Hz   speedup {:.1}x",
+                it,
+                cold.total_inner_iters,
+                cold.outer_iters,
+                cold.freqs_hz[0],
+                warm.total_inner_iters,
+                warm.outer_iters,
+                warm.freqs_hz[0],
+                cold.total_inner_iters as f64 / warm.total_inner_iters.max(1) as f64,
+            );
+
+            // Same design ⇒ same spectrum, whichever way we started.
+            for k in 0..cfg.num_modes {
+                let (a, b) = (cold.freqs_hz[k], warm.freqs_hz[k]);
+                let rel = (a - b).abs() / a.max(1e-12);
+                assert!(
+                    rel < 0.02,
+                    "mode {k}: warm {b:.3} Hz vs cold {a:.3} Hz disagree by {:.2}%",
+                    rel * 100.0
+                );
+            }
+        }
+
+        let speedup = cold_total as f64 / warm_total.max(1) as f64;
+        eprintln!(
+            "\nTOTAL over 6 steps: cold {cold_total} V-cycles, warm {warm_total} V-cycles \
+             — {speedup:.1}x\nper-iteration warm cost: {:.0} V-cycles",
+            warm_total as f64 / 6.0
+        );
+        // The whole feature rests on this: if a warm re-analysis is not
+        // dramatically cheaper, the objective is not viable in the browser.
+        assert!(
+            speedup > 2.0,
+            "warm start only {speedup:.1}x cheaper than cold — frequency objective not viable"
         );
     }
 

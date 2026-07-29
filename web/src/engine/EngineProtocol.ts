@@ -143,6 +143,16 @@ export interface EngineRequests {
     colors: string[];
     thumbnail: Uint8Array | null;
   };
+  /** Modifier-free slicer project: the part as positioned/oriented for the
+   *  analysis. `optimized` ships the Part Topo body instead of the import. */
+  exportPositionedThreeMf: {
+    slicer: SlicerFlavor;
+    thumbnail: Uint8Array | null;
+    baseDensity: number;
+    perimeters: number;
+    topBottomLayers: number;
+    optimized: boolean;
+  };
   exportStls: Empty;
   exportSolidStl: Empty;
   /** Orientation sweep (DESIGN §15): fold `ids` result stashes worst-case
@@ -277,6 +287,7 @@ export interface EngineResponses {
   vertexDensity: Float32Array;
   exportThreeMf: Uint8Array;
   exportColorThreeMf: Uint8Array;
+  exportPositionedThreeMf: Uint8Array;
   exportStls: Uint8Array;
   exportSolidStl: Uint8Array;
   orientationSweep: OrientationSweepResult;

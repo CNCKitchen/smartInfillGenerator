@@ -728,6 +728,19 @@ self.onmessage = async (ev: MessageEvent<EngineWorkerRequest>) => {
         reply(msg, bytes, [bytes.buffer]);
         return;
       }
+      case "exportPositionedThreeMf": {
+        const thumb = msg.thumbnail ?? new Uint8Array(0);
+        const bytes = requireModel().export_positioned_3mf(
+          msg.slicer,
+          thumb,
+          msg.baseDensity,
+          msg.perimeters,
+          msg.topBottomLayers,
+          msg.optimized
+        );
+        reply(msg, bytes, [bytes.buffer]);
+        return;
+      }
       case "exportStls": {
         const bytes = requireModel().export_stls();
         reply(msg, bytes, [bytes.buffer]);

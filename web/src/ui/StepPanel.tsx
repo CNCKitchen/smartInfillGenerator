@@ -2516,6 +2516,9 @@ function StepOptimize() {
       busy: s.busy,
       optProgress: s.optProgress,
       optSummary: s.optSummary,
+      // §26: the frequency goal binds to the FIRST case's supports only, so the
+      // picker has to know how many cases exist to warn about the rest.
+      loadSteps: s.loadSteps,
     }))
   );
   const solid = s.optMode === "solid";
@@ -2538,7 +2541,7 @@ function StepOptimize() {
         badge={
           s.goal === "strength"
             ? `SF ≥ ${s.sfTarget}`
-            : `${s.budget} %${s.goal === "match" ? " ref" : ""}`
+            : `${s.budget} %${s.goal === "match" ? " ref" : s.goal === "frequency" ? " · max f₁" : ""}`
         }
       >
         <div className="group">
@@ -2570,8 +2573,28 @@ function StepOptimize() {
             >
               Safety factor
             </button>
+            <button
+              className={s.goal === "frequency" ? "on" : ""}
+              onClick={() => s.setGoal("frequency")}
+              title="Maximize the fundamental natural frequency at a given material budget — for parts driven by vibration (drone arms, machine mounts)"
+            >
+              Frequency
+            </button>
           </div>
         </div>
+
+        {s.goal === "frequency" && (
+          // Free vibration is force-free and takes ONE support set (the first
+          // load case's). With several cases defined, that is a real and
+          // non-obvious limitation — surface it at the point of choosing, not
+          // only in the log after a long run.
+          <p className="hint">
+            Maximizes f₁ at the material budget below. Free vibration ignores forces
+            {s.loadSteps.length > 1
+              ? ` — only the FIRST load case's supports apply, the other ${s.loadSteps.length - 1} are ignored.`
+              : " — only the supports shape the design."}
+          </p>
+        )}
 
         {s.goal === "strength" ? (
           <div className="group">
@@ -2859,6 +2882,11 @@ function StepOptimize() {
                 ? `pass ${s.optProgress.pass}/${s.optProgress.passes} · `
                 : ""}
               iteration {s.optProgress.iteration} of max {s.optProgress.maxIter}
+              {/* §26: the frequency goal has a headline number that climbs
+                  during the run — far more informative than the bar alone. */}
+              {s.goal === "frequency" && (s.optProgress.f1Hz ?? 0) > 0
+                ? ` · f₁ ${(s.optProgress.f1Hz ?? 0).toFixed(0)} Hz`
+                : ""}
             </span>
           </div>
         )}
@@ -2902,6 +2930,8 @@ function StepExport() {
       setExportSlicer: s.setExportSlicer,
       downloadThreeMf: s.downloadThreeMf,
       downloadStls: s.downloadStls,
+      downloadPositionedThreeMf: s.downloadPositionedThreeMf,
+      analyzeMode: s.analyzeMode,
       activeResultId: s.activeResultId,
       resultField: s.resultField,
       colorSteps: s.colorSteps,
@@ -3056,76 +3086,102 @@ function StepExport() {
           </button>
         </div>
       )}
-      {s.optSummary && !s.optSummary.solid && (
-        <>
-          <div className="group">
-            <div className="g-label">
-              <span>Hand off</span>
-              <InfoTip help={EXPORT_HELP.threemf} />
-            </div>
-            <div className="seg">
-              <button
-                className={s.exportSlicer === "orca" ? "on" : ""}
-                onClick={() => s.setExportSlicer("orca")}
-                title="OrcaSlicer project flavor"
-              >
-                Orca
-              </button>
-              <button
-                className={s.exportSlicer === "bambu" ? "on" : ""}
-                onClick={() => s.setExportSlicer("bambu")}
-                title="Bambu Studio flavor (its renamed pattern values — no 'values replaced' dialog)"
-              >
-                Bambu
-              </button>
-              <button
-                className={s.exportSlicer === "prusa" ? "on" : ""}
-                onClick={() => s.setExportSlicer("prusa")}
-                title="PrusaSlicer flavor (modifier volumes + per-volume infill config)"
-              >
-                Prusa
-              </button>
-            </div>
-            <button className="primary" onClick={() => void s.downloadThreeMf()}>
-              Download {SLICER_NAMES[s.exportSlicer]} project (.3mf)
-            </button>
-            <button onClick={() => void s.downloadStls()}>Download modifier STLs (.zip)</button>
-            <div className="dim small">
-              Base infill {Math.round(s.optSummary.baseDensity * 100)}% on the object, modifier
-              volumes on top.
-            </div>
-          </div>
-        </>
-      )}
-      {s.hasResult && (
+      {/* Slicer hand-off. One flavor picker, three payloads: graded/binary
+          infill ships the part + its modifier volumes; Part Topo ships the
+          optimized body alone; a plain analysis ships the part itself. The
+          last two carry no modifier geometry but still carry what the STL
+          can't — plate placement, the analyzed orientation, and the walls /
+          shells / infill the run assumed. */}
+      {(s.optSummary || s.hasResult) && (
         <div className="group">
           <div className="g-label">
-            <span>Color 3MF</span>
-            <InfoTip help={EXPORT_HELP.color3mf} />
-          </div>
-          <label className="row" style={{ justifyContent: "space-between", alignItems: "center" }}>
-            <span className="dim small">Color steps</span>
-            <NumInput
-              value={s.colorSteps}
-              min={COLOR_STEPS_MIN}
-              max={COLOR_STEPS_MAX}
-              step={1}
-              onCommit={(v) => s.setColorSteps(v)}
+            <span>Hand off</span>
+            <InfoTip
+              help={
+                s.optSummary && !s.optSummary.solid ? EXPORT_HELP.threemf : EXPORT_HELP.positioned
+              }
             />
-          </label>
-          <button
-            className="primary"
-            disabled={!s.activeResultId}
-            onClick={() => void s.downloadColorThreeMf()}
-          >
-            Download color 3MF (.3mf)
-          </button>
-          <div className="dim small">
-            Paints{" "}
-            <b>{RESULT_FIELDS.find((f) => f.value === s.resultField)?.label ?? s.resultField}</b> —
-            the active result field — into {s.colorSteps} filament bands.
           </div>
+          <div className="seg">
+            <button
+              className={s.exportSlicer === "orca" ? "on" : ""}
+              onClick={() => s.setExportSlicer("orca")}
+              title="OrcaSlicer project flavor"
+            >
+              Orca
+            </button>
+            <button
+              className={s.exportSlicer === "bambu" ? "on" : ""}
+              onClick={() => s.setExportSlicer("bambu")}
+              title="Bambu Studio flavor (its renamed pattern values — no 'values replaced' dialog)"
+            >
+              Bambu
+            </button>
+            <button
+              className={s.exportSlicer === "prusa" ? "on" : ""}
+              onClick={() => s.setExportSlicer("prusa")}
+              title="PrusaSlicer flavor (modifier volumes + per-volume infill config)"
+            >
+              Prusa
+            </button>
+          </div>
+          {s.optSummary && !s.optSummary.solid ? (
+            <>
+              <button className="primary" onClick={() => void s.downloadThreeMf()}>
+                Download {SLICER_NAMES[s.exportSlicer]} project (.3mf)
+              </button>
+              <button onClick={() => void s.downloadStls()}>Download modifier STLs (.zip)</button>
+              <div className="dim small">
+                Base infill {Math.round(s.optSummary.baseDensity * 100)}% on the object, modifier
+                volumes on top.
+              </div>
+            </>
+          ) : (
+            <>
+              <button className="primary" onClick={() => void s.downloadPositionedThreeMf()}>
+                Download {SLICER_NAMES[s.exportSlicer]} project (.3mf)
+              </button>
+              <div className="dim small">
+                {s.optSummary?.solid
+                  ? "The optimized body on the plate, printed solid — no modifier volumes."
+                  : s.analyzeMode === "solid" || isIsotropic(s.material)
+                    ? "The part on the plate in the analyzed orientation, printed solid — the way it was analyzed."
+                    : "The part on the plate in the analyzed orientation, at the walls, shells and infill the solve assumed."}
+              </div>
+            </>
+          )}
         </div>
+      )}
+      {s.hasResult && (
+        <Section title="Color 3MF" help={EXPORT_HELP.color3mf} badge={`${s.colorSteps} bands`}>
+          <div className="group">
+            <label
+              className="row"
+              style={{ justifyContent: "space-between", alignItems: "center" }}
+            >
+              <span className="dim small">Color steps</span>
+              <NumInput
+                value={s.colorSteps}
+                min={COLOR_STEPS_MIN}
+                max={COLOR_STEPS_MAX}
+                step={1}
+                onCommit={(v) => s.setColorSteps(v)}
+              />
+            </label>
+            <button
+              className="primary"
+              disabled={!s.activeResultId}
+              onClick={() => void s.downloadColorThreeMf()}
+            >
+              Download color 3MF (.3mf)
+            </button>
+            <div className="dim small">
+              Paints{" "}
+              <b>{RESULT_FIELDS.find((f) => f.value === s.resultField)?.label ?? s.resultField}</b>{" "}
+              — the active result field — into {s.colorSteps} filament bands.
+            </div>
+          </div>
+        </Section>
       )}
     </>
   );

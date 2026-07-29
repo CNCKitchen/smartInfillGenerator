@@ -24,7 +24,8 @@ use crate::bins::{
 use crate::eps::{build_eps, build_vfrac};
 use crate::simp::{
     classify_cells, design_split, evaluate_cached, evaluate_cached_stats, optimize_cached,
-    step_displacement, LoadSet, OptimizeError, OptimizeParams, OptimizeProgress, OptimizeResult,
+    step_displacement, FreqSpec, LoadSet, OptimizeError, OptimizeParams, OptimizeProgress,
+    OptimizeResult,
 };
 use crate::solve::{NodeProblem, SolveSettings, SolverCache};
 use crate::strength::{self, StrengthSpec};
@@ -77,6 +78,45 @@ pub struct StrengthGoal {
     pub spec: StrengthSpec,
 }
 
+/// Fundamental frequency (Hz) of an explicit density field — the §26 goal's
+/// verification measure, and the counterpart of `evaluate_cached` for the
+/// frequency objective.
+///
+/// Cold-started deliberately: this runs once per reported design, on a field
+/// (the BINNED one) that the optimizer's warm block was never converged
+/// against, so reusing that block would risk reporting a subspace that never
+/// re-converged. Correctness over the ~3x here; it is not in the loop.
+#[allow(clippy::too_many_arguments)]
+fn modal_f1(
+    slot: &mut Option<SolverCache>,
+    grid: &VoxelGrid,
+    levels: usize,
+    problem: &NodeProblem,
+    settings: &SolveSettings,
+    skin: &[u32],
+    design: &[u32],
+    skin_frac: &[f32],
+    x: &[f64],
+    exp: f64,
+    coeff: f64,
+    fs: &FreqSpec,
+) -> Result<f64, OptimizeError> {
+    let eps = crate::simp::build_eps(grid, skin, design, skin_frac, x, exp, coeff);
+    let vfrac = crate::simp::build_vfrac(grid, design, skin_frac, x);
+    let cache = SolverCache::prepare(slot, grid, levels, problem, settings, eps.clone());
+    cache.solver.update_eps(eps);
+    let cfg = crate::modal::ModalConfig::new(fs.resolved_modes());
+    let res = crate::modal::analyze(
+        &mut cache.solver,
+        &vfrac,
+        fs.density,
+        &fs.extra_mass,
+        &cfg,
+        |_, _, _| {},
+    )?;
+    Ok(res.freqs_hz[0])
+}
+
 /// Knobs that shape the pipeline beyond the per-iteration `OptimizeParams`.
 pub struct PipelineCfg<'a> {
     pub eval: EvalLaw,
@@ -86,6 +126,14 @@ pub struct PipelineCfg<'a> {
     /// "reach safety factor" goal (§17): `Some` walks the budget so the binned
     /// design meets the SF target at minimum mass. None = budget/match.
     pub strength: Option<StrengthGoal>,
+    /// "maximize fundamental frequency" goal (§26): `Some` runs the frequency
+    /// objective at the user's FIXED budget. Unlike match and strength this
+    /// walks no budget — the mass constraint is the user's number and the
+    /// objective is what changes — so it needs exactly one pass.
+    ///
+    /// Mutually exclusive with `goal_match` and `strength`: all three would
+    /// otherwise try to own the budget.
+    pub freq: Option<&'a FreqSpec>,
     /// Reference uniform infill fraction — the match target AND the mass
     /// baseline ("vs X% uniform").
     pub ref_frac: f64,
@@ -171,6 +219,15 @@ pub struct OptOutcome {
     pub verify_residual: f64,
     pub c_binned: f64,
     pub c_uniform: f64,
+    /// §26 frequency goal (all 0.0 when the goal is off): fundamental frequency
+    /// in Hz of, respectively, the optimizer's final CONTINUOUS design, the
+    /// delivered BINNED design, and an equal-mass UNIFORM print.
+    ///
+    /// `f1_binned` is the number to show — `f1_design` is unprintable and
+    /// `f1_binned / f1_uniform` is what optimizing actually bought.
+    pub f1_design: f64,
+    pub f1_binned: f64,
+    pub f1_uniform: f64,
     pub c_solid: f64,
     /// Goal-match target compliance (0.0 when not matching).
     pub c_target: f64,
@@ -358,9 +415,16 @@ pub fn run_optimization(
     // within tolerance, each pass warm-started from the previous design.
     // "strength" (§17): an all-at-cap pre-flight decides feasibility, then the
     // same secant machinery walks the budget against SF_crit instead.
+    // "frequency" (§26): no budget walk at all — one pass at the user's budget
+    // with the eigenvalue objective in place of compliance.
     debug_assert!(
-        !(cfg.goal_match && cfg.strength.is_some()),
-        "match and strength goals are mutually exclusive"
+        (cfg.goal_match as u8) + (cfg.strength.is_some() as u8) + (cfg.freq.is_some() as u8) <= 1,
+        "match, strength and frequency goals are mutually exclusive (each owns the budget)"
+    );
+    debug_assert_eq!(
+        cfg.freq.is_some(),
+        params.objective == crate::simp::Objective::MaxFundamental,
+        "PipelineCfg::freq and OptimizeParams::objective must agree"
     );
     let strength_goal = cfg.strength.as_ref();
     let max_passes = if cfg.goal_match {
@@ -433,7 +497,9 @@ pub fn run_optimization(
             iterations: 0,
             converged: true,
             compliance: c_cap,
+            f1_hz: 0.0,
             u: u_cap.clone(),
+            mode1: Vec::new(),
             se: vec![0.0; bins.len()],
         };
         best_feasible = Some(Snapshot {
@@ -499,6 +565,7 @@ pub fn run_optimization(
             warm_x.as_deref(),
             warm_u.as_deref(),
             loads,
+            cfg.freq,
             |p, x_phys, design_cells| {
                 let upd = IterUpdate { progress: p, pass, passes: max_passes, budget };
                 progress(&upd, x_phys, design_cells);
@@ -738,6 +805,30 @@ pub fn run_optimization(
         grid, &result.skin_cells, &result.design_cells, &result.skin_frac, &x_uniform, eval_exp,
         eval_coeff,
     );
+    // ---- §26 frequency goal: the two numbers that make the result judgeable --
+    // `f1_binned` is what the user actually gets (the quantized, printable
+    // design — the optimizer's continuous field is not deliverable), and
+    // `f1_uniform` is the same MASS spent as uniform infill. The second is the
+    // honest comparison: a high f1 means nothing without knowing what the plain
+    // print at that mass already gave, and binning can give back some of the
+    // gain, so reporting only the optimizer's own λ would overstate the result.
+    let (f1_binned, f1_uniform) = match cfg.freq {
+        Some(fs) => {
+            status(PipelinePhase::VerifySolve);
+            let fb = modal_f1(
+                slot, grid, levels, problem, settings, &result.skin_cells, &result.design_cells,
+                &result.skin_frac, &x_binned, eval_exp, eval_coeff, fs,
+            )?;
+            status(PipelinePhase::UniformSolve);
+            let fu = modal_f1(
+                slot, grid, levels, problem, settings, &result.skin_cells, &result.design_cells,
+                &result.skin_frac, &x_uniform, eval_exp, eval_coeff, fs,
+            )?;
+            (fb, fu)
+        }
+        None => (0.0, 0.0),
+    };
+
     status(PipelinePhase::SolidSolve);
     let x_solid = vec![1.0; x_binned.len()];
     let (c_solid, max_disp_solid, u_solid) = evaluate_cached(
@@ -806,6 +897,9 @@ pub fn run_optimization(
         verify_residual: verify_stats.rel_residual,
         c_binned,
         c_uniform,
+        f1_design: result.f1_hz,
+        f1_binned,
+        f1_uniform,
         c_solid,
         c_target,
         u_binned,
@@ -995,6 +1089,7 @@ mod tests {
             eval: EvalLaw { exp: 1.5, coeff: 1.0 },
             goal_match: false,
             strength: None,
+            freq: None,
             ref_frac: 0.35,
             n_bins: 3,
             levels_pct: None,
@@ -1067,6 +1162,7 @@ mod tests {
                 eval: EvalLaw { exp: 1.5, coeff: 1.0 },
                 goal_match: false,
                 strength: Some(StrengthGoal { target, spec }),
+                freq: None,
                 ref_frac: 0.35,
                 n_bins: 3,
                 levels_pct: None,
@@ -1126,6 +1222,7 @@ mod tests {
             eval: EvalLaw { exp: 1.5, coeff: 1.0 },
             goal_match: false,
             strength: None,
+            freq: None,
             ref_frac: 0.35,
             n_bins: 3,
             levels_pct: None,
@@ -1174,6 +1271,7 @@ mod tests {
             eval: EvalLaw { exp: 1.5, coeff: 1.0 },
             goal_match: false,
             strength: None,
+            freq: None,
             ref_frac: 0.35,
             n_bins: 3,
             levels_pct: None,

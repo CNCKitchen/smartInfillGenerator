@@ -250,7 +250,7 @@ function clampPct(v: number, lo: number, hi: number): number {
  *  printable band regardless of fill mode. */
 export function budgetBounds(s: {
   optMode: "graded" | "binary" | "solid";
-  goal: "budget" | "match" | "strength";
+  goal: "budget" | "match" | "strength" | "frequency";
   levelSettings: LevelSettings;
 }): [number, number] {
   // Solid topology: the budget is the RETAINED VOLUME fraction of the design
@@ -725,7 +725,7 @@ interface AppState {
   /** Optimization goal: stiffest at a mass budget, lightest at a target
    *  stiffness ("as stiff as uniform X%"), or lightest at a target safety
    *  factor (DESIGN §17). */
-  goal: "budget" | "match" | "strength";
+  goal: "budget" | "match" | "strength" | "frequency";
   /** Strength goal: required safety factor SF_crit (§17 dec. 1). Advisory —
    *  strengths come from preset/measured values and Gibson–Ashby scaling. */
   sfTarget: number;
@@ -761,7 +761,14 @@ interface AppState {
   check: CheckReport | null;
   stats: SolveStats | null;
   hasResult: boolean;
-  optProgress: { iteration: number; maxIter: number; pass?: number; passes?: number } | null;
+  optProgress: {
+    iteration: number;
+    maxIter: number;
+    pass?: number;
+    passes?: number;
+    /** Live f₁ (Hz) under the "frequency" goal (DESIGN §26); 0 otherwise. */
+    f1Hz?: number;
+  } | null;
   optSummary: OptSummary | null;
   /** Per-design min safety factor for the dock's margin-of-safety comparison
    *  (infill modes; worst load step for the optimized design). Computed after
@@ -1184,7 +1191,7 @@ interface AppState {
   setNBins(v: number): void;
   /** Minimum member size in mm; null restores auto (4× line width). */
   setMinMemberMm(v: number | null): void;
-  setGoal(g: "budget" | "match" | "strength"): void;
+  setGoal(g: "budget" | "match" | "strength" | "frequency"): void;
   /** Strength goal: required SF_crit (clamped to a sane 1..9.5 band). */
   setSfTarget(v: number): void;
   setSfMeasure(m: "material" | "layer" | "both"): void;
@@ -1252,6 +1259,11 @@ interface AppState {
   downloadStls(): Promise<void>;
   /** Solid topology mode: download the optimized shape as one STL. */
   downloadShape(): Promise<void>;
+  /** Slicer project 3MF WITHOUT modifier volumes — the hand-off for the runs
+   *  that have no modifier geometry: a plain as-printed analysis (the imported
+   *  part, at the analyzed walls/shells/infill) and Part Topo (the optimized
+   *  body, solid). Both land on the plate in the orientation that was analyzed. */
+  downloadPositionedThreeMf(): Promise<void>;
   /** Number of discrete color steps for the color-3MF export (= filament
    *  slots), clamped to COLOR_STEPS_MIN..MAX. */
   colorSteps: number;
@@ -6968,6 +6980,7 @@ export const useStore = create<AppState>((set, get) => ({
       const match = st.goal === "match" && !solid;
       // Strength goal (DESIGN §17): available in ALL modes incl. Part Topo.
       const strength = st.goal === "strength";
+      const freqGoal = st.goal === "frequency";
       const ls = st.levelSettings;
       const manual = !binary && !solid && ls.mode === "manual" && ls.manual.length >= 2;
       appendLog(
@@ -6984,7 +6997,10 @@ export const useStore = create<AppState>((set, get) => ({
                 : strength
                   ? `reach safety factor ≥ ${st.sfTarget} (${st.sfMeasure === "both" ? "material & layer" : st.sfMeasure}) — ` +
                     `all-at-cap pre-flight, then lightest design via budget secant`
-                  : `infill budget ${st.budget}%`) +
+                  : freqGoal
+                    ? `maximize the fundamental frequency at infill budget ${st.budget}% — ` +
+                      `force-free (first load case's supports only), single pass`
+                    : `infill budget ${st.budget}%`) +
               ` (${st.pattern}: E/E₀ = ${curve.coeff}·ρ^${curve.exponent}), ` +
               `skin ${st.perimeters}×${st.lineWidth} mm — convergence when mean |Δρ| < 0.005 twice` +
               (binary ? " · optimizer SIMP-penalized p=3" : "") +
@@ -7044,6 +7060,7 @@ export const useStore = create<AppState>((set, get) => ({
               maxIter: p.maxIter,
               pass: p.pass,
               passes: p.passes,
+              f1Hz: p.f1Hz,
             },
             optSeries: [
               ...s.optSeries,
@@ -7126,6 +7143,42 @@ export const useStore = create<AppState>((set, get) => ({
           set,
           "  note: SF targets are a design aid from preset/measured strengths and Gibson–Ashby " +
             "scaling — not a certified safety factor."
+        );
+      }
+      if (out.summary.goal === "frequency") {
+        const fm = out.summary;
+        const f1 = fm.f1Hz ?? 0;
+        const fu = fm.f1UniformHz ?? 0;
+        const gain = (fm.f1GainVsUniform ?? 0) * 100;
+        appendLog(
+          set,
+          `  frequency: f₁ = ${f1.toFixed(1)} Hz vs ${fu.toFixed(1)} Hz for uniform ` +
+            `${Math.round(fm.meanInfill * 100)}% infill at equal weight (${gain >= 0 ? "+" : ""}${gain.toFixed(1)}%)`
+        );
+        // Binning is where a frequency gain most often evaporates: the graded
+        // field the optimizer converged to may need more levels than the run
+        // allowed. Say so rather than leaving the user to wonder why the
+        // delivered number undershoots.
+        const loss = (fm.f1BinningLoss ?? 0) * 100;
+        if (loss > 2) {
+          appendLog(
+            set,
+            `  note: quantizing to ${out.summary.bins.length} levels gave back ${loss.toFixed(1)}% of ` +
+              `the optimizer's f₁ (continuous design reached ${(fm.f1DesignHz ?? 0).toFixed(1)} Hz) — ` +
+              `more density levels would recover some of it.`
+          );
+        }
+        if ((fm.f1IgnoredLoadCases ?? 0) > 0) {
+          appendLog(
+            set,
+            `  note: free vibration is force-free — the other ${fm.f1IgnoredLoadCases} load case(s) ` +
+              `were IGNORED. Only the first case's supports shaped this design.`
+          );
+        }
+        appendLog(
+          set,
+          "  note: undamped natural frequency of the analyzed geometry — validate against a " +
+            "measurement or FEA before relying on it."
         );
       }
       if (out.summary.goal === "match" && out.summary.massUniformRefGrams) {
@@ -7309,6 +7362,33 @@ export const useStore = create<AppState>((set, get) => ({
       const bytes = await engine.exportSolidStl();
       const base = (get().fileName ?? "part").replace(/\.(stl|3mf)$/i, "");
       download(bytes, `${base}_optimized.stl`, "model/stl");
+    } catch (e) {
+      set({ error: e instanceof Error ? e.message : String(e) });
+    }
+  },
+
+  async downloadPositionedThreeMf() {
+    const s = get();
+    // Part Topo's body IS the design — it prints solid. A plain analysis
+    // exports the imported part with the print settings the solve assumed, so
+    // what gets printed is what was checked; an analysis that ran on the
+    // CAD-ideal solid (isotropic materials always do) assumed 100%.
+    const optimized = s.optSummary?.solid === true;
+    const dense = optimized || s.analyzeMode === "solid" || isIsotropic(s.material);
+    try {
+      const thumbnail = sceneEvents.captureThumbnail?.() ?? null;
+      const bytes = await engine.exportPositionedThreeMf(
+        s.exportSlicer,
+        {
+          baseDensity: dense ? 1 : s.printInfill / 100,
+          perimeters: s.perimeters,
+          topBottomLayers: s.topBottomLayers,
+          optimized,
+        },
+        thumbnail
+      );
+      const base = (s.fileName ?? "part").replace(/\.(stl|3mf)$/i, "");
+      download(bytes, `${base}_${optimized ? "optimized" : "positioned"}.3mf`, "model/3mf");
     } catch (e) {
       set({ error: e instanceof Error ? e.message : String(e) });
     }

@@ -2720,6 +2720,13 @@ impl Model {
         let params = OptimizeParams {
             // Budget = target mean INFILL density of the interior — the
             // engine clamps it to the printable [floor, cap] band.
+            // §26: the frequency goal swaps the OBJECTIVE, not the budget — the
+            // mass constraint stays exactly what the user asked for.
+            objective: if opts.goal == "frequency" {
+                filasim_core::simp::Objective::MaxFundamental
+            } else {
+                filasim_core::simp::Objective::Compliance
+            },
             budget: (budget_pct / 100.0).clamp(0.01, 1.0),
             exponent: opt_exp,
             coeff: opt_coeff,
@@ -2781,6 +2788,18 @@ impl Model {
                 shear_z: self.shear_strength_z_eff(),
             },
         });
+        // Frequency goal (§26): maximize f1 at the user's budget. Force-free —
+        // only the PRIMARY case's supports enter (the modal design note §3 rule,
+        // reused verbatim), so extra load cases are silently irrelevant here and
+        // the UI says so. Remote point masses DO matter and are lumped from the
+        // BCs exactly as `modal_analysis` does, so a motor/battery mount drags
+        // the design the way it drags the real part.
+        let freq_spec = (opts.goal == "frequency").then(|| filasim_core::simp::FreqSpec {
+            density: self.density,
+            extra_mass: filasim_core::attach::point_mass_lumping(&self.mesh, grid, primary_bcs),
+            num_modes: 0, // module default
+            kappa: 0.0,   // module default
+        });
         let ref_frac = (budget_pct / 100.0).clamp(params.floor, params.cap);
         // Manual level override (binary {floor,1} or user densities): clamp,
         // sort, dedup once here; the pipeline takes the list verbatim.
@@ -2798,6 +2817,7 @@ impl Model {
             eval: filasim_core::pipeline::EvalLaw { exp: eval_exp, coeff: eval_coeff },
             goal_match,
             strength: strength_goal,
+            freq: freq_spec.as_ref(),
             ref_frac,
             n_bins,
             levels_pct: levels_clean.as_deref(),
@@ -2839,6 +2859,9 @@ impl Model {
                     "passes": upd.passes,
                     "budgetNow": upd.budget,
                     "compliance": upd.progress.compliance,
+                    // §26: the frequency arm solves no static case, so
+                    // `compliance` is 0 there and this is the live headline.
+                    "f1Hz": upd.progress.f1_hz,
                     "massFrac": upd.progress.mass_frac,
                     "meanInfill": upd.progress.mean_infill,
                     "change": upd.progress.change,
@@ -2927,11 +2950,50 @@ impl Model {
                 "match"
             } else if strength_goal.is_some() {
                 "strength"
+            } else if freq_spec.is_some() {
+                "frequency"
             } else {
                 "budget"
             },
             "passes": oc.pass_trace.len(),
         });
+        if freq_spec.is_some() {
+            // Frequency summary (§26). `f1Hz` is the DELIVERED (binned) number —
+            // the continuous field it came from is not printable, so reporting
+            // that one would overstate the result. `f1UniformHz` is the same
+            // mass spent as plain uniform infill: the only honest way to read
+            // the gain, and it is quoted even when negative.
+            let o = summary_v.as_object_mut().unwrap();
+            o.insert("f1Hz".into(), serde_json::json!(oc.f1_binned));
+            o.insert("f1UniformHz".into(), serde_json::json!(oc.f1_uniform));
+            o.insert("f1DesignHz".into(), serde_json::json!(oc.f1_design));
+            o.insert(
+                "f1GainVsUniform".into(),
+                serde_json::json!(if oc.f1_uniform > 0.0 {
+                    oc.f1_binned / oc.f1_uniform - 1.0
+                } else {
+                    0.0
+                }),
+            );
+            // Quantization loss: how much of the optimizer's gain binning gave
+            // back. Large ⇒ the design wanted a grading the level count can't
+            // express, and more bins would help.
+            o.insert(
+                "f1BinningLoss".into(),
+                serde_json::json!(if oc.f1_design > 0.0 {
+                    1.0 - oc.f1_binned / oc.f1_design
+                } else {
+                    0.0
+                }),
+            );
+            // §26 / modal design note §3: the eigenproblem is force-free and
+            // takes ONE support set. Extra load cases contributed nothing, and
+            // silently ignoring them would be the wrong kind of quiet.
+            o.insert(
+                "f1IgnoredLoadCases".into(),
+                serde_json::json!(self.load_cases.len().saturating_sub(1)),
+            );
+        }
         if let Some(sg) = &strength_goal {
             // Strength summary (§17): target vs achieved, the pre-flight's
             // best-achievable ceiling, and the binding-region diagnosis the
@@ -4745,6 +4807,59 @@ impl Model {
     /// SOLID topology mode: the single optimized body as one binary STL (the
     /// regions hold exactly one kept-material mesh). Re-sliceable / re-CAD-able.
     pub fn export_solid_stl(&self) -> Result<Vec<u8>, JsValue> {
+        Ok(self.solid_body_mesh()?.to_stl_binary())
+    }
+
+    /// Slicer project 3MF with NO modifier volumes — just the part, placed on
+    /// the plate in the orientation the analysis ran in and carrying the walls,
+    /// shells and infill the analysis assumed. This is the hand-off for the runs
+    /// that have no modifier geometry to ship: a plain as-printed analysis, and
+    /// Part Topo (`optimized` swaps the imported part for the kept-material
+    /// body). Same flavors as `export_3mf`; `base_density` is a fraction.
+    pub fn export_positioned_3mf(
+        &self,
+        slicer: &str,
+        thumbnail: &[u8],
+        base_density: f64,
+        wall_loops: u32,
+        top_bottom_layers: u32,
+        optimized: bool,
+    ) -> Result<Vec<u8>, JsValue> {
+        let part = if optimized { weld(&self.solid_body_mesh()?) } else { weld(&self.mesh_orig) };
+        let name = if self.name.is_empty() { "part" } else { &self.name };
+        let thumb = if thumbnail.is_empty() { None } else { Some(thumbnail) };
+        // A body meant to print solid must not slice as gyroid & friends (they
+        // fill poorly at 100%); below that the user's own profile pattern stays
+        // in charge. Bambu Studio renamed the value — see `export_3mf`.
+        let pattern = (base_density >= 0.999)
+            .then(|| if slicer == "bambu" { "zig-zag" } else { "rectilinear" });
+        Ok(match slicer {
+            "prusa" => filasim_core::threemf::export_prusa_3mf(
+                name,
+                &part,
+                &[],
+                base_density,
+                wall_loops,
+                top_bottom_layers,
+                pattern.map(|_| "rectilinear"),
+                None,
+            ),
+            _ => export_orca_3mf(
+                name,
+                &part,
+                &[],
+                base_density,
+                wall_loops,
+                top_bottom_layers,
+                pattern,
+                None,
+                thumb,
+            ),
+        })
+    }
+
+    /// The single kept-material body of a SOLID (Part Topo) optimization.
+    fn solid_body_mesh(&self) -> Result<TriMesh, JsValue> {
         let opt = self.opt.as_ref().ok_or_else(|| err("no optimization result — run optimize first"))?;
         let r = opt.regions.first().ok_or_else(|| err("no optimized shape"))?;
         let mut tris: Vec<[f32; 9]> = Vec::with_capacity(r.indices.len() / 3);
@@ -4756,7 +4871,7 @@ impl Model {
             let (a, b, c) = (v(f[0]), v(f[1]), v(f[2]));
             tris.push([a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2]]);
         }
-        Ok(TriMesh::from_triangles(tris).to_stl_binary())
+        Ok(TriMesh::from_triangles(tris))
     }
 }
 

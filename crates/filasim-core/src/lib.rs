@@ -18,6 +18,7 @@ pub mod check;
 pub mod cylinder;
 pub mod eps;
 pub mod fem;
+pub mod freq;
 pub mod mesh;
 pub mod mg;
 pub mod modal;

@@ -150,6 +150,16 @@ export const OPT_HELP: Record<string, HelpContent> = {
       "Stiffest: spend a fixed material budget as well as possible — the least deflection you can get for that mass.",
       "Match stiffness: the other way round. Name a uniform infill % you are happy with and get the LIGHTEST graded design that is just as stiff.",
       "Safety factor: the lightest design whose safety factor stays at or above a target under every included load step.",
+      "Frequency: spend a fixed material budget to push the part's lowest natural frequency as HIGH as possible — the goal for anything driven by vibration, where you want the first resonance to sit above the excitation.",
+      "Frequency works differently from the other three. Free vibration has no forces in it, so your loads are ignored and only the supports (of the first load case) matter. It also fights itself: material adds stiffness, which raises the frequency, but it also adds mass, which lowers it. The optimizer places density only where the stiffness wins.",
+    ],
+  },
+  goalFrequency: {
+    title: "Maximize first natural frequency",
+    text: [
+      "Keeps your infill budget and rearranges it so the part's fundamental frequency f₁ is as high as it can be at that weight.",
+      "Read the result against the equal-weight uniform print quoted in the log — that comparison, not the raw Hz, is what the optimization bought you.",
+      "This is an undamped free-vibration estimate of the analyzed geometry. Treat it as a design aid and confirm anything load-bearing against a measurement or FEA.",
     ],
   },
   budget: {
@@ -351,6 +361,13 @@ export const EXPORT_HELP: Record<string, HelpContent> = {
     text: [
       "A single watertight body of the kept material — re-slice it (solid / 100 % infill) or take it back into CAD.",
       "Material under loads and supports was kept automatically; floating islands were dropped.",
+    ],
+  },
+  positioned: {
+    title: "Slicer project (.3mf)",
+    text: [
+      "This run has no modifier volumes to ship, so the project carries the model itself — on the plate, in the orientation that was analyzed.",
+      "After an as-printed analysis it also carries the walls, shells and infill % the solve assumed, so what you print is what was checked. After a Part Topo run it carries the optimized body at 100 % infill. Everything else comes from your own profile.",
     ],
   },
   color3mf: {
