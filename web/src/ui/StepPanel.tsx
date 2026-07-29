@@ -230,6 +230,7 @@ function StepModel() {
     useShallow((s) => ({
       fileName: s.fileName,
       model: s.model,
+      isSample: s.isSample,
       loadFile: s.loadFile,
       tool: s.tool,
       setTool: s.setTool,
@@ -251,7 +252,12 @@ function StepModel() {
         hidden
         onChange={(e) => void onFile(e.target.files?.[0])}
       />
-      <button className="primary" onClick={() => fileRef.current?.click()}>
+      <button
+        // While the startup sample is loaded, a soft pulse marks this button
+        // as the "bring your own part" entry point.
+        className={s.isSample ? "primary sample-pulse" : "primary"}
+        onClick={() => fileRef.current?.click()}
+      >
         {s.fileName ? "Replace model…" : "Open STL / 3MF / STEP…"}
       </button>
       {s.fileName ? (

@@ -20,11 +20,14 @@ export interface StepTessOpts {
 }
 
 /** Main thread → worker: one STEP file to convert. `opts` overrides the
- *  file-derived tessellation defaults (project reopen). */
+ *  file-derived tessellation defaults (project reopen). `cached` is an
+ *  optional pre-tessellated container (stepMeshCache.ts) — the worker
+ *  validates it against the bytes and skips tessellation on a match. */
 export interface StepImportRequest {
   id: number;
   bytes: ArrayBuffer;
   opts?: StepTessOpts;
+  cached?: ArrayBuffer;
 }
 
 /** STEP product-structure tree over the DENSE solid ids — the assembly
@@ -97,6 +100,9 @@ export interface StepMeshPayload {
    *  FILE — a CAD re-export renumbers them, so a changed hash means face-id
    *  selections must be re-bound by the user, not trusted (DESIGN §18). */
   sha256: string;
+  /** Session-only: the worker served this payload from a validated
+   *  pre-tessellated cache instead of tessellating (never persisted). */
+  fromCache?: boolean;
 }
 
 export type StepImportWorkerMessage =
@@ -117,11 +123,13 @@ class StepImporter {
 
   /** Convert a STEP file to a mesh payload. A still-running previous import
    *  is cancelled first. Rejects with "cancelled" on `cancel()`. `opts`
-   *  overrides the file-derived tessellation defaults (project reopen). */
+   *  overrides the file-derived tessellation defaults (project reopen);
+   *  `cached` short-circuits tessellation when it matches (sample model). */
   import(
     bytes: ArrayBuffer,
     onProgress?: StepProgressHandler,
-    opts?: StepTessOpts
+    opts?: StepTessOpts,
+    cached?: ArrayBuffer
   ): Promise<StepMeshPayload> {
     if (this.active) this.cancel();
     const id = this.nextId++;
@@ -148,7 +156,10 @@ class StepImporter {
         this.active = null;
         reject(new Error(ev.message || "STEP import worker crashed"));
       };
-      worker.postMessage({ id, bytes, opts } satisfies StepImportRequest, [bytes]);
+      worker.postMessage(
+        { id, bytes, opts, cached } satisfies StepImportRequest,
+        cached ? [bytes, cached] : [bytes]
+      );
     });
   }
 

@@ -12,6 +12,7 @@
     "build": "tsc -b && vite build",
     "check:units": "node scripts/check-units.mjs",
     "check:step": "node scripts/check-step-selection.mjs",
+    "sample:mesh": "node scripts/build-sample-mesh.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

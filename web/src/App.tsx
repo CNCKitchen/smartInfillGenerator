@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
 
-import { useRef } from "react";
+import { useEffect, useRef } from "react";
 import { TopBar } from "./ui/TopBar";
 import { StepRail } from "./ui/StepRail";
 import { StepPanel } from "./ui/StepPanel";
@@ -32,6 +32,38 @@ export function App() {
   const notice = useStore((s) => s.notice);
   const model = useStore((s) => s.model);
   const clearError = useStore((s) => s.clearError);
+
+  // Startup default: the bundled sample model with its loads applied, so the
+  // first paint invites poking at a working setup instead of a bare drop
+  // zone. The action itself is race-safe (one-shot latch + re-checks), and
+  // opting out lives in the nerd log next to the disclaimer skip.
+  useEffect(() => {
+    const s = useStore.getState();
+    if (!s.sampleSkipped) void s.loadSampleModel();
+  }, []);
+
+  // Drag & drop anywhere in the window. Overlays (the empty-state drop card,
+  // panels, chips) sit above the viewer canvas, so an element-scoped listener
+  // misses drops on them and the browser navigates to the file instead.
+  useEffect(() => {
+    const onDrop = (ev: DragEvent) => {
+      ev.preventDefault();
+      const f = ev.dataTransfer?.files?.[0];
+      if (!f) return;
+      void (async () => {
+        const s = useStore.getState();
+        if (/\.filasim$/i.test(f.name)) await s.openProject(f);
+        else await s.loadFile(f.name, await f.arrayBuffer());
+      })();
+    };
+    const onDrag = (ev: DragEvent) => ev.preventDefault();
+    window.addEventListener("drop", onDrop);
+    window.addEventListener("dragover", onDrag);
+    return () => {
+      window.removeEventListener("drop", onDrop);
+      window.removeEventListener("dragover", onDrag);
+    };
+  }, []);
 
   return (
     <div className="app">

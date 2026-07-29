@@ -41,6 +41,7 @@ import {
   type StepManifestInfo,
 } from "./engine/stepSelection";
 import { buildBinaryStl, connectedBodies, isIdentityTransform } from "./engine/assembly";
+import { SAMPLE_BCS, SAMPLE_FILE, SAMPLE_MESH, SAMPLE_NOTICE, sampleUrl } from "./sampleModel";
 import { ENVELOPE_STEP, FieldServer, isEnvelope, resultIsSolidBody } from "./engine/FieldServer";
 import type {
   Bc,
@@ -856,6 +857,12 @@ interface AppState {
   disclaimerOpen: boolean;
   /** Dev/testing escape hatch (persisted in this browser). */
   disclaimerSkipped: boolean;
+  /** Don't auto-load the bundled sample model on startup (persisted in this
+   *  browser, toggled in the nerd log like the disclaimer skip). */
+  sampleSkipped: boolean;
+  /** The loaded model IS the startup sample (cleared by any user load) —
+   *  the Model step's replace button pulses to point at the next step. */
+  isSample: boolean;
   // ---- display units (presentation only; see docs/units-design.md) ----
   /** Per-quantity display-unit selection. The engine/store stay canonical;
    *  this only drives rendering + input conversion. */
@@ -952,7 +959,13 @@ interface AppState {
   setActiveStep(n: number): void;
   /** Open a model. For an ambiguous STL it shows the import-unit picker (unless
    *  "don't ask again"); `unitId` set = use it directly (the picker's confirm). */
-  loadFile(name: string, bytes: ArrayBuffer, unitId?: string): Promise<void>;
+  /** `sampleCache` is the pre-tessellated mesh container for the bundled
+   *  sample model — validated (and possibly discarded) by the import worker. */
+  loadFile(name: string, bytes: ArrayBuffer, unitId?: string, sampleCache?: ArrayBuffer): Promise<void>;
+  /** Fetch the bundled sample model and load it with its canned loads applied
+   *  (startup default). Silently a no-op when the assets are missing or a
+   *  user model beat it to the viewport. */
+  loadSampleModel(): Promise<void>;
   /** Picker confirmed: bake the pending STL at `unitId`; `remember` = stop
    *  asking on future imports. */
   confirmImport(unitId: string, remember: boolean): void;
@@ -1188,6 +1201,7 @@ interface AppState {
   setResultSurface(surface: "stl" | "voxel"): Promise<void>;
   consentDisclaimer(): void;
   setDisclaimerSkipped(on: boolean): void;
+  setSampleSkipped(on: boolean): void;
   /** Open/close the unit-settings popover. */
   openUnits(open: boolean): void;
   /** Apply a whole preset (Metric / SI-mm / US-in / …). */
@@ -1400,6 +1414,20 @@ function disclaimerSkippedInit(): boolean {
     return false;
   }
 }
+
+const SKIP_SAMPLE_KEY = "filasim-skip-sample";
+
+function sampleSkippedInit(): boolean {
+  try {
+    return localStorage.getItem(SKIP_SAMPLE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+/** One-shot latch for the startup sample load — StrictMode double-mounts the
+ *  boot effect in dev, and the async guards alone leave a fetch-race window. */
+let sampleLoadRequested = false;
 
 /** Owns the per-solution engine-session state (field caches, voxel-result
  *  geometry, residual poll). The `onVoxelResult` sink forwards to the scene at
@@ -1734,7 +1762,8 @@ function appendLog(set: SetState, msg: string) {
 async function importStepWithProgress(
   bytes: ArrayBuffer,
   set: SetState,
-  opts?: StepTessOpts
+  opts?: StepTessOpts,
+  cached?: ArrayBuffer
 ): Promise<StepMeshPayload> {
   set({ busy: "Reading CAD geometry…", importingStep: true });
   try {
@@ -1748,7 +1777,8 @@ async function importStepWithProgress(
           set({ busy: "Finalizing mesh…" });
         }
       },
-      opts
+      opts,
+      cached
     );
   } finally {
     set({ importingStep: false });
@@ -4170,6 +4200,8 @@ export const useStore = create<AppState>((set, get) => ({
   supportOpen: false,
   disclaimerOpen: !disclaimerSkippedInit(),
   disclaimerSkipped: disclaimerSkippedInit(),
+  sampleSkipped: sampleSkippedInit(),
+  isSample: false,
   unitPrefs: initialUnitPrefs,
   unitsOpen: false,
   unitRev: 0,
@@ -4215,7 +4247,7 @@ export const useStore = create<AppState>((set, get) => ({
     pushSymmetry(get);
   },
 
-  async loadFile(name, bytes, unitId) {
+  async loadFile(name, bytes, unitId, sampleCache) {
     const isStl = /\.stl$/i.test(name);
     // STL is unitless → prompt for the import unit (unless "don't ask again").
     // 3MF/STEP carry their own units, so never prompt and never rescale here.
@@ -4237,12 +4269,13 @@ export const useStore = create<AppState>((set, get) => ({
         // STEP tessellates in the meshStep worker (DESIGN §18); the engine
         // gets the finished mesh + CAD-face ids, plus the ORIGINAL bytes so
         // project save embeds the .step verbatim.
-        const imp = await importStepWithProgress(bytes, set);
+        const imp = await importStepWithProgress(bytes, set, undefined, sampleCache);
         stepNotices = stepImportNotices(imp);
         appendLog(
           set,
           `STEP converted by meshStep ${imp.meshstepVersion} — ${imp.faceEntityIds.length} CAD faces, ` +
-            `${imp.stats.solids} solid${imp.stats.solids === 1 ? "" : "s"}, deviation ${imp.opts.surfaceDeviation} mm, max edge ${imp.opts.maxEdge} mm`
+            `${imp.stats.solids} solid${imp.stats.solids === 1 ? "" : "s"}, deviation ${imp.opts.surfaceDeviation} mm, max edge ${imp.opts.maxEdge} mm` +
+            (imp.fromCache ? " (pre-tessellated cache)" : "")
         );
         set({ busy: "Segmenting…" });
         // Copies for the assembly cache — loadMesh TRANSFERS its arguments,
@@ -4328,6 +4361,8 @@ export const useStore = create<AppState>((set, get) => ({
         fileName: name,
         model,
         stepInfo,
+        // Any load lands here — loadSampleModel re-flags after its BCs apply.
+        isSample: false,
         // STEP arrives already segmented by its BREP faces (Model::new default),
         // so reflect that; STL/3MF use the crease-angle slider.
         segSource: model.hasCadFaces ? "cad" : "angle",
@@ -4427,6 +4462,45 @@ export const useStore = create<AppState>((set, get) => ({
       // A cancelled STEP conversion is the user's Stop, not an error.
       set({ busy: null, error: /cancelled/i.test(emsg) ? null : emsg });
     }
+  },
+
+  async loadSampleModel() {
+    if (sampleLoadRequested) return;
+    sampleLoadRequested = true;
+    if (get().model || get().busy || get().pendingImport) return;
+    let stepBytes: ArrayBuffer;
+    let cache: ArrayBuffer | undefined;
+    try {
+      const [stepRes, meshRes] = await Promise.all([
+        fetch(sampleUrl(SAMPLE_FILE)),
+        fetch(sampleUrl(SAMPLE_MESH)),
+      ]);
+      if (!stepRes.ok) return; // assets not deployed — keep the drop zone
+      stepBytes = await stepRes.arrayBuffer();
+      // A missing mesh cache is fine: the worker tessellates live instead.
+      cache = meshRes.ok ? await meshRes.arrayBuffer() : undefined;
+    } catch {
+      return; // offline/dev without assets — silently keep the empty state
+    }
+    // A user drop may have won the race while the sample was downloading.
+    if (get().model || get().busy || get().pendingImport) return;
+    await get().loadFile(SAMPLE_FILE, stepBytes, undefined, cache);
+    const st = get();
+    if (st.fileName !== SAMPLE_FILE || !st.model || !st.stepInfo) return;
+    // Canned loads bind by CAD-face ENTITY ID (stable for these exact bytes);
+    // an id that no longer resolves means the asset pair is inconsistent —
+    // ship the bare model rather than a half-rigged setup.
+    const bcs: Bc[] = [];
+    for (const spec of SAMPLE_BCS) {
+      const tris = trisForFaceIds(spec.faceIds, st.stepInfo.cadPatchIds, st.stepInfo.faceEntityIds);
+      if (tris.length === 0) return;
+      bcs.push({ ...spec.bc, id: `bc${++bcCounter}`, tris });
+    }
+    // Stay on Model (the normal first-run flow starts with orientation); the
+    // load glyphs are visible in the viewport regardless of station.
+    set({ bcs, activeBcId: null, activeStep: 1, notice: SAMPLE_NOTICE, isSample: true });
+    await pushBcs(get);
+    pushBcGlyphs(get, null);
   },
 
   confirmImport(unitId, remember) {
@@ -7178,6 +7252,16 @@ export const useStore = create<AppState>((set, get) => ({
     }
   },
 
+  setSampleSkipped(on) {
+    set({ sampleSkipped: on });
+    try {
+      if (on) localStorage.setItem(SKIP_SAMPLE_KEY, "1");
+      else localStorage.removeItem(SKIP_SAMPLE_KEY);
+    } catch {
+      // private mode: the checkbox still works for this session
+    }
+  },
+
   openUnits(open) {
     set({ unitsOpen: open });
   },
@@ -7471,6 +7555,7 @@ export const useStore = create<AppState>((set, get) => ({
         fileName: mf.fileName,
         model,
         stepInfo,
+        isSample: false,
         segAngle: st.segAngle,
         segSource: st.segSource,
         material: projMat,

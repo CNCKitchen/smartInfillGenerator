@@ -199,24 +199,8 @@ export function Viewer() {
     scene.setProbeFormatter(fmt);
   }, [viewMode, resultField, meshDensity]);
 
-  // Drag & drop.
-  useEffect(() => {
-    const el = wrapRef.current!;
-    const onDrop = async (ev: DragEvent) => {
-      ev.preventDefault();
-      const file = ev.dataTransfer?.files?.[0];
-      if (!file) return;
-      const bytes = await file.arrayBuffer();
-      void useStore.getState().loadFile(file.name, bytes);
-    };
-    const onDrag = (ev: DragEvent) => ev.preventDefault();
-    el.addEventListener("drop", onDrop);
-    el.addEventListener("dragover", onDrag);
-    return () => {
-      el.removeEventListener("drop", onDrop);
-      el.removeEventListener("dragover", onDrag);
-    };
-  }, []);
+  // Drag & drop is handled window-wide in App (overlays above the canvas
+  // would otherwise swallow drops).
 
   return (
     <div className="viewer" ref={wrapRef}>

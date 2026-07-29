@@ -2420,12 +2420,33 @@ button.linkbtn {
   }
 }
 
+/* Soft attention pulse on the Model step's replace button while the startup
+   sample is loaded — an expanding accent ring, gentle enough not to nag. */
+.sample-pulse {
+  animation: samplepulse 2s ease-out infinite;
+}
+
+@keyframes samplepulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(24, 119, 192, 0.55);
+  }
+  70% {
+    box-shadow: 0 0 0 9px rgba(24, 119, 192, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(24, 119, 192, 0);
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .lamp.busy {
     animation: none;
   }
   .spinner {
     animation-duration: 2s;
+  }
+  .sample-pulse {
+    animation: none;
   }
 }
 

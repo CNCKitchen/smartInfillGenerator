@@ -10,6 +10,17 @@ compatibility or simulation results; patch releases are fixes only.
 ## [Unreleased]
 
 ### Added
+- **Sample model on startup**: instead of an empty drop zone, filaSim now
+  boots with the CNC Kitchen Hook loaded and a working load case applied
+  (elastic strap support on the big slot's far wall, 250 N pulling on the
+  bearing flat in the small hook's eye), starting on the Model step as usual. The
+  STEP ships with a **pre-tessellated mesh cache** (`npm run sample:mesh`),
+  validated by the import worker (sha-256 + meshStep version + tessellation
+  opts) so the part appears in about a second without re-tessellating — CAD
+  faces, colors and feature edges fully intact; any mismatch falls back to a
+  normal live import. Dropping your own file replaces the sample as usual,
+  and a "don't load the sample model" checkbox lives in the nerd log next to
+  the disclaimer skip. (DESIGN §25)
 - **Material Manager**: materials get the same library surface as infill
   properties — a modal (⚙ Settings → Materials, or the Properties step's
   "edit" link) with a material list, a grouped detail panel and a chart band.
