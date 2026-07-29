@@ -20,6 +20,7 @@ import type {
 } from "./engine/EngineProtocol";
 import {
   isStepName,
+  looksLikeStep,
   stepImporter,
   stepImportNotices,
   type AssemblyTreeNode,
@@ -4477,6 +4478,10 @@ export const useStore = create<AppState>((set, get) => ({
       ]);
       if (!stepRes.ok) return; // assets not deployed — keep the drop zone
       stepBytes = await stepRes.arrayBuffer();
+      // SPA hosting serves index.html with a 200 for MISSING paths (the
+      // Cloudflare `single-page-application` fallback), so `ok` alone proves
+      // nothing: sniff the ISO-10303 header before trusting the bytes.
+      if (!looksLikeStep(stepBytes)) return;
       // A missing mesh cache is fine: the worker tessellates live instead.
       cache = meshRes.ok ? await meshRes.arrayBuffer() : undefined;
     } catch {

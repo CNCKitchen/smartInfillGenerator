@@ -30,10 +30,14 @@ node_modules/
 #   3dbenchy.stl  -> web/bench + crates phase3 test
 #   Cube.3mf      -> crates phase3 import_3mf test
 #   hook5 v3.*    -> stepbench / stepnode_test default input + reference mesh
+#   CNCKTestHook  -> the startup sample model (DESIGN §25): root = source,
+#                    web/public/sample = deployed copy (npm run sample:mesh)
 !/3dbenchy.stl
 !/Cube.3mf
 !/hook5 v3.step
 !/hook5 v3.stl
+!/CNCKTestHook.step
+!/web/public/sample/CNCKTestHook.step
 
 # ===========================================================================
 # Dev / bench scratch output

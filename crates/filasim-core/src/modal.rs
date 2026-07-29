@@ -39,7 +39,7 @@ pub struct ModalConfig {
 
 impl ModalConfig {
     pub fn new(num_modes: usize) -> Self {
-        Self { num_modes, max_iters: 100, tol: 1e-3 }
+        Self { num_modes, max_iters: 300, tol: 1e-3 }
     }
 }
 
