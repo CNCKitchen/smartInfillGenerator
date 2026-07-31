@@ -30,6 +30,7 @@
 //! Run:  cargo test -p filasim-core --test surfstress -- --ignored --nocapture
 
 use filasim_core::solve::{active_nodes, grid_eps};
+use filasim_core::spr::{project_traction, recover_nodal_spr};
 use filasim_core::stress::{cell_field, material_factor, recover_nodal, FieldKind};
 use filasim_core::{
     pad_for_levels, solve_nodes, NodeProblem, SolveSettings, VoxelGrid,
@@ -104,14 +105,38 @@ fn voxelize_production(
 /// Uses `material_factor` (the shipping default, Theory Manual §11.1) so a cut
 /// boundary cell reports true MATERIAL stress rather than an occupancy-scaled
 /// one; that is the field the user reads.
+/// Which recovery is under test. `Mean` is what ships today.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Recovery {
+    /// Volume-averaged nodal recovery (`stress::recover_nodal`) — production.
+    Mean,
+    /// Quadratic superconvergent patch recovery (`spr::recover_nodal_spr`).
+    Spr,
+    /// SPR plus the closed-form traction projection at the sample point.
+    SprProjected,
+}
+
+impl Recovery {
+    fn label(self) -> &'static str {
+        match self {
+            Recovery::Mean => "mean (today)",
+            Recovery::Spr => "SPR",
+            Recovery::SprProjected => "SPR+proj",
+        }
+    }
+}
+
+const RECOVERIES: [Recovery; 3] = [Recovery::Mean, Recovery::Spr, Recovery::SprProjected];
+
 struct SurfaceStress {
     grid: VoxelGrid,
-    /// nodal σ in Voigt order [xx, yy, zz, xy, yz, zx]
-    nodal: Vec<Vec<f32>>,
+    /// nodal σ interleaved, Voigt order [xx, yy, zz, xy, yz, zx]
+    nodal: Vec<f32>,
+    mode: Recovery,
 }
 
 impl SurfaceStress {
-    fn new(grid: &VoxelGrid, u: &[f32]) -> Self {
+    fn new(grid: &VoxelGrid, u: &[f32], mode: Recovery) -> Self {
         let eps = material_factor(grid, &grid_eps(grid));
         let kinds = [
             FieldKind::Sxx,
@@ -121,14 +146,36 @@ impl SurfaceStress {
             FieldKind::Syz,
             FieldKind::Szx,
         ];
-        let nodal = kinds
-            .iter()
-            .map(|&k| {
-                let cellf = cell_field(grid, u, E0, NU, &eps, k);
-                recover_nodal(grid, &cellf)
-            })
-            .collect();
-        Self { grid: grid.clone(), nodal }
+        let cellf: Vec<Vec<f32>> =
+            kinds.iter().map(|&k| cell_field(grid, u, E0, NU, &eps, k)).collect();
+        let nodal = if mode == Recovery::Mean {
+            // Interleave the six independently mean-recovered components so both
+            // paths share one sampler.
+            let per: Vec<Vec<f32>> = cellf.iter().map(|c| recover_nodal(grid, c)).collect();
+            let nn = per[0].len();
+            let mut v = vec![0f32; nn * 6];
+            for n in 0..nn {
+                for c in 0..6 {
+                    v[n * 6 + c] = per[c][n];
+                }
+            }
+            v
+        } else {
+            let refs: [&[f32]; 6] = [
+                &cellf[0], &cellf[1], &cellf[2], &cellf[3], &cellf[4], &cellf[5],
+            ];
+            recover_nodal_spr(grid, &refs)
+        };
+        Self { grid: grid.clone(), nodal, mode }
+    }
+
+    /// Sample and, for `SprProjected`, enforce `σ·n = 0` at the point.
+    fn sigma_on_free_surface(&self, p: [f64; 3], n: [f64; 3]) -> Option<[f64; 6]> {
+        let mut s = self.sigma(p)?;
+        if self.mode == Recovery::SprProjected {
+            project_traction(&mut s, n, [0.0; 3]);
+        }
+        Some(s)
     }
 
     /// Active-aware trilinear sample: NaN nodes (touching no solid cell) are
@@ -162,11 +209,11 @@ impl SurfaceStress {
                     let w = (if ox == 1 { t[0] } else { 1.0 - t[0] })
                         * (if oy == 1 { t[1] } else { 1.0 - t[1] })
                         * (if oz == 1 { t[2] } else { 1.0 - t[2] });
-                    if w <= 0.0 || self.nodal[0][n].is_nan() {
+                    if w <= 0.0 || self.nodal[n * 6].is_nan() {
                         continue;
                     }
                     for c in 0..6 {
-                        acc[c] += w * self.nodal[c][n] as f64;
+                        acc[c] += w * self.nodal[n * 6 + c] as f64;
                     }
                     wsum += w;
                 }
@@ -319,48 +366,54 @@ fn surf_round_cantilever() {
 
     for &h in &[1.0, 0.5] {
         let (pg, u, f_tip) = round_cantilever(r, l, h);
-        let probe = SurfaceStress::new(&pg, &u);
 
         // Sample the mid-span band only: away from the clamped root and the
         // loaded tip, where St-Venant end effects and BC singularities live.
         let (x0, x1) = (0.30 * l, 0.70 * l);
         let sigma_ref = (-f_tip) * (l - x0) * r / inertia; // peak |σxx| in the band
+        println!(
+            "\n  h={h}  ({:.0} cells across the diameter, σ_ref={sigma_ref:.2} MPa)",
+            2.0 * r / h
+        );
 
-        let mut resid = ErrBins::new();
-        let mut sxx_err = ErrBins::new();
-        let mut sampled = 0usize;
-
-        let n_theta = 360;
-        let n_x = 21;
-        for ix in 0..n_x {
-            let x = x0 + (x1 - x0) * ix as f64 / (n_x - 1) as f64;
-            for it in 0..n_theta {
-                let th = 2.0 * PI * it as f64 / n_theta as f64;
-                let (cy, cz) = (r * th.cos(), r * th.sin());
-                // Sample a hair inside the true surface so the trilinear stencil
-                // is dominated by material nodes, not the void ring.
-                let p = [x, cy * (1.0 - 0.25 * h / r), cz * (1.0 - 0.25 * h / r)];
-                let n = [0.0, th.cos(), th.sin()];
-                let Some(s) = probe.sigma(p) else { continue };
-                sampled += 1;
-                let ang = axis_angle_deg(n);
-                // Metric 1: traction residual on a free surface (exact zero).
-                resid.add(ang, norm3(traction(&s, n)) / sigma_ref);
-                // Metric 2: bending stress vs beam theory, σxx = -F(L-x)z/I.
-                let exact = (-f_tip) * (l - x) * cz / inertia;
-                sxx_err.add(ang, (s[0] - exact) / sigma_ref);
+        let mut resid_rows = Vec::new();
+        let mut sxx_rows = Vec::new();
+        for mode in RECOVERIES {
+            let probe = SurfaceStress::new(&pg, &u, mode);
+            let mut resid = ErrBins::new();
+            let mut sxx_err = ErrBins::new();
+            let n_theta = 360;
+            let n_x = 21;
+            for ix in 0..n_x {
+                let x = x0 + (x1 - x0) * ix as f64 / (n_x - 1) as f64;
+                for it in 0..n_theta {
+                    let th = 2.0 * PI * it as f64 / n_theta as f64;
+                    let (cy, cz) = (r * th.cos(), r * th.sin());
+                    // Sample a hair inside the true surface so the trilinear
+                    // stencil is dominated by material nodes, not the void ring.
+                    let p = [x, cy * (1.0 - 0.25 * h / r), cz * (1.0 - 0.25 * h / r)];
+                    let n = [0.0, th.cos(), th.sin()];
+                    let Some(s) = probe.sigma_on_free_surface(p, n) else { continue };
+                    let ang = axis_angle_deg(n);
+                    // Metric 1: traction residual on a free surface (exact zero).
+                    resid.add(ang, norm3(traction(&s, n)) / sigma_ref);
+                    // Metric 2: bending stress vs beam theory, σxx = -F(L-x)z/I.
+                    let exact = (-f_tip) * (l - x) * cz / inertia;
+                    sxx_err.add(ang, (s[0] - exact) / sigma_ref);
+                }
             }
+            resid_rows.push((mode, resid));
+            sxx_rows.push((mode, sxx_err));
         }
 
-        println!(
-            "\n  h={h}  ({:.0} cells across the diameter, {} surface samples, σ_ref={sigma_ref:.2} MPa)",
-            2.0 * r / h,
-            sampled
-        );
         ErrBins::header("traction residual ‖σ·n‖/σ_ref  (exact answer: 0)");
-        resid.print_row("free-surface residual");
+        for (m, b) in &resid_rows {
+            b.print_row(m.label());
+        }
         ErrBins::header("bending stress error (σxx − M·z/I)/σ_ref");
-        sxx_err.print_row("σxx vs beam theory");
+        for (m, b) in &sxx_rows {
+            b.print_row(m.label());
+        }
     }
     println!("\n  Read the BINS, not the totals: if the 0-10° column is small and");
     println!("  the 40-55° column is large, today's axis-aligned benchmarks are");
@@ -472,42 +525,43 @@ fn surf_kirsch_plate_with_hole_offaxis() {
     for &h in &[1.0, 0.5] {
         println!("\n  h={h}  (cells per hole radius ~ {:.0})", a / h);
         println!(
-            "    {:<10} {:>10} {:>10} {:>12} {:>12}",
-            "rotation", "Kt(VM)", "Kt err%", "resid RMS%", "resid MAX%"
+            "    {:<8} {:<14} {:>10} {:>10} {:>12} {:>12}",
+            "rotation", "recovery", "Kt(VM)", "Kt err%", "resid RMS%", "resid MAX%"
         );
         for &deg in &[0.0f64, 15.0, 30.0, 45.0] {
             let phi = deg.to_radians();
-            let (pg, u, to_local) = rotated_plate(&inside_local, [-hw, -hw, 0.0], [hw, hw, t], phi, h, f_total);
-            let probe = SurfaceStress::new(&pg, &u);
-
-            // Peak von Mises on the hole rim at mid-thickness (VM is rotation
-            // invariant, and at the rim σ_rr = σ_zz = 0 so VM = |σ_θθ| = Kt·σ∞).
-            let mut kt = 0.0f64;
-            let mut resid = ErrBins::new();
-            let n_theta = 720;
-            for it in 0..n_theta {
-                let th = 2.0 * PI * it as f64 / n_theta as f64;
-                // Rim point in LOCAL coords, nudged inside, then to world.
-                let rr = a + 0.30 * h;
-                let ql = [rr * th.cos(), rr * th.sin(), t / 2.0];
-                let (c, s) = (phi.cos(), phi.sin());
-                let p = [ql[0] * c - ql[1] * s, ql[0] * s + ql[1] * c, ql[2]];
-                // Outward normal of the MATERIAL at a bore points INTO the hole.
-                let nl = [-th.cos(), -th.sin(), 0.0];
-                let n = [nl[0] * c - nl[1] * s, nl[0] * s + nl[1] * c, 0.0];
-                let Some(sg) = probe.sigma(p) else { continue };
-                let vm = von_mises(&sg);
-                kt = kt.max(vm / sigma_inf);
-                resid.add(axis_angle_deg(n), norm3(traction(&sg, n)) / (3.0 * sigma_inf));
+            let (pg, u, _tl) =
+                rotated_plate(&inside_local, [-hw, -hw, 0.0], [hw, hw, t], phi, h, f_total);
+            for mode in RECOVERIES {
+                let probe = SurfaceStress::new(&pg, &u, mode);
+                // Peak von Mises on the hole rim at mid-thickness (VM is rotation
+                // invariant, and at the rim σ_rr = σ_zz = 0 so VM = |σ_θθ| = Kt·σ∞).
+                let mut kt = 0.0f64;
+                let mut resid = ErrBins::new();
+                let n_theta = 720;
+                for it in 0..n_theta {
+                    let th = 2.0 * PI * it as f64 / n_theta as f64;
+                    // Rim point in LOCAL coords, nudged inside, then to world.
+                    let rr = a + 0.30 * h;
+                    let ql = [rr * th.cos(), rr * th.sin(), t / 2.0];
+                    let (c, s) = (phi.cos(), phi.sin());
+                    let p = [ql[0] * c - ql[1] * s, ql[0] * s + ql[1] * c, ql[2]];
+                    // Outward normal of the MATERIAL at a bore points INTO the hole.
+                    let nl = [-th.cos(), -th.sin(), 0.0];
+                    let n = [nl[0] * c - nl[1] * s, nl[0] * s + nl[1] * c, 0.0];
+                    let Some(sg) = probe.sigma_on_free_surface(p, n) else { continue };
+                    kt = kt.max(von_mises(&sg) / sigma_inf);
+                    resid.add(axis_angle_deg(n), norm3(traction(&sg, n)) / (3.0 * sigma_inf));
+                }
+                println!(
+                    "    {:<8} {:<14} {kt:>10.3} {:>+9.1}% {:>11.1}% {:>11.1}%",
+                    if mode == RECOVERIES[0] { format!("{deg:.0}°") } else { String::new() },
+                    mode.label(),
+                    (kt - 3.0) / 3.0 * 100.0,
+                    resid.rms() * 100.0,
+                    resid.max() * 100.0
+                );
             }
-            let _ = &to_local;
-            println!(
-                "    {:<10} {kt:>10.3} {:>+9.1}% {:>11.1}% {:>11.1}%",
-                format!("{deg:.0}°"),
-                (kt - 3.0) / 3.0 * 100.0,
-                resid.rms() * 100.0,
-                resid.max() * 100.0
-            );
         }
     }
     println!("\n  If Kt err% grows sharply from 0° to 45°, the 1-3% figure in the");
@@ -550,42 +604,45 @@ fn surf_stepped_shaft_fillet_offaxis() {
         for &h in &[0.5, 0.25] {
             println!("    h={h}  (cells across the fillet ~ {:.0})", r / h);
             println!(
-                "    {:<10} {:>10} {:>10} {:>12} {:>12}",
-                "rotation", "Kt(VM)", "Kt err%", "resid RMS%", "resid MAX%"
+                "    {:<8} {:<14} {:>10} {:>10} {:>12} {:>12}",
+                "rotation", "recovery", "Kt(VM)", "Kt err%", "resid RMS%", "resid MAX%"
             );
             for &deg in &[0.0f64, 15.0, 30.0, 45.0] {
                 let phi = deg.to_radians();
                 let (pg, u, _tl) =
                     rotated_plate(&inside_local, [0.0, -hd, 0.0], [lbar, hd, t], phi, h, f_total);
-                let probe = SurfaceStress::new(&pg, &u);
                 let (c, s) = (phi.cos(), phi.sin());
-
-                // Walk the fillet arc (local frame), top flank, mid-thickness.
-                let mut kt = 0.0f64;
-                let mut resid = ErrBins::new();
-                let n_arc = 240;
-                for ia in 0..=n_arc {
-                    // Arc from the shoulder face (angle pi) to the narrow flank
-                    // (angle 3pi/2), i.e. the concave quarter round.
-                    let ang = std::f64::consts::PI * (1.0 + 0.5 * ia as f64 / n_arc as f64);
-                    // Point ON the fillet surface, nudged into the material.
-                    let rr = r + 0.30 * h;
-                    let ql = [cx + rr * ang.cos(), cy + rr * ang.sin(), t / 2.0];
-                    // Material outward normal points toward the fillet centre.
-                    let nl = [-ang.cos(), -ang.sin(), 0.0];
-                    let p = [ql[0] * c - ql[1] * s, ql[0] * s + ql[1] * c, ql[2]];
-                    let n = [nl[0] * c - nl[1] * s, nl[0] * s + nl[1] * c, 0.0];
-                    let Some(sg) = probe.sigma(p) else { continue };
-                    kt = kt.max(von_mises(&sg) / sigma_nom);
-                    resid.add(axis_angle_deg(n), norm3(traction(&sg, n)) / (kt_ref * sigma_nom));
+                for mode in RECOVERIES {
+                    let probe = SurfaceStress::new(&pg, &u, mode);
+                    // Walk the fillet arc (local frame), top flank, mid-thickness.
+                    let mut kt = 0.0f64;
+                    let mut resid = ErrBins::new();
+                    let n_arc = 240;
+                    for ia in 0..=n_arc {
+                        // Arc from the shoulder face (angle pi) to the narrow
+                        // flank (3pi/2): the concave quarter round.
+                        let ang = std::f64::consts::PI * (1.0 + 0.5 * ia as f64 / n_arc as f64);
+                        // Point ON the fillet surface, nudged into the material.
+                        let rr = r + 0.30 * h;
+                        let ql = [cx + rr * ang.cos(), cy + rr * ang.sin(), t / 2.0];
+                        // Material outward normal points toward the fillet centre.
+                        let nl = [-ang.cos(), -ang.sin(), 0.0];
+                        let p = [ql[0] * c - ql[1] * s, ql[0] * s + ql[1] * c, ql[2]];
+                        let n = [nl[0] * c - nl[1] * s, nl[0] * s + nl[1] * c, 0.0];
+                        let Some(sg) = probe.sigma_on_free_surface(p, n) else { continue };
+                        kt = kt.max(von_mises(&sg) / sigma_nom);
+                        resid
+                            .add(axis_angle_deg(n), norm3(traction(&sg, n)) / (kt_ref * sigma_nom));
+                    }
+                    println!(
+                        "    {:<8} {:<14} {kt:>10.3} {:>+9.1}% {:>11.1}% {:>11.1}%",
+                        if mode == RECOVERIES[0] { format!("{deg:.0}°") } else { String::new() },
+                        mode.label(),
+                        (kt - kt_ref) / kt_ref * 100.0,
+                        resid.rms() * 100.0,
+                        resid.max() * 100.0
+                    );
                 }
-                println!(
-                    "    {:<10} {kt:>10.3} {:>+9.1}% {:>11.1}% {:>11.1}%",
-                    format!("{deg:.0}°"),
-                    (kt - kt_ref) / kt_ref * 100.0,
-                    resid.rms() * 100.0,
-                    resid.max() * 100.0
-                );
             }
         }
     }
@@ -610,7 +667,7 @@ fn surface_probe_finds_material_and_reports_residual() {
     use std::f64::consts::PI;
     let (r, l, h) = (6.0f64, 40.0f64, 1.5f64);
     let (pg, u, f_tip) = round_cantilever(r, l, h);
-    let probe = SurfaceStress::new(&pg, &u);
+    let probe = SurfaceStress::new(&pg, &u, Recovery::Mean);
     let inertia = PI * r.powi(4) / 4.0;
     let sigma_ref = (-f_tip) * l * r / inertia;
 

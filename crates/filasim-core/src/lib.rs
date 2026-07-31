@@ -33,6 +33,7 @@ pub mod settings;
 pub mod simp;
 pub mod solve;
 pub mod strength;
+pub mod spr;
 pub mod stress;
 pub mod threemf;
 pub mod ti;
