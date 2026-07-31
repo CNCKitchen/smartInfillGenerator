@@ -30,6 +30,19 @@ export function Inspector() {
   return null;
 }
 
+/** Whether the dock has anything to show. On narrow windows the inspector is
+ *  an overlay drawer, and its tab must not offer to open an empty panel — so
+ *  App gates the tab on this. Kept next to the render conditions above so the
+ *  two cannot drift apart. */
+export function useInspectorPopulated(): boolean {
+  return useStore((s) => {
+    const entry = s.results.find((r) => r.id === s.activeResultId);
+    if (entry?.kind === "asprinted" && s.printedStats) return true;
+    if (s.optSummary) return true;
+    return !!(s.printedStats && s.stats && s.hasResult);
+  });
+}
+
 /** Dock for "Solve once · As printed": the part at today's print settings. */
 function PrintedResults() {
   const s = useStore(

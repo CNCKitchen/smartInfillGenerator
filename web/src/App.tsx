@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright (C) 2026 Stefan Hermann (CNC Kitchen) <stefan@cnckitchen.com>
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { TopBar } from "./ui/TopBar";
 import { StepRail } from "./ui/StepRail";
 import { StepPanel } from "./ui/StepPanel";
-import { Inspector } from "./ui/Inspector";
+import { Inspector, useInspectorPopulated } from "./ui/Inspector";
 import { StatusStrip } from "./ui/StatusStrip";
 import { ViewportChips } from "./ui/ViewportChips";
 import { SettingsModal } from "./ui/Settings";
@@ -32,6 +32,20 @@ export function App() {
   const notice = useStore((s) => s.notice);
   const model = useStore((s) => s.model);
   const clearError = useStore((s) => s.clearError);
+  // Narrow windows only: below the drawer breakpoint the inspector leaves the
+  // column row and overlays the stage's right edge, so it needs a handle. Wide
+  // layouts never see this — the tab is display:none above the breakpoint and
+  // the collapse class is inert there.
+  //
+  // It starts CLOSED under the breakpoint (and only there): an open drawer
+  // covers the stage's right edge, which is where the color legend sits, and
+  // the first thing someone should see on a small window is an unobstructed
+  // part. Read once at mount — after that the tab is the user's to drive, and
+  // yanking it open or shut mid-resize would be worse than either default.
+  const [inspectorOpen, setInspectorOpen] = useState(
+    () => !window.matchMedia("(max-width: 1040px)").matches
+  );
+  const inspectorPopulated = useInspectorPopulated();
 
   // Startup default: the bundled sample model with its loads applied, so the
   // first paint invites poking at a working setup instead of a bare drop
@@ -68,7 +82,7 @@ export function App() {
   return (
     <div className="app">
       <TopBar />
-      <div className="mid">
+      <div className={`mid${inspectorOpen ? "" : " inspect-off"}`}>
         <StepRail />
         <StepPanel />
         <div className="stage">
@@ -108,6 +122,16 @@ export function App() {
             </div>
           )}
         </div>
+        {inspectorPopulated && (
+          <button
+            className="inspecttab"
+            onClick={() => setInspectorOpen((o) => !o)}
+            title={inspectorOpen ? "Hide the results panel" : "Show the results panel"}
+            aria-label={inspectorOpen ? "Hide the results panel" : "Show the results panel"}
+          >
+            {inspectorOpen ? "›" : "‹"}
+          </button>
+        )}
         <Inspector />
       </div>
       <StatusStrip />

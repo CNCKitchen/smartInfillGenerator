@@ -85,7 +85,7 @@ export function TopBar() {
           disabled={!!s.busy || !m}
           title="Save the project as a .filasim file"
         >
-          Save Project ▾
+          Save <span className="btxt">Project </span>▾
         </button>
         {saveOpen && (
           <div className="savemenu">
@@ -123,14 +123,14 @@ export function TopBar() {
         disabled={!!s.busy}
         title="Open a .filasim project — or a plain STL / 3MF to start fresh"
       >
-        Load Project
+        Load<span className="btxt"> Project</span>
       </button>
       <button
         className="ghost"
         onClick={() => s.openSettings(true)}
         title="Materials, infill stiffness curves, density levels"
       >
-        ⚙ Settings
+        ⚙ <span className="btxt">Settings</span>
       </button>
       <a
         className="ghost iconbtn"

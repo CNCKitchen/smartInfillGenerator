@@ -52,8 +52,8 @@ const r4 = (x: number) => Math.round(x * 1e4) / 1e4;
 const HEAD: Record<number, { title: string; sub: string }> = {
   1: { title: "Model", sub: "Drop an STL, 3MF, or STEP — units are mm." },
   2: { title: "Boundary conditions", sub: "Where the part is held, how it is loaded." },
-  3: { title: "Properties", sub: "Material, print settings, analysis grid." },
-  4: { title: "Analyze", sub: "Static deflection, stress & safety — or the part's natural frequencies." },
+  3: { title: "Properties", sub: "Material and print settings." },
+  4: { title: "Analyze", sub: "Grid resolution, then static deflection, stress & safety — or natural frequencies." },
   5: { title: "Optimization", sub: "Infill density where the loads need it — and the best print orientation." },
   6: { title: "View & export", sub: "Inspect the result, hand off to the slicer." },
 };
@@ -138,6 +138,34 @@ function SurfacePatchControl() {
   );
 }
 
+/** Surface detection is a REPAIR tool, not a setup step: it only matters once
+ *  the picker keeps grabbing the wrong patch. Shown up front it asked the user
+ *  to answer a question they had not hit yet ("what problem is that solving?"),
+ *  so it hides behind a link — and reveals itself the moment someone reaches
+ *  for Extend/Shrink, which is the tell that they are fighting the selection.
+ *  Sticky for the lifetime of the tab, like Section's fold state: once you have
+ *  needed it, re-hiding it on every step change would only annoy. */
+let surfacesRevealed = false;
+
+function SurfaceDetection({ nudge = false }: { nudge?: boolean }) {
+  const [open, setOpen] = useState(() => surfacesRevealed);
+  const show = open || nudge;
+  useEffect(() => {
+    if (show) surfacesRevealed = true;
+  }, [show]);
+  if (!show)
+    return (
+      <a
+        className="link small revealsurf"
+        onClick={() => setOpen(true)}
+        title="Change how the part is split into pickable surfaces — CAD faces, or grouped by crease angle"
+      >
+        Picking the wrong surface?
+      </a>
+    );
+  return <SurfacePatchControl />;
+}
+
 export function StepPanel() {
   const s = useStore(
     useShallow((s) => ({
@@ -188,7 +216,7 @@ export function StepPanel() {
   let head = (buildsim ? BUILD_HEAD : HEAD)[step];
   // Isotropic material: the print-flavored copy would promise the wrong thing.
   if (!buildsim && isIsotropic(s.material)) {
-    if (step === 3) head = { title: "Properties", sub: "Material and the analysis grid." };
+    if (step === 3) head = { title: "Properties", sub: "The part's material." };
     else if (step === 5)
       head = { title: "Optimization", sub: "Part topology — remove material where the loads don't need it." };
     else if (step === 6)
@@ -309,7 +337,7 @@ function StepModel() {
             )}
           </div>
           <div className="group" data-keeptool>
-            <SurfacePatchControl />
+            <SurfaceDetection />
           </div>
           <div className="group">
             <div className="g-label">
@@ -554,11 +582,18 @@ function StepBcs() {
   );
   const activeBc = s.bcs.find((bc) => bc.id === s.activeBcId);
   const hasSelection = !!activeBc && activeBc.kind !== "accel" && activeBc.tris.length > 0;
+  // Reaching for Extend/Shrink means the picked patch is not the wanted one —
+  // that, and only that, is when surface detection earns its place on screen.
+  const [foughtSelection, setFoughtSelection] = useState(false);
   const supports = s.bcs.filter((bc) => SUPPORT_KINDS.includes(bc.kind));
   const loads = s.bcs.filter((bc) => !SUPPORT_KINDS.includes(bc.kind));
   return (
     <>
-      <LoadStepPanel />
+      {/* Multi-step setups only: the pill bar decides which case the lists
+          below are editing, so it has to lead. The "+ Add load step" offer for
+          single-case setups is the opposite — it belongs after the loads, and
+          only once there is a load to have a second case OF (see below). */}
+      <LoadStepSelector />
       <div className="group">
         <div className="g-label">
           <span>Supports</span>
@@ -613,6 +648,7 @@ function StepBcs() {
           </HelpTip>
         </div>
         <AttachedMassNote />
+        <AddLoadStepOffer hasLoad={loads.length > 0} />
       </div>
 
       {s.bcs.length > 0 && (
@@ -637,21 +673,27 @@ function StepBcs() {
           <div className="toolrow" style={{ marginTop: 4 }}>
             <button
               disabled={!hasSelection}
-              onClick={() => s.resizeBcSelection(1)}
+              onClick={() => {
+                setFoughtSelection(true);
+                s.resizeBcSelection(1);
+              }}
               title="Grow the highlighted condition's selection by one row of elements"
             >
               ⊕ Extend
             </button>
             <button
               disabled={!hasSelection}
-              onClick={() => s.resizeBcSelection(-1)}
+              onClick={() => {
+                setFoughtSelection(true);
+                s.resizeBcSelection(-1);
+              }}
               title="Shrink the highlighted condition's selection by one row of elements"
             >
               ⊖ Shrink
             </button>
           </div>
           <div style={{ marginTop: 4 }}>
-            <SurfacePatchControl />
+            <SurfaceDetection nudge={foughtSelection} />
           </div>
         </div>
       )}
@@ -700,12 +742,33 @@ function StepBcs() {
   );
 }
 
-// Load steps (FEA load cases) — DESIGN §13. The single-case setup is unchanged:
-// with one step this is just a subtle "+ Add load step". Adding a 2nd step
-// reveals a compact step SELECTOR; the BC list below then edits whichever step
-// is active (and its loads show in the viewport). Naming + the per-step on/off
-// matrix live in the ⚙ Manage modal (LoadStepsModal), like Settings.
-function LoadStepPanel() {
+// Load steps (FEA load cases) — DESIGN §13. Two halves that used to be one
+// component pinned to the top of the step:
+//
+//   AddLoadStepOffer  — the single-case "+ Add load step". A second load case
+//                       is a power feature, and offering it above the supports
+//                       (before the user has even made a first one) read as
+//                       the primary action of the whole step. It now sits
+//                       under the loads and only appears once a load exists.
+//   LoadStepSelector  — the multi-case pill bar. This one DOES lead the step,
+//                       because it decides which case the lists below edit.
+//
+// Naming + the per-step on/off matrix live in the ⚙ Manage modal
+// (LoadStepsModal), like Settings.
+function AddLoadStepOffer({ hasLoad }: { hasLoad: boolean }) {
+  const loadSteps = useStore((s) => s.loadSteps);
+  const addLoadStep = useStore((s) => s.addLoadStep);
+  if (loadSteps.length > 1 || !hasLoad) return null;
+  return (
+    <div className="addrow lsadd">
+      <button onClick={() => addLoadStep()} title="Analyze the part under several load cases">
+        + Add load step
+      </button>
+    </div>
+  );
+}
+
+function LoadStepSelector() {
   const s = useStore(
     useShallow((s) => ({
       loadSteps: s.loadSteps,
@@ -715,15 +778,7 @@ function LoadStepPanel() {
       openLoadSteps: s.openLoadSteps,
     }))
   );
-  if (s.loadSteps.length <= 1) {
-    return (
-      <div className="addrow lsadd">
-        <button onClick={() => s.addLoadStep()} title="Analyze the part under several load cases">
-          + Add load step
-        </button>
-      </div>
-    );
-  }
+  if (s.loadSteps.length <= 1) return null;
   const active = s.loadSteps.find((ls) => ls.id === s.activeLoadStepId);
   return (
     <div className="group lsbar">
@@ -1791,9 +1846,9 @@ function DisplacementEditor({ bc }: { bc: Bc }) {
 function StepProperties() {
   const s = useStore(
     useShallow((s) => ({
+      appMode: s.appMode,
       perimeters: s.perimeters,
       lineWidth: s.lineWidth,
-      voxelInfo: s.voxelInfo,
       material: s.material,
       materials: s.materials,
       setMaterial: s.setMaterial,
@@ -1812,21 +1867,12 @@ function StepProperties() {
       openPropsManager: s.openPropsManager,
       printInfill: s.printInfill,
       setPrintInfill: s.setPrintInfill,
-      resolution: s.resolution,
-      setResolution: s.setResolution,
-      model: s.model,
-      customH: s.customH,
-      setCustomH: s.setCustomH,
-      snapVoxel: s.snapVoxel,
-      setSnapVoxel: s.setSnapVoxel,
-      compositeSkin: s.compositeSkin,
-      setCompositeSkin: s.setCompositeSkin,
-      anisotropicInfill: s.anisotropicInfill,
-      setAnisotropicInfill: s.setAnisotropicInfill,
     }))
   );
+  // Build Sim has no analyze step, so the grid stays here (its step 2 is
+  // "Material & analysis grid"). The analysis workspace shows it in step 4.
+  const buildsim = s.appMode === "buildsim";
   const wall = s.perimeters * s.lineWidth;
-  const k = s.voxelInfo ? Math.max(1, Math.round(wall / s.voxelInfo.h)) : null;
   const iso = isIsotropic(s.material);
   const fdmMats = s.materials.filter((m) => !isIsotropic(m));
   const isoMats = s.materials.filter((m) => isIsotropic(m));
@@ -1980,104 +2026,140 @@ function StepProperties() {
       </>
       )}
 
-      <div className="group">
-        <div className="g-label">
-          <span>Analysis resolution</span>
-          <InfoTip help={PROP_HELP.resolution} />
-        </div>
-        <select
-          value={s.resolution}
-          onChange={(e) =>
-            s.setResolution(e.target.value as "preview" | "normal" | "fine" | "custom")
-          }
-        >
-          <option value="preview">Preview (fast, ~100k cells)</option>
-          <option value="normal">Normal (~300k cells)</option>
-          <option value="fine">Fine (~1M cells)</option>
-          <option value="custom">Custom…</option>
-        </select>
-        {s.resolution === "custom" &&
-          (() => {
-            const b = s.model?.bbox;
-            const vol = b ? (b[3] - b[0]) * (b[4] - b[1]) * (b[5] - b[2]) : 0;
-            const cells = vol > 0 && s.customH > 0 ? vol / s.customH ** 3 : 0;
-            const tooFine = cells > 4_000_000;
-            const tooCoarse = cells > 0 && cells < 10_000;
-            return (
-              <>
-                <label className="row">
-                  <span className="dim small">Cell size h ({unitLabel("length")})</span>
-                  <UnitInput
-                    value={s.customH}
-                    kind="length"
-                    step={0.1}
-                    min={0.05}
-                    max={20}
-                    onCommit={(v) => s.setCustomH(v)}
-                  />
-                </label>
-                <div className="dim small">
-                  {cells > 0
-                    ? `≈ ${Math.round(cells / 1000).toLocaleString()}k cells at this size.`
-                    : "Load a model to size the grid."}
-                  {tooFine &&
-                    " Too fine — past the 4M-cell cap; the engine will coarsen to fit."}
-                  {tooCoarse && " Very coarse — expect blocky geometry and rough numbers."}
-                  {!iso && !tooFine && !tooCoarse && cells > 0 && s.customH > wall + 1e-9 && (
-                    <>
-                      {" "}
-                      Coarser than the {format(wall, "length")} wall — composite skin keeps the
-                      stiffness honest, but the geometry stays blocky.
-                    </>
-                  )}
-                  {!iso && s.snapVoxel && " Voxel snap may still adjust h to wall/k."}
-                </div>
-              </>
-            );
-          })()}
-        {!iso && (
-          <>
-            <label className="rowcheck">
-              <input
-                type="checkbox"
-                checked={s.snapVoxel}
-                onChange={(e) => s.setSnapVoxel(e.target.checked)}
-              />
-              <span>Snap voxel size to the wall (h = wall/k)</span>
-            </label>
-            <label className="rowcheck">
-              <input
-                type="checkbox"
-                checked={s.compositeSkin}
-                onChange={(e) => s.setCompositeSkin(e.target.checked)}
-              />
-              <span>Composite skin (blend part-wall cells)</span>
-            </label>
-            <label className="rowcheck">
-              <input
-                type="checkbox"
-                checked={s.anisotropicInfill}
-                onChange={(e) => s.setAnisotropicInfill(e.target.checked)}
-              />
-              <span>Anisotropic infill (measured, layer-plane vs Z)</span>
-              <InfoTip help={PROP_HELP.anisotropic} />
-            </label>
-          </>
-        )}
-        <div className="dim small">
-          {s.voxelInfo
-            ? iso
-              ? `Grid h = ${format(s.voxelInfo.h, "length")}.`
-              : s.compositeSkin
-                ? `Grid h = ${format(s.voxelInfo.h, "length")} — the ${format(wall, "length")} skin spans ${(wall / s.voxelInfo.h).toFixed(2)} cell layers; partially covered cells get a blended wall + infill stiffness.`
-                : `Grid h = ${format(s.voxelInfo.h, "length")} — the ${format(wall, "length")} skin is ${k} cell layer${k === 1 ? "" : "s"} thick.`
-            : "Grid size is computed at the next check/solve/optimize."}
-          {!iso && !s.compositeSkin && s.snapVoxel && k === 1 && (
-            <> Single-layer skin is coarse — raise the resolution for printed-mode accuracy.</>
-          )}
-        </div>
-      </div>
+      {buildsim && <AnalysisGrid />}
     </>
+  );
+}
+
+/** The analysis grid — voxel resolution and the skin/infill homogenization
+ *  switches that go with it. This is a SOLVER setting, not a property of the
+ *  part: it trades run time against accuracy and changes nothing about the
+ *  design. It used to close out step 3 next to material and print settings,
+ *  which is what made that step read as three unrelated topics at once. In the
+ *  analysis workspace it now sits in step 4 beside Check/Solve. Build Sim keeps
+ *  it in its own step 2 — that step IS "Material & analysis grid", and it has
+ *  no separate analyze step to move it to. */
+function AnalysisGrid() {
+  const s = useStore(
+    useShallow((s) => ({
+      material: s.material,
+      perimeters: s.perimeters,
+      lineWidth: s.lineWidth,
+      voxelInfo: s.voxelInfo,
+      resolution: s.resolution,
+      setResolution: s.setResolution,
+      model: s.model,
+      customH: s.customH,
+      setCustomH: s.setCustomH,
+      snapVoxel: s.snapVoxel,
+      setSnapVoxel: s.setSnapVoxel,
+      compositeSkin: s.compositeSkin,
+      setCompositeSkin: s.setCompositeSkin,
+      anisotropicInfill: s.anisotropicInfill,
+      setAnisotropicInfill: s.setAnisotropicInfill,
+    }))
+  );
+  const wall = s.perimeters * s.lineWidth;
+  const k = s.voxelInfo ? Math.max(1, Math.round(wall / s.voxelInfo.h)) : null;
+  const iso = isIsotropic(s.material);
+  return (
+    <div className="group">
+      <div className="g-label">
+        <span>Analysis resolution</span>
+        <InfoTip help={PROP_HELP.resolution} />
+      </div>
+      <select
+        value={s.resolution}
+        onChange={(e) =>
+          s.setResolution(e.target.value as "preview" | "normal" | "fine" | "custom")
+        }
+      >
+        <option value="preview">Preview (fast, ~100k cells)</option>
+        <option value="normal">Normal (~300k cells)</option>
+        <option value="fine">Fine (~1M cells)</option>
+        <option value="custom">Custom…</option>
+      </select>
+      {s.resolution === "custom" &&
+        (() => {
+          const b = s.model?.bbox;
+          const vol = b ? (b[3] - b[0]) * (b[4] - b[1]) * (b[5] - b[2]) : 0;
+          const cells = vol > 0 && s.customH > 0 ? vol / s.customH ** 3 : 0;
+          const tooFine = cells > 4_000_000;
+          const tooCoarse = cells > 0 && cells < 10_000;
+          return (
+            <>
+              <label className="row">
+                <span className="dim small">Cell size h ({unitLabel("length")})</span>
+                <UnitInput
+                  value={s.customH}
+                  kind="length"
+                  step={0.1}
+                  min={0.05}
+                  max={20}
+                  onCommit={(v) => s.setCustomH(v)}
+                />
+              </label>
+              <div className="dim small">
+                {cells > 0
+                  ? `≈ ${Math.round(cells / 1000).toLocaleString()}k cells at this size.`
+                  : "Load a model to size the grid."}
+                {tooFine &&
+                  " Too fine — past the 4M-cell cap; the engine will coarsen to fit."}
+                {tooCoarse && " Very coarse — expect blocky geometry and rough numbers."}
+                {!iso && !tooFine && !tooCoarse && cells > 0 && s.customH > wall + 1e-9 && (
+                  <>
+                    {" "}
+                    Coarser than the {format(wall, "length")} wall — composite skin keeps the
+                    stiffness honest, but the geometry stays blocky.
+                  </>
+                )}
+                {!iso && s.snapVoxel && " Voxel snap may still adjust h to wall/k."}
+              </div>
+            </>
+          );
+        })()}
+      {!iso && (
+        <>
+          <label className="rowcheck">
+            <input
+              type="checkbox"
+              checked={s.snapVoxel}
+              onChange={(e) => s.setSnapVoxel(e.target.checked)}
+            />
+            <span>Snap voxel size to the wall (h = wall/k)</span>
+          </label>
+          <label className="rowcheck">
+            <input
+              type="checkbox"
+              checked={s.compositeSkin}
+              onChange={(e) => s.setCompositeSkin(e.target.checked)}
+            />
+            <span>Composite skin (blend part-wall cells)</span>
+          </label>
+          <label className="rowcheck">
+            <input
+              type="checkbox"
+              checked={s.anisotropicInfill}
+              onChange={(e) => s.setAnisotropicInfill(e.target.checked)}
+            />
+            <span>Anisotropic infill (measured, layer-plane vs Z)</span>
+            <InfoTip help={PROP_HELP.anisotropic} />
+          </label>
+        </>
+      )}
+      <div className="dim small">
+        {s.voxelInfo
+          ? iso
+            ? `Grid h = ${format(s.voxelInfo.h, "length")}.`
+            : s.compositeSkin
+              ? `Grid h = ${format(s.voxelInfo.h, "length")} — the ${format(wall, "length")} skin spans ${(wall / s.voxelInfo.h).toFixed(2)} cell layers; partially covered cells get a blended wall + infill stiffness.`
+              : `Grid h = ${format(s.voxelInfo.h, "length")} — the ${format(wall, "length")} skin is ${k} cell layer${k === 1 ? "" : "s"} thick.`
+          : "Grid size is computed at the next check/solve/optimize."}
+        {!iso && !s.compositeSkin && s.snapVoxel && k === 1 && (
+          <> Single-layer skin is coarse — raise the resolution for printed-mode accuracy.</>
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -2196,6 +2278,7 @@ function StepAnalyze() {
           </label>
         </div>
       )}
+      <AnalysisGrid />
       <div className="g-label">
         <span>Run</span>
         <InfoTip help={ANALYZE_HELP.run} />

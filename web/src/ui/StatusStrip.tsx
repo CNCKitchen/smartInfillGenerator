@@ -123,7 +123,11 @@ export function StatusStrip() {
       >
         {unitLabel("length")} · {unitLabel("stress")} · {unitLabel("mass")}
       </button>
-      <button onClick={() => s.openImprint(true)} title="Impressum & Datenschutzerklärung">
+      <button
+        className="stripimprint"
+        onClick={() => s.openImprint(true)}
+        title="Impressum & Datenschutzerklärung"
+      >
         § IMPRINT
       </button>
       <button
@@ -131,7 +135,7 @@ export function StatusStrip() {
         onClick={() => s.setLogOpen(!s.logOpen)}
         title="Solver & optimizer telemetry with convergence charts"
       >
-        ▤ LOG FOR NERDS
+        ▤ <span className="btxt">LOG FOR NERDS</span>
       </button>
     </footer>
   );

@@ -67,13 +67,18 @@ body {
   display: flex;
   flex-direction: column;
   height: 100%;
-  min-width: 980px;
+  /* A floor, not a design width. The workspace adapts down to here via the
+     responsive block at the end of this file; below it the window scrolls
+     rather than crushing the columns into each other. */
+  min-width: 680px;
 }
 
 .mid {
   flex: 1;
   display: flex;
   min-height: 0;
+  /* Positioning context for the inspector drawer + its tab on narrow windows. */
+  position: relative;
 }
 
 .grow {
@@ -632,6 +637,22 @@ button.sec-head:hover:not(:disabled) .caret {
 
 .addrow.lsadd {
   grid-template-columns: 1fr;
+  /* Now sits under the loads rather than above the supports — a little air
+     keeps it from reading as a seventh load type. */
+  margin-top: 3px;
+}
+
+/* Reveal link for surface detection (StepPanel's SurfaceDetection). Quiet by
+   design: it is a question the user asks, not one the panel asks them. */
+.revealsurf {
+  align-self: flex-start;
+  color: var(--dim);
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+}
+
+.revealsurf:hover {
+  color: var(--accent);
 }
 
 /* Fusion-style hover help card (HelpTip.tsx). Portal to <body>; never takes
@@ -1497,6 +1518,11 @@ button.linkbtn {
   left: 50%;
   transform: translateX(-50%);
   display: flex;
+  /* Must never wrap: it sits at top:10px and the field chip is pinned at
+     top:46px, so a second row would land underneath it. The responsive block
+     tightens the buttons instead, which is enough for five of them. */
+  white-space: nowrap;
+  max-width: calc(100% - 16px);
   gap: 2px;
   background: rgba(252, 252, 250, 0.94);
   padding: 3px;
@@ -1533,6 +1559,20 @@ button.linkbtn {
   padding: 2px;
   display: flex;
   align-items: center;
+  /* Two selects plus a segment toggle outgrow a narrow stage and used to slide
+     under the legend. Reserve the legend's gutter (its 190px cap is generous;
+     it renders ~118px + 12px inset) so a stage-centered chip always stops
+     short of it, then wrap downward — nothing sits below until the bottom
+     chips, so growing taller is free. Under 1200px centering stops paying for
+     itself and the responsive block left-aligns both top chips instead. */
+  max-width: calc(100% - 276px);
+  /* Without this the chip is shrink-to-fit against `left: 50%`, so its
+     available width is only HALF the stage and it wraps far earlier than it
+     has to. max-content asks for the unwrapped width and lets max-width above
+     be the thing that actually decides when to wrap. */
+  width: max-content;
+  flex-wrap: wrap;
+  justify-content: center;
   gap: 4px;
 }
 
@@ -1561,6 +1601,7 @@ button.linkbtn {
   bottom: 12px;
   left: 50%;
   transform: translateX(-50%);
+  max-width: calc(100% - 24px);
   padding: 5px 14px;
   font-weight: 600;
   font-size: 12px;
@@ -1733,6 +1774,9 @@ button.linkbtn {
   gap: 7px;
   pointer-events: none;
   min-width: 116px;
+  /* The reaction table can push this wide; cap it so the centered field chip
+     keeps a predictable right gutter to clear. */
+  max-width: 190px;
 }
 
 .legendtitle {
@@ -3133,4 +3177,234 @@ button.linkbtn {
   align-items: center;
   gap: 6px;
   flex-wrap: wrap;
+}
+
+/* ==================== responsive: window size ====================
+   The workspace is three fixed columns — rail | step panel | inspector —
+   around a flexible stage, so the stage is the only thing that shrinks when
+   the window does. Past ~1200px it starves and the centered viewport chips
+   start colliding with the legend and each other.
+
+   The order things give way, cheapest first:
+     1400  columns trim their generous widths
+     1200  rail narrows, top bar drops its subtitle, chips compact
+     1040  rail goes numeric-only; the inspector leaves the row and becomes an
+           overlay drawer over the stage's right edge (tab toggles it)
+      880  brand block goes, panel takes its last trim, strip sheds buttons
+   Below 880 the .app min-width takes over and the window scrolls. */
+
+/* The inspector drawer's handle. Inert (and invisible) above the breakpoint —
+   only the ≤1040 block gives it a position and turns it on. */
+.inspecttab {
+  display: none;
+  position: absolute;
+  z-index: 7;
+  top: 50%;
+  margin-top: -26px;
+  width: 15px;
+  height: 52px;
+  padding: 0;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  color: var(--dim);
+  background: var(--chassis);
+  border: 1px solid var(--line);
+  border-right: none;
+  border-radius: var(--r) 0 0 var(--r);
+  box-shadow: -2px 0 6px rgba(0, 0, 0, 0.1);
+}
+
+.inspecttab:hover {
+  color: var(--ink);
+  background: var(--panel);
+}
+
+@media (max-width: 1400px) {
+  .panel {
+    width: 318px;
+    min-width: 318px;
+  }
+
+  .inspector {
+    width: 266px;
+    min-width: 266px;
+  }
+
+  /* Centering the top chips spends width on BOTH margins to clear a legend
+     that only occupies one side — below this the stage can no longer afford
+     that. Anchor them left: they grow into the width they actually have and
+     stop at the legend's gutter, which is the only side that matters. */
+  .viewmodes,
+  .fieldchip {
+    left: 10px;
+    transform: none;
+    max-width: calc(100% - 200px);
+  }
+}
+
+@media (max-width: 1200px) {
+  .panel {
+    width: 300px;
+    min-width: 300px;
+    padding: 13px 12px 20px;
+  }
+
+  .inspector {
+    width: 248px;
+    min-width: 248px;
+    padding: 11px;
+  }
+
+  .rail {
+    width: 70px;
+    min-width: 70px;
+  }
+
+  .top {
+    height: 46px;
+    gap: 8px;
+    padding: 0 8px;
+  }
+
+  .brand span {
+    display: none;
+  }
+
+  .top button,
+  .top a.iconbtn {
+    flex: none;
+    padding: 6px 9px;
+  }
+
+  .top .workspace select {
+    max-width: 168px;
+  }
+
+  /* The file name + bbox + tri count is the longest thing in the strip and the
+     step panel already shows all of it. */
+  .strip .partinfo {
+    display: none;
+  }
+
+  .viewmodes button {
+    padding: 4px 8px;
+    font-size: 11.5px;
+  }
+
+  .fieldchip select {
+    max-width: 176px;
+  }
+}
+
+@media (max-width: 1040px) {
+  .panel {
+    width: 284px;
+    min-width: 284px;
+  }
+
+  /* Numbers only — the station names are the first thing worth trading for
+     stage width, and the rail's tooltips still carry the full title. */
+  .rail {
+    width: 44px;
+    min-width: 44px;
+  }
+
+  .st-name {
+    display: none;
+  }
+
+  .station {
+    height: 46px;
+  }
+
+  .rail::before {
+    right: 5px;
+    width: 5px;
+  }
+
+  .station.active {
+    margin: 0 9px 0 4px;
+  }
+
+  .station.active::after {
+    right: -7px;
+    border-width: 5px;
+    margin-top: -5px;
+  }
+
+  /* The inspector leaves the flex row and overlays the stage instead, so the
+     viewport keeps its width whether or not results are on screen. */
+  .inspector {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 6;
+    width: 250px;
+    min-width: 250px;
+    border-left: 1px solid var(--line-strong);
+    box-shadow: -5px 0 16px rgba(0, 0, 0, 0.14);
+  }
+
+  .mid.inspect-off .inspector {
+    display: none;
+  }
+
+  .inspecttab {
+    display: flex;
+    right: 250px;
+  }
+
+  .mid.inspect-off .inspecttab {
+    right: 0;
+  }
+
+  /* The legend shares the stage's right edge with the drawer — shorten it so
+     the two read as one column instead of a pile. */
+  .legend {
+    padding: 7px 9px;
+    min-width: 100px;
+    max-width: 160px;
+  }
+
+  .legendbar {
+    height: 112px;
+  }
+
+  .viewmodes button {
+    padding: 4px 6px;
+    font-size: 11px;
+  }
+
+  .fieldchip select {
+    max-width: 148px;
+  }
+}
+
+@media (max-width: 880px) {
+  .brand,
+  .brandmark {
+    display: none;
+  }
+
+  .panel {
+    width: 268px;
+    min-width: 268px;
+  }
+
+  /* Labelled buttons collapse to their glyph — "⚙ Settings" → "⚙",
+     "▤ LOG FOR NERDS" → "▤" — with the title attribute carrying the name. */
+  .top .btxt,
+  .strip .btxt {
+    display: none;
+  }
+
+  .strip .stripimprint {
+    display: none;
+  }
+
+  .strip > div {
+    padding: 0 9px;
+  }
 }

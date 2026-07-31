@@ -13,8 +13,8 @@ import { SUPPORT_KINDS } from "./bcmeta";
 const OPTIMIZE_STEPS: { n: number; label: string; title: string }[] = [
   { n: 1, label: "Model", title: "1 · Model" },
   { n: 2, label: "Loads", title: "2 · Boundary conditions" },
-  { n: 3, label: "Properties", title: "3 · Properties — material, print settings, analysis grid" },
-  { n: 4, label: "Analyze", title: "4 · Analyze — deflection, stress & safety, or natural frequencies" },
+  { n: 3, label: "Properties", title: "3 · Properties — material and print settings" },
+  { n: 4, label: "Analyze", title: "4 · Analyze — grid resolution, then deflection, stress & safety, or natural frequencies" },
   { n: 5, label: "Optimize", title: "5 · Optimization — infill density & print orientation" },
   { n: 6, label: "Export", title: "6 · View & export" },
 ];
@@ -47,7 +47,7 @@ export function StepRail() {
   if (!buildsim && isIsotropic(s.material)) {
     STEPS = STEPS.map((st) =>
       st.n === 3
-        ? { ...st, title: "3 · Properties — material, analysis grid" }
+        ? { ...st, title: "3 · Properties — the part's material" }
         : st.n === 5
           ? { ...st, title: "5 · Optimization — part topology" }
           : st
