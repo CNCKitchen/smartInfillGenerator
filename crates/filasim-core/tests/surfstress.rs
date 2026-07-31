@@ -612,6 +612,329 @@ fn surf_kirsch_plate_with_hole_offaxis() {
     println!("  Verification Manual is an axis-alignment artifact.");
 }
 
+// -------------------------- case B′: h-refinement of the hole concentration
+
+/// **Does the concentration error keep converging?** — the question that decides
+/// whether SUBMODELING (a local box re-voxelized 4–8× finer, driven by Dirichlet
+/// data interpolated from the global solve) can pay.
+///
+/// Submodeling buys exactly one thing: smaller `h` in the neighbourhood of the
+/// hot spot. So it is worth building iff the error is genuinely mesh-driven and
+/// still falling at the rate it fell between the two points case B already has
+/// (−16.6% at 5 cells/radius, −7.6% at 10). If the sequence flattens instead,
+/// the residue is a property of the ELEMENT (trilinear hex, constant strain per
+/// direction) and no amount of local refinement of the same element removes it.
+///
+/// Case B's matrix is the wrong shape for this: it crosses four rotations with
+/// two boundary operators, and a 45° rotation inflates the world AABB by √2 in
+/// both in-plane directions — 2× the cells — for a variable already shown not to
+/// matter. This test therefore fixes ONE configuration (φ=0, shipping ersatz
+/// boundary, shipping mean recovery) and spends the budget on `h` instead.
+///
+/// # Read the order, not the error
+///
+/// It reports the decision rule (error vs `Kt = 3.0`) *and* a **reference-free**
+/// observed order and Richardson limit taken from the Kt sequence alone. That
+/// second column is not decoration: 3.0 is the INFINITE-plate, PLANE-STRESS
+/// value, and this plate is neither. At `d/W = 0.1` the finite-width (Howland)
+/// correction puts the gross-stress Kt near 3.02, and a `t/d = 0.8` section
+/// carries some 3-D constraint on top of that. If the discretization converges
+/// to, say, 3.05, then "error vs 3.0" flattens at −1.7% for a reason that has
+/// nothing to do with mesh size — and reading that as "refinement stopped
+/// paying" would be exactly the wrong conclusion. The order `p` computed from
+/// successive Kt differences is immune to a wrong reference.
+///
+/// The free-surface traction residual is reported for the same reason: its exact
+/// answer is 0 by construction, so it needs no reference at all.
+///
+/// # MEASURED VERDICT — refinement does NOT fix the displayed peak
+///
+/// | h | cells/a | Kt(σ₁) | err vs 3 | ratio p50 | p90 | max | resid RMS | resid MAX |
+/// |---|---|---|---|---|---|---|---|---|
+/// | 1.0   | 5  | 2.501 | −16.6% | 0.934 | 1.036 | 1.119 | 8.8% | 12.1% |
+/// | 0.5   | 10 | 2.773 |  −7.6% | 0.976 | 1.001 | 1.022 | 5.3% |  9.2% |
+/// | 0.25  | 20 | 2.976 |  −0.8% | 1.002 | 1.026 | 1.033 | 3.9% | 11.5% |
+/// | 0.125 | 40 | 3.138 |  +4.6% | 0.997 | 1.051 | 1.075 | 2.9% | 11.1% |
+///
+/// **The distribution splits.** The median rim point converges — `ratio_p50`
+/// reaches 1.00 by 20 cells per radius and stays — but the upper tail does not:
+/// p90 goes 1.001 → 1.026 → 1.051 and the max 1.022 → 1.033 → 1.075, both rising
+/// monotonically once the median has settled. The same split shows up with no
+/// analytic reference at all in the traction residual, whose exact answer is 0:
+/// **RMS falls 3× (8.8 → 2.9%) while its MAX sits flat at ~11% through an 8×
+/// refinement.**
+///
+/// That `p50 → 1.00` is the load-bearing number. Had the scheme been converging
+/// to a genuinely higher 3-D answer (finite width plus `t/d = 0.8` constraint
+/// could plausibly justify ~1.04), the median would have settled there too, and
+/// the h=0.125 reading of 3.138 would be *correct*. It settles at 1.00 instead,
+/// so this specimen's true Kt really is ≈3.0 and 3.138 is an over-read.
+///
+/// **Consequence for submodeling: it does not pay, and this test is the direct
+/// evidence.** A submodel buys exactly one thing — smaller `h` around the hot
+/// spot — and the h=0.125 column IS that result, computed globally. Going from
+/// 10 to 40 cells per radius moves the displayed peak from −7.6% to +4.6%: it
+/// does not halve, it overshoots and keeps climbing, and the Richardson limit on
+/// the raw Kt sequence *rises* under refinement (3.59 → 3.76), which is what a
+/// non-converging sequence looks like. The −0.8% at h=0.25 is not accuracy, it
+/// is two errors cancelling — peak-flattening from volume averaging on the way
+/// up, boundary roughness on the way down.
+///
+/// The mechanism is the staircase, and refinement makes it worse in the only
+/// statistic the app shows: the number of boundary corners on the rim grows like
+/// `1/h`, so a maximum taken over them grows even as each one's typical error
+/// shrinks. This also retro-explains the shoulder fillet (7.3 / meshbench 2.6)
+/// diverging under refinement — same mechanism, second topology, and a better
+/// explanation than the 3-D-constraint guess previously recorded for it.
+///
+/// See [`surf_kirsch_probe_standoff`] for the control on the one harness choice
+/// that could have faked this, and for the caveat it leaves behind.
+///
+/// Cost warning: h=0.125 is a ~53 M-cell solve (~160 M DOF). It took **98 min
+/// and ~13 GB**; the whole test is ~107 min. Do not put it in a routine sweep.
+#[test]
+#[ignore]
+fn surf_kirsch_h_refinement() {
+    use std::f64::consts::PI;
+    use std::time::Instant;
+    println!("\n=== CASE B′: PLATE WITH A HOLE — h-refinement of the concentration ===");
+    println!("  Plate hw=50 t=8, hole a=5, σ∞=1 MPa, φ=0, ersatz boundary, mean");
+    println!("  recovery — i.e. exactly what ships. Only h moves.");
+
+    let (hw, t, a) = (50.0f64, 8.0f64, 5.0f64);
+    let sigma_inf = 1.0f64;
+    let inside_local = move |p: [f64; 3]| -> bool {
+        p[0] >= -hw
+            && p[0] <= hw
+            && p[1] >= -hw
+            && p[1] <= hw
+            && p[2] >= 0.0
+            && p[2] <= t
+            && (p[0] * p[0] + p[1] * p[1]) >= a * a
+    };
+    let f_total = sigma_inf * (2.0 * hw) * t;
+
+    println!("\n  Kt = max σ₁ over the whole rim (what the app paints). ratio_* are");
+    println!("  σ₁ divided by the Kirsch σ_θθ AT THE SAME POINT, over the tensile");
+    println!("  half of the rim — an h-independent normalizer, so it separates 'the");
+    println!("  whole field drifts up' (p50 rises) from 'only the extremes do'");
+    println!("  (p50 flat, max rises).");
+    println!(
+        "\n  {:<7} {:>7} {:>11} {:>8} {:>9} | {:>8} {:>8} {:>8} | {:>9} {:>9} {:>8}",
+        "h",
+        "cells/a",
+        "cells",
+        "Kt(s1)",
+        "err vs 3",
+        "ratio_p50",
+        "ratio_p90",
+        "ratio_max",
+        "residRMS",
+        "residMAX",
+        "solve s"
+    );
+
+    let mut kts: Vec<(f64, f64)> = Vec::new(); // (h, Kt max)
+    let mut p50s: Vec<(f64, f64)> = Vec::new(); // (h, median ratio)
+    for &h in &[1.0f64, 0.5, 0.25, 0.125] {
+        let t0 = Instant::now();
+        let (pg, u, _tl) =
+            rotated_plate(&inside_local, [-hw, -hw, 0.0], [hw, hw, t], 0.0, h, f_total, false);
+        let secs = t0.elapsed().as_secs_f64();
+        let cells = pg.cell_count();
+
+        let probe = SurfaceStress::new(&pg, &u, Recovery::Mean);
+        let mut kt = 0.0f64;
+        let mut resid = ErrBins::new();
+        let mut ratios: Vec<f64> = Vec::new();
+        // Angular sampling refines WITH the mesh so the number of samples per
+        // boundary cell is constant (~23). Otherwise the fine grids would be
+        // undersampled and the peak would look artificially low.
+        let n_theta = (720.0 / h.min(1.0)) as usize;
+        let rr = a + 0.30 * h;
+        for it in 0..n_theta {
+            let th = 2.0 * PI * it as f64 / n_theta as f64;
+            let p = [rr * th.cos(), rr * th.sin(), t / 2.0];
+            let n = [-th.cos(), -th.sin(), 0.0];
+            let Some(sg) = probe.sigma_on_free_surface(p, n) else { continue };
+            let s1 = principal_max(&sg) / sigma_inf;
+            kt = kt.max(s1);
+            resid.add(axis_angle_deg(n), norm3(traction(&sg, n)) / (3.0 * sigma_inf));
+            // Ratio statistics only where the analytic hoop stress is safely
+            // tensile (θ ∈ [45°,135°] ∪ [225°,315°]); near θ=0 it goes
+            // compressive, σ₁ saturates at ~0 and the ratio is meaningless.
+            let exact = kirsch_stt(a, rr, th, sigma_inf);
+            if exact >= 1.0 * sigma_inf {
+                ratios.push(s1 / exact);
+            }
+        }
+        ratios.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        let q = |f: f64| ratios[((ratios.len() - 1) as f64 * f) as usize];
+        let (p50, p90, rmax) = (q(0.50), q(0.90), q(1.0));
+        println!(
+            "  {h:<7} {:>7.0} {cells:>11} {kt:>8.3} {:>+8.1}% | {p50:>8.3} {p90:>8.3} {rmax:>8.3} | {:>8.1}% {:>8.1}% {secs:>8.0}",
+            a / h,
+            (kt - 3.0) / 3.0 * 100.0,
+            resid.rms() * 100.0,
+            resid.max() * 100.0
+        );
+        kts.push((h, kt));
+        p50s.push((h, p50));
+    }
+
+    // Reference-free convergence: observed order from successive differences,
+    // and the Richardson limit the sequence is heading for.
+    println!("\n  Reference-free convergence (needs no textbook Kt):");
+    println!(
+        "    {:<12} {:<20} {:>10} {:>9} {:>12}",
+        "quantity", "h triple", "Δ", "order p", "extrapolated"
+    );
+    for (name, seq) in [("Kt (max)", &kts), ("ratio_p50", &p50s)] {
+        for w in seq.windows(3) {
+            let (d1, d2) = (w[1].1 - w[0].1, w[2].1 - w[1].1);
+            let p = (d1 / d2).abs().log2();
+            let lim = w[2].1 + d2 / ((2f64).powf(p) - 1.0);
+            println!(
+                "    {name:<12} {:<20} {d2:>10.4} {p:>9.2} {lim:>12.3}",
+                format!("{}/{}/{}", w[0].0, w[1].0, w[2].0)
+            );
+        }
+    }
+
+    println!("\n  MEASURED (see the doc comment): ratio_p50 settles at 1.00 by 20");
+    println!("  cells/radius while p90 and the rim MAX keep climbing, and the");
+    println!("  traction-residual MAX stays flat at ~11% through an 8x refinement.");
+    println!("  The field converges; the MAX over it does not. Submodeling buys");
+    println!("  only smaller h, so it does not fix the displayed peak — decided,");
+    println!("  do not re-derive.");
+}
+
+/// Control for the one harness choice that could fake case B′'s result.
+///
+/// B′ samples at `r = a + 0.30·h`, so the probe sits a FIXED fraction of a cell
+/// inside the surface and therefore moves physically closer to the jagged
+/// boundary as `h` shrinks. That is faithful to production — the app paints the
+/// true surface whatever the mesh — but it means "the rim max grows under
+/// refinement" could in principle be a property of the probe rather than of the
+/// field.
+///
+/// This sweeps the standoff independently of `h`. If the max ratio grows with
+/// refinement at EVERY standoff, the B′ finding is a property of the displayed
+/// field. If it only grows when the probe is hard against the boundary, B′ is
+/// measuring its own sampling and must be discounted.
+///
+/// Cheap on purpose: only h = 0.5 and 0.25, which is where the trend reverses.
+///
+/// # MEASURED — B′ survives, but with a stated caveat
+///
+/// ```text
+/// ratio_p50                        ratio_max
+/// h \ standoff  0.15  0.30  0.60  1.00      0.15  0.30  0.60  1.00
+/// 0.5          0.953 0.976 1.018 1.069     1.010 1.022 1.052 1.105
+/// 0.25         0.985 1.003 1.030 1.055     1.029 1.033 1.049 1.084
+/// ```
+///
+/// **The caveat, stated plainly:** the rim MAX rises under refinement at 0.15
+/// and 0.30 cells of standoff, is flat at 0.60, and *falls* at 1.00. So "the
+/// displayed peak grows as the mesh refines" is NOT unconditional — it is a
+/// property of sampling within about a third of a cell of the boundary, which is
+/// what the app does (it paints the true surface at whatever `h` the user has),
+/// but it is not a statement about the interior field.
+///
+/// **What survives regardless of standoff, and is what B′ actually rests on:**
+///
+/// * `ratio_p50` converges in every column, and the SPREAD across columns
+///   narrows with refinement (11.6 points at h=0.5 → 7.0 at h=0.25). The field
+///   is converging; only the extreme-value statistic taken over it is not.
+/// * `ratio_p50` converges to ≈1.00, not to ≈1.04. That is the number that
+///   rules out "the h=0.125 over-read is really convergence to a higher 3-D
+///   truth", which was the one reading under which submodeling would have paid.
+///
+/// Note the standoff trend itself is a real effect, not noise: reading farther
+/// inside gives a HIGHER ratio because the analytic hoop stress falls steeply
+/// with `r` while the cell-averaged discrete field cannot. That is the same
+/// peak-flattening documented in `spr.rs`, seen radially.
+#[test]
+#[ignore]
+fn surf_kirsch_probe_standoff() {
+    use std::f64::consts::PI;
+    println!("\n=== CASE B″: is B′'s rising rim MAX a probe artifact? ===");
+    println!("  Same plate, same solve, sampled at several standoffs from the rim.");
+    println!("  ratio = σ₁ / Kirsch σ_θθ at the SAME point, tensile half of the rim.");
+
+    let (hw, t, a) = (50.0f64, 8.0f64, 5.0f64);
+    let sigma_inf = 1.0f64;
+    let inside_local = move |p: [f64; 3]| -> bool {
+        p[0] >= -hw
+            && p[0] <= hw
+            && p[1] >= -hw
+            && p[1] <= hw
+            && p[2] >= 0.0
+            && p[2] <= t
+            && (p[0] * p[0] + p[1] * p[1]) >= a * a
+    };
+    let f_total = sigma_inf * (2.0 * hw) * t;
+    const STANDOFFS: [f64; 4] = [0.15, 0.30, 0.60, 1.00];
+
+    let mut rows: Vec<(f64, Vec<(f64, f64)>)> = Vec::new(); // h -> [(p50, max)]
+    for &h in &[0.5f64, 0.25] {
+        let (pg, u, _tl) =
+            rotated_plate(&inside_local, [-hw, -hw, 0.0], [hw, hw, t], 0.0, h, f_total, false);
+        let probe = SurfaceStress::new(&pg, &u, Recovery::Mean);
+        let n_theta = (720.0 / h) as usize;
+        let mut per_standoff = Vec::new();
+        for &so in &STANDOFFS {
+            let rr = a + so * h;
+            let mut ratios: Vec<f64> = Vec::new();
+            for it in 0..n_theta {
+                let th = 2.0 * PI * it as f64 / n_theta as f64;
+                let p = [rr * th.cos(), rr * th.sin(), t / 2.0];
+                let n = [-th.cos(), -th.sin(), 0.0];
+                let Some(sg) = probe.sigma_on_free_surface(p, n) else { continue };
+                let exact = kirsch_stt(a, rr, th, sigma_inf);
+                if exact >= 1.0 * sigma_inf {
+                    ratios.push(principal_max(&sg) / sigma_inf / exact);
+                }
+            }
+            ratios.sort_by(|x, y| x.partial_cmp(y).unwrap());
+            let q = |f: f64| ratios[((ratios.len() - 1) as f64 * f) as usize];
+            per_standoff.push((q(0.50), q(1.0)));
+        }
+        rows.push((h, per_standoff));
+    }
+
+    for (stat, idx) in [("ratio_p50", 0usize), ("ratio_max", 1usize)] {
+        println!("\n    {stat} by standoff (fraction of a cell inside the rim)");
+        print!("    {:<10}", "h \\ standoff");
+        for so in STANDOFFS {
+            print!("{so:>10.2}");
+        }
+        println!();
+        for (h, per) in &rows {
+            print!("    {h:<10}");
+            for s in per {
+                print!("{:>10.3}", if idx == 0 { s.0 } else { s.1 });
+            }
+            println!();
+        }
+    }
+    println!("\n  Read the ratio_max block ACROSS rows at a fixed column. If every");
+    println!("  column rises from h=0.5 to h=0.25, refinement really does inflate");
+    println!("  the displayed peak and B′ stands.");
+}
+
+/// Kirsch hoop stress `σ_θθ(r, θ)` for a remote uniaxial `σ∞` along +x around a
+/// hole of radius `a` (infinite plate, plane stress).
+///
+/// Used only as an **h-independent normalizer**. Its absolute value carries the
+/// usual offsets for this specimen — finite width at `d/W = 0.1` and 3-D
+/// constraint at `t/d = 0.8`, together worth a few percent — but those do not
+/// move with the mesh, so a TREND in `σ₁/σ_θθ` is pure discretization error.
+fn kirsch_stt(a: f64, r: f64, th: f64, s_inf: f64) -> f64 {
+    let k = a * a / (r * r);
+    0.5 * s_inf * ((1.0 + k) - (1.0 + 3.0 * k * k) * (2.0 * th).cos())
+}
+
 #[test]
 #[ignore]
 fn surf_stepped_shaft_fillet_offaxis() {

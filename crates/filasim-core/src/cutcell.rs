@@ -67,11 +67,15 @@
 //! assembled matrices at 322k solid cells. Not a trade worth making.
 //!
 //! So this module stays OPT-IN and OFF. It is kept because it is finished,
-//! tested, and it is the right foundation if a future need appears (a stress
-//! formulation that actually reads the boundary element, or a submodel small
-//! enough that the memory is free). Do not spend effort compressing the storage
-//! until something shows a user-visible gain to justify it — the compression was
-//! never the blocker, the absent benefit is.
+//! tested, and it is the right foundation if a future need appears — a stress
+//! formulation that actually reads the boundary element, or a genuinely
+//! conforming surface representation. **The submodel this note used to suggest
+//! is no longer one of those needs:** `tests/surfstress.rs` refined the Kirsch
+//! plate to 40 cells per hole radius and the displayed peak did not converge
+//! (median does, max does not — the staircase adds corners like `O(1/h)`), so a
+//! locally finer box inherits the defect. Do not spend effort compressing the
+//! storage until something shows a user-visible gain to justify it — the
+//! compression was never the blocker, the absent benefit is.
 
 use crate::fem::{iso_stiffness, NODE_SIGNS};
 

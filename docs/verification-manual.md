@@ -237,16 +237,82 @@ can be pointed at a real part.
 | 7.3 | **Stepped shaft fillet**, rotated 0/45° | Pilkey/Peterson Kt (see the caution in §10) | a second stress-raiser topology |
 | 7.4 | **Thin-walled tube** — ro=10, ri=8, wall 2–4 cells | `σxx = M·z/I`; both surfaces traction-free | the FDM-relevant, boundary-cell-dominated regime |
 | 7.5 | **`bench_cut_cell_cost`** | — | runtime, MGCG iteration count and memory, exact cut cells vs ersatz |
+| 7.6 | **`surf_kirsch_h_refinement`** — the hole at h = 1 → 0.125 | Kirsch `σ_θθ(r,θ)` as an *h-independent normalizer* | does the displayed peak converge under refinement? **~107 min, ~13 GB** |
+| 7.7 | **`surf_kirsch_probe_standoff`** | — | control: is 7.6's trend an artifact of where the probe samples? |
 
 Run: `cargo test -p filasim-core --test surfstress -- --ignored --nocapture`
+(7.6 is excluded from any routine sweep — run it by name, deliberately.)
 
 **Headline findings.** Orientation is *not* the driver — error is flat across
 normal-angle bins in every case. The displayed field is accurate on smooth
-surfaces (0.6–3.8% RMS) and materially less so at a stress concentration
-(−7.6% on a well-resolved hole). Neither superconvergent patch recovery
-(`spr.rs`) nor exactly-integrated boundary elements (`cutcell.rs`) improve the
-displayed number enough to justify shipping; both modules carry their measured
-verdicts in their own docs so the results are not re-derived.
+surfaces (0.6–3.8% RMS) and materially less so at a stress concentration.
+Neither superconvergent patch recovery (`spr.rs`) nor exactly-integrated
+boundary elements (`cutcell.rs`) improve the displayed number enough to justify
+shipping; both modules carry their measured verdicts in their own docs so the
+results are not re-derived.
+
+**The refinement result (7.6) — the displayed peak does not converge.** This is
+the finding that closed the surface-stress investigation, and it corrects an
+earlier claim in this manual that the concentration error "converges ~O(h)".
+
+| h | cells per hole radius | displayed Kt(σ₁) | err vs 3.0 | σ₁/Kirsch p50 | p90 | max | traction resid RMS | resid MAX |
+|---|---|---|---|---|---|---|---|---|
+| 1.0   | 5  | 2.501 | −16.6% | 0.934 | 1.036 | 1.119 | 8.8% | 12.1% |
+| 0.5   | 10 | 2.773 | −7.6%  | 0.976 | 1.001 | 1.022 | 5.3% | 9.2% |
+| 0.25  | 20 | 2.976 | −0.8%  | 1.002 | 1.026 | 1.033 | 3.9% | 11.5% |
+| 0.125 | 40 | 3.138 | **+4.6%** | 0.997 | 1.051 | 1.075 | 2.9% | 11.1% |
+
+The distribution splits under refinement. The **median** surface point converges
+— `σ₁/Kirsch` reaches 1.00 by 20 cells per radius and stays — while the **upper
+tail does not**: p90 climbs 1.001 → 1.026 → 1.051 and the max 1.022 → 1.033 →
+1.075, both rising monotonically *after* the median has settled. The traction
+residual says the same thing with no analytic reference at all, since its exact
+answer is zero by construction: **RMS falls 3× while its MAX stays flat at ~11%
+through an 8× refinement.**
+
+The mechanism is the staircase. The number of boundary corners on the rim grows
+like `1/h`, so a maximum taken over them grows even as each corner's typical
+error shrinks — and a maximum is exactly what the app paints. This also
+retro-explains the shoulder fillet's divergence under refinement (§10's second
+caution, and case 2.6): same mechanism, second topology, and better supported
+than the 3-D-constraint guess previously offered for it.
+
+Two consequences worth stating explicitly:
+
+- **The −0.8% at 20 cells per radius is not accuracy, it is cancellation** —
+  peak-flattening from volume averaging pulling down, boundary roughness pushing
+  up. Refining past that point makes the displayed number worse, not better.
+- **Submodeling was evaluated and rejected on this evidence.** A local
+  re-voxelized box with interpolated Dirichlet BCs buys exactly one thing,
+  smaller `h` at the hot spot, and the h=0.125 column *is* that result computed
+  globally. It does not halve the error; it overshoots the reference and keeps
+  climbing, and the Richardson limit on the raw Kt sequence *rises* under
+  refinement (3.59 → 3.76), which is what a non-converging sequence looks like.
+  Nothing was built.
+
+**Caveat from the control (7.7).** Sweeping the probe standoff independently of
+`h` shows the rising max holds at 0.15 and 0.30 cells from the rim, is flat at
+0.60, and reverses at 1.00. So "refinement inflates the displayed peak" is a
+statement about sampling within ~⅓ cell of the boundary — which is what the app
+does — and not about the interior field. What is unconditional is that
+`σ₁/Kirsch` p50 converges at every standoff, that the spread across standoffs
+narrows with refinement (11.6 → 7.0 points), and that it converges to ≈1.00
+rather than ≈1.04 — which is what rules out the alternative reading that the
+h=0.125 over-read is really convergence to a higher 3-D truth. That reading was
+the only one under which submodeling would have paid.
+
+**Where this line of work stands.** Three candidate fixes for displayed surface
+stress have now been implemented or evaluated and all three are closed:
+superconvergent recovery (`spr.rs` — sharpens the spurious peak along with the
+real one), exact cut-cell elements (`cutcell.rs` — correct, no user-visible
+gain, even on thin walls), and local submodeling (7.6 — the defect is not one
+that smaller `h` removes). What is left is a *representational* change, not a
+numerical one: a conforming surface, or displaying a spatially filtered peak
+instead of a raw cell max. Both change what the number means and neither is a
+small job, so **the accuracy of the displayed peak should be treated as
+capped at roughly ±5% and effort spent elsewhere** — transverse isotropy
+(`DESIGN §22`) and E(ρ)/allowables calibration both sit on larger, unmeasured
+error budgets and affect every part rather than the neighbourhood of a hole.
 
 ---
 
@@ -336,9 +402,10 @@ cases — useful for setting user expectations.
 | Elastic-foundation settlement | `< 8%` | 1.11 |
 | Voxelized volume (curved bodies) | `< 4%` (sphere); bias ≈ 0% with cut-cell occupancy | 1.13, 2.1 |
 | Stress-concentration Kt — **raw cell stress** (hole, fillet) | within ~1–3% on curved features (cut-cell convention) | 2.4, 2.6 |
-| Stress-concentration Kt — **the field the app displays** (hole) | **−7.6% at 10 cells per hole radius**, −16.6% at 5; converges ~O(h) | 7.2 |
+| Stress-concentration Kt — **the field the app displays** (hole) | −16.6% at 5 cells per hole radius, −7.6% at 10, −0.8% at 20, **+4.6% at 40**. Best inside ~±5% at 10–40 cells/radius, and **does not converge** — refining past ~20 cells/radius makes it worse | 7.2, 7.6 |
+| Stress-concentration — *typical* (median) surface point, vs Kirsch | converges to within 1% by 20 cells per hole radius | 7.6 |
 | Surface stress on a smooth free surface (round cantilever, thin tube) | 0.6–1.3% (thin wall) to 1.7–3.8% (solid), RMS | 7.1, 7.4 |
-| Free-surface traction residual ‖σ·n‖/σ_ref (should be 0) | 0.5–2% on smooth surfaces, 5–16% at a stress raiser | 7.1–7.4 |
+| Free-surface traction residual ‖σ·n‖/σ_ref (should be 0) | 0.5–2% on smooth surfaces, 5–16% at a stress raiser. At a raiser the **RMS converges (~O(√h)) but the MAX does not** — flat at ~11% over an 8× refinement | 7.1–7.4, 7.6 |
 | Printed composite-beam stiffness | within ~10% of the sandwich closed form | 3.1, 3.2 |
 | MGCG iteration count | mesh-independent (8–9 iters, 130k→1M solid cells) | `PHASE1_RESULTS.md` |
 | Graded-infill stiffness gain vs uniform (equal mass) | +15% (cantilever), up to +40% (binary smoke beam) | 1.19, 1.20, `DESIGN.md` |
@@ -367,10 +434,21 @@ cases — useful for setting user expectations.
 > - **The shoulder-fillet case (2.6) does not converge to its 2-D textbook Kt**
 >   for the section thickness used here: the error grows from +4.9% to +14.6% as
 >   `h` halves, with σ₁ and with an exactly-integrated boundary element alike.
->   The most likely cause is 3-D constraint at the shoulder making the true
->   answer higher than the plane-stress reference, but that is unproven. **Do not
->   use case 2.6 as an accuracy gate until the Tier-5 CalculiX cross-check gives
->   it a 3-D reference.** It can measure *changes*, not *correctness*.
+>   The 3-D-constraint explanation previously offered here is **no longer the
+>   leading one**: case 7.6 refined the *hole* to 40 cells per radius and found
+>   the same signature — median converging, peak diverging — on a topology where
+>   3-D constraint is measurably small (median settles at 1.00× Kirsch, not
+>   1.04×). Staircase roughness in a max statistic explains both cases with one
+>   mechanism. **Do not use case 2.6 as an accuracy gate until the Tier-5
+>   CalculiX cross-check gives it a 3-D reference.** It can measure *changes*,
+>   not *correctness*.
+>
+> - **Do not refine a mesh to make a displayed peak more accurate.** It is the
+>   natural reflex and it is counterproductive at a staircased stress raiser
+>   (§6b, 7.6). More cells per feature radius improve the field everywhere except
+>   the statistic on screen. The useful band is roughly 10–40 cells per feature
+>   radius; below it the peak is flattened, above it boundary roughness takes
+>   over, and no setting makes it better than about ±5%.
 
 ---
 

@@ -64,10 +64,17 @@
 //!
 //! So SPR is **not a net win as a drop-in replacement**, and the recovery is NOT
 //! the bottleneck: no recovery can repair a cell field that already contains a
-//! spurious peak. The remaining error is in the cell-centre stress itself, which
-//! is why it tracks O(h). Fixing it means fixing the boundary element — proper
-//! cut-cell quadrature instead of a scalar occupancy factor — or resolving the
-//! feature locally (submodel).
+//! spurious peak. The remaining error is in the cell-centre stress itself.
+//!
+//! Both follow-ons this paragraph used to propose have since been measured and
+//! both failed. Proper cut-cell quadrature: implemented in [`crate::cutcell`],
+//! correct, no user-visible gain. Resolving the feature locally (submodel):
+//! killed by `tests/surfstress.rs::surf_kirsch_h_refinement`, which refined the
+//! Kirsch plate to 40 cells per hole radius and found that the MEDIAN surface
+//! point converges while the MAX — the only statistic the app shows — does not,
+//! because the staircase puts `O(1/h)` corners on the rim. A submodel buys only
+//! smaller `h`, so it inherits the defect it was meant to cure. Read that test's
+//! verdict before proposing either again.
 //!
 //! What IS unambiguously worth shipping from this module is
 //! [`project_traction`]: it zeroes the free-surface traction by construction for
