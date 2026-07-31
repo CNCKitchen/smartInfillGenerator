@@ -15,6 +15,7 @@ pub mod buildsim;
 pub mod bvh;
 pub mod cancel;
 pub mod check;
+pub mod cutcell;
 pub mod cylinder;
 pub mod eps;
 pub mod fem;
