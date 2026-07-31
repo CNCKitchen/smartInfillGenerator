@@ -853,3 +853,109 @@ fn surface_probe_finds_material_and_reports_residual() {
     // sampler or the recovery path changed shape, not just accuracy.
     assert!(worst < 2.0, "free-surface traction residual {worst:.2}x σ_ref is implausible");
 }
+
+// ------------------------------------------ CASE D: thin wall (the FDM regime)
+
+/// THE DECIDING CASE. Everything above is chunky solid geometry with 5–12 cells
+/// across the feature — the regime where the occupancy ersatz is LEAST wrong.
+///
+/// The cut-cell shape error scales with how empty the cell is (24% at 79% full,
+/// 66% at 21% full, `cutcell::report_occupancy_scaling_error`), so the payoff
+/// should be largest where cells are slivers. A thin wall is made of slivers,
+/// and a thin wall is what an FDM part IS. If exact cut cells do not pay here,
+/// they do not pay anywhere that matters for this product.
+///
+/// Thin-walled tube cantilever (the `meshbench.rs` 7B geometry, chosen there for
+/// exactly this reason): both surfaces are traction-free, the section has a
+/// closed-form I, and at h=1 the wall is only 2 cells thick.
+#[test]
+#[ignore]
+fn surf_thin_wall_tube() {
+    use std::f64::consts::PI;
+    println!("\n=== CASE D: THIN-WALLED TUBE — the FDM-relevant regime ===");
+    println!("  Tube ro=10 ri=8 (wall 2.0), L=80, tip load 10 N. Nearly every solid");
+    println!("  cell is a boundary sliver, so this is where exact cut cells should");
+    println!("  earn their memory — or fail to.");
+
+    let (ro, ri, l) = (10.0f64, 8.0f64, 80.0f64);
+    let inertia = PI * (ro.powi(4) - ri.powi(4)) / 4.0;
+    let f_tip = -10.0f64;
+    // Euler-Bernoulli tip deflection; the FE result sits slightly below it
+    // (shear softening) but the ERSATZ-vs-EXACT gap is the signal here.
+    let delta_eb = f_tip * l.powi(3) / (3.0 * E0 * inertia);
+
+    for &h in &[1.0f64, 0.667, 0.5] {
+        let inside = move |p: [f64; 3]| {
+            let rr = p[1] * p[1] + p[2] * p[2];
+            p[0] >= 0.0 && p[0] <= l && rr <= ro * ro && rr >= ri * ri
+        };
+        let grid = voxelize_production(&inside, [0.0, -ro, -ro], [l, ro, ro], h, 4, 1);
+        let settings =
+            SolveSettings { e0: E0, nu: NU, tol: 1e-7, max_iter: 1200, ..Default::default() };
+        let (pg, levels) = pad_for_levels(&grid, settings.max_levels);
+        let np = cantilever_problem(&pg, l);
+
+        println!(
+            "\n  h={h}  (wall ≈ {:.1} cells, {} solid cells)",
+            (ro - ri) / h,
+            pg.solid_count()
+        );
+        println!(
+            "    {:<16} {:>12} {:>12} {:>12} {:>12}",
+            "boundary", "tip/EB", "σxx RMS%", "resid RMS%", "resid MAX%"
+        );
+
+        for &exact_cut in &[false, true] {
+            let u = solve_with_optional_cut(&pg, levels, &np, &settings, &inside, exact_cut);
+
+            // Tip deflection: the global-stiffness signal. A thin wall built of
+            // slivers is exactly where a wrong boundary stiffness costs most.
+            let (mx, my, mz) = (pg.nx + 1, pg.ny + 1, pg.nz + 1);
+            let active = active_nodes(&pg);
+            let (mut sum, mut cnt) = (0f64, 0usize);
+            for n in 0..mx * my * mz {
+                if active[n] && (n % mx) as f64 * pg.h + pg.origin[0] >= l - 0.5 * pg.h {
+                    sum += u[3 * n + 2] as f64;
+                    cnt += 1;
+                }
+            }
+            let tip_ratio = if cnt > 0 { (sum / cnt as f64) / delta_eb } else { f64::NAN };
+
+            let probe = SurfaceStress::new(&pg, &u, Recovery::Mean);
+            let (x0, x1) = (0.30 * l, 0.70 * l);
+            let sigma_ref = (-f_tip) * (l - x0) * ro / inertia;
+            let mut resid = ErrBins::new();
+            let mut sxx = ErrBins::new();
+            // Sample BOTH free surfaces — the bore is as traction-free as the OD,
+            // and on a thin wall the two are only a couple of cells apart.
+            for (rad, sgn) in [(ro, 1.0f64), (ri, -1.0f64)] {
+                for ix in 0..15 {
+                    let x = x0 + (x1 - x0) * ix as f64 / 14.0;
+                    for it in 0..240 {
+                        let th = 2.0 * PI * it as f64 / 240.0;
+                        // Nudge INTO the material: outward for the bore, inward
+                        // for the OD.
+                        let rr = rad - sgn * 0.25 * h;
+                        let p = [x, rr * th.cos(), rr * th.sin()];
+                        let n = [0.0, sgn * th.cos(), sgn * th.sin()];
+                        let Some(s) = probe.sigma_on_free_surface(p, n) else { continue };
+                        let ang = axis_angle_deg(n);
+                        resid.add(ang, norm3(traction(&s, n)) / sigma_ref);
+                        let exact = (-f_tip) * (l - x) * (rr * th.sin()) / inertia;
+                        sxx.add(ang, (s[0] - exact) / sigma_ref);
+                    }
+                }
+            }
+            println!(
+                "    {:<16} {tip_ratio:>12.4} {:>11.1}% {:>11.1}% {:>11.1}%",
+                if exact_cut { "EXACT cut KE" } else { "ersatz (today)" },
+                sxx.rms() * 100.0,
+                resid.rms() * 100.0,
+                resid.max() * 100.0
+            );
+        }
+    }
+    println!("\n  tip/EB nearer 1.0 = better global stiffness. If the ersatz→exact");
+    println!("  gap is large here and small on the solid cases, the cut-cell work");
+    println!("  pays for FDM parts specifically — which is the whole question.");
+}

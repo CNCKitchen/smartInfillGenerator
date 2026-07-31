@@ -43,6 +43,35 @@
 //! (slow, the ground truth) and [`ke_from_moments`] reconstructs from the 27
 //! moments. The tests assert they agree, which is what licenses storing only the
 //! moments.
+//!
+//! # MEASURED VERDICT — this is correct, and it is NOT worth shipping
+//!
+//! The element matrices are right (24–67% closer to truth than the ersatz, see
+//! `report_occupancy_scaling_error`) and the solver wiring is right (MGCG
+//! iteration count is unchanged, `bench_cut_cell_cost`). What it buys on the
+//! numbers a user actually reads, measured in `tests/surfstress.rs`:
+//!
+//! | case | displayed σ error | global stiffness | free-surface traction residual |
+//! |---|---|---|---|
+//! | thin-walled tube (the FDM regime) | 0.6–1.3%, **unchanged** | **unchanged** | MAX 2.0% → **0.6%** |
+//! | round cantilever | 3.8% → 3.3% | unchanged | 0.8% → 0.9% |
+//! | plate with hole, Kt(σ₁) | −7.6% → −5.8% | — | MAX 9.2% → **7.5%** |
+//!
+//! The thin-wall row is the one that decides it. The theory said the payoff
+//! scales with how empty the cells are, so a 2-cell wall should be the best
+//! case — and there the displayed stress does not move AT ALL, nor does the
+//! stiffness. Only the traction residual improves (consistently 2–3×), and on a
+//! thin wall it was already under 2%.
+//!
+//! Against that: +5–30% solve time, 0.4–2.4 s of setup, and **82 MB** of
+//! assembled matrices at 322k solid cells. Not a trade worth making.
+//!
+//! So this module stays OPT-IN and OFF. It is kept because it is finished,
+//! tested, and it is the right foundation if a future need appears (a stress
+//! formulation that actually reads the boundary element, or a submodel small
+//! enough that the memory is free). Do not spend effort compressing the storage
+//! until something shows a user-visible gain to justify it — the compression was
+//! never the blocker, the absent benefit is.
 
 use crate::fem::{iso_stiffness, NODE_SIGNS};
 

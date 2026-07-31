@@ -29,6 +29,7 @@ the acceptance tolerance.
 4. [Tier 2 — Meshing / discretization benchmarks](#4-tier-2--meshing--discretization-benchmarks)
 5. [Tier 3 — Printed-material (composite) verification](#5-tier-3--printed-material-composite-verification)
 6. [Tier 4 — Interoperability / format golden files](#6-tier-4--interoperability--format-golden-files)
+6b. [Tier 7 — Displayed surface-stress accuracy](#6b-tier-7--displayed-surface-stress-accuracy)
 7. [Tier 5 — Cross-code golden comparison (planned)](#7-tier-5--cross-code-golden-comparison-planned)
 8. [Tier 6 — Physical testing (planned)](#8-tier-6--physical-testing-planned)
 9. [The Standard Validation Battery](#9-the-standard-validation-battery)
@@ -41,7 +42,7 @@ the acceptance tolerance.
 The validation bar (`DESIGN.md §13`): **solver unit tests vs analytic solutions
 in CI**, **golden comparisons vs established FEA on ~5 representative parts**, and
 physical testing as post-launch content (not a release gate). The suite is
-organized into six tiers by what they prove:
+organized into seven tiers by what they prove:
 
 | Tier | Proves | Runs | Status |
 |---|---|---|---|
@@ -51,6 +52,7 @@ organized into six tiers by what they prove:
 | 4 | Exports/imports are byte-correct for slicers | CI | ✅ implemented |
 | 5 | Whole-part results match an established FEA code | manual, periodic | ⏳ planned |
 | 6 | The model matches physical reality | offline, post-launch | ⏳ planned |
+| 7 | The DISPLAYED surface stress is accurate (not just the cell field) | manual benchmark | ✅ implemented |
 
 All Tier-1/3/4 tests are first-party (no GPL test deps) and assert against
 formulas or exact structure, so a regression fails the build.
@@ -71,6 +73,10 @@ cargo test -p filasim-core --test meshbench -- --ignored --nocapture
 # Phase-1 exit-criterion benchmark (throughput + analytic cantilever check).
 cargo run -p filasim-core --release --bin bench            # add --small to skip the 1M-cell run
 # Optional: drop a 3dbenchy.stl in the working dir for the thin-shell case.
+
+# Tier 7 — displayed surface-stress accuracy (what the app paints on the part),
+# plus the exact-cut-cell cost benchmark. Also #[ignore]d.
+cargo test -p filasim-core --test surfstress -- --ignored --nocapture
 
 # STEP tessellation regularity harness (needs the `step` feature).
 cargo run -p filasim-core --features step --bin stepbench -- "model.step" "model.stl"
@@ -211,6 +217,39 @@ against the real slicer dialects (pinned from the `Cube.3mf` sample). CI.
 
 ---
 
+## 6b. Tier 7 — Displayed surface-stress accuracy
+
+`crates/filasim-core/tests/surfstress.rs`. Tiers 1–2 measure the raw cell field;
+this tier measures **what the app paints on the part** — the nodal-recovered
+stress tensor evaluated on the true surface — and reports it as a distribution
+binned by how far the surface normal sits from a grid axis. Geometry is an exact
+indicator, not a tessellation, so STL faceting cannot contaminate the result.
+
+Its distinguishing metric is the **traction residual** `‖σ·n‖ / σ_ref` on a
+traction-free surface: σ·n must vanish there, so all of it is error, and it needs
+**no analytic solution** — which makes it the only stress diagnostic here that
+can be pointed at a real part.
+
+| # | Case | Reference | What it measures |
+|---|---|---|---|
+| 7.1 | **Round cantilever** — r=8, L=100, tip load | `σxx = M·z/I`; lateral surface traction-free | the cylinder sweeps every normal orientation in one solve |
+| 7.2 | **Plate with a hole**, rotated 0/15/30/45° | Kirsch `Kt = 3.0` on σ₁ | peak accuracy when the concentration is moved off-axis |
+| 7.3 | **Stepped shaft fillet**, rotated 0/45° | Pilkey/Peterson Kt (see the caution in §10) | a second stress-raiser topology |
+| 7.4 | **Thin-walled tube** — ro=10, ri=8, wall 2–4 cells | `σxx = M·z/I`; both surfaces traction-free | the FDM-relevant, boundary-cell-dominated regime |
+| 7.5 | **`bench_cut_cell_cost`** | — | runtime, MGCG iteration count and memory, exact cut cells vs ersatz |
+
+Run: `cargo test -p filasim-core --test surfstress -- --ignored --nocapture`
+
+**Headline findings.** Orientation is *not* the driver — error is flat across
+normal-angle bins in every case. The displayed field is accurate on smooth
+surfaces (0.6–3.8% RMS) and materially less so at a stress concentration
+(−7.6% on a well-resolved hole). Neither superconvergent patch recovery
+(`spr.rs`) nor exactly-integrated boundary elements (`cutcell.rs`) improve the
+displayed number enough to justify shipping; both modules carry their measured
+verdicts in their own docs so the results are not re-derived.
+
+---
+
 ## 7. Tier 5 — Cross-code golden comparison (planned)
 
 The release bar calls for **golden comparisons vs an established FEA code**
@@ -273,6 +312,7 @@ battery is a strong statement that "the tool works", suitable to show users.
 | Battery item | Command | Proves |
 |---|---|---|
 | **B12 Mesh-convention benchmark** | `cargo test -p filasim-core --test meshbench -- --ignored --nocapture` | cut-cell convention still wins on volume/phase/Kirsch/fillet |
+| **B12b Displayed surface stress** | `cargo test -p filasim-core --test surfstress -- --ignored --nocapture` | the field the USER reads stays inside its (looser) envelope; free-surface traction residual does not regress |
 | **B13 Performance budget** | `cargo run -p filasim-core --release --bin bench` | 1 M cells solved in seconds; cantilever ratio in band |
 | **B14 Cross-code goldens (Tier 5)** | manual, per §7 | whole-part agreement with CalculiX/Fusion |
 
@@ -295,7 +335,10 @@ cases — useful for setting user expectations.
 | Uniaxial stress (St-Venant zone) | `< 6%` | 1.10 |
 | Elastic-foundation settlement | `< 8%` | 1.11 |
 | Voxelized volume (curved bodies) | `< 4%` (sphere); bias ≈ 0% with cut-cell occupancy | 1.13, 2.1 |
-| Stress-concentration Kt (hole, fillet) | within ~1–3% on curved features (cut-cell convention) | 2.4, 2.6 |
+| Stress-concentration Kt — **raw cell stress** (hole, fillet) | within ~1–3% on curved features (cut-cell convention) | 2.4, 2.6 |
+| Stress-concentration Kt — **the field the app displays** (hole) | **−7.6% at 10 cells per hole radius**, −16.6% at 5; converges ~O(h) | 7.2 |
+| Surface stress on a smooth free surface (round cantilever, thin tube) | 0.6–1.3% (thin wall) to 1.7–3.8% (solid), RMS | 7.1, 7.4 |
+| Free-surface traction residual ‖σ·n‖/σ_ref (should be 0) | 0.5–2% on smooth surfaces, 5–16% at a stress raiser | 7.1–7.4 |
 | Printed composite-beam stiffness | within ~10% of the sandwich closed form | 3.1, 3.2 |
 | MGCG iteration count | mesh-independent (8–9 iters, 130k→1M solid cells) | `PHASE1_RESULTS.md` |
 | Graded-infill stiffness gain vs uniform (equal mass) | +15% (cantilever), up to +40% (binary smoke beam) | 1.19, 1.20, `DESIGN.md` |
@@ -303,6 +346,31 @@ cases — useful for setting user expectations.
 > These envelopes apply to **global stiffness/deflection** and **nominal stress**.
 > Surface stress at staircased curves, re-entrant corners, and point loads is
 > advisory and does not carry these tolerances — see Theory Manual §12.
+
+> **Read the two Kt rows carefully — they are not the same number.** Tier 2
+> measures the **raw cell-centre** stress at the single worst cell. The app
+> displays a **nodal-recovered field sampled on the true surface**, which is a
+> different quantity and is materially less accurate at a stress concentration,
+> because volume-averaging a curved field flattens its peak. Quoting the ~1–3%
+> figure for what a user reads on screen overstates the accuracy by roughly 3×.
+> The displayed value **under**-reads a concentration, which is unconservative:
+> low stress means a high reported safety factor.
+>
+> Two further cautions from the Tier-7 work:
+>
+> - **Kt is defined on the peak principal stress σ₁, not von Mises.** They agree
+>   only under plane stress; at the mid-thickness of a 3D section the state tends
+>   toward plane strain and von Mises reads lower. Reading the wrong one on the
+>   Kirsch plate costs ~8 percentage points. Both matter — σ₁ against a textbook
+>   Kt, von Mises for the material safety factor — but they are not
+>   interchangeable.
+> - **The shoulder-fillet case (2.6) does not converge to its 2-D textbook Kt**
+>   for the section thickness used here: the error grows from +4.9% to +14.6% as
+>   `h` halves, with σ₁ and with an exactly-integrated boundary element alike.
+>   The most likely cause is 3-D constraint at the shoulder making the true
+>   answer higher than the plane-stress reference, but that is unproven. **Do not
+>   use case 2.6 as an accuracy gate until the Tier-5 CalculiX cross-check gives
+>   it a 3-D reference.** It can measure *changes*, not *correctness*.
 
 ---
 
