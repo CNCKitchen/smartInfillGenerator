@@ -1608,8 +1608,11 @@ button.linkbtn {
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.1);
 }
 
-/* When the support banner is visible it owns the bottom-center; stack the
-   deflection-playback button just above it so the two never collide. */
+/* The bottom-center is a stack, from the floor up: support banner (12px, ~36
+   tall) → deflection-playback button (~26 tall) → error/notice toast. Each
+   element only shifts for the ones actually rendered below it, matched via
+   sibling combinators (all three are siblings inside .stage, in that DOM
+   order). Keep these offsets in sync with the heights above. */
 .supportbanner ~ .playchip {
   bottom: 54px;
 }
@@ -2070,6 +2073,12 @@ button.linkbtn {
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.12);
   padding: 9px 14px;
   cursor: pointer;
+}
+
+/* Banner + playback button both showing (a non-converged modal solve is the
+   usual case): clear the raised chip instead of landing on top of it. */
+.supportbanner ~ .playchip ~ .toast {
+  bottom: 92px;
 }
 
 .toast.notice {
