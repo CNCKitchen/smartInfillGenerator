@@ -568,13 +568,14 @@ fn surf_kirsch_plate_with_hole_offaxis() {
         println!("\n  h={h}  (cells per hole radius ~ {:.0})", a / h);
         println!(
             "    {:<8} {:<14} {:>10} {:>10} {:>12} {:>12}",
-            "rotation", "recovery", "Kt(VM)", "Kt err%", "resid RMS%", "resid MAX%"
+            "rotation", "boundary", "Kt(s1)", "Kt err%", "resid RMS%", "resid MAX%"
         );
         for &deg in &[0.0f64, 15.0, 30.0, 45.0] {
             let phi = deg.to_radians();
+          for &exact_cut in &[false, true] {
             let (pg, u, _tl) =
-                rotated_plate(&inside_local, [-hw, -hw, 0.0], [hw, hw, t], phi, h, f_total, false);
-            for mode in RECOVERIES {
+                rotated_plate(&inside_local, [-hw, -hw, 0.0], [hw, hw, t], phi, h, f_total, exact_cut);
+            for mode in [Recovery::Mean] {
                 let probe = SurfaceStress::new(&pg, &u, mode);
                 // Peak von Mises on the hole rim at mid-thickness (VM is rotation
                 // invariant, and at the rim σ_rr = σ_zz = 0 so VM = |σ_θθ| = Kt·σ∞).
@@ -592,18 +593,19 @@ fn surf_kirsch_plate_with_hole_offaxis() {
                     let nl = [-th.cos(), -th.sin(), 0.0];
                     let n = [nl[0] * c - nl[1] * s, nl[0] * s + nl[1] * c, 0.0];
                     let Some(sg) = probe.sigma_on_free_surface(p, n) else { continue };
-                    kt = kt.max(von_mises(&sg) / sigma_inf);
+                    kt = kt.max(principal_max(&sg) / sigma_inf);
                     resid.add(axis_angle_deg(n), norm3(traction(&sg, n)) / (3.0 * sigma_inf));
                 }
                 println!(
                     "    {:<8} {:<14} {kt:>10.3} {:>+9.1}% {:>11.1}% {:>11.1}%",
-                    if mode == RECOVERIES[0] { format!("{deg:.0}°") } else { String::new() },
-                    mode.label(),
+                    format!("{deg:.0}°"),
+                    if exact_cut { "EXACT cut KE" } else { "ersatz (today)" },
                     (kt - 3.0) / 3.0 * 100.0,
                     resid.rms() * 100.0,
                     resid.max() * 100.0
                 );
             }
+          }
         }
     }
     println!("\n  If Kt err% grows sharply from 0° to 45°, the 1-3% figure in the");
@@ -647,7 +649,7 @@ fn surf_stepped_shaft_fillet_offaxis() {
             println!("    h={h}  (cells across the fillet ~ {:.0})", r / h);
             println!(
                 "    {:<8} {:<14} {:>10} {:>10} {:>12} {:>12}",
-                "rotation", "recovery", "Kt(VM)", "Kt err%", "resid RMS%", "resid MAX%"
+                "rotation", "boundary", "Kt(s1)", "Kt err%", "resid RMS%", "resid MAX%"
             );
             for &deg in &[0.0f64, 45.0] {
               for &exact_cut in &[false, true] {
@@ -673,7 +675,7 @@ fn surf_stepped_shaft_fillet_offaxis() {
                         let p = [ql[0] * c - ql[1] * s, ql[0] * s + ql[1] * c, ql[2]];
                         let n = [nl[0] * c - nl[1] * s, nl[0] * s + nl[1] * c, 0.0];
                         let Some(sg) = probe.sigma_on_free_surface(p, n) else { continue };
-                        kt = kt.max(von_mises(&sg) / sigma_nom);
+                        kt = kt.max(principal_max(&sg) / sigma_nom);
                         resid
                             .add(axis_angle_deg(n), norm3(traction(&sg, n)) / (kt_ref * sigma_nom));
                     }
@@ -693,6 +695,125 @@ fn surf_stepped_shaft_fillet_offaxis() {
     println!("\n  Same read as Case B: watch whether the error is orientation-driven.");
 }
 
+// ------------------------------------------------------------- cost benchmark
+
+/// Runtime and memory of the exact cut-cell path against the shipping ersatz,
+/// on solids of increasing size. Reports the numbers that decide whether this
+/// can ship: setup cost, solve cost, MGCG iteration count (does the smoother
+/// still see a consistent operator?) and bytes of per-cell geometry.
+#[test]
+#[ignore]
+fn bench_cut_cell_cost() {
+    use std::time::Instant;
+    println!("\n=== cut-cell cost: exact vs ersatz ===");
+    println!("  solid round cantilever r=8 L=100, tip load. 'iters' = MGCG count;");
+    println!("  a big jump there would mean the smoother no longer matches the operator.");
+    println!(
+        "\n  {:<7} {:>9} {:>8} {:>9} {:>9} {:>8} {:>8} {:>7} {:>7} {:>10}",
+        "h", "cells", "solid", "cut", "setup ms", "old ms", "new ms", "it_old", "it_new", "cut mem"
+    );
+
+    let (r, l) = (8.0f64, 100.0f64);
+    for &h in &[1.0f64, 0.6, 0.4] {
+        let inside =
+            move |p: [f64; 3]| p[0] >= 0.0 && p[0] <= l && (p[1] * p[1] + p[2] * p[2]) <= r * r;
+        let grid = voxelize_production(&inside, [0.0, -r, -r], [l, r, r], h, 4, 1);
+        let settings =
+            SolveSettings { e0: E0, nu: NU, tol: 1e-6, max_iter: 900, ..Default::default() };
+        let (pg, levels) = pad_for_levels(&grid, settings.max_levels);
+        let np = cantilever_problem(&pg, l);
+
+        // Setup: moments + element assembly (one-off, geometry only).
+        let t0 = Instant::now();
+        let cg = CutGeometry::build(&pg, &inside, 4);
+        let cut = CutStiffness::build(&cg, pg.cell_count(), settings.e0, settings.nu, pg.h);
+        let setup_ms = t0.elapsed().as_secs_f64() * 1e3;
+
+        let t1 = Instant::now();
+        let old = solve_nodes(&pg, levels, &np, &settings).expect("ersatz solve");
+        let old_ms = t1.elapsed().as_secs_f64() * 1e3;
+
+        let t2 = Instant::now();
+        let mut cache = SolverCache::build(&pg, levels, &np, &settings, grid_eps(&pg));
+        cache.set_cut(cut.clone());
+        let mut slot = Some(cache);
+        let new = solve_cached(
+            &mut slot,
+            &pg,
+            levels,
+            &np,
+            &settings,
+            grid_eps(&pg),
+            settings.tol,
+            settings.max_iter,
+        )
+        .expect("cut solve");
+        let new_ms = t2.elapsed().as_secs_f64() * 1e3;
+
+        println!(
+            "  {h:<7} {:>9} {:>8} {:>9} {setup_ms:>9.0} {old_ms:>8.0} {new_ms:>8.0} {:>7} {:>7} {:>9.1}MB",
+            pg.cell_count(),
+            pg.solid_count(),
+            cut.len(),
+            old.iterations,
+            new.stats.iterations,
+            cut.bytes() as f64 / 1048576.0
+        );
+    }
+    println!("\n  Moment form (what the geometry COSTS to carry) vs assembled matrices");
+    println!("  (what the matvec needs) is the storage trade — see cutcell.rs.");
+}
+
+/// Shared cantilever BC set: clamp x≈0, load the far face in −z.
+fn cantilever_problem(pg: &VoxelGrid, l: f64) -> NodeProblem {
+    let (mx, my, mz) = (pg.nx + 1, pg.ny + 1, pg.nz + 1);
+    let active = active_nodes(pg);
+    let mut np = NodeProblem::default();
+    let mut load_nodes = Vec::new();
+    for n in 0..mx * my * mz {
+        if !active[n] {
+            continue;
+        }
+        let x = (n % mx) as f64 * pg.h + pg.origin[0];
+        if x <= 0.5 * pg.h {
+            np.fixed.push(n as u32);
+        } else if x >= l - 0.5 * pg.h {
+            load_nodes.push(n);
+        }
+    }
+    let inv = 1.0 / load_nodes.len() as f64;
+    for n in load_nodes {
+        np.forces.push((n as u32, [0.0, 0.0, -10.0 * inv]));
+    }
+    np
+}
+
+/// Largest principal stress of a Voigt-ordered symmetric tensor.
+///
+/// This — not von Mises — is what a textbook Kt is defined on. At a free surface
+/// they coincide only under plane STRESS; at the mid-thickness of a 3D bar the
+/// state tends toward plane STRAIN, where σzz = ν(σxx+σyy) is nonzero and von
+/// Mises is simply a different quantity from the reference. Reading σ1 removes
+/// that mismatch, which is what made the fillet Kt look divergent.
+fn principal_max(s: &[f64; 6]) -> f64 {
+    let (sxx, syy, szz, sxy, syz, szx) = (s[0], s[1], s[2], s[3], s[4], s[5]);
+    let p1 = sxy * sxy + syz * syz + szx * szx;
+    if p1 <= 1e-18 {
+        return sxx.max(syy).max(szz);
+    }
+    let q = (sxx + syy + szz) / 3.0;
+    let p2 = (sxx - q).powi(2) + (syy - q).powi(2) + (szz - q).powi(2) + 2.0 * p1;
+    let p = (p2 / 6.0).sqrt();
+    let (b00, b11, b22) = ((sxx - q) / p, (syy - q) / p, (szz - q) / p);
+    let (b01, b12, b02) = (sxy / p, syz / p, szx / p);
+    let det = b00 * (b11 * b22 - b12 * b12) - b01 * (b01 * b22 - b12 * b02)
+        + b02 * (b01 * b12 - b11 * b02);
+    let r = (det / 2.0).clamp(-1.0, 1.0);
+    let phi = r.acos() / 3.0;
+    q + 2.0 * p * phi.cos()
+}
+
+#[allow(dead_code)]
 fn von_mises(s: &[f64; 6]) -> f64 {
     (0.5 * ((s[0] - s[1]).powi(2) + (s[1] - s[2]).powi(2) + (s[2] - s[0]).powi(2))
         + 3.0 * (s[3] * s[3] + s[4] * s[4] + s[5] * s[5]))
