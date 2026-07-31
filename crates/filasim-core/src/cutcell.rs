@@ -536,6 +536,88 @@ impl CutGeometry {
     }
 }
 
+/// Built element matrices for the cut cells of one grid — what the solver
+/// actually consumes.
+///
+/// # The material/geometry split
+///
+/// A cut cell's operator is `(eps / occupancy) · KE_cut`, NOT `eps · KE_cut`.
+/// `eps` already carries `occupancy × material density` (Theory Manual §11.1),
+/// and the occupancy part is now baked into `KE_cut` by the integration — so it
+/// has to be divided back out or it would be applied twice. What remains is the
+/// pure material factor (infill `rel(ρ)`, skin blend), still a scalar.
+///
+/// That split is what keeps the optimizer fast: geometry lives in the matrix and
+/// never changes, density stays a scalar, so `update_eps` needs no rebuild.
+///
+/// # Memory
+///
+/// One f32 24×24 per cut cell (~2.3 kB). The 27-moment form (~112 B) is the
+/// compact way to CARRY and rebuild the geometry, but the matvec needs the
+/// assembled matrix every iteration and rebuilding costs 27× a matvec. Halving
+/// this with symmetric packing, or deduplicating similar cut shapes into a
+/// dictionary, are the follow-ups if the accuracy gain justifies them — measure
+/// first.
+#[derive(Clone, Default)]
+pub struct CutStiffness {
+    /// Per cell: index into `ke`, or −1 when not a cut cell.
+    slot: Vec<i32>,
+    ke: Vec<[[f32; 24]; 24]>,
+    /// `1 / occupancy` per slot — divides the ersatz factor back out of `eps`.
+    inv_occ: Vec<f32>,
+}
+
+impl CutStiffness {
+    /// Assemble every cut cell's element matrix for an isotropic material.
+    pub fn build(cg: &CutGeometry, n_cells: usize, e0: f64, nu: f64, h: f64) -> Self {
+        let coeffs = moment_coeffs(&iso_stiffness(e0, nu));
+        let mut slot = vec![-1i32; n_cells];
+        let mut ke = Vec::with_capacity(cg.cells.len());
+        let mut inv_occ = Vec::with_capacity(cg.cells.len());
+        for (ci, m32) in cg.cells.iter() {
+            let mut m = [0f64; 27];
+            for k in 0..27 {
+                m[k] = m32[k] as f64;
+            }
+            let occ = m[0] / 8.0;
+            if occ <= 1e-6 {
+                continue;
+            }
+            let k64 = ke_from_moments(&coeffs, h, &m);
+            let mut k32 = [[0f32; 24]; 24];
+            for i in 0..24 {
+                for j in 0..24 {
+                    k32[i][j] = k64[i][j] as f32;
+                }
+            }
+            slot[*ci as usize] = ke.len() as i32;
+            ke.push(k32);
+            inv_occ.push((1.0 / occ) as f32);
+        }
+        Self { slot, ke, inv_occ }
+    }
+
+    /// `(element matrix, 1/occupancy)` for a cut cell, else `None`.
+    #[inline]
+    pub fn get(&self, ci: usize) -> Option<(&[[f32; 24]; 24], f32)> {
+        let s = *self.slot.get(ci)?;
+        if s < 0 {
+            return None;
+        }
+        Some((&self.ke[s as usize], self.inv_occ[s as usize]))
+    }
+
+    pub fn len(&self) -> usize {
+        self.ke.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.ke.is_empty()
+    }
+    pub fn bytes(&self) -> usize {
+        self.ke.len() * (24 * 24 * 4 + 4) + self.slot.len() * 4
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -688,6 +770,65 @@ mod tests {
             cg.len(),
             cg.bytes() as f64 / 1024.0,
             per_cell
+        );
+    }
+
+    /// THE SAFETY TEST for the solver wiring: if every "cut" cell is actually
+    /// FULL, the exact path must reproduce the ersatz path bit-for-bit within
+    /// f32 round-off. That single assertion exercises all of it at once — both
+    /// apply kernels, the `eps / occupancy` division, and the block-Jacobi
+    /// diagonal — and would fail loudly on the easiest mistake to make here,
+    /// applying occupancy twice.
+    #[test]
+    fn full_cells_through_the_cut_path_reproduce_the_ersatz_operator() {
+        use crate::mg::Level;
+        use crate::voxel::VoxelGrid;
+
+        let (nx, ny, nz, h) = (6usize, 5, 4, 0.8);
+        let (e0, nu) = (2000.0, 0.3);
+        let grid = VoxelGrid::solid_box(nx, ny, nz, h);
+        let eps = grid.scale.clone();
+        let ndof = 3 * (nx + 1) * (ny + 1) * (nz + 1);
+        let fixed = vec![false; ndof];
+
+        let mk = || Level::new(nx, ny, nz, h, eps.clone(), e0, nu, &fixed, Vec::new(), Vec::new());
+        let plain = mk();
+
+        // `inside = always true` on a solid box flags the outer shell of cells
+        // as boundary (their off-grid neighbours disagree) and hands each of
+        // them the EXACT full-cell moments — so occupancy is 1 and KE_cut is
+        // ke_hex. Anything other than an identical operator is a bug.
+        let all_in = |_: [f64; 3]| true;
+        let cg = CutGeometry::build(&grid, &all_in, 2);
+        assert!(!cg.is_empty(), "expected the shell of cells to be flagged");
+        for (ci, _) in cg.cells.iter() {
+            let occ = cg.occupancy(*ci as usize).unwrap();
+            assert!((occ - 1.0).abs() < 1e-9, "full cell reported occupancy {occ}");
+        }
+        let mut with_cut = mk();
+        with_cut.set_cut(CutStiffness::build(&cg, nx * ny * nz, e0, nu, h));
+
+        // Deterministic pseudo-random probe vector.
+        let mut x = vec![0f64; ndof];
+        let mut s = 12345u64;
+        for v in x.iter_mut() {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *v = ((s >> 33) as f64 / (1u64 << 31) as f64) - 1.0;
+        }
+        let (mut y0, mut y1) = (vec![0f64; ndof], vec![0f64; ndof]);
+        plain.apply64(&x, &mut y0);
+        with_cut.apply64(&x, &mut y1);
+
+        let norm = y0.iter().fold(0f64, |a, v| a + v * v).sqrt();
+        let diff = y0
+            .iter()
+            .zip(&y1)
+            .fold(0f64, |a, (p, q)| a + (p - q) * (p - q))
+            .sqrt();
+        assert!(
+            diff / norm < 1e-6,
+            "cut path changed the operator on full cells: rel diff {:.3e}",
+            diff / norm
         );
     }
 

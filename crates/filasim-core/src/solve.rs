@@ -412,6 +412,13 @@ impl SolverCache {
             && self.rigid == problem.rigid
     }
 
+    /// Attach exact cut-cell element matrices to this hierarchy's finest level
+    /// (`cutcell.rs`). Geometry only — it survives every `update_eps`, so the
+    /// optimizer's per-iteration density updates never rebuild it.
+    pub fn set_cut(&mut self, cut: crate::cutcell::CutStiffness) {
+        self.solver.set_cut(cut);
+    }
+
     /// Cold-build a hierarchy for `problem` (constraints + grid + eps). Public so
     /// the multi-load optimizer can build a per-constraint-group cache outside the
     /// single-`slot` reuse path.

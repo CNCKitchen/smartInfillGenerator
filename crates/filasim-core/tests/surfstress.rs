@@ -29,7 +29,8 @@
 //!
 //! Run:  cargo test -p filasim-core --test surfstress -- --ignored --nocapture
 
-use filasim_core::solve::{active_nodes, grid_eps};
+use filasim_core::cutcell::{CutGeometry, CutStiffness};
+use filasim_core::solve::{active_nodes, grid_eps, solve_cached, SolverCache};
 use filasim_core::spr::{project_traction, recover_nodal_spr};
 use filasim_core::stress::{cell_field, material_factor, recover_nodal, FieldKind};
 use filasim_core::{
@@ -311,7 +312,7 @@ impl ErrBins {
 /// axis-alignment range instead of testing one lucky angle. Both metrics are
 /// available — the lateral surface is traction-free (residual metric) and beam
 /// theory gives σxx = M·z/I (analytic metric).
-fn round_cantilever(r: f64, l: f64, h: f64) -> (VoxelGrid, Vec<f32>, f64) {
+fn round_cantilever(r: f64, l: f64, h: f64, exact_cut: bool) -> (VoxelGrid, Vec<f32>, f64) {
     let inside = move |p: [f64; 3]| {
         p[0] >= 0.0 && p[0] <= l && (p[1] * p[1] + p[2] * p[2]) <= r * r
     };
@@ -348,8 +349,45 @@ fn round_cantilever(r: f64, l: f64, h: f64) -> (VoxelGrid, Vec<f32>, f64) {
     for n in load_nodes {
         np.forces.push((n as u32, [0.0, 0.0, f_tip * inv]));
     }
-    let sol = solve_nodes(&pg, levels, &np, &settings).expect("round cantilever solve");
-    (pg, sol.u, f_tip)
+    let sol = solve_with_optional_cut(&pg, levels, &np, &settings, inside_ref(&inside), exact_cut);
+    (pg, sol, f_tip)
+}
+
+/// Erase the closure type so both cases can share the solve helper.
+fn inside_ref<'a>(f: &'a dyn Fn([f64; 3]) -> bool) -> &'a dyn Fn([f64; 3]) -> bool {
+    f
+}
+
+/// Solve with either the shipping ersatz boundary cells or exact cut-cell
+/// element matrices, so the harness can A/B the OPERATOR, not just the readout.
+fn solve_with_optional_cut(
+    pg: &VoxelGrid,
+    levels: usize,
+    np: &NodeProblem,
+    settings: &SolveSettings,
+    inside: &dyn Fn([f64; 3]) -> bool,
+    exact_cut: bool,
+) -> Vec<f32> {
+    if !exact_cut {
+        return solve_nodes(pg, levels, np, settings).expect("solve").u;
+    }
+    let cg = CutGeometry::build(pg, inside, 4);
+    let cut = CutStiffness::build(&cg, pg.cell_count(), settings.e0, settings.nu, pg.h);
+    let mut cache = SolverCache::build(pg, levels, np, settings, grid_eps(pg));
+    cache.set_cut(cut);
+    let mut slot = Some(cache);
+    let r = solve_cached(
+        &mut slot,
+        pg,
+        levels,
+        np,
+        settings,
+        grid_eps(pg),
+        settings.tol,
+        settings.max_iter,
+    )
+    .expect("cut solve");
+    r.u.iter().map(|&v| v as f32).collect()
 }
 
 #[test]
@@ -365,15 +403,17 @@ fn surf_round_cantilever() {
     let inertia = PI * r.powi(4) / 4.0;
 
     for &h in &[1.0, 0.5] {
-        let (pg, u, f_tip) = round_cantilever(r, l, h);
+      for &exact_cut in &[false, true] {
+        let (pg, u, f_tip) = round_cantilever(r, l, h, exact_cut);
 
         // Sample the mid-span band only: away from the clamped root and the
         // loaded tip, where St-Venant end effects and BC singularities live.
         let (x0, x1) = (0.30 * l, 0.70 * l);
         let sigma_ref = (-f_tip) * (l - x0) * r / inertia; // peak |σxx| in the band
         println!(
-            "\n  h={h}  ({:.0} cells across the diameter, σ_ref={sigma_ref:.2} MPa)",
-            2.0 * r / h
+            "\n  h={h}  ({:.0} cells across the diameter, σ_ref={sigma_ref:.2} MPa)  boundary cells: {}",
+            2.0 * r / h,
+            if exact_cut { "EXACT cut-cell KE" } else { "occupancy ersatz (today)" }
         );
 
         let mut resid_rows = Vec::new();
@@ -414,6 +454,7 @@ fn surf_round_cantilever() {
         for (m, b) in &sxx_rows {
             b.print_row(m.label());
         }
+      }
     }
     println!("\n  Read the BINS, not the totals: if the 0-10° column is small and");
     println!("  the 40-55° column is large, today's axis-aligned benchmarks are");
@@ -436,6 +477,7 @@ fn rotated_plate(
     phi: f64,
     h: f64,
     f_total: f64,
+    exact_cut: bool,
 ) -> (VoxelGrid, Vec<f32>, Box<dyn Fn([f64; 3]) -> [f64; 3]>) {
     let (c, s) = (phi.cos(), phi.sin());
     let to_local = move |p: [f64; 3]| -> [f64; 3] {
@@ -496,8 +538,8 @@ fn rotated_plate(
             [f_total * inv * dir[0], f_total * inv * dir[1], 0.0],
         ));
     }
-    let sol = solve_nodes(&pg, levels, &np, &settings).expect("rotated plate solve");
-    (pg, sol.u, Box::new(to_local))
+    let u = solve_with_optional_cut(&pg, levels, &np, &settings, &inside_world, exact_cut);
+    (pg, u, Box::new(to_local))
 }
 
 #[test]
@@ -531,7 +573,7 @@ fn surf_kirsch_plate_with_hole_offaxis() {
         for &deg in &[0.0f64, 15.0, 30.0, 45.0] {
             let phi = deg.to_radians();
             let (pg, u, _tl) =
-                rotated_plate(&inside_local, [-hw, -hw, 0.0], [hw, hw, t], phi, h, f_total);
+                rotated_plate(&inside_local, [-hw, -hw, 0.0], [hw, hw, t], phi, h, f_total, false);
             for mode in RECOVERIES {
                 let probe = SurfaceStress::new(&pg, &u, mode);
                 // Peak von Mises on the hole rim at mid-thickness (VM is rotation
@@ -607,12 +649,13 @@ fn surf_stepped_shaft_fillet_offaxis() {
                 "    {:<8} {:<14} {:>10} {:>10} {:>12} {:>12}",
                 "rotation", "recovery", "Kt(VM)", "Kt err%", "resid RMS%", "resid MAX%"
             );
-            for &deg in &[0.0f64, 15.0, 30.0, 45.0] {
+            for &deg in &[0.0f64, 45.0] {
+              for &exact_cut in &[false, true] {
                 let phi = deg.to_radians();
                 let (pg, u, _tl) =
-                    rotated_plate(&inside_local, [0.0, -hd, 0.0], [lbar, hd, t], phi, h, f_total);
+                    rotated_plate(&inside_local, [0.0, -hd, 0.0], [lbar, hd, t], phi, h, f_total, exact_cut);
                 let (c, s) = (phi.cos(), phi.sin());
-                for mode in RECOVERIES {
+                for mode in [Recovery::Mean] {
                     let probe = SurfaceStress::new(&pg, &u, mode);
                     // Walk the fillet arc (local frame), top flank, mid-thickness.
                     let mut kt = 0.0f64;
@@ -636,13 +679,14 @@ fn surf_stepped_shaft_fillet_offaxis() {
                     }
                     println!(
                         "    {:<8} {:<14} {kt:>10.3} {:>+9.1}% {:>11.1}% {:>11.1}%",
-                        if mode == RECOVERIES[0] { format!("{deg:.0}°") } else { String::new() },
-                        mode.label(),
+                        format!("{deg:.0}°"),
+                        if exact_cut { "EXACT cut KE" } else { "ersatz (today)" },
                         (kt - kt_ref) / kt_ref * 100.0,
                         resid.rms() * 100.0,
                         resid.max() * 100.0
                     );
                 }
+              }
             }
         }
     }
@@ -666,7 +710,7 @@ fn von_mises(s: &[f64; 6]) -> f64 {
 fn surface_probe_finds_material_and_reports_residual() {
     use std::f64::consts::PI;
     let (r, l, h) = (6.0f64, 40.0f64, 1.5f64);
-    let (pg, u, f_tip) = round_cantilever(r, l, h);
+    let (pg, u, f_tip) = round_cantilever(r, l, h, false);
     let probe = SurfaceStress::new(&pg, &u, Recovery::Mean);
     let inertia = PI * r.powi(4) / 4.0;
     let sigma_ref = (-f_tip) * l * r / inertia;

@@ -129,6 +129,14 @@ pub struct Level {
     /// Transverse-isotropic infill (DESIGN §22). `None` = the original
     /// single-tensor kernel, unchanged.
     ti: Option<TiOverlay>,
+    /// Exact cut-cell element matrices (`cutcell.rs`). FINEST LEVEL ONLY —
+    /// [`Level::coarsen`] deliberately drops it, so the coarse grids keep the
+    /// cheap `occupancy · KE_full` ersatz and the V-cycle stays a pure
+    /// preconditioner. The outer CG operator is exact either way, so
+    /// convergence is unaffected; this is the same fine-level-only discipline
+    /// the rigid remote-mass coupling uses. `None` = byte-identical to the
+    /// pre-cut-cell code path.
+    cut: Option<crate::cutcell::CutStiffness>,
     /// Non-void cells grouped into contiguous z-slab ranges for two-phase
     /// parallel scatter: even-indexed slabs run concurrently (phase A), then
     /// odd (phase B). Every slab spans ≥1 whole z-plane of cells, so two
@@ -311,6 +319,8 @@ impl Level {
             ke64,
             eps,
             ti,
+            // Attached after construction by `set_cut`, finest level only.
+            cut: None,
             slabs: Vec::new(),
             constrained: vec![false; ndof],
             live: Vec::new(),
@@ -600,6 +610,7 @@ impl Level {
         // matching the two-KE matvec exactly (an approximate diagonal would
         // still converge, just slower — but a WRONG one hides real errors).
         let ti_blocks = self.ti.as_ref().map(|t| (ke_diag_blocks(&t.ke64), &t.eps));
+        let cut = self.cut.as_ref();
         let constrained = &self.constrained;
         par::chunks_mut_indexed(&mut dinv, 6 * NODE_CHUNK, |off, chunk| {
             let n0 = off / 6;
@@ -629,9 +640,27 @@ impl Level {
                             any = true;
                             let l = OFF_TO_LOCAL[dx][dy][dz];
                             if e > 0.0 {
-                                for r in 0..3 {
-                                    for c in 0..3 {
-                                        acc[r][c] += e as f64 * blocks[l][r][c];
+                                // Must mirror the matvec exactly: a cut cell
+                                // contributes ITS diagonal, not the reference
+                                // cube's. A merely-approximate diagonal still
+                                // converges, just slower — but a wrong one
+                                // masks real errors, so keep them identical.
+                                match cut.and_then(|c| c.get(ci)) {
+                                    Some((ke, inv_occ)) => {
+                                        let w = (e * inv_occ) as f64;
+                                        for r in 0..3 {
+                                            for c in 0..3 {
+                                                acc[r][c] +=
+                                                    w * ke[3 * l + r][3 * l + c] as f64;
+                                            }
+                                        }
+                                    }
+                                    None => {
+                                        for r in 0..3 {
+                                            for c in 0..3 {
+                                                acc[r][c] += e as f64 * blocks[l][r][c];
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -709,7 +738,14 @@ impl Level {
     ) {
         let e = self.eps[ci];
         if e > 0.0 {
-            unsafe { self.apply_cell::<COLUMN>(ci, e, &self.ke, x, ys) };
+            // A cut cell carries its own exactly-integrated matrix; `eps` then
+            // has to shed the occupancy it already contains (see CutStiffness).
+            match self.cut.as_ref().and_then(|c| c.get(ci)) {
+                Some((ke, inv_occ)) => unsafe {
+                    self.apply_cell::<COLUMN>(ci, e * inv_occ, ke, x, ys)
+                },
+                None => unsafe { self.apply_cell::<COLUMN>(ci, e, &self.ke, x, ys) },
+            }
         }
         if let Some(t) = &self.ti {
             let ei = t.eps[ci];
@@ -847,7 +883,17 @@ impl Level {
     ) {
         let e = eps[ci];
         if e > 0.0 {
-            unsafe { self.apply_cell64::<COLUMN>(ci, e as f64, &self.ke64, x, ys) };
+            match self.cut.as_ref().and_then(|c| c.get(ci)) {
+                // Cut cells are stored f32-only; the cast is 576 ops against
+                // 576 multiply-adds, and this is the outer-CG operator, not the
+                // V-cycle bulk. Storing an f64 twin would double the dominant
+                // memory stream for no accuracy — the matrix entries came from
+                // an f32 round-trip either way.
+                Some((ke, inv_occ)) => unsafe {
+                    self.apply_cell64_f32ke::<COLUMN>(ci, (e * inv_occ) as f64, ke, x, ys)
+                },
+                None => unsafe { self.apply_cell64::<COLUMN>(ci, e as f64, &self.ke64, x, ys) },
+            }
         }
         if let (Some(t), Some(te)) = (&self.ti, ti_eps) {
             let ei = te[ci];
@@ -855,6 +901,73 @@ impl Level {
                 unsafe { self.apply_cell64::<COLUMN>(ci, ei as f64, &t.ke64, x, ys) };
             }
         }
+    }
+
+    /// `apply_cell64` reading an f32 element matrix — the cut-cell path, which
+    /// stores f32 only. Arithmetic stays f64; just the matrix entries are cast.
+    /// # Safety
+    /// Same disjoint-scatter rule as `apply_cell`.
+    #[inline(always)]
+    unsafe fn apply_cell64_f32ke<const COLUMN: bool>(
+        &self,
+        ci: usize,
+        e: f64,
+        ke: &[[f32; 24]; 24],
+        x: &[f64],
+        ys: &UnsafeSlice<f64>,
+    ) {
+        let (nx, ny) = (self.nx, self.ny);
+        let (mx, my) = (self.mx, self.my);
+        let cx = ci % nx;
+        let cy = (ci / nx) % ny;
+        let cz = ci / (nx * ny);
+        let mut xl = [0f64; 24];
+        let mut nidx = [0usize; 8];
+        for l in 0..8 {
+            let [ox, oy, oz] = NODE_OFFSETS[l];
+            let n = ((cz + oz) * my + (cy + oy)) * mx + (cx + ox);
+            nidx[l] = n;
+            xl[3 * l] = x[3 * n];
+            xl[3 * l + 1] = x[3 * n + 1];
+            xl[3 * l + 2] = x[3 * n + 2];
+        }
+        let mut yl = [0f64; 24];
+        if COLUMN {
+            for j in 0..24 {
+                let xj = xl[j];
+                let row = &ke[j];
+                for i in 0..24 {
+                    yl[i] += row[i] as f64 * xj;
+                }
+            }
+            for v in yl.iter_mut() {
+                *v *= e;
+            }
+        } else {
+            for i in 0..24 {
+                let row = &ke[i];
+                let mut s = 0f64;
+                for j in 0..24 {
+                    s += row[j] as f64 * xl[j];
+                }
+                yl[i] = e * s;
+            }
+        }
+        for l in 0..8 {
+            let n = nidx[l];
+            *ys.get_mut(3 * n) += yl[3 * l];
+            *ys.get_mut(3 * n + 1) += yl[3 * l + 1];
+            *ys.get_mut(3 * n + 2) += yl[3 * l + 2];
+        }
+    }
+
+    /// Attach exact cut-cell element matrices to THIS level (must be the
+    /// finest). Rebuilds the block-Jacobi diagonal and the Chebyshev eigenvalue
+    /// estimate, both of which depend on the element matrices.
+    pub fn set_cut(&mut self, cut: crate::cutcell::CutStiffness) {
+        self.cut = Some(cut);
+        self.build_dinv();
+        self.refresh_lmax();
     }
 
     /// f64 twin of `apply_cell` (outer-CG operator).
@@ -1510,6 +1623,16 @@ pub struct SolveStats {
 }
 
 impl MgSolver {
+    /// Attach exact cut-cell element matrices to the FINEST level.
+    ///
+    /// Coarse levels keep the `occupancy · KE_full` ersatz on purpose: they are
+    /// preconditioner-only, and the outer CG operator (`apply64`) runs on the
+    /// finest level, so the answer is exact regardless. Same fine-level-only
+    /// discipline as the rigid remote-mass coupling.
+    pub fn set_cut(&mut self, cut: crate::cutcell::CutStiffness) {
+        self.levels[0].set_cut(cut);
+    }
+
     /// Coarsen while dimensions stay even and at least 2 cells per axis.
     pub fn new(mut finest: Level, max_levels: usize) -> Self {
         let eps_exact = finest.eps.clone();
