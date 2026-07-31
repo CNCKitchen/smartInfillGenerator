@@ -413,6 +413,129 @@ pub fn ke_cut_iso(
     ke_from_moments(&coeffs, h, &m)
 }
 
+/// Per-cell cut geometry for a whole grid — the 27 moments of every boundary
+/// cell, keyed by cell index.
+///
+/// Interior and void cells are absent: an interior cell's moments are the exact
+/// full-cell set (reproducing `ke_hex`), so storing them would be redundant.
+/// Only cells the surface actually crosses carry data, which is why this is
+/// sparse and why the cost scales with surface area rather than volume.
+///
+/// Kept BESIDE `VoxelGrid` rather than inside it so no existing construction
+/// site changes and the whole feature stays opt-in — the same discipline the TI
+/// overlay uses in `mg.rs`.
+#[derive(Clone, Default)]
+pub struct CutGeometry {
+    /// (cell index, 27 moments) sorted by cell index.
+    cells: Vec<(u32, [f32; 27])>,
+}
+
+impl CutGeometry {
+    /// Compute moments for every cell the surface crosses.
+    ///
+    /// A cell is treated as cut when its own inside/outside classification
+    /// disagrees with any of its 6 face neighbours — the same boundary test the
+    /// voxelizer already uses to decide where to supersample, so this visits
+    /// exactly the cells that pay for supersampling today.
+    pub fn build(
+        grid: &crate::voxel::VoxelGrid,
+        inside: &dyn Fn([f64; 3]) -> bool,
+        depth: u32,
+    ) -> Self {
+        let (nx, ny, nz) = (grid.nx, grid.ny, grid.nz);
+        let centre_in = |cx: usize, cy: usize, cz: usize| {
+            inside([
+                grid.origin[0] + (cx as f64 + 0.5) * grid.h,
+                grid.origin[1] + (cy as f64 + 0.5) * grid.h,
+                grid.origin[2] + (cz as f64 + 0.5) * grid.h,
+            ])
+        };
+        let mut ci_flags = vec![false; nx * ny * nz];
+        for cz in 0..nz {
+            for cy in 0..ny {
+                for cx in 0..nx {
+                    ci_flags[(cz * ny + cy) * nx + cx] = centre_in(cx, cy, cz);
+                }
+            }
+        }
+        let at = |x: i64, y: i64, z: i64| -> Option<bool> {
+            if x < 0 || y < 0 || z < 0 || x >= nx as i64 || y >= ny as i64 || z >= nz as i64 {
+                None
+            } else {
+                Some(ci_flags[((z as usize) * ny + y as usize) * nx + x as usize])
+            }
+        };
+
+        let mut cells = Vec::new();
+        for cz in 0..nz {
+            for cy in 0..ny {
+                for cx in 0..nx {
+                    let ci = (cz * ny + cy) * nx + cx;
+                    if grid.scale[ci] <= 0.0 {
+                        continue; // void: nothing to integrate
+                    }
+                    let me = ci_flags[ci];
+                    let (x, y, z) = (cx as i64, cy as i64, cz as i64);
+                    let boundary = [
+                        (x - 1, y, z),
+                        (x + 1, y, z),
+                        (x, y - 1, z),
+                        (x, y + 1, z),
+                        (x, y, z - 1),
+                        (x, y, z + 1),
+                    ]
+                    .iter()
+                    .any(|&(a, b, c)| at(a, b, c) != Some(me));
+                    if !boundary {
+                        continue; // fully interior: exact full-cell moments
+                    }
+                    let origin = [
+                        grid.origin[0] + cx as f64 * grid.h,
+                        grid.origin[1] + cy as f64 * grid.h,
+                        grid.origin[2] + cz as f64 * grid.h,
+                    ];
+                    let m = cut_moments(origin, grid.h, inside, depth);
+                    if m[0] <= 0.0 {
+                        continue;
+                    }
+                    let mut f = [0f32; 27];
+                    for k in 0..27 {
+                        f[k] = m[k] as f32;
+                    }
+                    cells.push((ci as u32, f));
+                }
+            }
+        }
+        Self { cells }
+    }
+
+    pub fn len(&self) -> usize {
+        self.cells.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.cells.is_empty()
+    }
+
+    /// Moments of a cut cell, or `None` when the cell is interior/void.
+    pub fn get(&self, ci: usize) -> Option<&[f32; 27]> {
+        self.cells
+            .binary_search_by_key(&(ci as u32), |&(c, _)| c)
+            .ok()
+            .map(|i| &self.cells[i].1)
+    }
+
+    /// Volume fraction implied by the moments (reference-cell volume is 8).
+    pub fn occupancy(&self, ci: usize) -> Option<f64> {
+        self.get(ci).map(|m| m[0] as f64 / 8.0)
+    }
+
+    /// Bytes of per-cell geometry carried. The point of the moment form: 27 f32
+    /// per boundary cell instead of a 24×24 element matrix.
+    pub fn bytes(&self) -> usize {
+        self.cells.len() * (4 + 27 * 4)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -513,6 +636,59 @@ mod tests {
             let rel = r.sqrt() / scale;
             assert!(rel < 1e-12, "rigid mode {k} stores energy: |KE·m|/‖KE‖ = {rel:.3e}");
         }
+    }
+
+    /// Grid-level sanity: on a sphere the moments must reproduce the occupancy
+    /// the voxelizer computed independently, only boundary cells may be stored,
+    /// and the memory has to stay in the "27 numbers" regime rather than the
+    /// "24×24 matrix" regime.
+    #[test]
+    fn cut_geometry_matches_voxelizer_occupancy_on_a_sphere() {
+        use crate::bvh::WindingBvh;
+        use crate::mesh::primitives;
+        use crate::voxel::VoxelGrid;
+
+        let mesh = primitives::sphere([0.0; 3], 8.0, 96, 48);
+        let grid = VoxelGrid::voxelize(&mesh, 1.0);
+        let bvh = WindingBvh::build(&mesh);
+        let inside = |q: [f64; 3]| bvh.winding_number(q).abs() >= 0.5;
+        let cg = CutGeometry::build(&grid, &inside, 4);
+
+        assert!(!cg.is_empty(), "a sphere must have cut cells");
+        // Only boundary cells are stored — far fewer than the solid count.
+        let solid = grid.solid_count();
+        assert!(
+            cg.len() < solid,
+            "stored {} cut cells for {solid} solid cells — should be surface-only",
+            cg.len()
+        );
+
+        // Moment-derived occupancy must track the voxelizer's supersampled one.
+        let mut worst = 0f64;
+        let mut n = 0usize;
+        for (ci, _) in cg.cells.iter() {
+            let ci = *ci as usize;
+            let vox = grid.scale[ci] as f64;
+            let mom = cg.occupancy(ci).unwrap();
+            worst = worst.max((vox - mom).abs());
+            n += 1;
+        }
+        assert!(n > 100, "expected many cut cells, got {n}");
+        assert!(
+            worst < 0.12,
+            "moment occupancy disagrees with the voxelizer by {worst:.3} (max)"
+        );
+
+        // The memory claim: ~112 B per cut cell, vs 1200 B for a packed
+        // symmetric 24×24 f32 element matrix.
+        let per_cell = cg.bytes() as f64 / cg.len() as f64;
+        assert!(per_cell < 200.0, "per-cut-cell geometry is {per_cell:.0} B");
+        println!(
+            "\n  sphere r=8 @h=1: {} cut cells of {solid} solid, {:.0} kB total ({:.0} B/cell)",
+            cg.len(),
+            cg.bytes() as f64 / 1024.0,
+            per_cell
+        );
     }
 
     /// THE MEASUREMENT that justifies wiring this into the solver: how far is
