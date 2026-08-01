@@ -145,3 +145,10 @@ strength_sfcrit_excl	4.537606239318848	Q
 strength_excl_cells	64	Q
 strength_excl_radius_mm	2	Q
 strength_time_ms	297.9794	I
+freq_f1_optimized	787.7372825710293	Q
+freq_f1_uniform	650.6459859600698	Q
+freq_gain_vs_uniform	1.21070028797407	Q
+freq_mean_infill	0.3000007212880637	Q
+freq_negative_sens_share	0.5086206896551724	Q
+freq_iters	7	I
+freq_time_ms	1347.3008	I

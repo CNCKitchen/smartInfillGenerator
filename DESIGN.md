@@ -1790,3 +1790,138 @@ first-run flow (orient → loads → analyze), just with the rig pre-filled.
 
 Verification: `web/bench/shot-sample.mjs` — serves `dist/`, asserts the
 auto-load, the cache-hit log line, both BC bindings, and a green solve.
+
+## 26. Maximize fundamental frequency — the f₁ goal (built 2026-07-29)
+
+**Goal.** A fourth optimization goal beside *budget* / *match* / *strength*:
+**maximize the part's lowest natural frequency f₁ at the user's material
+budget**. For anything driven by vibration — drone arms under prop-wash, machine
+mounts, tool holders — the design question is "keep the first resonance above the
+excitation", and neither stiffness nor strength answers it. Listed as a wanted
+simulation type in §10 since 2026-06; the eigensolver §10 called for already
+shipped as `modal.rs`, so this is the optimizer half.
+
+Requested as "minimize", corrected to **maximize** during scoping. The two are a
+sign flip in the code but have opposite difficulty profiles, and the shipped
+direction is the harder one on mode switching (dec. 2) and the easier one on
+localized modes (dec. 5).
+
+### Decisions
+
+1. **The budget is NOT walked.** Match and strength both own the budget and walk
+   it with a secant. Frequency spends the budget the user asked for and changes
+   the *objective* instead — so `max_passes = 1`, no secant, no pre-flight. This
+   makes it the cheapest goal to orchestrate, and the mass-constraint machinery
+   (the `simp.rs` OC volume bisection) is reused untouched. `PipelineCfg::freq`
+   is asserted mutually exclusive with `goal_match` and `strength`.
+
+2. **KS-aggregated eigenvalue, not λ₁ (`freq.rs`).** Maximizing λ₁ is a max-min:
+   push the lowest eigenvalue up and it collides with the second, where λ₁ is
+   non-differentiable and a plain gradient step ping-pongs forever. Real parts
+   live there — `cantilever_matches_euler_bernoulli` asserts modes 1 and 2 of a
+   square-section beam agree within 10 %. So the objective is a
+   **Kreisselmeier–Steinhauser softmin** over the lowest `KS_MODES = 4`
+   eigenvalues at `KS_KAPPA = 30`: a smooth lower bound on λ₁ whose gradient is a
+   convex blend of the per-mode sensitivities. At a crossing both modes carry
+   weight and the update raises the *pair*; as the spectrum separates the weights
+   collapse onto mode 1 and the objective becomes λ₁ again.
+
+   **The normalizer must be frozen.** `ks_aggregate` takes an explicit
+   `lambda_ref` the caller holds constant while differentiating; that is what
+   makes `dλ_KS/dλⱼ = weights[j]` exact. Normalizing by the live λ₁ is the
+   obvious-looking simplification and is wrong — λ₁ then enters through the shift
+   and the scale factor too, adding unaccounted `dλ₁/dx` terms. It put the
+   gradient **31 % off at κ = 2**, and the error nearly vanishes at large κ, so it
+   would have shipped looking fine while quietly degrading the search direction on
+   exactly the clustered spectra the aggregation exists for. Caught by the FD
+   test — that is why the test exists.
+
+3. **Work in λ = ω², convert to Hz only at the reporting boundary.** λ is the
+   quantity linear in `K` (the Rayleigh quotient is `λ = φᵀKφ / φᵀMφ`), so the
+   sensitivity is clean there; `f = √λ/2π` is monotone, so maximizing λ maximizes
+   f.
+
+4. **The OC update needs no MMA.** `∂λ/∂x = φᵀK'φ − λ·φᵀM'φ` is
+   **sign-indefinite** (stiffness raises f₁, the mass it costs lowers it), where
+   the compliance sensitivity never is. The existing OC step's `.max(0.0)` clamp
+   turns out to be exactly the right rule rather than the failure it looks like:
+   a cell whose mass costs more than its stiffness buys clamps to `be = 0` ⇒
+   `x_new = max(x − move_limit, floor)`, i.e. shed material as fast as the move
+   limit allows. The bisection still reaches the target mean as long as some cell
+   has a positive sensitivity. Measured: converged in 7 iterations, **+12.3 % f₁
+   over uniform at equal mass** on the golden cantilever. MMA was budgeted as the
+   likely fallback and was not needed.
+
+5. **Guarded mass interpolation for solid mode (`freq::mass_interp`).**
+   Stiffness ~ρ^p (p = 3 in Part Topo) against mass ~ρ¹ makes `K/M ~ ρ^(p−1)`
+   collapse as a cell empties, so near-void regions grow **spurious localized
+   low-frequency modes** and the optimizer chases a numerical artifact instead of
+   the part. Below `MASS_RHO0 = 0.10`, mass is bent to `ρ₀·(ρ/ρ₀)^6`, making
+   `K/M` *grow* as a cell empties. `MASS_RHO0` is the printable infill floor, so
+   for every infill mode the interpolation is the **exact identity** and the
+   mechanism is inert — asserted, not assumed. Applied only inside the optimizer
+   loop; verification uses TRUE mass (the two coincide at any deliverable design,
+   since binned infill sits at or above the floor and binned solid mode is
+   {void, solid}).
+
+6. **Force-free, first load case only.** The eigenproblem has no forces in it and
+   takes one support set — the modal design note §3 rule, reused verbatim. Extra
+   load cases contribute nothing, so `LoadSet` weighted-sum aggregation is
+   bypassed entirely. This is a real and non-obvious limitation, so it is stated
+   in the goal picker *before* the run and echoed in the log after
+   (`f1IgnoredLoadCases`). Remote point masses DO matter and are lumped from the
+   BCs exactly as `modal_analysis` does — a motor or battery mount drags the
+   design the way it drags the real part.
+
+7. **Report the BINNED frequency against an EQUAL-MASS uniform print.** The
+   optimizer's continuous field is not printable, so `f1Hz` is the quantized
+   delivered design (`pipeline::modal_f1` on `x_binned`). A raw Hz number is
+   unjudgeable on its own, so `f1UniformHz` re-measures the same mass spent as
+   plain uniform infill; the gain is quoted against that and may be negative.
+   `f1BinningLoss` reports how much quantization gave back, and the log suggests
+   more density levels when it exceeds 2 %.
+
+8. **`OptimizeResult::se` carries the SIGNED `dλ_KS/dx`.** `bins.rs` consumes
+   `se` as a non-negative importance weight (`.max(0.0)` in both `cluster_levels`
+   and `assign_bins_mass`), so cells where extra mass LOWERS the frequency clamp
+   to zero weight and are pinned to their round-down level — exactly right, since
+   promoting them would hurt the objective. Storing `|dλ/dx|` there instead would
+   rank the worst possible cells as the most important. Zero `bins.rs` changes.
+
+### Performance — why this is affordable (M0)
+
+The forecast risk was runtime: a cold modal analysis is ~600 V-cycles (modal
+design note §12b), and 40 of those per optimization would be hours. The fix is
+warm-starting the LOBPCG subspace across optimizer iterations
+(`modal::analyze_warm` + the opaque `ModalBlock`), since consecutive designs
+differ by one move-limited step. Measured on a 9216-cell beam at block width
+p = 7 (`warm_start_beats_cold_on_a_moving_design`):
+
+```
+cold 112-133 V-cycles/analysis (16-19 iters)  ->  warm 42-56 (6-8 iters), 2.7x
+per-iteration warm cost: 47 V-cycles
+```
+
+The **compliance optimizer spends 15–60 MGCG iterations** per outer iteration
+(the `simp.rs` inner schedule), so the frequency objective costs about the same
+per iteration as what already ships. Warm and cold agree on frequencies to 5
+figures, which is also the guard against a warm block locking onto a stale
+subspace after a mode crossing.
+
+### Validation
+
+| Test | What it pins |
+|---|---|
+| `freq::ks_sensitivity_matches_finite_difference` | `dλ_KS/dx` vs central FD of two full modal analyses, at κ = 2 (all four modes weighted) and κ = 30. Also asserts some cell has a NEGATIVE sensitivity — the direct guard on the mass term, which can be dropped entirely and still produce a plausible-looking optimization. Needs `ModalConfig::eig_tol` driven to 1e-13; the shipping 1e-4 stop is pure noise at FD scale. |
+| `freq::optimizing_for_frequency_beats_uniform_at_equal_mass` | End-to-end: beats uniform at the optimizer's OWN achieved mean (not the requested budget, so neither design gets a mass advantage), and the tracked f₁ matches an independent cold re-analysis. |
+| `freq::mass_interp_*` (3) | Identity across every infill band; `K/M` grows below the threshold; continuity at the join; the guarded branch's derivative vs FD. |
+| `freq::ks_*` (4) | Weights sum to 1, collapse when separated, split 50/50 on a degenerate pair, survive a zero fundamental. |
+| `smoke-wasm.mjs` frequency block | Full chain through wasm on a cantilever with **no force at all** — proving the arm is genuinely force-free. Measured +43.2 % f₁ over equal-mass uniform at a 30 % budget. |
+| `regbench` `freq_*` | Guards the optimized f₁, the uniform baseline and the gain against future refactors. |
+
+**The compliance path is unchanged** — regbench PASS, all quality metrics
++0.000 %.
+
+*Caveat carried through to the UI: this is an undamped free-vibration estimate of
+the analyzed geometry. It is a design aid; validate anything load-bearing against
+a measurement or FEA.*

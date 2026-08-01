@@ -17,7 +17,8 @@ use filasim_core::solve::{
     active_nodes, pad_for_levels, solve_nodes_cached, SolveSettings, Solution, SolverCache,
 };
 use filasim_core::stress::{
-    cell_field_eigen, cell_field_ti, material_factor, recover_nodal, recover_nodal_where,
+    cell_field_cut, cell_field_eigen, cut_normals, material_factor, recover_nodal,
+    recover_nodal_where, recover_surface, surface_band,
     FieldKind,
 };
 use filasim_core::threemf::{export_orca_3mf, export_stl_zip, import_3mf, weld};
@@ -646,6 +647,13 @@ pub struct Model {
     /// each cell's center value flat. Removes the staircase checkerboard.
     /// Display-side only — the solution is untouched.
     smooth_stress: bool,
+    /// Surface recovery on/off (default ON). The peak of a voxel stress field
+    /// sits on the cells the staircase runs through, and that maximum does not
+    /// converge — it scatters with where the steps happen to land. With this
+    /// on, every boundary cell's displayed value is a linear patch fit of the
+    /// clean interior around it (`stress::recover_surface`) instead of its own
+    /// polluted reading. Interior cells are untouched either way.
+    surface_recovery: bool,
     /// Material (occupancy-decoupled) stress display. The reported stress and
     /// the SF allowable are evaluated with the cell's MATERIAL density factor
     /// (`eps ÷ occupancy`) instead of the occupancy-scaled `eps`. A finite-cell
@@ -970,6 +978,7 @@ impl Model {
             composite_skin: false,
             smooth_stress: false,
             material_stress: true,
+            surface_recovery: true,
             grid: None,
             solver_cache: None,
             solution: None,
@@ -1302,6 +1311,13 @@ impl Model {
     /// fields are recomputed on the next fetch; the safety factor is unaffected.
     pub fn set_material_stress(&mut self, on: bool) {
         self.material_stress = on;
+    }
+
+    /// Surface recovery on/off (see the `surface_recovery` field). Pure
+    /// post-processing: the solution stays valid, fields are recomputed on the
+    /// next fetch. Off reproduces the pre-2026-08 read-back exactly.
+    pub fn set_surface_recovery(&mut self, on: bool) {
+        self.surface_recovery = on;
     }
 
     pub fn clear_bcs(&mut self) {
@@ -2720,6 +2736,13 @@ impl Model {
         let params = OptimizeParams {
             // Budget = target mean INFILL density of the interior — the
             // engine clamps it to the printable [floor, cap] band.
+            // §26: the frequency goal swaps the OBJECTIVE, not the budget — the
+            // mass constraint stays exactly what the user asked for.
+            objective: if opts.goal == "frequency" {
+                filasim_core::simp::Objective::MaxFundamental
+            } else {
+                filasim_core::simp::Objective::Compliance
+            },
             budget: (budget_pct / 100.0).clamp(0.01, 1.0),
             exponent: opt_exp,
             coeff: opt_coeff,
@@ -2781,6 +2804,18 @@ impl Model {
                 shear_z: self.shear_strength_z_eff(),
             },
         });
+        // Frequency goal (§26): maximize f1 at the user's budget. Force-free —
+        // only the PRIMARY case's supports enter (the modal design note §3 rule,
+        // reused verbatim), so extra load cases are silently irrelevant here and
+        // the UI says so. Remote point masses DO matter and are lumped from the
+        // BCs exactly as `modal_analysis` does, so a motor/battery mount drags
+        // the design the way it drags the real part.
+        let freq_spec = (opts.goal == "frequency").then(|| filasim_core::simp::FreqSpec {
+            density: self.density,
+            extra_mass: filasim_core::attach::point_mass_lumping(&self.mesh, grid, primary_bcs),
+            num_modes: 0, // module default
+            kappa: 0.0,   // module default
+        });
         let ref_frac = (budget_pct / 100.0).clamp(params.floor, params.cap);
         // Manual level override (binary {floor,1} or user densities): clamp,
         // sort, dedup once here; the pipeline takes the list verbatim.
@@ -2798,6 +2833,7 @@ impl Model {
             eval: filasim_core::pipeline::EvalLaw { exp: eval_exp, coeff: eval_coeff },
             goal_match,
             strength: strength_goal,
+            freq: freq_spec.as_ref(),
             ref_frac,
             n_bins,
             levels_pct: levels_clean.as_deref(),
@@ -2839,6 +2875,9 @@ impl Model {
                     "passes": upd.passes,
                     "budgetNow": upd.budget,
                     "compliance": upd.progress.compliance,
+                    // §26: the frequency arm solves no static case, so
+                    // `compliance` is 0 there and this is the live headline.
+                    "f1Hz": upd.progress.f1_hz,
                     "massFrac": upd.progress.mass_frac,
                     "meanInfill": upd.progress.mean_infill,
                     "change": upd.progress.change,
@@ -2927,11 +2966,50 @@ impl Model {
                 "match"
             } else if strength_goal.is_some() {
                 "strength"
+            } else if freq_spec.is_some() {
+                "frequency"
             } else {
                 "budget"
             },
             "passes": oc.pass_trace.len(),
         });
+        if freq_spec.is_some() {
+            // Frequency summary (§26). `f1Hz` is the DELIVERED (binned) number —
+            // the continuous field it came from is not printable, so reporting
+            // that one would overstate the result. `f1UniformHz` is the same
+            // mass spent as plain uniform infill: the only honest way to read
+            // the gain, and it is quoted even when negative.
+            let o = summary_v.as_object_mut().unwrap();
+            o.insert("f1Hz".into(), serde_json::json!(oc.f1_binned));
+            o.insert("f1UniformHz".into(), serde_json::json!(oc.f1_uniform));
+            o.insert("f1DesignHz".into(), serde_json::json!(oc.f1_design));
+            o.insert(
+                "f1GainVsUniform".into(),
+                serde_json::json!(if oc.f1_uniform > 0.0 {
+                    oc.f1_binned / oc.f1_uniform - 1.0
+                } else {
+                    0.0
+                }),
+            );
+            // Quantization loss: how much of the optimizer's gain binning gave
+            // back. Large ⇒ the design wanted a grading the level count can't
+            // express, and more bins would help.
+            o.insert(
+                "f1BinningLoss".into(),
+                serde_json::json!(if oc.f1_design > 0.0 {
+                    1.0 - oc.f1_binned / oc.f1_design
+                } else {
+                    0.0
+                }),
+            );
+            // §26 / modal design note §3: the eigenproblem is force-free and
+            // takes ONE support set. Extra load cases contributed nothing, and
+            // silently ignoring them would be the wrong kind of quiet.
+            o.insert(
+                "f1IgnoredLoadCases".into(),
+                serde_json::json!(self.load_cases.len().saturating_sub(1)),
+            );
+        }
         if let Some(sg) = &strength_goal {
             // Strength summary (§17): target vs achieved, the pre-flight's
             // best-achievable ceiling, and the binding-region diagnosis the
@@ -3196,6 +3274,12 @@ impl Model {
     /// Per-cell scalar values of a result field on the padded grid (valid
     /// where grid.scale > 0), evaluated with the eps the solve actually used.
     fn cell_values(&self, kind: &str) -> Result<Vec<f32>, JsValue> {
+        self.cell_values_opt(kind, self.surface_recovery)
+    }
+
+    /// [`cell_values`] with the surface recovery forced on or off, so
+    /// `field_uncertainty` can price the difference between the two.
+    fn cell_values_opt(&self, kind: &str, recover_on: bool) -> Result<Vec<f32>, JsValue> {
         let sol =
             self.solution.as_ref().ok_or_else(|| err("no solution — run Solve or Optimize"))?;
         // Build-sim results carry a per-cell eigenstrain so stress comes out as
@@ -3257,6 +3341,18 @@ impl Model {
                 None => (factor, None),
             };
         let mat: &[f32] = factor;
+        // DESIGN §21 / F1: the occupancy decoupling is DIRECTIONAL — the
+        // in-plane block of a cut cell keeps the 1/occ, the traction on the
+        // cut face does not (see `stress::decouple_traction`). Needs the cut
+        // normals; a no-op on every fully-solid cell, so a part with no cut
+        // cells is byte-identical.
+        let cut = cut_normals(grid);
+        // Plain stress fields only get it when they are showing MATERIAL
+        // stress; the raw ersatz read-back stays exactly as it was. The
+        // SAFETY FACTORS always get it — the factor cancels there, so an SF
+        // is a material-stress quantity whichever way the toggle is set.
+        let cut_stress: Option<&[[f32; 3]]> =
+            if self.material_stress { Some(&cut) } else { None };
         // Safety factors: allowable = strength × the SAME relative factor as
         // the stiffness (Gibson–Ashby, first order; the skin carries full
         // strength). "sfm" checks the material against σ_vM; "sfz" checks
@@ -3265,8 +3361,9 @@ impl Model {
         // along the layer plane: (⟨σzz⟩₊/Sᵗᶻ)² + (τ/Sˢᶻ)² = 1/SF²;
         // "sf" is the per-cell worst of both. All capped at SF_CAP.
         let sf_material = || -> Vec<f32> {
-            let mut c = cell_field_ti(
-                grid, &sol.u, self.settings.e0, self.settings.nu, stress_factor, ti, eigen, FieldKind::VonMises,
+            let mut c = cell_field_cut(
+                grid, &sol.u, self.settings.e0, self.settings.nu, stress_factor, ti, eigen,
+                FieldKind::VonMises, Some(&cut),
             );
             for (i, v) in c.iter_mut().enumerate() {
                 let allow = self.strength as f32 * mat[i];
@@ -3277,7 +3374,10 @@ impl Model {
         let sf_layer = || -> Result<Vec<f32>, JsValue> {
             let field = |name: &str| -> Result<Vec<f32>, JsValue> {
                 let k = FieldKind::parse(name).ok_or_else(|| err("stress field missing"))?;
-                Ok(cell_field_ti(grid, &sol.u, self.settings.e0, self.settings.nu, stress_factor, ti, eigen, k))
+                Ok(cell_field_cut(
+                    grid, &sol.u, self.settings.e0, self.settings.nu, stress_factor, ti, eigen, k,
+                    Some(&cut),
+                ))
             };
             let mut c = field("szz")?;
             let tyz = field("syz")?;
@@ -3316,7 +3416,18 @@ impl Model {
             let mask = filasim_core::strength::criterion_mask(grid, &[], &[], false, &excl);
             filasim_core::strength::smooth_masked(grid, &cells, &mask)
         };
-        Ok(match kind {
+        // F3 / surface recovery: the `…x` CRITERION fields are excluded on
+        // purpose — they must stay exactly the field the reported number is
+        // computed from (§20 dec. 7), and that number comes from the core
+        // `sf_cells` path, which does its own masked smoothing.
+        let recover = |c: Vec<f32>, _this: &Self| -> Vec<f32> {
+            if recover_on && !matches!(kind, "sfx" | "sfmx" | "sfzx") {
+                recover_surface(grid, &c)
+            } else {
+                c
+            }
+        };
+        Ok(recover(match kind {
             "sfm" => sf_material(),
             "sfz" => sf_layer()?,
             "sf" => sf_worst()?,
@@ -3325,9 +3436,48 @@ impl Model {
             "sfx" => criterion(sf_worst()?, self),
             _ => {
                 let k = FieldKind::parse(kind).ok_or_else(|| err("unknown result field"))?;
-                cell_field_ti(grid, &sol.u, self.settings.e0, self.settings.nu, stress_factor, ti, eigen, k)
+                cell_field_cut(
+                    grid, &sol.u, self.settings.e0, self.settings.nu, stress_factor, ti, eigen, k,
+                    cut_stress,
+                )
             }
+        }, self))
+    }
+
+    /// **Discretization uncertainty of a result field** — the number that says
+    /// how much to believe the peak.
+    ///
+    /// A voxel stress peak is read off the cells the staircase runs through,
+    /// and that maximum is not a convergent quantity on its own: measured on
+    /// the Kirsch plate it scattered −26…+30 % over a 1000× cell-count range
+    /// with no trend. `stress::recover_surface` fixes the ESTIMATE by fitting
+    /// the clean interior instead, but the honest thing to ship alongside it is
+    /// how far the two disagree — which is exactly how much staircase is in the
+    /// answer, and it costs nothing because both fields already exist.
+    ///
+    /// Returns JSON: `peak` (recovered — mesh-stable, the one to compare
+    /// between designs), `bound` (un-recovered — the conservative figure, and
+    /// by construction never below what the app reported before surface
+    /// recovery existed), `band` = their relative gap, `quality` of
+    /// `"resolved"` / `"marginal"` / `"unresolved"`, and `at` (the peak's
+    /// location). A verdict should be taken from `bound`; a design comparison
+    /// from `peak`; and when `quality` is `"unresolved"` neither is a number —
+    /// the mesh does not see the feature and the answer is to refine.
+    pub fn field_uncertainty(&self, kind: &str) -> Result<String, JsValue> {
+        let (grid, _, _) = self.solution_grid()?;
+        let recovered = self.cell_values_opt(kind, true)?;
+        let raw = self.cell_values_opt(kind, false)?;
+        let b = surface_band(grid, &raw, &recovered)
+            .ok_or_else(|| err("no solid cells to measure"))?;
+        Ok(serde_json::json!({
+            "kind": kind,
+            "peak": b.peak,
+            "bound": b.bound,
+            "band": b.band,
+            "quality": b.quality.as_str(),
+            "at": { "x": b.at[0], "y": b.at[1], "z": b.at[2] },
         })
+        .to_string())
     }
 
     /// Stress/strain scalar per soup vertex, from the current solution.
@@ -3650,15 +3800,24 @@ impl Model {
     /// entry per included load step, so the criterion mask is the SAME for
     /// every step of an envelope. A BC contributes its attached nodes when it
     /// is an artificial infinite-stiffness interface: fixed / displacement /
-    /// frictionless / cylindrical supports (all four are penalty- or
-    /// elimination-enforced kinematic constraints, so all inject the same
-    /// non-convergent corner stress) and §16 RIGID mounts. Deliberately NOT
-    /// included:
+    /// cylindrical supports and §16 RIGID mounts. Deliberately NOT included:
     /// - force / pressure / bearing / moment pads and deformable masses — an
     ///   under-sized load introduction is a REAL failure mode the criterion
     ///   must keep seeing (dec. 6);
     /// - elastic (Winkler) supports, whose whole point is a compliant mount
-    ///   that spreads the interface stress physically.
+    ///   that spreads the interface stress physically;
+    /// - **frictionless supports**. Listed here until 2026-08-01 on the
+    ///   grounds that a penalty-enforced kinematic constraint is a penalty-
+    ///   enforced kinematic constraint. It is not the same animal: Fixed bonds
+    ///   all three DOFs, and it is that tangential bond — material that cannot
+    ///   slide or contract against a rigid face — which produces the
+    ///   non-convergent corner stress the exclusion exists for. Frictionless
+    ///   holds ONE direction and leaves the surface free to deform in plane;
+    ///   it is a roller, and on a half/quarter model it is a SYMMETRY PLANE,
+    ///   an exact boundary condition with no artifact to exclude. Excluding it
+    ///   deleted the answer: on the Kirsch plate the peak sits on the symmetry
+    ///   plane, so the criterion blanked the very cell it exists to find
+    ///   (`bin/kirschbench --excl`).
     ///
     /// Each patch gets its own physical radius, so a small tab and a large
     /// clamped face are treated at their own scales.
@@ -3673,7 +3832,9 @@ impl Model {
             let asm = assemble(&self.mesh, grid, bcs, None, &self.settings).map_err(err)?;
             for (bc, nodes) in bcs.iter().zip(&asm.bc_nodes) {
                 let rigid_iface = match &bc.kind {
-                    BcKind::Fixed | BcKind::Frictionless | BcKind::Displacement(_, _) => true,
+                    BcKind::Fixed | BcKind::Displacement(_, _) => true,
+                    // A roller / symmetry plane — see the doc comment.
+                    BcKind::Frictionless => false,
                     // Same penalty-enforced kinematic constraint; an all-free
                     // cylindrical support constrains nothing, so it excludes
                     // nothing.
@@ -3706,7 +3867,14 @@ impl Model {
     /// The §17/§20 criterion of ONE displacement field on the analysis grid:
     /// `sf_cells → smooth_masked → sf_min` over the BC-excluded mask — i.e.
     /// the MINIMUM of exactly the field `result_field("sfx")` plots.
-    /// Returns (SF_crit, smoothed field, mask).
+    /// Returns (SF_crit, smoothed field, mask, exclusion-dropped).
+    ///
+    /// The last flag is `true` when the support exclusion covered every cell
+    /// and had to be dropped to keep the criterion meaningful — see
+    /// `strength::criterion_mask_checked`. It travels with the number because
+    /// the fallback is a WEAKER criterion than the caller asked for, and
+    /// presenting it as a clean result is exactly the silent failure the guard
+    /// exists to stop.
     fn criterion_of(
         &self,
         grid: &VoxelGrid,
@@ -3714,7 +3882,7 @@ impl Model {
         eps: &[f32],
         measure: filasim_core::strength::SfMeasure,
         bc_excl: &[bool],
-    ) -> (f64, Vec<f32>, Vec<bool>) {
+    ) -> (f64, Vec<f32>, Vec<bool>, bool) {
         use filasim_core::strength as sg;
         let spec = sg::StrengthSpec {
             measure,
@@ -3722,11 +3890,11 @@ impl Model {
             strength_z: self.strength_z,
             shear_z: self.shear_strength_z_eff(),
         };
-        let mask = sg::criterion_mask(grid, &[], &[], false, bc_excl);
+        let (mask, dropped) = sg::criterion_mask_checked(grid, &[], &[], false, bc_excl);
         let cells = sg::sf_cells(grid, u, self.settings.e0, self.settings.nu, eps, &mask, &spec);
         let sm = sg::smooth_masked(grid, &cells, &mask);
         let crit = sg::sf_min(grid, &sm, &mask);
-        (crit, sm, mask)
+        (crit, sm, mask, dropped)
     }
 
     /// World position + value of the WORST scored cell of a smoothed criterion
@@ -3785,7 +3953,7 @@ impl Model {
         let excl = self.bc_exclusion_live();
         let m = filasim_core::strength::SfMeasure::parse(measure)
             .unwrap_or(filasim_core::strength::SfMeasure::Both);
-        let (crit, sm, mask) = self.criterion_of(grid, &sol.u, eps, m, &excl);
+        let (crit, sm, mask, excl_dropped) = self.criterion_of(grid, &sol.u, eps, m, &excl);
         let worst = Self::worst_scored_cell(grid, &sm, &mask);
         // How peaked the field is at the binding cell (§17 dec. 4, 2026-07-25):
         // ~1 = a broad weak region, SF_crit is a converged property of the
@@ -3793,14 +3961,39 @@ impl Model {
         // mesh is refined. Reported so the UI can say so instead of the old
         // trim silently papering over it.
         let riser = filasim_core::strength::riser_ratio(grid, &sm, &mask).map(|(_, r)| r);
+        // Discretization band of the VERDICT, same idea as `field_uncertainty`:
+        // `sf` above is scored on the raw per-cell field (the conservative
+        // figure, unchanged), `sfStable` on the surface-recovered one. Their
+        // gap is how much of the safety factor is staircase. Purely additive —
+        // `sf` itself is untouched, so no result moves.
+        let sf_stable = {
+            let rec = filasim_core::stress::recover_surface(grid, &sm);
+            filasim_core::strength::sf_min(grid, &rec, &mask)
+        };
+        let sf_band = if sf_stable > 0.0 { ((sf_stable - crit) / sf_stable).max(0.0) } else { 0.0 };
+        let quality = if sf_band < filasim_core::stress::BAND_RESOLVED {
+            filasim_core::stress::MeshQuality::Resolved
+        } else if sf_band < filasim_core::stress::BAND_MARGINAL {
+            filasim_core::stress::MeshQuality::Marginal
+        } else {
+            filasim_core::stress::MeshQuality::Unresolved
+        };
         Ok(serde_json::json!({
             "sf": crit,
             // Identical to `sf` since the trim was retired — kept so callers
             // written against the old two-number contract keep working.
             "rawMin": worst.map(|(_, v)| v).unwrap_or(crit),
             "riserRatio": riser,
+            // The mesh-stable companion to `sf` and how far apart they are;
+            // `sf` stays the number a verdict is taken from.
+            "sfStable": sf_stable,
+            "sfBand": sf_band,
+            "meshQuality": quality.as_str(),
             "excludedCells": excl.iter().filter(|&&e| e).count(),
             "scoredCells": mask.iter().filter(|&&m| m).count(),
+            // The support exclusion covered the whole part and was dropped:
+            // this SF is scored on every cell, support artifacts included.
+            "exclusionDropped": excl_dropped,
             "worst": worst.map(|(p, v)| serde_json::json!({
                 "x": p[0], "y": p[1], "z": p[2], "sf": v,
             })),
@@ -4147,7 +4340,7 @@ impl Model {
             })
             .to_string();
             let u32f: Vec<f32> = u.iter().map(|&v| v as f32).collect();
-            let (_, sm, _) = self.criterion_of(grid, &u32f, eps, measure, &bc_excl);
+            let (_, sm, _, _) = self.criterion_of(grid, &u32f, eps, measure, &bc_excl);
             let field = if smooth {
                 let nodal = recover_nodal(grid, &sm);
                 sample_nodal_values(mesh_tris, grid, &nodal, &sm)
@@ -4235,7 +4428,7 @@ impl Model {
         if let Some(w) = winner.as_ref() {
             let (_c, u, eps) = sweep.evaluate_keep(w.wall_index, w.density_index).map_err(err)?;
             let u32f: Vec<f32> = u.iter().map(|&v| v as f32).collect();
-            let (_, sm, mask) = self.criterion_of(grid, &u32f, &eps, measure, &bc_excl);
+            let (_, sm, mask, _) = self.criterion_of(grid, &u32f, &eps, measure, &bc_excl);
             if let Some((p, v)) = Self::worst_scored_cell(grid, &sm, &mask) {
                 worst_json = serde_json::json!({"x": p[0], "y": p[1], "z": p[2], "sf": v});
                 raw_min = v;
@@ -4746,6 +4939,59 @@ impl Model {
     /// SOLID topology mode: the single optimized body as one binary STL (the
     /// regions hold exactly one kept-material mesh). Re-sliceable / re-CAD-able.
     pub fn export_solid_stl(&self) -> Result<Vec<u8>, JsValue> {
+        Ok(self.solid_body_mesh()?.to_stl_binary())
+    }
+
+    /// Slicer project 3MF with NO modifier volumes — just the part, placed on
+    /// the plate in the orientation the analysis ran in and carrying the walls,
+    /// shells and infill the analysis assumed. This is the hand-off for the runs
+    /// that have no modifier geometry to ship: a plain as-printed analysis, and
+    /// Part Topo (`optimized` swaps the imported part for the kept-material
+    /// body). Same flavors as `export_3mf`; `base_density` is a fraction.
+    pub fn export_positioned_3mf(
+        &self,
+        slicer: &str,
+        thumbnail: &[u8],
+        base_density: f64,
+        wall_loops: u32,
+        top_bottom_layers: u32,
+        optimized: bool,
+    ) -> Result<Vec<u8>, JsValue> {
+        let part = if optimized { weld(&self.solid_body_mesh()?) } else { weld(&self.mesh_orig) };
+        let name = if self.name.is_empty() { "part" } else { &self.name };
+        let thumb = if thumbnail.is_empty() { None } else { Some(thumbnail) };
+        // A body meant to print solid must not slice as gyroid & friends (they
+        // fill poorly at 100%); below that the user's own profile pattern stays
+        // in charge. Bambu Studio renamed the value — see `export_3mf`.
+        let pattern = (base_density >= 0.999)
+            .then(|| if slicer == "bambu" { "zig-zag" } else { "rectilinear" });
+        Ok(match slicer {
+            "prusa" => filasim_core::threemf::export_prusa_3mf(
+                name,
+                &part,
+                &[],
+                base_density,
+                wall_loops,
+                top_bottom_layers,
+                pattern.map(|_| "rectilinear"),
+                None,
+            ),
+            _ => export_orca_3mf(
+                name,
+                &part,
+                &[],
+                base_density,
+                wall_loops,
+                top_bottom_layers,
+                pattern,
+                None,
+                thumb,
+            ),
+        })
+    }
+
+    /// The single kept-material body of a SOLID (Part Topo) optimization.
+    fn solid_body_mesh(&self) -> Result<TriMesh, JsValue> {
         let opt = self.opt.as_ref().ok_or_else(|| err("no optimization result — run optimize first"))?;
         let r = opt.regions.first().ok_or_else(|| err("no optimized shape"))?;
         let mut tris: Vec<[f32; 9]> = Vec::with_capacity(r.indices.len() / 3);
@@ -4757,7 +5003,7 @@ impl Model {
             let (a, b, c) = (v(f[0]), v(f[1]), v(f[2]));
             tris.push([a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2]]);
         }
-        Ok(TriMesh::from_triangles(tris).to_stl_binary())
+        Ok(TriMesh::from_triangles(tris))
     }
 }
 

@@ -22,8 +22,58 @@ use crate::voxel::VoxelGrid;
 
 pub use crate::eps::{build_eps, build_vfrac};
 
+/// What the optimizer is actually minimizing under the mass budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Objective {
+    /// Minimize compliance `uᵀKu` — the shipping default (DESIGN #8).
+    #[default]
+    Compliance,
+    /// MAXIMIZE the fundamental natural frequency (DESIGN §26), via the
+    /// KS-aggregated lowest eigenvalue in [`crate::freq`]. Force-free: the
+    /// load cases' forces are ignored and only the primary case's supports
+    /// matter, so [`LoadSet`] multi-case aggregation is bypassed entirely.
+    MaxFundamental,
+}
+
+/// Extra inputs the [`Objective::MaxFundamental`] arm needs and the compliance
+/// arm has no use for. Separate (and not `Copy`) because it carries the remote
+/// point masses, which are a `Vec`.
+#[derive(Clone, Debug, Default)]
+pub struct FreqSpec {
+    /// Material mass density in consistent units (tonne/mm³).
+    pub density: f64,
+    /// Remote point masses as `(node, tonne)` — motors, battery, ESCs
+    /// (DESIGN §16). These are density-INDEPENDENT, so they contribute to the
+    /// mass matrix but not to `∂M/∂x`; they are exactly what makes the
+    /// objective interesting (the optimizer routes stiffness to the mounts).
+    pub extra_mass: Vec<(u32, f64)>,
+    /// Modes entering the KS aggregate. Defaults to [`crate::freq::KS_MODES`].
+    pub num_modes: usize,
+    /// KS sharpness. Defaults to [`crate::freq::KS_KAPPA`].
+    pub kappa: f64,
+}
+
+impl FreqSpec {
+    /// Resolve the two knobs, substituting the module defaults for zeros so a
+    /// caller can pass `FreqSpec { density, extra_mass, ..Default::default() }`.
+    fn resolved(&self) -> (usize, f64) {
+        (self.resolved_modes(), if self.kappa <= 0.0 { crate::freq::KS_KAPPA } else { self.kappa })
+    }
+
+    /// Mode count with the default substituted for 0.
+    pub fn resolved_modes(&self) -> usize {
+        if self.num_modes == 0 {
+            crate::freq::KS_MODES
+        } else {
+            self.num_modes
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct OptimizeParams {
+    /// What to optimize. See [`Objective`].
+    pub objective: Objective,
     /// Target mean INFILL density of the interior (design) cells — the number
     /// a user compares to a slicer's uniform infill percentage. The solid
     /// skin is always 100% and is NOT part of this budget.
@@ -78,6 +128,7 @@ pub struct OptimizeParams {
 impl Default for OptimizeParams {
     fn default() -> Self {
         Self {
+            objective: Objective::Compliance,
             budget: 0.25,
             exponent: 1.5,
             coeff: 1.0,
@@ -100,7 +151,13 @@ impl Default for OptimizeParams {
 
 pub struct OptimizeProgress {
     pub iteration: usize,
+    /// Compliance of this iterate. Meaningful only for
+    /// [`Objective::Compliance`]; the frequency arm never solves a static case
+    /// and leaves it 0.0 — read `f1_hz` there instead.
     pub compliance: f64,
+    /// Fundamental frequency (Hz) of this iterate — the headline for
+    /// [`Objective::MaxFundamental`], 0.0 for the compliance objective.
+    pub f1_hz: f64,
     /// Current total mass fraction of solid (skin + interior).
     pub mass_frac: f64,
     /// Current mean infill density over the interior cells.
@@ -131,11 +188,29 @@ pub struct OptimizeResult {
     /// True if the design-change criterion fired before the iteration cap.
     pub converged: bool,
     pub compliance: f64,
+    /// Fundamental frequency (Hz) of the final iterate — the headline for
+    /// [`Objective::MaxFundamental`], 0.0 for the compliance objective.
+    pub f1_hz: f64,
     /// Last displacement field (padded node grid, f64) — warm start / reuse.
+    /// EMPTY for [`Objective::MaxFundamental`]: that arm solves no static case,
+    /// and seeding a static warm start with a mode shape would be worse than
+    /// starting from zero. The fundamental mode shape is in `mode1` instead.
     pub u: Vec<f64>,
-    /// Per-design-cell strain energy (unit relative stiffness) of the final
-    /// iterate — the compliance sensitivity used for level placement and
-    /// mass-constrained bin assignment.
+    /// [`Objective::MaxFundamental`] only: the fundamental mode shape on the
+    /// padded node grid — the field the caller displays as "what this design
+    /// was tuned against". Empty for the compliance objective.
+    pub mode1: Vec<f64>,
+    /// Per-design-cell structural IMPORTANCE of the final iterate, consumed by
+    /// `bins::cluster_levels` / `bins::assign_bins_mass` as a non-negative
+    /// weight (both apply `.max(0.0)`), and scale-free in both.
+    ///
+    /// - Compliance objective: strain energy at unit relative stiffness.
+    /// - Frequency objective: the SIGNED `dλ_KS/dx`. Cells where extra mass
+    ///   LOWERS the frequency come out negative, clamp to zero weight, and are
+    ///   therefore pinned to their round-down level — which is exactly right,
+    ///   since promoting them would hurt the objective. Storing `|dλ/dx|` here
+    ///   instead would rank those cells as important and quietly promote the
+    ///   worst possible ones.
     pub se: Vec<f64>,
 }
 
@@ -708,7 +783,9 @@ fn project_t(
 }
 
 /// Per-cell strain energy u_e^T KE u_e for the given cells (unit-eps KE).
-fn cell_strain_energy(
+/// Public because the frequency objective reuses it verbatim on a MODE SHAPE
+/// (`crate::freq::ks_sensitivity`) — `φᵀK'φ` is the same quadratic form.
+pub fn cell_strain_energy(
     level: &Level,
     ke64: &[[f64; 24]; 24],
     u: &[f64],
@@ -845,6 +922,7 @@ pub fn optimize(
         x0,
         u0,
         &LoadSet::default(),
+        None,
         progress,
     )
 }
@@ -863,8 +941,18 @@ pub fn optimize_cached(
     x0: Option<&[f64]>,
     u0: Option<&[f64]>,
     loads: &LoadSet,
+    freq: Option<&FreqSpec>,
     mut progress: impl FnMut(&OptimizeProgress, &[f64], &[u32]),
 ) -> Result<OptimizeResult, OptimizeError> {
+    let freq_mode = params.objective == Objective::MaxFundamental;
+    let freq_spec = match (freq_mode, freq) {
+        (true, Some(f)) => f.clone(),
+        (true, None) => {
+            debug_assert!(false, "MaxFundamental requires a FreqSpec");
+            FreqSpec::default()
+        }
+        (false, _) => FreqSpec::default(),
+    };
     let SkinSplit { skin, design: design_cells, skin_frac } = design_split(grid, params, problem, loads);
     if design_cells.is_empty() {
         return Err(OptimizeError::NoInterior);
@@ -1010,6 +1098,15 @@ pub fn optimize_cached(
     // update before it is read, so a per-iteration alloc (up to max_iter ×
     // design_cells f64) is pure waste.
     let mut x_new = vec![0f64; x.len()];
+    // FREQUENCY objective state (DESIGN §26). `mblock` is the previous
+    // iteration's converged LOBPCG subspace: re-analyzing a design one
+    // move-limit step away from it costs ~1/3 the V-cycles of a cold start
+    // (`modal::warm_start_beats_cold_on_a_moving_design`), which is what puts
+    // the per-iteration cost inside the same band as the compliance solve.
+    let mut mblock: Option<crate::modal::ModalBlock> = None;
+    let (ks_modes, ks_kappa) = freq_spec.resolved();
+    let mut f1_hz = 0f64;
+    let mut mode1: Vec<f64> = Vec::new();
     for it in 0..params.max_iter {
         iterations = it + 1;
         project(&filter, ss.as_ref(), &x, &mut x_tilde, &mut x_phys, params.floor, params.cap);
@@ -1022,6 +1119,73 @@ pub fn optimize_cached(
         // Unconditional refresh every iteration (the prepare inside
         // solve_cached then sees eps unchanged and skips its own update).
         slot.as_mut().unwrap().solver.update_eps(eps.clone());
+        // Inner-solver effort of this iteration, for the progress readout —
+        // MGCG iterations for compliance, multigrid V-cycles for the frequency
+        // arm (the same unit of work, one level up).
+        let inner_iters: usize;
+        let inner_residual: f64;
+        // ---- FREQUENCY objective (DESIGN §26) ----------------------------
+        // Force-free: no static solve, no load-case aggregation. One warm
+        // modal analysis gives the lowest `ks_modes` eigenpairs; the KS softmin
+        // over them is the smooth surrogate for λ₁, and its density gradient
+        // replaces the strain-energy sensitivity. Everything downstream — the
+        // filter/self-support adjoint, symmetry, the OC update, the mass
+        // bisection and the convergence test — is shared verbatim with the
+        // compliance arm.
+        if freq_mode {
+            // Guarded mass (see `freq::mass_interp`): identity for infill bands,
+            // and the thing that stops solid mode's emptying cells from growing
+            // spurious localized low-frequency modes.
+            let vfrac = crate::freq::build_modal_vfrac(grid, &design_cells, &skin_frac, &x_phys);
+            let cfg = crate::modal::ModalConfig::new(ks_modes);
+            let solver = &mut slot.as_mut().unwrap().solver;
+            let (res, block) = match crate::modal::analyze_warm(
+                solver,
+                &vfrac,
+                freq_spec.density,
+                &freq_spec.extra_mass,
+                &cfg,
+                mblock.as_ref(),
+                |_, _, _| {},
+            ) {
+                Err(crate::solve::SolveError::Cancelled) => return Err(OptimizeError::Cancelled),
+                r => r?,
+            };
+            mblock = Some(block);
+            // λ_ref frozen at THIS iterate's fundamental — see `ks_aggregate`:
+            // the weights are only the exact KS gradient when the normalizer is
+            // held constant through the differentiation.
+            let agg = crate::freq::ks_aggregate(&res.lambdas, ks_kappa, res.lambdas[0]);
+            f1_hz = res.freqs_hz[0];
+            let law = crate::freq::DesignLaw {
+                w: &w,
+                x_phys: &x_phys,
+                exponent: params.exponent,
+                coeff: params.coeff,
+                density: freq_spec.density,
+                cell_vol: grid.h * grid.h * grid.h,
+            };
+            // `se` carries dλ_KS/dx: positive where material RAISES the
+            // frequency. It is both the search direction and (signed, on the
+            // final iterate) the bin-ordering weight — see `OptimizeResult::se`.
+            crate::freq::ks_sensitivity(
+                &slot.as_ref().unwrap().solver.levels[0],
+                &ke64,
+                &res.shapes,
+                &res.lambdas,
+                &agg.weights,
+                &design_cells,
+                &law,
+                &mut se,
+            );
+            // The OC update minimizes, so hand it −dλ_KS/dx.
+            for k in 0..design_cells.len() {
+                sens_phys[k] = -se[k];
+            }
+            mode1 = res.shapes.into_iter().next().unwrap_or_default();
+            inner_iters = res.total_inner_iters;
+            inner_residual = 0.0;
+        } else {
         // Inexact inner solves are standard in topology optimization: while
         // the layout is forming, sensitivity noise is tolerated (filter +
         // move limits), so cap the MGCG work. Once the design slows down,
@@ -1133,6 +1297,9 @@ pub fn optimize_cached(
                 * x_phys[k].powf(params.exponent - 1.0)
                 * se[k];
         }
+        inner_iters = inner.iterations;
+        inner_residual = inner.rel_residual;
+        } // end compliance arm
         project_t(&filter, ss.as_ref(), &x_tilde, &sens_phys, &mut sens_tilde, &mut sens);
         if !sym_partner.is_empty() {
             symmetrize(&mut sens, &sym_partner, &mut sym_buf);
@@ -1150,6 +1317,24 @@ pub fn optimize_cached(
             let lambda = (lo * hi).sqrt();
             let mut mean_phys = 0f64;
             for k in 0..x.len() {
+                // `.max(0.0)` is what lets ONE update rule serve both
+                // objectives. Compliance sensitivities are negative everywhere
+                // (more material never hurts), so the clamp never binds and
+                // this is the textbook OC step.
+                //
+                // Frequency sensitivities are sign-INDEFINITE: at a cell with
+                // high modal displacement and low strain, the mass a density
+                // increase adds costs more frequency than its stiffness buys,
+                // so `dλ_KS/dx < 0` and `sens > 0`. Those cells clamp to
+                // `be = 0` ⇒ `x_new = max(x − move_limit, floor)`: shed material
+                // as fast as the move limit allows. That is precisely the
+                // desired response, so the clamp is a correct rule here rather
+                // than the failure mode it looks like — no MMA required.
+                //
+                // The bisection still reaches the target mean as long as SOME
+                // cell has a positive sensitivity (λ → 0 drives those to
+                // `x + move_limit`). If none does, no material placement raises
+                // the frequency and the design correctly walks to the floor.
                 let be = (-sens[k] / lambda).max(0.0);
                 let xn = (x[k] * be.sqrt())
                     .clamp(x[k] - move_limit, x[k] + move_limit)
@@ -1204,12 +1389,13 @@ pub fn optimize_cached(
             &OptimizeProgress {
                 iteration: it + 1,
                 compliance,
+                f1_hz,
                 mass_frac,
                 mean_infill: sum_wx / w_sum.max(1e-12),
                 change,
                 mean_change,
-                inner_iters: inner.iterations,
-                inner_residual: inner.rel_residual,
+                inner_iters,
+                inner_residual,
             },
             &x_phys,
             &design_cells,
@@ -1245,7 +1431,12 @@ pub fn optimize_cached(
         iterations,
         converged,
         compliance,
-        u,
+        f1_hz,
+        // The frequency arm never solved a static case: `u` is still the
+        // zero/`u0` seed and would be a misleading warm start. Hand back
+        // nothing rather than something that looks like a displacement field.
+        u: if freq_mode { Vec::new() } else { u },
+        mode1,
         se,
     })
 }

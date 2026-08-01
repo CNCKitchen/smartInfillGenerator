@@ -594,6 +594,22 @@ export class EngineClient {
     });
   }
 
+  /** Modifier-free project 3MF: the part on the plate in the orientation the
+   *  analysis ran in, with the walls/shells/infill it assumed. `optimized`
+   *  ships the Part Topo body instead of the imported part. */
+  exportPositionedThreeMf(
+    slicer: SlicerFlavor,
+    opts: { baseDensity: number; perimeters: number; topBottomLayers: number; optimized: boolean },
+    thumbnail?: Uint8Array | null
+  ): Promise<Uint8Array> {
+    return this.call({
+      op: "exportPositionedThreeMf",
+      slicer,
+      thumbnail: thumbnail ?? null,
+      ...opts,
+    });
+  }
+
   exportStls(): Promise<Uint8Array> {
     return this.call({ op: "exportStls" });
   }
@@ -768,8 +784,13 @@ export interface OptimizeOptions {
    *  as stiff as a uniform print at budgetPct (secant on the budget);
    *  "strength" = lightest design whose safety-factor criterion SF_crit (the
    *  lowest smoothed scored cell) meets `sfTarget` on every included load
-   *  step (DESIGN §17). */
-  goal: "budget" | "match" | "strength";
+   *  step (DESIGN §17); "frequency" = stiffest-sounding design at the given
+   *  mean infill — maximize the fundamental natural frequency f1 (DESIGN §26).
+   *
+   *  "frequency" spends the SAME budget as "budget", it just optimizes a
+   *  different thing, so it takes one pass and no secant. It is force-free:
+   *  only the FIRST load case's supports enter, and forces are ignored. */
+  goal: "budget" | "match" | "strength" | "frequency";
   /** Strength goal: required SF_crit (advisory design aid — §17 dec. 8). */
   sfTarget?: number;
   /** Strength goal SF measure: material / layer adhesion / both (§17 dec. 2). */
@@ -816,8 +837,12 @@ export interface OptProgress {
   passes: number;
   /** Budget the current pass is running at (0..1). */
   budgetNow: number;
-  /** Compliance estimate from the (inexact, warm-started) inner solve. */
+  /** Compliance estimate from the (inexact, warm-started) inner solve.
+   *  0 under the "frequency" goal, which solves no static case — read `f1Hz`. */
   compliance: number;
+  /** Fundamental frequency (Hz) of the current iterate under the "frequency"
+   *  goal (DESIGN §26); 0 for every other goal. The live headline there. */
+  f1Hz: number;
   /** Total mass fraction of solid (skin + interior). */
   massFrac: number;
   /** Mean infill density over the interior cells. */
@@ -871,9 +896,27 @@ export interface OptSummary {
   /** True when the run was solid topology (material-removal) mode. */
   solid: boolean;
   /** Optimization goal of the run. */
-  goal: "budget" | "match" | "strength";
+  goal: "budget" | "match" | "strength" | "frequency";
   /** Outer passes executed (1 for budget mode). */
   passes: number;
+  // ---- frequency mode only (DESIGN §26) ----
+  /** Fundamental natural frequency (Hz) of the DELIVERED binned design — the
+   *  number to show. */
+  f1Hz?: number;
+  /** f1 (Hz) of an equal-mass UNIFORM print: what the same material already
+   *  bought without optimizing. The gain is only meaningful against this. */
+  f1UniformHz?: number;
+  /** f1 (Hz) of the optimizer's continuous field, before binning. Unprintable
+   *  — diagnostic only. */
+  f1DesignHz?: number;
+  /** `f1Hz / f1UniformHz − 1`. Can be negative (binning gave back the gain). */
+  f1GainVsUniform?: number;
+  /** Share of the continuous design's f1 lost to quantization. Large ⇒ more
+   *  density levels would help. */
+  f1BinningLoss?: number;
+  /** Load cases the modal eigenproblem ignored (it is force-free and takes one
+   *  support set). > 0 ⇒ the UI must say so. */
+  f1IgnoredLoadCases?: number;
   // ---- strength mode only (DESIGN §17) ----
   /** Required SF_crit of the run. */
   sfTarget?: number;

@@ -198,6 +198,82 @@ fn bench_optimize(m: &mut Metrics) {
     m.i("opt_time_ms", dt * 1000.0);
 }
 
+/// FREQUENCY objective (DESIGN §26): maximize f1 at a fixed budget on the same
+/// cantilever, with NO force (free vibration is force-free — a load here would
+/// hide an accidental dependence on one).
+///
+/// The headline quality metric is `freq_gain_vs_uniform`: optimized f1 over an
+/// EQUAL-MASS uniform print. Absolute frequencies alone would drift with any
+/// mesh or material change and say nothing about whether the optimizer still
+/// works; the ratio is the thing that must hold.
+fn bench_optimize_frequency(m: &mut Metrics) {
+    use filasim_core::modal::{analyze, ModalConfig};
+    use filasim_core::simp::{build_eps, build_vfrac, FreqSpec, Objective};
+
+    let beam = primitives::boxx([0.0; 3], [60.0, 10.0, 10.0]);
+    let grid0 = VoxelGrid::voxelize(&beam, 1.0);
+    let settings = SolveSettings { e0: BEAM_E0, nu: BEAM_NU, tol: 1e-5, ..Default::default() };
+    let (grid, levels) = pad_for_levels(&grid0, settings.max_levels);
+    // Supports only — no force.
+    let bcs = vec![BcSpec { kind: BcKind::Fixed, tris: vec![0, 1] }];
+    let asm = assemble(&beam, &grid, &bcs, None, &settings).expect("assemble freq");
+    let params = OptimizeParams {
+        objective: Objective::MaxFundamental,
+        budget: 0.30,
+        exponent: INFILL_EXP,
+        coeff: INFILL_COEFF,
+        wall_mm: 1.0,
+        max_iter: 30,
+        ..Default::default()
+    };
+    let spec = FreqSpec { density: BEAM_RHO, ..Default::default() };
+
+    let t0 = Instant::now();
+    let res = optimize_cached(
+        &mut None, &grid, levels, &asm.problem, &settings, &params, None, None,
+        &LoadSet::default(), Some(&spec), |_, _, _| {},
+    )
+    .expect("frequency optimize");
+    let dt = t0.elapsed().as_secs_f64();
+
+    // Equal-mass uniform reference at the achieved mean (occupancy-weighted, so
+    // cut boundary cells don't skew it).
+    let w: Vec<f64> = res
+        .design_cells
+        .iter()
+        .zip(&res.skin_frac)
+        .map(|(&c, &f)| grid.scale[c as usize] as f64 * (1.0 - f as f64))
+        .collect();
+    let w_sum: f64 = w.iter().sum();
+    let mean: f64 = w.iter().zip(&res.x).map(|(&wk, &xk)| wk * xk).sum::<f64>() / w_sum.max(1e-12);
+
+    let f1_of = |x: &[f64]| -> f64 {
+        let eps = build_eps(
+            &grid, &res.skin_cells, &res.design_cells, &res.skin_frac, x, params.exponent,
+            params.coeff,
+        );
+        let vfrac = build_vfrac(&grid, &res.design_cells, &res.skin_frac, x);
+        let mut cache = SolverCache::build(&grid, levels, &asm.problem, &settings, eps);
+        analyze(&mut cache.solver, &vfrac, BEAM_RHO, &[], &ModalConfig::new(1), |_, _, _| {})
+            .expect("freq eval")
+            .freqs_hz[0]
+    };
+    let f_opt = f1_of(&res.x);
+    let f_uni = f1_of(&vec![mean; res.x.len()]);
+
+    m.q("freq_f1_optimized", f_opt);
+    m.q("freq_f1_uniform", f_uni);
+    m.q("freq_gain_vs_uniform", f_opt / f_uni);
+    m.q("freq_mean_infill", mean);
+    // The sensitivity is sign-indefinite by construction (dec. 4); if a refactor
+    // ever drops the mass term, every cell goes non-negative and this hits 0.
+    // A silent change of that kind would still produce a plausible design.
+    let neg = res.se.iter().filter(|&&s| s < 0.0).count();
+    m.q("freq_negative_sens_share", neg as f64 / res.se.len().max(1) as f64);
+    m.i("freq_iters", res.iterations as f64);
+    m.i("freq_time_ms", dt * 1000.0);
+}
+
 /// SIMP optimization DRIVEN BY SELF-WEIGHT (DESIGN §16 dec. 4): the same
 /// cantilever as `bench_optimize`, but the only load is the part's own weight
 /// under 1 g — a DESIGN-DEPENDENT load the optimizer must recompute from the
@@ -234,7 +310,7 @@ fn bench_optimize_selfweight(m: &mut Metrics) {
 
     let t0 = Instant::now();
     let res = optimize_cached(
-        &mut None, &grid, levels, &asm.problem, &settings, &params, None, None, &loads,
+        &mut None, &grid, levels, &asm.problem, &settings, &params, None, None, &loads, None,
         |_, _, _| {},
     )
     .expect("optimize self-weight");
@@ -886,6 +962,7 @@ fn main() {
     bench_cantilever(&mut m, "solve_small", 80, 8, 8, 1.0);
     bench_cantilever(&mut m, "solve_mid", 160, 16, 16, 0.5);
     bench_optimize(&mut m);
+    bench_optimize_frequency(&mut m);
     bench_optimize_selfweight(&mut m);
     bench_beam_suite(&mut m);
     bench_accel(&mut m);

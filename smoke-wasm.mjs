@@ -919,6 +919,19 @@ assert(threeMf.length > 500 && threeMf[0] === 0x50 && threeMf[1] === 0x4b, "3MF 
 }
 const stlZip = optModel.export_stls();
 assert(stlZip.length > 100 && stlZip[0] === 0x50, "STL zip export");
+// Modifier-free hand-off (the runs with no modifier geometry to ship): the
+// part alone on the plate, carrying the walls / shells / infill the analysis
+// assumed. Sub-100% base infill leaves the pattern to the user's profile.
+{
+  const posMf = optModel.export_positioned_3mf("orca", new Uint8Array(), 0.25, 3, 4, false);
+  const raw = new TextDecoder("latin1").decode(posMf);
+  assert(posMf[0] === 0x50 && posMf[1] === 0x4b, "positioned 3MF is a zip");
+  assert(!raw.includes("modifier_part"), "positioned export ships no modifier volumes");
+  assert(raw.includes('wall_loops" value="3"'), "positioned export carries the analyzed walls");
+  assert(raw.includes('sparse_infill_density" value="25%"'), "positioned export carries the infill");
+  assert(raw.includes('top_shell_layers" value="4"'), "positioned export carries the shells");
+  assert(!raw.includes("sparse_infill_pattern"), "sub-100% leaves the pattern to the profile");
+}
 // Re-import our own 3MF (full circle; re-import subdivides for display again).
 const reimported = new Model(threeMf, "roundtrip");
 assert(reimported.triangle_count() >= 12, "exported 3MF re-imports (part wins by bbox)");
@@ -1018,6 +1031,16 @@ console.log("ok: binary mode pipeline (optimize + export)");
   const tight = topo.voxel_results(true);
   assert(tight[0].length !== masked[0].length,
     `hull follows iso_threshold (${tight[0].length / 9} tris at 0.9)`);
+  // Hand-off for a topology run: the KEPT-MATERIAL body on the plate, printed
+  // solid — same body the STL export ships, wrapped as a slicer project.
+  const solidStl = topo.export_solid_stl();
+  const topoMf = topo.export_positioned_3mf("bambu", new Uint8Array(), 1.0, 2, 5, true);
+  const raw = new TextDecoder("latin1").decode(topoMf);
+  assert(solidStl.length > 100 && topoMf[0] === 0x50, "Part Topo STL + project export");
+  assert(!raw.includes("modifier_part"), "Part Topo project ships no modifier volumes");
+  assert(raw.includes('sparse_infill_density" value="100%"'), "optimized body prints solid");
+  assert(raw.includes('sparse_infill_pattern" value="zig-zag"'),
+    "100% dense gets a solid-capable pattern (bambu naming)");
 }
 console.log("ok: Part Topo masked result hull (fields on the optimized shape)");
 
@@ -1105,6 +1128,45 @@ assert(Array.isArray(sfOk.sfTrace) && sfOk.sfTrace.length >= 2,
   "pre-flight + passes traced (budget vs SF)");
 assert(sfOk.sfMeasure === "both", "SF measure echoed in the summary");
 console.log("ok: strength goal (SF target met at minimum material; honest infeasibility)");
+
+// ---- frequency goal (DESIGN §26) ----
+// Maximize f1 at a FIXED budget. Unlike match/strength this walks no budget, so
+// the checks are: the same mass is actually spent, the delivered (binned) f1
+// beats an equal-mass uniform print, and the reported numbers are self-
+// consistent. Runs on a cantilever with NO force at all — proving the arm is
+// genuinely force-free rather than quietly relying on a load being present.
+const fqModel = new Model(boxStl([0, 0, 0], [60, 12, 12]), "beam6");
+const fsel = patchSelector(fqModel);
+fqModel.set_material(2400, 0.35, 1.24, 50, 35);
+fqModel.set_resolution(25000);
+fqModel.add_fixed(fsel(0, "min"));
+const t5 = performance.now();
+const fq = JSON.parse(
+  fqModel.optimize(
+    JSON.stringify({
+      budgetPct: 30, exponent: 1.5, coeff: 1.0, perimeters: 2, lineWidth: 0.45,
+      smoothIters: 4, nBins: 3, floorPct: 10, capPct: 70, levelsPct: null,
+      binary: false, solidPattern: null, goal: "frequency",
+    }),
+    () => {}
+  )
+);
+console.log(
+  `   frequency: f1 ${fq.f1Hz.toFixed(1)} Hz vs uniform ${fq.f1UniformHz.toFixed(1)} Hz ` +
+    `(${(fq.f1GainVsUniform * 100).toFixed(1)}%) at mean ${(fq.meanInfill * 100).toFixed(1)}%, ` +
+    `${((performance.now() - t5) / 1000).toFixed(1)} s`
+);
+assert(fq.goal === "frequency", "summary flags frequency goal");
+assert(fq.passes === 1, "frequency goal takes exactly one pass (no budget secant)");
+assert(fq.f1Hz > 0 && fq.f1UniformHz > 0, "both frequencies reported");
+assert(Math.abs(fq.meanInfill - 0.3) < 0.03,
+  `budget honored (mean ${(fq.meanInfill * 100).toFixed(1)}% vs 30%)`);
+assert(fq.f1Hz > fq.f1UniformHz,
+  `optimized f1 beats equal-mass uniform (${fq.f1Hz.toFixed(1)} vs ${fq.f1UniformHz.toFixed(1)} Hz)`);
+assert(Math.abs(fq.f1GainVsUniform - (fq.f1Hz / fq.f1UniformHz - 1)) < 1e-9,
+  "reported gain is self-consistent");
+assert(fq.f1IgnoredLoadCases === 0, "single-case run ignores nothing");
+console.log("ok: frequency goal (f1 maximized at a fixed budget, beats uniform at equal mass)");
 
 // ---- project (.filasim) save / load round-trip ----
 // Orient → optimize → export project → re-import the original file + replay the
