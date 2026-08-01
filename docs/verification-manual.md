@@ -239,9 +239,34 @@ can be pointed at a real part.
 | 7.5 | **`bench_cut_cell_cost`** | — | runtime, MGCG iteration count and memory, exact cut cells vs ersatz |
 | 7.6 | **`surf_kirsch_h_refinement`** — the hole at h = 1 → 0.125 | Kirsch `σ_θθ(r,θ)` as an *h-independent normalizer* | does the displayed peak converge under refinement? **~107 min, ~13 GB** |
 | 7.7 | **`surf_kirsch_probe_standoff`** | — | control: is 7.6's trend an artifact of where the probe samples? |
+| 7.8 | **`bin/kirschbench`** — quarter plate, 7+ meshes | Kirsch with the Heywood finite-width correction, `Kt_gross = 3.032` | independent cross-check: the app's four CAD/voxel samplers verbatim, plus the `surface_band` / `MeshQuality` calibration |
 
 Run: `cargo test -p filasim-core --test surfstress -- --ignored --nocapture`
-(7.6 is excluded from any routine sweep — run it by name, deliberately.)
+(7.6 is excluded from any routine sweep — run it by name, deliberately: it took
+111 min and ~13 GB for the four-mesh sweep across three read-back modes.)
+
+7.8 needs its geometry tessellated through the app's own STEP import path first:
+
+```bash
+node web/scripts/tessellate-step.mjs KischPlateWHole_quater.step kirsch-q.bin
+cargo run --release -p filasim-core --bin kirschbench -- --mesh kirsch-q.bin \
+    --h 1.0,0.7,0.5,0.37,0.25,0.2,0.125
+```
+
+The quarter part is required — `classify` locates the `x=0` and `y=0` symmetry
+planes geometrically, and handing it the full plate fails with "boundary
+condition 0 has no triangles".
+
+Every case sweeps the read-back modes side by side on ONE solve, so a difference
+between rows is the read-back and nothing else:
+
+| mode | what it is |
+|---|---|
+| `mean (today)` | volume-averaged nodal recovery — the long-standing production path |
+| `SPR` | superconvergent patch recovery (`spr.rs`) |
+| `SPR+proj` | SPR plus the closed-form traction projection at the sample point |
+| `cut-decoupled` | F1 — directional occupancy decoupling on cut cells (`stress::cut_normals` + `decouple_traction`) |
+| `cut+surf-rec` | F1 + F3 — plus `stress::recover_surface` before nodal recovery. **This is the shipping wasm path** (`cell_field_cut` → `recover_surface` → `recover_nodal`) |
 
 **Headline findings.** Orientation is *not* the driver — error is flat across
 normal-angle bins in every case. The displayed field is accurate on smooth
@@ -251,44 +276,83 @@ boundary elements (`cutcell.rs`) improve the displayed number enough to justify
 shipping; both modules carry their measured verdicts in their own docs so the
 results are not re-derived.
 
-**The refinement result (7.6) — the displayed peak does not converge.** This is
-the finding that closed the surface-stress investigation, and it corrects an
-earlier claim in this manual that the concentration error "converges ~O(h)".
+**Surface recovery (F3) is the exception, and it is resolution-dependent.** It
+biases the reading *downward* by removing the boundary cells from it, so its
+sign of benefit follows the sign of the baseline error, and that flips at
+roughly **10–15 cells per feature radius**:
 
-| h | cells per hole radius | displayed Kt(σ₁) | err vs 3.0 | σ₁/Kirsch p50 | p90 | max | traction resid RMS | resid MAX |
-|---|---|---|---|---|---|---|---|---|
-| 1.0   | 5  | 2.501 | −16.6% | 0.934 | 1.036 | 1.119 | 8.8% | 12.1% |
-| 0.5   | 10 | 2.773 | −7.6%  | 0.976 | 1.001 | 1.022 | 5.3% | 9.2% |
-| 0.25  | 20 | 2.976 | −0.8%  | 1.002 | 1.026 | 1.033 | 3.9% | 11.5% |
-| 0.125 | 40 | 3.138 | **+4.6%** | 0.997 | 1.051 | 1.075 | 2.9% | 11.1% |
+- *Below* the threshold the baseline under-reads and F3 doubles the error
+  (hole at 5 cells/radius: −16.6% → −31.3%).
+- *Above* it the baseline diverges upward on the staircase and F3 converges
+  (hole at 40 cells/radius: +4.6% → +2.1%; fillet at 8 cells across the
+  fillet: +17.6% → +3.7%).
 
-The distribution splits under refinement. The **median** surface point converges
-— `σ₁/Kirsch` reaches 1.00 by 20 cells per radius and stays — while the **upper
-tail does not**: p90 climbs 1.001 → 1.026 → 1.051 and the max 1.022 → 1.033 →
-1.075, both rising monotonically *after* the median has settled. The traction
-residual says the same thing with no analytic reference at all, since its exact
-answer is zero by construction: **RMS falls 3× while its MAX stays flat at ~11%
-through an 8× refinement.**
+The same crossover appears independently in `bin/kirschbench` on a different
+geometry (quarter plate, symmetry BCs, its own samplers). Normalised to cells
+per hole radius the two harnesses agree to within a few points — 5 cells:
+raw −12.9% / recovered −29.1% there vs −16.6% / −31.3% here; 10 cells: −0.7% /
+−10.2% vs −7.6% / −13.6%. Two independently written samplers, same curve.
+
+F1 alone is a **no-op on the peak** (identical to three decimals at every mesh
+in 7.6) but consistently improves the free-surface traction residual MAX
+(11.5% → 7.3% at 20 cells/radius). Its value is equilibrium and far field, not
+the concentration; the far-field claim it was built for is **not** measured by
+this tier.
+
+**The refinement result (7.6) — the RAW peak does not converge; the
+surface-recovered one does.** The first half of that sentence was the finding
+that closed the surface-stress investigation. The second half was measured
+afterwards, on the same case with the same solves, and reopens it.
+
+| h | cells/radius | mean (today) | cut-decoupled (F1) | **cut+surf-rec (F1+F3)** |
+|---|---|---|---|---|
+| 1.0   | 5  | 2.501 (−16.6%) | 2.501 (−16.6%) | 2.062 (−31.3%) |
+| 0.5   | 10 | 2.773 (−7.6%)  | 2.773 (−7.6%)  | 2.592 (−13.6%) |
+| 0.25  | 20 | 2.976 (−0.8%)  | 2.976 (−0.8%)  | 2.904 (**−3.2%**) |
+| 0.125 | 40 | 3.138 (**+4.6%**) | 3.138 (+4.6%) | 3.063 (**+2.1%**) |
+
+Under the production read-back the distribution splits. The **median** surface
+point converges — `σ₁/Kirsch` reaches 1.00 by 20 cells per radius and stays —
+while the **upper tail does not**: p90 climbs 1.001 → 1.026 → 1.051 and the max
+1.022 → 1.033 → 1.075, both rising monotonically *after* the median has settled.
+The traction residual says the same thing with no analytic reference at all,
+since its exact answer is zero by construction: RMS falls 3× while its MAX stays
+flat at ~11% through an 8× refinement.
 
 The mechanism is the staircase. The number of boundary corners on the rim grows
 like `1/h`, so a maximum taken over them grows even as each corner's typical
-error shrinks — and a maximum is exactly what the app paints. This also
-retro-explains the shoulder fillet's divergence under refinement (§10's second
-caution, and case 2.6): same mechanism, second topology, and better supported
-than the 3-D-constraint guess previously offered for it.
+error shrinks — and a maximum is exactly what the app paints.
 
-Two consequences worth stating explicitly:
+**`recover_surface` removes the exposure to that mechanism** by fitting the
+clean interior and never reading the corrupted boundary cells. Every
+reference-free diagnostic that indicted the production path reverses under it:
 
-- **The −0.8% at 20 cells per radius is not accuracy, it is cancellation** —
-  peak-flattening from volume averaging pulling down, boundary roughness pushing
-  up. Refining past that point makes the displayed number worse, not better.
-- **Submodeling was evaluated and rejected on this evidence.** A local
-  re-voxelized box with interpolated Dirichlet BCs buys exactly one thing,
-  smaller `h` at the hot spot, and the h=0.125 column *is* that result computed
-  globally. It does not halve the error; it overshoots the reference and keeps
-  climbing, and the Richardson limit on the raw Kt sequence *rises* under
-  refinement (3.59 → 3.76), which is what a non-converging sequence looks like.
-  Nothing was built.
+| diagnostic (no analytic reference needed) | mean (today) | cut+surf-rec |
+|---|---|---|
+| Richardson limit, successive `h` triples | 3.588 → **3.758** (runs away) | 3.354 → **3.225** (settles) |
+| observed order `p` | 0.42 → **0.33** (degrading) | 0.76 → **0.98** (≈ first order) |
+| traction resid MAX, h = 1 → 0.125 | 12.1 → 9.2 → 11.5 → **11.1%** (flat) | 17.1 → 13.5 → 6.8 → **6.5%** (falling) |
+| `σ₁/Kirsch` max (upper tail) | 1.119 → 1.022 → 1.033 → **1.075** (rising) | 1.079 → 1.037 → 1.025 → **1.047** (flat) |
+
+Consequences, restated against the new evidence:
+
+- **The −0.8% at 20 cells per radius is still cancellation, not accuracy** —
+  peak-flattening pulling down, boundary roughness pushing up. That reading is
+  unchanged; it is why the production number looks best at exactly the mesh
+  where two errors happen to cross.
+- **Refining is counterproductive on the raw read-back and productive on the
+  recovered one.** This is the practical inversion: the reflex to add cells was
+  wrong before and is right now, *provided* surface recovery is on and the mesh
+  is past ~15 cells per feature radius.
+- **The submodeling rejection argument is void; submodeling itself is still
+  probably not worth building.** The rejection rested on "smaller `h` at the hot
+  spot is all submodeling buys, and smaller `h` makes it worse." Smaller `h` now
+  makes it monotonically better, so that argument no longer holds. What replaces
+  it is a cost comparison, not a correctness one: 20 cells/radius reaches −3.2%
+  in 515 s and 8.3M cells, while 40 cells/radius reaches +2.1% in 6030 s and
+  53M cells. Submodeling would buy the second number at closer to the first
+  number's cost — a real but incremental gain on an already-acceptable figure.
+  Still nothing built; the reason is now economics rather than futility.
 
 **Caveat from the control (7.7).** Sweeping the probe standoff independently of
 `h` shows the rising max holds at 0.15 and 0.30 cells from the rim, is flat at
@@ -301,18 +365,41 @@ rather than ≈1.04 — which is what rules out the alternative reading that the
 h=0.125 over-read is really convergence to a higher 3-D truth. That reading was
 the only one under which submodeling would have paid.
 
-**Where this line of work stands.** Three candidate fixes for displayed surface
-stress have now been implemented or evaluated and all three are closed:
-superconvergent recovery (`spr.rs` — sharpens the spurious peak along with the
-real one), exact cut-cell elements (`cutcell.rs` — correct, no user-visible
-gain, even on thin walls), and local submodeling (7.6 — the defect is not one
-that smaller `h` removes). What is left is a *representational* change, not a
-numerical one: a conforming surface, or displaying a spatially filtered peak
-instead of a raw cell max. Both change what the number means and neither is a
-small job, so **the accuracy of the displayed peak should be treated as
-capped at roughly ±5% and effort spent elsewhere** — transverse isotropy
-(`DESIGN §22`) and E(ρ)/allowables calibration both sit on larger, unmeasured
-error budgets and affect every part rather than the neighbourhood of a hole.
+**Where this line of work stands.** Two of the original candidate fixes remain
+closed: superconvergent recovery (`spr.rs` — sharpens the spurious peak along
+with the real one) and exact cut-cell elements (`cutcell.rs` — correct, no
+user-visible gain, even on thin walls; F1 shrinks the ersatz↔exact gap further
+still, from 2.9 points to 0.3 on the fillet, so fixing the read-back makes the
+operator matter *less*, not more).
+
+The earlier version of this section concluded that what remained was a
+*representational* change — "a conforming surface, or displaying a spatially
+filtered peak instead of a raw cell max" — and treated that as too large to
+attempt, capping the displayed peak at ±5%. **`stress::recover_surface` is that
+change**, and it was built: a degree-1 fit over clean interior cells evaluated
+at the boundary cell centre is exactly a spatially filtered peak. It reaches
++2.1% at 40 cells per hole radius and −3.2% at 20, and +3.7% on the fillet at 8
+cells across the fillet where the production path reads +17.6%. **The ±5% cap no
+longer describes the recovered read-back**, though it still describes the raw
+one.
+
+What that does *not* change: the recovered value is a better estimator of the
+peak, not a more equilibrium-consistent field. It raises the traction residual
+in the under-resolved regime (hole at 10 cells/radius: 5.3% → 9.5% RMS) even
+where it improves Kt, and it under-reads — the unconservative direction — below
+the crossover. Both facts are why the shipping path reports a **band** rather
+than a single number: `stress::surface_band` returns the recovered peak, the
+un-recovered `bound`, and a `MeshQuality` bucket, and the calibrated rule is to
+take the verdict from `bound` whenever quality is not `unresolved`. That rule
+was independently re-checked against `bin/kirschbench` on the quarter plate: on
+every mesh the band calls trustworthy, the worst unconservative bound error is
+−0.7%, and `unresolved` fires on precisely the three meshes where the recovered
+peak under-reads by 25–47%.
+
+**Still unmeasured by this tier:** F1's actual claim. The directional decoupling
+was built for a far-field over-read at a constrained face landing mid-cell, and
+no case here samples the far field — 7.6 shows it changing the peak by nothing
+at all. A far-field probe is the obvious gap.
 
 ---
 
@@ -402,10 +489,12 @@ cases — useful for setting user expectations.
 | Elastic-foundation settlement | `< 8%` | 1.11 |
 | Voxelized volume (curved bodies) | `< 4%` (sphere); bias ≈ 0% with cut-cell occupancy | 1.13, 2.1 |
 | Stress-concentration Kt — **raw cell stress** (hole, fillet) | within ~1–3% on curved features (cut-cell convention) | 2.4, 2.6 |
-| Stress-concentration Kt — **the field the app displays** (hole) | −16.6% at 5 cells per hole radius, −7.6% at 10, −0.8% at 20, **+4.6% at 40**. Best inside ~±5% at 10–40 cells/radius, and **does not converge** — refining past ~20 cells/radius makes it worse | 7.2, 7.6 |
+| Stress-concentration Kt — **raw (un-recovered) displayed field** (hole) | −16.6% at 5 cells per hole radius, −7.6% at 10, −0.8% at 20, **+4.6% at 40**. **Does not converge** — refining past ~20 cells/radius makes it worse. This is the `bound` half of the reported band | 7.2, 7.6 |
+| Stress-concentration Kt — **surface-recovered field, what the app displays** (hole) | −31.3% at 5 cells/radius, −13.6% at 10, −3.2% at 20, **+2.1% at 40**. **Converges**, observed order ≈1. Under-reads below ~10–15 cells/radius — the unconservative side, which `MeshQuality` flags | 7.2, 7.6 |
+| Stress-concentration Kt — surface-recovered, fillet | +3.7% at 8 cells across the fillet, where the raw path reads +17.6% | 7.3 |
 | Stress-concentration — *typical* (median) surface point, vs Kirsch | converges to within 1% by 20 cells per hole radius | 7.6 |
 | Surface stress on a smooth free surface (round cantilever, thin tube) | 0.6–1.3% (thin wall) to 1.7–3.8% (solid), RMS | 7.1, 7.4 |
-| Free-surface traction residual ‖σ·n‖/σ_ref (should be 0) | 0.5–2% on smooth surfaces, 5–16% at a stress raiser. At a raiser the **RMS converges (~O(√h)) but the MAX does not** — flat at ~11% over an 8× refinement | 7.1–7.4, 7.6 |
+| Free-surface traction residual ‖σ·n‖/σ_ref (should be 0) | 0.5–2% on smooth surfaces, 5–16% at a stress raiser. Raw read-back: **RMS converges (~O(√h)), MAX does not** — flat at ~11% over an 8× refinement. Surface-recovered: MAX falls 17.1% → 6.5% over the same refinement | 7.1–7.4, 7.6 |
 | Printed composite-beam stiffness | within ~10% of the sandwich closed form | 3.1, 3.2 |
 | MGCG iteration count | mesh-independent (8–9 iters, 130k→1M solid cells) | `PHASE1_RESULTS.md` |
 | Graded-infill stiffness gain vs uniform (equal mass) | +15% (cantilever), up to +40% (binary smoke beam) | 1.19, 1.20, `DESIGN.md` |
@@ -443,12 +532,22 @@ cases — useful for setting user expectations.
 >   CalculiX cross-check gives it a 3-D reference.** It can measure *changes*,
 >   not *correctness*.
 >
-> - **Do not refine a mesh to make a displayed peak more accurate.** It is the
->   natural reflex and it is counterproductive at a staircased stress raiser
->   (§6b, 7.6). More cells per feature radius improve the field everywhere except
->   the statistic on screen. The useful band is roughly 10–40 cells per feature
->   radius; below it the peak is flattened, above it boundary roughness takes
->   over, and no setting makes it better than about ±5%.
+>   **The staircase reading is now confirmed rather than inferred.** Under
+>   surface recovery the same fillet converges: −8.5% at `h`=0.5 and +6.2% at
+>   `h`=0.25, against +4.9% → +14.6% raw, and the same reversal holds across
+>   both radii, both rotations and both stiffness operators. A read-back change
+>   cannot remove a genuine 3-D-constraint effect, so the fact that it removes
+>   this divergence rules the 3-D explanation out and leaves the staircase.
+>
+> - **Refining now helps — but only with surface recovery on.** This caution
+>   previously read "do not refine a mesh to make a displayed peak more
+>   accurate," and that is still correct for the raw read-back: more cells per
+>   feature radius improve the field everywhere except the max statistic, which
+>   boundary roughness drives upward. With `recover_surface` the max converges
+>   too (observed order ≈1), so refining is productive above roughly **15 cells
+>   per feature radius**. Below that threshold recovery under-reads and the raw
+>   value is closer — which is the regime `MeshQuality` reports as `unresolved`.
+>   Read the band, not one number.
 
 ---
 

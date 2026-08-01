@@ -836,6 +836,27 @@ voxel hull). This is pure post-processing — the solution is untouched, and
 toggling re-fetches fields only. It does **not** fix re-entrant-corner
 singularities (those peaks never converge — advisory framing stands).
 
+**Nonlinear fields are averaged as scalars, not as tensors.** von Mises, the
+safety factors and the principal stresses σ₁/σ₂/σ₃ are each evaluated per cell
+and *then* node-averaged, so what is displayed is the mean of a nonlinear
+function, not that function of the mean tensor. The two differ wherever the
+tensor varies across the patch — i.e. exactly at a stress concentration. This is
+long-standing behaviour and consistent across all such fields, but it means the
+displayed σ₁ is not the same quantity as the σ₁ that Tier-7 case 7.2 reports as
+`Kt(σ₁)`: that harness recovers the six components to the nodes first and takes
+the principals at the sample point. Expect the two to differ near a peak.
+
+**Boundary cells are excluded from the fit by default.** Ahead of nodal
+recovery, `stress::recover_surface` replaces each cut cell's value with a
+degree-1 fit over the clean interior cells within two cells (occupancy 1 on all
+six faces), degrading to nearest-clean and then to the raw value when no clean
+patch exists — as on a wall only two cells thick. This is what makes the
+displayed peak converge under refinement; see Verification Manual §6b for the
+measured crossover at ~10–15 cells per feature radius, below which it under-reads
+and the un-recovered `bound` is the better number. Toggle with
+`Model::set_surface_recovery`; the criterion (`sf…`) fields are excluded so the
+plot stays what the reported number is computed from.
+
 ### 11.4 Visualization
 
 Deformed shape with an editable exaggeration factor and playback; click-to-edit
