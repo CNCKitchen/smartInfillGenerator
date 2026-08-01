@@ -241,6 +241,8 @@ can be pointed at a real part.
 | 7.7 | **`surf_kirsch_probe_standoff`** | — | control: is 7.6's trend an artifact of where the probe samples? |
 | 7.8 | **`bin/kirschbench`** — quarter plate, 7+ meshes | Kirsch with the Heywood finite-width correction, `Kt_gross = 3.032` | independent cross-check: the app's four CAD/voxel samplers verbatim, plus the `surface_band` / `MeshQuality` calibration |
 | 7.9 | **`surf_kirsch_submodel`** — ±3a box, Dirichlet-driven from a coarse global | the same global solved fine everywhere | does voxel submodeling recover the fine answer, and at what cost? **~11 min** (dominated by the fine global it is checked against) |
+| 7.10 | **`surf_kirsch_submodel_box_sweep`** — 5 box sizes × 3 driver meshes | global h=0.25 | how small can the box be, and how coarse the driver, before submodeling breaks? ~4 min |
+| 7.11 | **`far_field_cut_perpendicular_to_stress`** — bar, frictionless ends, 11 meshes | `σxx = σ∞` exactly, everywhere | the FAR-FIELD read-back on a cell cut perpendicular to the stress — the case F1 was built for. ~10 s |
 
 Run: `cargo test -p filasim-core --test surfstress -- --ignored --nocapture`
 (7.6 is excluded from any routine sweep — run it by name, deliberately: it took
@@ -359,9 +361,34 @@ Consequences, restated against the new evidence:
 
   The failure mode this was expected to hit — the coarse global's *local
   compliance* being wrong, and that error living in the very displacements being
-  interpolated — did not appear at a box half-width of 3a, where Kirsch's
-  perturbation has decayed like `(a/r)²` to ~11% and displacements are far less
-  sensitive to it than stresses are.
+  interpolated — did not appear, and case 7.10 then swept both knobs to find
+  where it would:
+
+  | box half-width | from h=0.5 (10 cells/a) | from h=1 (5 cells/a) | from h=2 (2.5 cells/a) |
+  |---|---|---|---|
+  | ±1.25a | −2.8% | −3.1% | −10.0% |
+  | ±1.5a  | −3.0% | −3.4% | −9.5% |
+  | ±2a    | −3.1% | −3.7% | −7.9% |
+  | ±3a    | −3.2% | −3.7% | −6.4% |
+  | ±4a    | −3.3% | −3.7% | −5.8% |
+
+  **Box size barely matters, provided the driver is adequate.** From a 5
+  cells/radius global, ±1.25a is as good as ±4a — all five rows sit within half
+  a point of the −3.2% target, at 196k cells against the global's 8.31M (42×
+  fewer). The `(a/r)²`-decay reasoning that motivated a large box turns out not
+  to govern: the submodel *re-solves* the perturbation itself, so it needs only
+  the boundary data to be right, and a 5 cells/radius global is already accurate
+  a short distance out.
+
+  **Box size matters a great deal once the driver is pathological**, and the
+  trend reverses: from a 2.5 cells/radius global — which reads −56.1% on its own
+  — a bigger box is monotonically better (−10.0% → −5.8%), because it pushes the
+  artificial cut out of the neighbourhood the coarse solve got wrong. Even at
+  its worst that is a 46-point improvement on the driver.
+
+  Practical rule: **±1.5a from a driver with ≥5 cells per feature radius, ±3a or
+  more below that.** The cell counts above are the padded multigrid grids, so
+  ±1.25a and ±1.5a round to the same solve size.
 
   **The framing that matters is 5 → 20 cells per radius, not 20 → 40.** The
   latter is one point of Kt for 12× the runtime and is not worth chasing. The
@@ -414,10 +441,33 @@ every mesh the band calls trustworthy, the worst unconservative bound error is
 −0.7%, and `unresolved` fires on precisely the three meshes where the recovered
 peak under-reads by 25–47%.
 
-**Still unmeasured by this tier:** F1's actual claim. The directional decoupling
-was built for a far-field over-read at a constrained face landing mid-cell, and
-no case here samples the far field — 7.6 shows it changing the peak by nothing
-at all. A far-field probe is the obvious gap.
+**F1's own claim, finally measured (7.11) — and it is the more important of the
+two fixes.** Every other case in this tier reads a stress *concentration*, where
+7.6 shows F1 changing the peak by nothing at all. It was built for something
+else: a cell cut PERPENDICULAR to the stress is a soft link in series, its ersatz
+stress is already the material stress, and the scalar `material_factor` divides
+by the occupancy a second time. Case 7.11 probes a bar in pure tension with
+frictionless ends, where the exact answer is `σxx = σ∞` *everywhere* — boundary
+column included, so the reference is a constant and any deviation is read-back
+error:
+
+| column occupancy | production | with F1 | `1/occ − 1` |
+|---|---|---|---|
+| 1.00 (5 of 11 meshes) | −1.7 … 0.0% | identical | 0% |
+| 0.83 | +19.1, +21.2% | −0.7, +1.0% | +20% |
+| 0.67 | +51.9, +52.9, +59.4% | +1.3, +2.0, +6.2% | +49% |
+| 0.50 | **+108.3%** | +4.2% | +100% |
+
+The error tracks `1/occ` to within a few points at every occupancy — the double
+division, confirmed as a formula and not merely as a magnitude. Worst case is a
+**doubling** of the reported stress, at 1 of 11 mesh sizes; 6 of 11 are affected
+at all, which is the "5 times in 6" the production voxelizer's grid centring
+produces. Mid-bar columns are bit-identical between modes at every `h`,
+confirming F1 is a no-op away from cut cells.
+
+This makes F1 the fix that matters most for ordinary parts. A doubled stress in a
+**uniform far field** on a plain bar is a wrong number in the safe-looking part
+of a model, with no notch present to warn anyone it is there.
 
 ---
 
@@ -512,6 +562,7 @@ cases — useful for setting user expectations.
 | Stress-concentration Kt — surface-recovered, fillet | +3.7% at 8 cells across the fillet, where the raw path reads +17.6% | 7.3 |
 | Stress-concentration — *typical* (median) surface point, vs Kirsch | converges to within 1% by 20 cells per hole radius | 7.6 |
 | Surface stress on a smooth free surface (round cantilever, thin tube) | 0.6–1.3% (thin wall) to 1.7–3.8% (solid), RMS | 7.1, 7.4 |
+| Uniform far-field stress in a **cut boundary column** (cut ⊥ to the stress) | with the directional decoupling: −1.7 … +6.2%. **Without it: up to +108%**, tracking `1/occupancy`, on 6 of 11 mesh sizes | 7.11 |
 | Free-surface traction residual ‖σ·n‖/σ_ref (should be 0) | 0.5–2% on smooth surfaces, 5–16% at a stress raiser. Raw read-back: **RMS converges (~O(√h)), MAX does not** — flat at ~11% over an 8× refinement. Surface-recovered: MAX falls 17.1% → 6.5% over the same refinement | 7.1–7.4, 7.6 |
 | Printed composite-beam stiffness | within ~10% of the sandwich closed form | 3.1, 3.2 |
 | MGCG iteration count | mesh-independent (8–9 iters, 130k→1M solid cells) | `PHASE1_RESULTS.md` |

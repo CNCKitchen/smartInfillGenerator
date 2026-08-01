@@ -1555,3 +1555,348 @@ fn surf_kirsch_submodel() {
     println!("  solve's defect and the idea stays dead.");
 }
 
+
+// ------------------------------------ case Bâ—: how big does the submodel box need to be?
+
+/// 7.9 measured ONE box half-width (3a) driven by ONE global (5 cells/radius).
+/// Both were the friendly choice, and the whole result rests on the hole's
+/// perturbation having decayed by the time it reaches the artificial cut â€”
+/// Kirsch falls off like `(a/r)Â²`, so 3a leaves ~11% of it at the boundary.
+/// This sweeps both knobs to find where that stops being true.
+///
+/// Reads: every row should approach `global h=0.25` (âˆ’3.2%). A row that drifts
+/// back toward its DRIVER's error has a box too small or a driver too coarse to
+/// carry usable displacement data.
+#[test]
+#[ignore]
+fn surf_kirsch_submodel_box_sweep() {
+    use std::f64::consts::PI;
+    println!("\n=== CASE B4: submodel box size and driver coarseness ===");
+    println!("  Same plate. Box half-width in units of the hole radius a, driven");
+    println!("  from globals of increasing coarseness. Target: the global h=0.25");
+    println!("  answer, -3.2%. h=2 is 2.5 cells per radius â€” a deliberately");
+    println!("  pathological driver, coarser than anything 7.9 tried.");
+
+    let (hw, t, a) = (50.0f64, 8.0f64, 5.0f64);
+    let sigma_inf = 1.0f64;
+    let inside = move |p: [f64; 3]| -> bool {
+        p[0] >= -hw
+            && p[0] <= hw
+            && p[1] >= -hw
+            && p[1] <= hw
+            && p[2] >= 0.0
+            && p[2] <= t
+            && (p[0] * p[0] + p[1] * p[1]) >= a * a
+    };
+    let f_total = sigma_inf * (2.0 * hw) * t;
+    let h_s = 0.25f64;
+
+    let read_kt = |pg: &VoxelGrid, u: &[f32], h: f64| -> f64 {
+        let probe = SurfaceStress::new(pg, u, Recovery::CutSurface);
+        let mut kt = 0.0f64;
+        let n_theta = (720.0 / h.min(1.0)) as usize;
+        let rr = a + 0.30 * h;
+        for it in 0..n_theta {
+            let th = 2.0 * PI * it as f64 / n_theta as f64;
+            let p = [rr * th.cos(), rr * th.sin(), t / 2.0];
+            let n = [-th.cos(), -th.sin(), 0.0];
+            let Some(sg) = probe.sigma_on_free_surface(p, n) else { continue };
+            kt = kt.max(principal_max(&sg) / sigma_inf);
+        }
+        kt
+    };
+    let sample_u = |pg: &VoxelGrid, u: &[f32], act: &[bool], p: [f64; 3]| -> Option<[f64; 3]> {
+        let (mx, my) = (pg.nx + 1, pg.ny + 1);
+        let mz = pg.nz + 1;
+        let f = [
+            (p[0] - pg.origin[0]) / pg.h,
+            (p[1] - pg.origin[1]) / pg.h,
+            (p[2] - pg.origin[2]) / pg.h,
+        ];
+        let base = [
+            (f[0].floor() as i64).clamp(0, mx as i64 - 2) as usize,
+            (f[1].floor() as i64).clamp(0, my as i64 - 2) as usize,
+            (f[2].floor() as i64).clamp(0, mz as i64 - 2) as usize,
+        ];
+        let tt = [
+            (f[0] - base[0] as f64).clamp(0.0, 1.0),
+            (f[1] - base[1] as f64).clamp(0.0, 1.0),
+            (f[2] - base[2] as f64).clamp(0.0, 1.0),
+        ];
+        let (mut acc, mut wsum) = ([0f64; 3], 0f64);
+        for oz in 0..2 {
+            for oy in 0..2 {
+                for ox in 0..2 {
+                    let n = ((base[2] + oz) * my + (base[1] + oy)) * mx + (base[0] + ox);
+                    let w = (if ox == 1 { tt[0] } else { 1.0 - tt[0] })
+                        * (if oy == 1 { tt[1] } else { 1.0 - tt[1] })
+                        * (if oz == 1 { tt[2] } else { 1.0 - tt[2] });
+                    if w <= 0.0 || !act[n] {
+                        continue;
+                    }
+                    for c in 0..3 {
+                        acc[c] += w * u[3 * n + c] as f64;
+                    }
+                    wsum += w;
+                }
+            }
+        }
+        if wsum <= 1e-12 {
+            return None;
+        }
+        Some([acc[0] / wsum, acc[1] / wsum, acc[2] / wsum])
+    };
+
+    // Drivers, coarse to pathological.
+    let mut drivers: Vec<(f64, VoxelGrid, Vec<f32>)> = Vec::new();
+    for &h in &[0.5f64, 1.0, 2.0] {
+        let (pg, u, _tl) =
+            rotated_plate(&inside, [-hw, -hw, 0.0], [hw, hw, t], 0.0, h, f_total, false);
+        let kt = read_kt(&pg, &u, h);
+        println!(
+            "\n  driver global h={h} ({:.1} cells/a): Kt {kt:.3} ({:+.1}%) on its own",
+            a / h,
+            (kt - 3.0) / 3.0 * 100.0
+        );
+        drivers.push((h, pg, u));
+    }
+
+    println!(
+        "\n  {:<10} {:>9} {:>10} | {:>22} {:>22} {:>22}",
+        "box", "cells", "cells/a", "from h=0.5", "from h=1", "from h=2"
+    );
+
+    for &bwa in &[1.25f64, 1.5, 2.0, 3.0, 4.0] {
+        let bw = bwa * a;
+        let mut cells_reported = 0usize;
+        let mut cols: Vec<String> = Vec::new();
+        for (h_g, pg_g, u_g) in &drivers {
+            let act_g = active_nodes(pg_g);
+            let inside_sub =
+                |p: [f64; 3]| -> bool { inside(p) && p[0].abs() <= bw && p[1].abs() <= bw };
+            let grid = voxelize_production(&inside_sub, [-bw, -bw, 0.0], [bw, bw, t], h_s, 6, 1);
+            let settings = SolveSettings {
+                e0: E0,
+                nu: NU,
+                tol: 1e-7,
+                max_iter: 1200,
+                ..Default::default()
+            };
+            let (pg, levels) = pad_for_levels(&grid, settings.max_levels);
+            let (mx, my, mz) = (pg.nx + 1, pg.ny + 1, pg.nz + 1);
+            let act = active_nodes(&pg);
+            let npos = |n: usize| -> [f64; 3] {
+                let (x, y, z) = (n % mx, (n / mx) % my, n / (mx * my));
+                [
+                    pg.origin[0] + x as f64 * pg.h,
+                    pg.origin[1] + y as f64 * pg.h,
+                    pg.origin[2] + z as f64 * pg.h,
+                ]
+            };
+            let k = 300.0 * E0 * pg.h;
+            let mut np = NodeProblem::default();
+            for n in 0..mx * my * mz {
+                if !act[n] {
+                    continue;
+                }
+                let p = npos(n);
+                if (p[0].abs() - bw).abs() > 0.5 * pg.h && (p[1].abs() - bw).abs() > 0.5 * pg.h {
+                    continue;
+                }
+                let Some(ud) = sample_u(pg_g, u_g, &act_g, p) else { continue };
+                for d in 0..3 {
+                    let mut dir = [0f64; 3];
+                    dir[d] = 1.0;
+                    np.springs.push((n as u32, dir, k));
+                    if ud[d] != 0.0 {
+                        let mut f = [0f64; 3];
+                        f[d] = k * ud[d];
+                        np.forces.push((n as u32, f));
+                    }
+                }
+            }
+            let u = solve_with_optional_cut(&pg, levels, &np, &settings, &inside_sub, false);
+            let kt = read_kt(&pg, &u, h_s);
+            cells_reported = pg.cell_count();
+            cols.push(format!("{kt:>9.3} ({:>+6.1}%)", (kt - 3.0) / 3.0 * 100.0));
+            let _ = h_g;
+        }
+        println!(
+            "  {:<10} {cells_reported:>9} {:>10.0} | {} {} {}",
+            format!("+-{bwa}a"),
+            a / h_s,
+            cols[0],
+            cols[1],
+            cols[2]
+        );
+    }
+
+    println!("\n  Reference: global h=0.25 reads 2.904 (-3.2%) at 8.31M cells.");
+    println!("  A row that drifts back toward its driver's own error means the box");
+    println!("  is inside the zone the hole still perturbs, or the driver is too");
+    println!("  coarse to carry usable displacements across the cut.");
+}
+
+// -------------------------------------------- case E: the FAR field, where F1 lives
+
+/// **The one claim F1 was built for, and the one this tier never measured.**
+/// `decouple_traction` was written for a far-field over-read: a cell cut
+/// PERPENDICULAR to the stress is a soft link in series, its ersatz stress is
+/// already the material stress, and the scalar `material_factor` divides by the
+/// occupancy a second time. Every other case in this file samples a stress
+/// CONCENTRATION, where 7.6 shows F1 changing the peak by nothing at all.
+///
+/// The probe: a bar in pure uniaxial tension with FRICTIONLESS ends. The exact
+/// solution is `Ïƒxx = Ïƒâˆž` everywhere â€” including inside the boundary cell column
+/// at `x=0`, which is cut perpendicular to the stress whenever the face lands
+/// mid-cell. So the reference needs no St-Venant argument and no analytic
+/// series: it is a constant, and any deviation is read-back error.
+///
+/// `h` is swept over values whose `L/h` have different fractional parts, so the
+/// face lands at a range of sub-cell positions â€” the "5 times in 6" the
+/// production voxelizer produces by centring the grid.
+///
+/// Reads: `col mean` is the boundary column, `col cut` the same column with F1.
+/// If F1 is doing what it was built for, `col cut` sits near 0% while
+/// `col mean` spikes wherever the column occupancy is low.
+#[test]
+#[ignore]
+fn far_field_cut_perpendicular_to_stress() {
+    println!("\n=== CASE E: FAR-FIELD cut column â€” the F1 claim ===");
+    println!("  Bar 40x10x4, pure tension sigma_inf=1 MPa, frictionless ends.");
+    println!("  Exact answer: sigma_xx = 1.000 MPa EVERYWHERE, so the boundary");
+    println!("  column at x=0 has a constant reference and any error is read-back.");
+    println!("  occ = mean occupancy of that column; low occ = face landed mid-cell.");
+
+    let (l, w, t) = (40.0f64, 10.0f64, 4.0f64);
+    let sigma_inf = 1.0f64;
+    let inside = move |p: [f64; 3]| -> bool {
+        p[0] >= 0.0 && p[0] <= l && p[1].abs() <= 0.5 * w && p[2] >= 0.0 && p[2] <= t
+    };
+    let f_total = sigma_inf * w * t;
+
+    println!(
+        "\n  {:>6} {:>7} {:>8} | {:>11} {:>11} | {:>11} {:>11}",
+        "h", "L/h", "occ", "col mean", "col cut", "mid mean", "mid cut"
+    );
+
+    for &h in &[1.0f64, 0.9, 0.8, 0.7, 0.6, 0.55, 0.5, 0.45, 0.4, 0.35, 0.3] {
+        let grid = voxelize_production(&inside, [0.0, -0.5 * w, 0.0], [l, 0.5 * w, t], h, 6, 1);
+        let settings =
+            SolveSettings { e0: E0, nu: NU, tol: 1e-8, max_iter: 2000, ..Default::default() };
+        let (pg, levels) = pad_for_levels(&grid, settings.max_levels);
+        let (mx, my, mz) = (pg.nx + 1, pg.ny + 1, pg.nz + 1);
+        let act = active_nodes(&pg);
+        let npos = |n: usize| -> [f64; 3] {
+            let (x, y, z) = (n % mx, (n / mx) % my, n / (mx * my));
+            [
+                pg.origin[0] + x as f64 * pg.h,
+                pg.origin[1] + y as f64 * pg.h,
+                pg.origin[2] + z as f64 * pg.h,
+            ]
+        };
+        let k = 300.0 * E0 * pg.h;
+        let mut np = NodeProblem::default();
+        let mut load_nodes = Vec::new();
+        // x = 0 is a roller (symmetry) plane: u_x = 0, y and z free so Poisson
+        // contraction is unimpeded and the state stays exactly uniaxial.
+        let (mut anchor_yz, mut anchor_z) = (usize::MAX, usize::MAX);
+        let (mut best_a, mut best_b) = (f64::MAX, f64::MAX);
+        for n in 0..mx * my * mz {
+            if !act[n] {
+                continue;
+            }
+            let p = npos(n);
+            if p[0] <= 0.5 * pg.h {
+                np.springs.push((n as u32, [1.0, 0.0, 0.0], k));
+                // Two more anchors kill lateral translation and roll about x
+                // without touching the axial field.
+                let da = p[1].abs() + (p[2] - 0.5 * t).abs();
+                if da < best_a {
+                    best_a = da;
+                    anchor_yz = n;
+                }
+                let db = (p[1] - 0.5 * w).abs() + (p[2] - 0.5 * t).abs();
+                if db < best_b {
+                    best_b = db;
+                    anchor_z = n;
+                }
+            } else if p[0] >= l - 0.5 * pg.h {
+                load_nodes.push(n);
+            }
+        }
+        assert!(anchor_yz != usize::MAX && !load_nodes.is_empty(), "bar BCs at h={h}");
+        np.springs.push((anchor_yz as u32, [0.0, 1.0, 0.0], k));
+        np.springs.push((anchor_yz as u32, [0.0, 0.0, 1.0], k));
+        if anchor_z != anchor_yz && anchor_z != usize::MAX {
+            np.springs.push((anchor_z as u32, [0.0, 0.0, 1.0], k));
+        }
+        let inv = 1.0 / load_nodes.len() as f64;
+        for n in load_nodes {
+            np.forces.push((n as u32, [f_total * inv, 0.0, 0.0]));
+        }
+        let u = solve_nodes(&pg, levels, &np, &settings).expect("bar solve").u;
+
+        // Raw cell fields: production (scalar material_factor) vs F1.
+        let eps = material_factor(&pg, &grid_eps(&pg));
+        let cut = cut_normals(&pg);
+        let f_mean =
+            cell_field_cut(&pg, &u, E0, NU, &eps, None, [0.0; 3], FieldKind::Sxx, None);
+        let f_cut = cell_field_cut(
+            &pg, &u, E0, NU, &eps, None, [0.0; 3], FieldKind::Sxx, Some(&cut),
+        );
+
+        // The first solid column in x, and a far-field column at mid-length.
+        let col_of = |x_target: f64| -> usize {
+            (((x_target - pg.origin[0]) / pg.h).floor() as i64).clamp(0, pg.nx as i64 - 1) as usize
+        };
+        let (cx_b, cx_m) = (col_of(0.5 * pg.h), col_of(0.5 * l));
+        let mut stat = |cx: usize, f: &[f32]| -> (f64, f64) {
+            let (mut s, mut occ, mut cnt) = (0f64, 0f64, 0usize);
+            for cz in 0..pg.nz {
+                for cy in 0..pg.ny {
+                    let ci = (cz * pg.ny + cy) * pg.nx + cx;
+                    if pg.scale[ci] <= 0.0 {
+                        continue;
+                    }
+                    // Interior of the cross-section only: the lateral skin is a
+                    // cut PARALLEL to the stress, a different (and already
+                    // correct) case that would otherwise contaminate the mean.
+                    let p = [
+                        pg.origin[1] + (cy as f64 + 0.5) * pg.h,
+                        pg.origin[2] + (cz as f64 + 0.5) * pg.h,
+                    ];
+                    if p[0].abs() > 0.5 * w - 1.5 * pg.h
+                        || p[1] < 1.5 * pg.h
+                        || p[1] > t - 1.5 * pg.h
+                    {
+                        continue;
+                    }
+                    s += f[ci] as f64;
+                    occ += pg.scale[ci] as f64;
+                    cnt += 1;
+                }
+            }
+            if cnt == 0 { (f64::NAN, f64::NAN) } else { (s / cnt as f64, occ / cnt as f64) }
+        };
+        let (b_mean, occ_b) = stat(cx_b, &f_mean);
+        let (b_cut, _) = stat(cx_b, &f_cut);
+        let (m_mean, _) = stat(cx_m, &f_mean);
+        let (m_cut, _) = stat(cx_m, &f_cut);
+        let e = |v: f64| (v - sigma_inf) / sigma_inf * 100.0;
+        println!(
+            "  {h:>6} {:>7.1} {occ_b:>8.2} | {:>10.1}% {:>10.1}% | {:>10.1}% {:>10.1}%",
+            l / h,
+            e(b_mean),
+            e(b_cut),
+            e(m_mean),
+            e(m_cut)
+        );
+    }
+
+    println!("\n  If `col mean` spikes where occ is low and `col cut` does not, F1");
+    println!("  does what it was built for and this tier simply never sampled the");
+    println!("  place it acts. If both are flat, the defect needs a constrained");
+    println!("  face (not a free one) to appear and the probe must be rebuilt.");
+}
+
