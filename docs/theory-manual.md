@@ -811,10 +811,20 @@ occupancy at the part boundary. Regression: `material_factor_removes_occupancy_s
 
 ### 11.2 Available fields
 
-- **Stress (MPa):** von Mises, σxx, σyy, σzz, σxy, σyz, σzx
+- **Stress (MPa):** von Mises, signed von Mises, principal σ₁ ≥ σ₂ ≥ σ₃,
+  σxx, σyy, σzz, σxy, σyz, σzx
 - **Strain:** equivalent (von-Mises) strain, εxx, εyy, εzz, γxy, γyz, γzx
 - **Safety factors:** material, layer adhesion, worst-case (§4.7)
 - **Displacement:** magnitude and components (mm/µm)
+
+The **principal stresses** are the eigenvalues of the cell's stress tensor,
+ordered by *value* — σ₁ ≥ σ₂ ≥ σ₃, not by magnitude. σ₁ is the maximum-tension
+field a textbook Kt and a max-normal-stress (brittle) check are defined on; it
+equals von Mises only in a uniaxial state, so on a 3D part the two peaks differ.
+σ₃ is the most compressive. Closed form (the trigonometric solution of the
+characteristic cubic) in `stress::principals`, which the orientation sweep's
+pruning bound (σₙₙ ≤ σ₁, τ ≤ (σ₁−σ₃)/2) also reads, so the plotted field and the
+bound can't drift apart. Regression: `principals_reproduce_the_stress_invariants`.
 
 ### 11.3 Smoothed (nodal) display
 

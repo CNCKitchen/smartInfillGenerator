@@ -3331,7 +3331,8 @@ impl Model {
     }
 
     /// Stress/strain scalar per soup vertex, from the current solution.
-    /// Kinds: "vm" | "sxx" | "syy" | "szz" | "sxy" | "syz" | "szx" (MPa),
+    /// Kinds: "vm" | "sxx" | "syy" | "szz" | "sxy" | "syz" | "szx" |
+    /// "s1" | "s2" | "s3" (principal stresses, descending — MPa),
     /// "evm" | "exx" | "eyy" | "ezz" | "gxy" | "gyz" | "gzx" (strain), and
     /// "sf" — safety factor σ_allow/σ_vM, where the allowable of graded
     /// infill scales with the SAME relative factor as its stiffness

@@ -70,7 +70,8 @@ Workflow in the app:
    adhesion σₜᶻ vs tension across the layers, and the worst-case min of
    both; graded infill's allowables scale with the same E(ρ) law as its
    stiffness, inverted colormap so red marks the critical low —, stress
-   von Mises / σxx/σyy/σzz / τxy/τyz/τzx in MPa, strain equivalent + components;
+   von Mises / principal σ₁σ₂σ₃ / σxx/σyy/σzz / τxy/τyz/τzx in MPa, strain
+   equivalent + components;
    cell-center values mapped to the surface), **▶ Play deflection**
    (0→max loop) bottom-center, and the legend carries the click-to-edit
    color scale, a **mark min/max** toggle, and the click-to-edit

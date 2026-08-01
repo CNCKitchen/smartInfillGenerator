@@ -433,6 +433,11 @@ export const RESULT_FIELDS: ResultFieldDef[] = [
   { value: "sfzx", label: "Criterion SF — layer adhesion", unit: "" },
   { value: "vm", label: "von Mises σ", unit: "MPa" },
   { value: "svm", label: "Signed von Mises σ", unit: "MPa" },
+  // Principal stresses, sorted by VALUE (σ₁ ≥ σ₂ ≥ σ₃), not magnitude: σ₁ is
+  // the max-tension check a textbook Kt is defined on, σ₃ the most compressive.
+  { value: "s1", label: "Principal σ₁ (max)", unit: "MPa" },
+  { value: "s2", label: "Principal σ₂ (mid)", unit: "MPa" },
+  { value: "s3", label: "Principal σ₃ (min)", unit: "MPa" },
   { value: "sxx", label: "Normal σxx", unit: "MPa" },
   { value: "syy", label: "Normal σyy", unit: "MPa" },
   { value: "szz", label: "Normal σzz", unit: "MPa" },

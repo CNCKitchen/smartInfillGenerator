@@ -28,6 +28,14 @@ pub enum FieldKind {
     Sxy,
     Syz,
     Szx,
+    /// Maximum principal stress σ₁ (MPa) — the largest eigenvalue of the
+    /// stress tensor. This, not von Mises, is what a textbook Kt and a
+    /// max-normal-stress (brittle) check are defined on.
+    S1,
+    /// Intermediate principal stress σ₂ (MPa).
+    S2,
+    /// Minimum principal stress σ₃ (MPa) — the most compressive.
+    S3,
     /// Equivalent (von Mises) strain, sqrt(2/3 e_dev : e_dev).
     EVonMises,
     Exx,
@@ -49,6 +57,9 @@ impl FieldKind {
             "sxy" => Self::Sxy,
             "syz" => Self::Syz,
             "szx" => Self::Szx,
+            "s1" => Self::S1,
+            "s2" => Self::S2,
+            "s3" => Self::S3,
             "evm" => Self::EVonMises,
             "exx" => Self::Exx,
             "eyy" => Self::Eyy,
@@ -71,8 +82,51 @@ impl FieldKind {
                 | Self::Sxy
                 | Self::Syz
                 | Self::Szx
+                | Self::S1
+                | Self::S2
+                | Self::S3
         )
     }
+}
+
+/// Principal stresses [σ₁, σ₂, σ₃] — the eigenvalues of the symmetric tensor
+/// given in Voigt order [sxx, syy, szz, sxy, syz, szx] — sorted DESCENDING.
+///
+/// Closed form (the trigonometric solution of the characteristic cubic): no
+/// iteration, and exact for an already-diagonal state. σ₂ comes from the trace
+/// (σ₁+σ₂+σ₃ = I₁) rather than a third cosine.
+pub fn principals(s: [f64; 6]) -> [f64; 3] {
+    let [sxx, syy, szz, sxy, syz, szx] = s;
+    let p1 = sxy * sxy + syz * syz + szx * szx;
+    if p1 == 0.0 {
+        let (mut a, mut b, mut c) = (sxx, syy, szz);
+        if a < b {
+            std::mem::swap(&mut a, &mut b);
+        }
+        if b < c {
+            std::mem::swap(&mut b, &mut c);
+        }
+        if a < b {
+            std::mem::swap(&mut a, &mut b);
+        }
+        return [a, b, c];
+    }
+    let q = (sxx + syy + szz) / 3.0;
+    let p2 = (sxx - q).powi(2) + (syy - q).powi(2) + (szz - q).powi(2) + 2.0 * p1;
+    let p = (p2 / 6.0).sqrt();
+    // r = det((A − qI)/p) / 2, clamped against fp drift outside acos' domain.
+    let (bxx, byy, bzz) = ((sxx - q) / p, (syy - q) / p, (szz - q) / p);
+    let (bxy, byz, bzx) = (sxy / p, syz / p, szx / p);
+    let det = bxx * (byy * bzz - byz * byz) - bxy * (bxy * bzz - byz * bzx)
+        + bzx * (bxy * byz - byy * bzx);
+    let r = (det / 2.0).clamp(-1.0, 1.0);
+    let phi = r.acos() / 3.0;
+    // Eigenvalues are q + 2p·cos(φ + 2πk/3), φ ∈ [0, π/3]: k = 0 is the
+    // largest; k = 1 lands in [2π/3, π] where cos is most negative — the
+    // smallest.
+    let s1 = q + 2.0 * p * phi.cos();
+    let s3 = q + 2.0 * p * (phi + 2.0 * std::f64::consts::FRAC_PI_3).cos();
+    [s1, 3.0 * q - s1 - s3, s3]
 }
 
 /// Sign (+1.0 / −1.0) for the signed von Mises stress: the sign of the first
@@ -286,6 +340,14 @@ pub fn cell_field_ti(
                             FieldKind::Sxy => sxy,
                             FieldKind::Syz => syz,
                             FieldKind::Szx => szx,
+                            FieldKind::S1 | FieldKind::S2 | FieldKind::S3 => {
+                                let p = principals([sxx, syy, szz, sxy, syz, szx]);
+                                match kind {
+                                    FieldKind::S1 => p[0],
+                                    FieldKind::S2 => p[1],
+                                    _ => p[2],
+                                }
+                            }
                             _ => {
                                 // von Mises (and its signed variant)
                                 let vm = (0.5
@@ -389,5 +451,52 @@ mod tests {
         // Sign tracks the first invariant I₁ = σxx+σyy+σzz.
         assert!(svm(&ut) > 0.0, "tension ⇒ +von Mises (got {})", svm(&ut));
         assert!(svm(&uc) < 0.0, "compression ⇒ −von Mises (got {})", svm(&uc));
+
+        // Uniaxial: σ₁ IS σxx and the other two principals vanish (ν = 0).
+        let p = |u: &[f32], k| cell_field(&grid, u, e0, nu, &eps, k)[0];
+        let sxx = p(&ut, FieldKind::Sxx);
+        assert!((p(&ut, FieldKind::S1) - sxx).abs() < 1e-3, "σ₁ == σxx in tension");
+        assert!(p(&ut, FieldKind::S2).abs() < 1e-3, "σ₂ ≈ 0");
+        assert!(p(&ut, FieldKind::S3).abs() < 1e-3, "σ₃ ≈ 0");
+        // Compression puts the same magnitude in σ₃ instead — the ordering is
+        // by VALUE, not magnitude, which is the whole point of plotting both.
+        assert!((p(&uc, FieldKind::S3) - p(&uc, FieldKind::Sxx)).abs() < 1e-3, "σ₃ == σxx");
+        assert!(p(&uc, FieldKind::S1).abs() < 1e-3, "σ₁ ≈ 0 under pure compression");
+    }
+
+    /// The principal solver against the tensor invariants: eigenvalues sorted
+    /// descending, Σσᵢ = I₁ = tr, Σσᵢσⱼ = I₂, Πσᵢ = I₃ = det.
+    #[test]
+    fn principals_reproduce_the_stress_invariants() {
+        let cases: [[f64; 6]; 5] = [
+            [5.0, -2.0, 1.0, 0.0, 0.0, 0.0],      // diagonal (shear-free branch)
+            [0.0, 0.0, 0.0, 3.0, 0.0, 0.0],       // pure shear ⇒ ±3, 0
+            [12.0, -4.0, 7.0, 2.5, -1.5, 0.8],    // general
+            [-9.0, -9.0, -9.0, 0.0, 0.0, 0.0],    // hydrostatic (triple root)
+            [1.0, 1.0, 1.0, 0.4, 0.4, 0.4],       // repeated eigenvalue with shear
+        ];
+        for s in cases {
+            let [sxx, syy, szz, sxy, syz, szx] = s;
+            let p = principals(s);
+            assert!(p[0] >= p[1] && p[1] >= p[2], "descending order, got {p:?}");
+            let i1 = sxx + syy + szz;
+            let i2 = sxx * syy + syy * szz + szz * sxx - sxy * sxy - syz * syz - szx * szx;
+            let i3 = sxx * (syy * szz - syz * syz) - sxy * (sxy * szz - syz * szx)
+                + szx * (sxy * syz - syy * szx);
+            let tol = 1e-9 * i1.abs().max(1.0);
+            assert!((p[0] + p[1] + p[2] - i1).abs() < tol, "I₁ for {s:?}: {p:?}");
+            assert!(
+                (p[0] * p[1] + p[1] * p[2] + p[2] * p[0] - i2).abs() < 1e-8 * i2.abs().max(1.0),
+                "I₂ for {s:?}: {p:?}"
+            );
+            assert!(
+                (p[0] * p[1] * p[2] - i3).abs() < 1e-7 * i3.abs().max(1.0),
+                "I₃ for {s:?}: {p:?}"
+            );
+        }
+        // Pure shear τ=3 ⇒ (3, 0, −3): the case where von Mises (5.196) and the
+        // max principal disagree most.
+        let p = principals([0.0, 0.0, 0.0, 3.0, 0.0, 0.0]);
+        assert!((p[0] - 3.0).abs() < 1e-9 && p[1].abs() < 1e-9 && (p[2] + 3.0).abs() < 1e-9);
     }
 }

@@ -70,29 +70,19 @@ pub fn hemisphere_grid(step_deg: f64) -> (usize, Vec<[f32; 3]>) {
 }
 
 /// (σ₁, σ₃): largest / smallest principal stress of a symmetric 3×3 given as
-/// [sxx, syy, szz, sxy, syz, szx]. Closed form (trigonometric), f64 internally.
+/// [sxx, syy, szz, sxy, syz, szx]. Closed form (trigonometric), f64 internally
+/// — [`crate::stress::principals`], which the σ₁/σ₂/σ₃ result fields plot, so
+/// the pruning bound and the displayed field can't drift apart.
 pub fn principal_range(s: [f32; 6]) -> (f64, f64) {
-    let [sxx, syy, szz, sxy, syz, szx] =
-        [s[0] as f64, s[1] as f64, s[2] as f64, s[3] as f64, s[4] as f64, s[5] as f64];
-    let p1 = sxy * sxy + syz * syz + szx * szx;
-    if p1 == 0.0 {
-        return (sxx.max(syy).max(szz), sxx.min(syy).min(szz));
-    }
-    let q = (sxx + syy + szz) / 3.0;
-    let p2 = (sxx - q).powi(2) + (syy - q).powi(2) + (szz - q).powi(2) + 2.0 * p1;
-    let p = (p2 / 6.0).sqrt();
-    // r = det((A − qI)/p) / 2, clamped against fp drift outside acos' domain.
-    let (bxx, byy, bzz) = ((sxx - q) / p, (syy - q) / p, (szz - q) / p);
-    let (bxy, byz, bzx) = (sxy / p, syz / p, szx / p);
-    let det = bxx * (byy * bzz - byz * byz) - bxy * (bxy * bzz - byz * bzx)
-        + bzx * (bxy * byz - byy * bzx);
-    let r = (det / 2.0).clamp(-1.0, 1.0);
-    let phi = r.acos() / 3.0;
-    let s1 = q + 2.0 * p * phi.cos();
-    // Eigenvalues are q + 2p·cos(φ + 2πk/3), φ ∈ [0, π/3]; k = 1 lands in
-    // [2π/3, π] where cos is most negative — the smallest.
-    let s3 = q + 2.0 * p * (phi + 2.0 * std::f64::consts::FRAC_PI_3).cos();
-    (s1, s3)
+    let p = crate::stress::principals([
+        s[0] as f64,
+        s[1] as f64,
+        s[2] as f64,
+        s[3] as f64,
+        s[4] as f64,
+        s[5] as f64,
+    ]);
+    (p[0], p[2])
 }
 
 /// Cells inside the constraint ring: seeded from the cells adjacent to each

@@ -10,6 +10,15 @@ compatibility or simulation results; patch releases are fixes only.
 ## [Unreleased]
 
 ### Added
+- **Principal stresses in the result picker**: σ₁ (max), σ₂ (mid) and σ₃ (min)
+  join the Stress (MPa) group, ordered by value rather than magnitude — σ₁ is
+  the maximum-tension field a textbook Kt and a max-normal-stress (brittle)
+  check are defined on (it equals von Mises only in a uniaxial state), σ₃ the
+  most compressive. Available everywhere the other stress fields are: surface
+  and voxel results, the section-volume interior scan, and the mode-shape
+  pattern view. Closed-form eigenvalues (`stress::principals`), now shared with
+  the orientation sweep's principal-stress pruning bound so the two can't drift
+  apart.
 - **Sample model on startup**: instead of an empty drop zone, filaSim now
   boots with the CNC Kitchen Hook loaded and a working load case applied
   (elastic strap support on the big slot's far wall, 250 N pulling on the
