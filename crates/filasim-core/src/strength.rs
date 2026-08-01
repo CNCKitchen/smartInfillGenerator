@@ -81,6 +81,18 @@ pub const BC_EXCL_PATCH_FRAC: f64 = 0.15;
 /// mesh still has one ring of cells whose stress is pure penalty artifact.
 pub const BC_EXCL_MIN_CELLS: f64 = 2.0;
 
+/// Ceiling on the exclusion radius, as a fraction of the part's SMALLEST solid
+/// bounding-box extent (DESIGN §20 dec. 5, amended).
+///
+/// The patch-scaled radius is a Saint-Venant argument, and Saint-Venant says
+/// nothing about a patch bigger than the part. A support covering a whole face
+/// of a thin section produces a radius larger than the section is thick, and
+/// the "local" exclusion swallows everything: measured on the Kirsch plate, a
+/// 620 mm² frictionless face on a 4 mm plate asks for 4.26 mm and blanks
+/// 100 % of the cells at every resolution (`bin/kirschbench --excl`). Half the
+/// thinnest dimension is the most a zone can take and still be local.
+pub const BC_EXCL_MAX_THICKNESS_FRAC: f64 = 0.5;
+
 /// Which safety factor the goal enforces (§17 dec. 2, per-project toggle).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SfMeasure {
@@ -162,6 +174,14 @@ pub fn sf_cells_ti(
     let (mx, my) = (nx + 1, ny + 1);
     let inv4h = 1.0 / (4.0 * grid.h);
     let mut out = vec![0f32; nx * ny * nz];
+    // The safety factor is a MATERIAL-stress quantity by construction (the
+    // `factor` cancels between allowable and stress), so it carries the
+    // occupancy-decoupling defect whether or not the display toggle is on —
+    // and therefore needs the same directional correction. Because the
+    // correction is linear it commutes with the `/factor` that cancels below,
+    // so it applies to the ersatz tensor here and the rest of the arithmetic
+    // is untouched. Free on a part with no cut cells (occ = 1 ⇒ no-op).
+    let cut = crate::stress::cut_normals(grid);
     for cz in 0..nz {
         for cy in 0..ny {
             for cx in 0..nx {
@@ -191,7 +211,7 @@ pub fn sf_cells_ti(
                 // Allowable scales with the TOTAL material share; stress comes
                 // from the blended tensor.
                 let factor = eps[ci] as f64 + fi;
-                let (sxx, syy, szz, sxy, syz, szx) = match ti {
+                let (mut sxx, mut syy, mut szz, mut sxy, mut syz, mut szx) = match ti {
                     Some((_, ratios)) => {
                         let s = crate::ti::blended_stress(
                             e0,
@@ -218,6 +238,11 @@ pub fn sf_cells_ti(
                         )
                     }
                 };
+                {
+                    let mut s = [sxx, syy, szz, sxy, syz, szx];
+                    crate::stress::decouple_traction(&mut s, cut[ci], grid.scale[ci] as f64);
+                    [sxx, syy, szz, sxy, syz, szx] = s;
+                }
 
                 let sf_m = || -> f64 {
                     let vm = (0.5
@@ -256,6 +281,31 @@ pub fn criterion_mask(
     solid_mode: bool,
     bc_excl: &[bool],
 ) -> Vec<bool> {
+    criterion_mask_checked(grid, design_cells, x, solid_mode, bc_excl).0
+}
+
+/// [`criterion_mask`] plus a flag: `true` when the BC exclusion had to be
+/// DROPPED because it covered every cell the criterion would otherwise score.
+///
+/// An exclusion that leaves nothing behind is not a stricter criterion, it is
+/// the absence of one — and the reduction stage silently reads it as perfect
+/// safety, because [`sf_min`] on an empty set returns [`SF_CAP`]. That is the
+/// worst possible failure direction for a strength check, and it is reachable
+/// from an ordinary setup: on a symmetry model every symmetry plane is a
+/// support, and three of them blank the part (measured: 158 800 of 158 800
+/// cells, SF_crit reported as 10.0 — `bin/kirschbench --excl`).
+///
+/// So the exclusion yields. An unmasked criterion still sees a support
+/// artifact, which is a known and visible over-conservatism; a masked-out one
+/// sees nothing at all and says the part is fine. Callers should surface the
+/// flag rather than quietly presenting the fallback number as a clean result.
+pub fn criterion_mask_checked(
+    grid: &VoxelGrid,
+    design_cells: &[u32],
+    x: &[f64],
+    solid_mode: bool,
+    bc_excl: &[bool],
+) -> (Vec<bool>, bool) {
     let mut mask: Vec<bool> = grid.scale.iter().map(|&sc| sc > 0.0).collect();
     if solid_mode {
         for (k, &c) in design_cells.iter().enumerate() {
@@ -264,15 +314,24 @@ pub fn criterion_mask(
             }
         }
     }
-    if !bc_excl.is_empty() {
-        debug_assert_eq!(bc_excl.len(), mask.len());
-        for (m, &e) in mask.iter_mut().zip(bc_excl) {
-            if e {
-                *m = false;
-            }
+    if bc_excl.is_empty() {
+        return (mask, false);
+    }
+    debug_assert_eq!(bc_excl.len(), mask.len());
+    let mut excluded = mask.clone();
+    let mut left = 0usize;
+    for (m, &e) in excluded.iter_mut().zip(bc_excl) {
+        if e {
+            *m = false;
+        } else if *m {
+            left += 1;
         }
     }
-    mask
+    if left == 0 {
+        (mask, true) // nothing survived — keep the unmasked criterion
+    } else {
+        (excluded, false)
+    }
 }
 
 /// Exclusion radius (mm) of one constraint patch (DESIGN §20 dec. 5):
@@ -283,7 +342,39 @@ pub fn criterion_mask(
 pub fn bc_exclusion_radius(grid: &VoxelGrid, patch_nodes: usize) -> f64 {
     let area = patch_nodes as f64 * grid.h * grid.h;
     let d_c = 2.0 * (area / std::f64::consts::PI).sqrt();
-    (BC_EXCL_PATCH_FRAC * d_c).max(BC_EXCL_MIN_CELLS * grid.h)
+    let r = (BC_EXCL_PATCH_FRAC * d_c).max(BC_EXCL_MIN_CELLS * grid.h);
+    // …but never wider than half the part's thinnest dimension; see
+    // [`BC_EXCL_MAX_THICKNESS_FRAC`]. The floor still wins on a coarse mesh —
+    // one ring of penalty-artifact cells has to go regardless.
+    let cap = (BC_EXCL_MAX_THICKNESS_FRAC * min_solid_extent(grid))
+        .max(BC_EXCL_MIN_CELLS * grid.h);
+    r.min(cap)
+}
+
+/// Smallest edge (mm) of the solid cells' bounding box — the part's thinnest
+/// overall dimension, at cell resolution. `0` when nothing is solid.
+pub fn min_solid_extent(grid: &VoxelGrid) -> f64 {
+    let (nx, ny, nz) = (grid.nx, grid.ny, grid.nz);
+    let (mut lo, mut hi) = ([usize::MAX; 3], [0usize; 3]);
+    let mut any = false;
+    for cz in 0..nz {
+        for cy in 0..ny {
+            for cx in 0..nx {
+                if grid.scale[(cz * ny + cy) * nx + cx] <= 0.0 {
+                    continue;
+                }
+                any = true;
+                for (d, &v) in [cx, cy, cz].iter().enumerate() {
+                    lo[d] = lo[d].min(v);
+                    hi[d] = hi[d].max(v);
+                }
+            }
+        }
+    }
+    if !any {
+        return 0.0;
+    }
+    (0..3).map(|d| (hi[d] - lo[d] + 1) as f64 * grid.h).fold(f64::INFINITY, f64::min)
 }
 
 /// **BC singularity exclusion** (DESIGN §20 dec. 5/6): cells whose center lies
