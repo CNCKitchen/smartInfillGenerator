@@ -240,6 +240,7 @@ can be pointed at a real part.
 | 7.6 | **`surf_kirsch_h_refinement`** — the hole at h = 1 → 0.125 | Kirsch `σ_θθ(r,θ)` as an *h-independent normalizer* | does the displayed peak converge under refinement? **~107 min, ~13 GB** |
 | 7.7 | **`surf_kirsch_probe_standoff`** | — | control: is 7.6's trend an artifact of where the probe samples? |
 | 7.8 | **`bin/kirschbench`** — quarter plate, 7+ meshes | Kirsch with the Heywood finite-width correction, `Kt_gross = 3.032` | independent cross-check: the app's four CAD/voxel samplers verbatim, plus the `surface_band` / `MeshQuality` calibration |
+| 7.9 | **`surf_kirsch_submodel`** — ±3a box, Dirichlet-driven from a coarse global | the same global solved fine everywhere | does voxel submodeling recover the fine answer, and at what cost? **~11 min** (dominated by the fine global it is checked against) |
 
 Run: `cargo test -p filasim-core --test surfstress -- --ignored --nocapture`
 (7.6 is excluded from any routine sweep — run it by name, deliberately: it took
@@ -344,15 +345,32 @@ Consequences, restated against the new evidence:
   recovered one.** This is the practical inversion: the reflex to add cells was
   wrong before and is right now, *provided* surface recovery is on and the mesh
   is past ~15 cells per feature radius.
-- **The submodeling rejection argument is void; submodeling itself is still
-  probably not worth building.** The rejection rested on "smaller `h` at the hot
-  spot is all submodeling buys, and smaller `h` makes it worse." Smaller `h` now
-  makes it monotonically better, so that argument no longer holds. What replaces
-  it is a cost comparison, not a correctness one: 20 cells/radius reaches −3.2%
-  in 515 s and 8.3M cells, while 40 cells/radius reaches +2.1% in 6030 s and
-  53M cells. Submodeling would buy the second number at closer to the first
-  number's cost — a real but incremental gain on an already-acceptable figure.
-  Still nothing built; the reason is now economics rather than futility.
+- **Submodeling is un-rejected, and it was then measured working (7.9).** The
+  rejection rested on "smaller `h` at the hot spot is all submodeling buys, and
+  smaller `h` makes it worse." Smaller `h` now makes it monotonically better, so
+  the argument no longer holds — and case 7.9 built the thing and measured it: a
+  ±3a box re-voxelized to 20 cells per radius, driven by displacements
+  interpolated from the **5 cells/radius** global, reads **−3.7% in 21 s total
+  against −3.2% in 548 s** for the full global refinement. Driven from the 10
+  cells/radius global it reproduces the fine answer exactly (2.904 vs 2.904).
+  The free-surface traction residual matches its global counterpart to the
+  decimal in every pairing, which is the reference-free confirmation that the
+  submodel reproduces the field and not merely a similar peak.
+
+  The failure mode this was expected to hit — the coarse global's *local
+  compliance* being wrong, and that error living in the very displacements being
+  interpolated — did not appear at a box half-width of 3a, where Kirsch's
+  perturbation has decayed like `(a/r)²` to ~11% and displacements are far less
+  sensitive to it than stresses are.
+
+  **The framing that matters is 5 → 20 cells per radius, not 20 → 40.** The
+  latter is one point of Kt for 12× the runtime and is not worth chasing. The
+  former is 28 points, and it is where real parts sit: a 3 mm fillet meshed at
+  `h`=0.5 has six cells across it, and globally refining a whole bracket to fix
+  that is usually infeasible. Below the crossover the recovered read-back also
+  *under*-reads — the unconservative direction — so the under-resolved regime is
+  not merely imprecise, it is imprecise the dangerous way. Submodeling is the
+  cheap way out of it.
 
 **Caveat from the control (7.7).** Sweeping the probe standoff independently of
 `h` shows the rising max holds at 0.15 and 0.30 cells from the rim, is flat at

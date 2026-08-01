@@ -69,13 +69,23 @@
 //! So this module stays OPT-IN and OFF. It is kept because it is finished,
 //! tested, and it is the right foundation if a future need appears — a stress
 //! formulation that actually reads the boundary element, or a genuinely
-//! conforming surface representation. **The submodel this note used to suggest
-//! is no longer one of those needs:** `tests/surfstress.rs` refined the Kirsch
-//! plate to 40 cells per hole radius and the displayed peak did not converge
-//! (median does, max does not — the staircase adds corners like `O(1/h)`), so a
-//! locally finer box inherits the defect. Do not spend effort compressing the
-//! storage until something shows a user-visible gain to justify it — the
-//! compression was never the blocker, the absent benefit is.
+//! conforming surface representation.
+//!
+//! **CORRECTION (supersedes the paragraph this note used to carry).** That
+//! paragraph said the submodel was no longer a candidate, because the displayed
+//! peak did not converge under refinement and so a locally finer box would
+//! inherit the defect. That was measured with the OLD read-back. With
+//! `stress::recover_surface` the recovered peak *does* converge (−31.3% →
+//! −13.6% → −3.2% → +2.1% at 5/10/20/40 cells per hole radius), and
+//! `surf_kirsch_submodel` then measured a real submodel recovering −3.7% in 21 s
+//! where the equivalent global refinement needs 548 s. **Submodeling is back on
+//! the table**; see Verification Manual §6b and case 7.9.
+//!
+//! None of that changes THIS module's verdict — a submodel is a finer voxel box,
+//! not an exactly-integrated boundary element, and the thin-wall row still shows
+//! no user-visible gain. Do not spend effort compressing the storage until
+//! something shows one — the compression was never the blocker, the absent
+//! benefit is.
 
 use crate::fem::{iso_stiffness, NODE_SIGNS};
 

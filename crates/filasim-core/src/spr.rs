@@ -66,15 +66,20 @@
 //! the bottleneck: no recovery can repair a cell field that already contains a
 //! spurious peak. The remaining error is in the cell-centre stress itself.
 //!
-//! Both follow-ons this paragraph used to propose have since been measured and
-//! both failed. Proper cut-cell quadrature: implemented in [`crate::cutcell`],
-//! correct, no user-visible gain. Resolving the feature locally (submodel):
-//! killed by `tests/surfstress.rs::surf_kirsch_h_refinement`, which refined the
-//! Kirsch plate to 40 cells per hole radius and found that the MEDIAN surface
-//! point converges while the MAX — the only statistic the app shows — does not,
-//! because the staircase puts `O(1/h)` corners on the rim. A submodel buys only
-//! smaller `h`, so it inherits the defect it was meant to cure. Read that test's
-//! verdict before proposing either again.
+//! Of the two follow-ons this paragraph used to propose, one failed and one was
+//! wrongly written off. Proper cut-cell quadrature: implemented in
+//! [`crate::cutcell`], correct, no user-visible gain — that verdict stands.
+//!
+//! Resolving the feature locally (submodel) was declared dead by
+//! `surf_kirsch_h_refinement`, on the grounds that the MEDIAN surface point
+//! converges while the MAX — the only statistic the app shows — does not,
+//! because the staircase puts `O(1/h)` corners on the rim, so a submodel would
+//! inherit the defect it was meant to cure. **That holds only for the raw
+//! read-back.** [`crate::stress::recover_surface`] stops reading the boundary
+//! cells at all, the MAX converges too (observed order ≈1), and
+//! `surf_kirsch_submodel` measured a real submodel reaching −3.7% in 21 s
+//! against 548 s for the equivalent global refinement. Submodeling is live
+//! again; SPR is not.
 //!
 //! What IS unambiguously worth shipping from this module is
 //! [`project_traction`]: it zeroes the free-surface traction by construction for

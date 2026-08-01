@@ -1350,3 +1350,208 @@ fn surf_thin_wall_tube() {
     println!("  gap is large here and small on the solid cases, the cut-cell work");
     println!("  pays for FDM parts specifically — which is the whole question.");
 }
+
+// ------------------------------------------- case Bâ€´: does submodeling work now?
+
+/// **Voxel submodeling, re-evaluated.** 7.6 rejected it on the grounds that a
+/// submodel buys exactly one thing â€” smaller `h` at the hot spot â€” and smaller
+/// `h` made the displayed peak WORSE. With `recover_surface` in the read-back
+/// that premise is gone: the recovered peak converges (âˆ’31.3% â†’ âˆ’13.6% â†’ âˆ’3.2%
+/// â†’ +2.1% at 5/10/20/40 cells per hole radius). So the mechanism is live again
+/// and the question is whether it survives contact with a real submodel.
+///
+/// The interesting comparison is NOT 20 â†’ 40 cells per radius (one point of Kt
+/// for 12Ã— the runtime). It is **5 â†’ 20**, which is 28 points, and which is
+/// where real parts sit: a 3 mm fillet meshed at h=0.5 has six cells across it,
+/// and refining a whole bracket to fix that is usually infeasible.
+///
+/// The risk this test exists to measure: submodeling assumes the coarse GLOBAL
+/// displacement field is trustworthy at the box boundary even though its local
+/// peak is not. That is usually safe â€” displacements converge far better than
+/// peak stress â€” but at 5 cells per radius the hole's local COMPLIANCE is also
+/// wrong, and that error is in the very field being interpolated. If the
+/// submodel inherits the coarse answer, the idea is dead for good; if it lands
+/// near the global-fine answer, it works.
+///
+/// Reads: `sub` should approach `global fine`, not `global coarse`.
+#[test]
+#[ignore]
+fn surf_kirsch_submodel() {
+    use std::f64::consts::PI;
+    use std::time::Instant;
+    println!("\n=== CASE B triple-prime: VOXEL SUBMODELING vs global refinement ===");
+    println!("  Same Kirsch plate (hw=50 t=8 a=5, sigma_inf=1). A box of +-3a around");
+    println!("  the hole is re-voxelized fine and driven by displacements");
+    println!("  interpolated from the COARSE global solve. The box's +-x/+-y faces");
+    println!("  are the artificial cuts; its z faces are the plate's own free");
+    println!("  surfaces and are left free.");
+
+    let (hw, t, a) = (50.0f64, 8.0f64, 5.0f64);
+    let sigma_inf = 1.0f64;
+    let inside = move |p: [f64; 3]| -> bool {
+        p[0] >= -hw
+            && p[0] <= hw
+            && p[1] >= -hw
+            && p[1] <= hw
+            && p[2] >= 0.0
+            && p[2] <= t
+            && (p[0] * p[0] + p[1] * p[1]) >= a * a
+    };
+    let f_total = sigma_inf * (2.0 * hw) * t;
+    let bw = 3.0 * a; // half-width of the submodel box
+
+    // Peak sigma1 on the rim + traction residual, exactly as 7.6 reads them.
+    let read_rim = |pg: &VoxelGrid, u: &[f32], mode: Recovery, h: f64| -> (f64, f64, f64) {
+        let probe = SurfaceStress::new(pg, u, mode);
+        let mut kt = 0.0f64;
+        let mut resid = ErrBins::new();
+        let n_theta = (720.0 / h.min(1.0)) as usize;
+        let rr = a + 0.30 * h;
+        for it in 0..n_theta {
+            let th = 2.0 * PI * it as f64 / n_theta as f64;
+            let p = [rr * th.cos(), rr * th.sin(), t / 2.0];
+            let n = [-th.cos(), -th.sin(), 0.0];
+            let Some(sg) = probe.sigma_on_free_surface(p, n) else { continue };
+            kt = kt.max(principal_max(&sg) / sigma_inf);
+            resid.add(axis_angle_deg(n), norm3(traction(&sg, n)) / (3.0 * sigma_inf));
+        }
+        (kt, resid.rms() * 100.0, resid.max() * 100.0)
+    };
+
+    // Trilinear sample of a padded nodal displacement field, skipping inactive
+    // nodes â€” the same weighting the stress sampler uses.
+    let sample_u = |pg: &VoxelGrid, u: &[f32], act: &[bool], p: [f64; 3]| -> Option<[f64; 3]> {
+        let (mx, my) = (pg.nx + 1, pg.ny + 1);
+        let mz = pg.nz + 1;
+        let f = [
+            (p[0] - pg.origin[0]) / pg.h,
+            (p[1] - pg.origin[1]) / pg.h,
+            (p[2] - pg.origin[2]) / pg.h,
+        ];
+        let base = [
+            (f[0].floor() as i64).clamp(0, mx as i64 - 2) as usize,
+            (f[1].floor() as i64).clamp(0, my as i64 - 2) as usize,
+            (f[2].floor() as i64).clamp(0, mz as i64 - 2) as usize,
+        ];
+        let tt = [
+            (f[0] - base[0] as f64).clamp(0.0, 1.0),
+            (f[1] - base[1] as f64).clamp(0.0, 1.0),
+            (f[2] - base[2] as f64).clamp(0.0, 1.0),
+        ];
+        let (mut acc, mut wsum) = ([0f64; 3], 0f64);
+        for oz in 0..2 {
+            for oy in 0..2 {
+                for ox in 0..2 {
+                    let n = ((base[2] + oz) * my + (base[1] + oy)) * mx + (base[0] + ox);
+                    let w = (if ox == 1 { tt[0] } else { 1.0 - tt[0] })
+                        * (if oy == 1 { tt[1] } else { 1.0 - tt[1] })
+                        * (if oz == 1 { tt[2] } else { 1.0 - tt[2] });
+                    if w <= 0.0 || !act[n] {
+                        continue;
+                    }
+                    for c in 0..3 {
+                        acc[c] += w * u[3 * n + c] as f64;
+                    }
+                    wsum += w;
+                }
+            }
+        }
+        if wsum <= 1e-12 {
+            return None;
+        }
+        Some([acc[0] / wsum, acc[1] / wsum, acc[2] / wsum])
+    };
+
+    println!(
+        "\n  {:<26} {:>9} {:>10} {:>9} {:>10} {:>10} {:>9}",
+        "solve", "cells/a", "cells", "Kt(s1)", "err vs 3", "residRMS", "time s"
+    );
+
+    // Global solves at both ends. The coarse ones drive every submodel.
+    let mut globals: Vec<(f64, VoxelGrid, Vec<f32>)> = Vec::new();
+    for &h in &[1.0f64, 0.5, 0.25] {
+        let t0 = Instant::now();
+        let (pg, u, _tl) =
+            rotated_plate(&inside, [-hw, -hw, 0.0], [hw, hw, t], 0.0, h, f_total, false);
+        let secs = t0.elapsed().as_secs_f64();
+        let (kt, rrms, _rmax) = read_rim(&pg, &u, Recovery::CutSurface, h);
+        println!(
+            "  {:<26} {:>9.0} {:>10} {kt:>9.3} {:>+9.1}% {:>9.1}% {secs:>9.0}",
+            format!("global h={h}"),
+            a / h,
+            pg.cell_count(),
+            (kt - 3.0) / 3.0 * 100.0,
+            rrms
+        );
+        globals.push((h, pg, u));
+    }
+
+    // Submodels: box of +-3a re-voxelized fine, Dirichlet-driven by a coarse global.
+    for &(h_g, h_s) in &[(1.0f64, 0.5f64), (1.0, 0.25), (0.5, 0.25)] {
+        let (_, pg_g, u_g) = globals.iter().find(|(h, _, _)| *h == h_g).unwrap();
+        let act_g = active_nodes(pg_g);
+
+        let t0 = Instant::now();
+        let inside_sub =
+            |p: [f64; 3]| -> bool { inside(p) && p[0].abs() <= bw && p[1].abs() <= bw };
+        let grid = voxelize_production(&inside_sub, [-bw, -bw, 0.0], [bw, bw, t], h_s, 6, 1);
+        let settings =
+            SolveSettings { e0: E0, nu: NU, tol: 1e-7, max_iter: 1200, ..Default::default() };
+        let (pg, levels) = pad_for_levels(&grid, settings.max_levels);
+        let (mx, my, mz) = (pg.nx + 1, pg.ny + 1, pg.nz + 1);
+        let act = active_nodes(&pg);
+        let npos = |n: usize| -> [f64; 3] {
+            let (x, y, z) = (n % mx, (n / mx) % my, n / (mx * my));
+            [
+                pg.origin[0] + x as f64 * pg.h,
+                pg.origin[1] + y as f64 * pg.h,
+                pg.origin[2] + z as f64 * pg.h,
+            ]
+        };
+        // Penalty springs + equivalent forces on the four ARTIFICIAL faces only.
+        let k = 300.0 * E0 * pg.h; // attach.rs SPRING_FACTOR
+        let mut np = NodeProblem::default();
+        let mut driven = 0usize;
+        for n in 0..mx * my * mz {
+            if !act[n] {
+                continue;
+            }
+            let p = npos(n);
+            let on_cut = (p[0].abs() - bw).abs() <= 0.5 * pg.h
+                || (p[1].abs() - bw).abs() <= 0.5 * pg.h;
+            if !on_cut {
+                continue;
+            }
+            let Some(ud) = sample_u(pg_g, u_g, &act_g, p) else { continue };
+            driven += 1;
+            for d in 0..3 {
+                let mut dir = [0f64; 3];
+                dir[d] = 1.0;
+                np.springs.push((n as u32, dir, k));
+                if ud[d] != 0.0 {
+                    let mut f = [0f64; 3];
+                    f[d] = k * ud[d];
+                    np.forces.push((n as u32, f));
+                }
+            }
+        }
+        assert!(driven > 0, "no driven nodes on the submodel cut faces");
+        let u = solve_with_optional_cut(&pg, levels, &np, &settings, &inside_sub, false);
+        let secs = t0.elapsed().as_secs_f64();
+        let (kt, rrms, _rmax) = read_rim(&pg, &u, Recovery::CutSurface, h_s);
+        println!(
+            "  {:<26} {:>9.0} {:>10} {kt:>9.3} {:>+9.1}% {:>9.1}% {secs:>9.0}",
+            format!("sub h={h_s} from h={h_g}"),
+            a / h_s,
+            pg.cell_count(),
+            (kt - 3.0) / 3.0 * 100.0,
+            rrms
+        );
+    }
+
+    println!("\n  DECISION: compare each `sub h=X from h=Y` row against `global h=X`.");
+    println!("  Close to it => submodeling recovers the fine answer at a fraction of");
+    println!("  the cost. Close to `global h=Y` instead => it inherited the coarse");
+    println!("  solve's defect and the idea stays dead.");
+}
+
