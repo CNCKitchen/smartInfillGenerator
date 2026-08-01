@@ -1990,7 +1990,9 @@ fn stepped_round_bar_vs_ansys() {
         "case", "h", "cells/rf", "readback", "SEQV", "vs ansys", "S1", "vs ansys", "Kt(S1)"
     );
 
-    for &h in &[1.0f64, 0.5, 0.25, 0.125] {
+    // 0.9 and 0.45 are FDM-typical: the cell size in production is set by the
+    // print (extrusion width / layer height), not chosen for stress accuracy.
+    for &h in &[1.0f64, 0.9, 0.5, 0.45, 0.25, 0.125] {
         let grid = voxelize_production(
             &inside,
             [0.0, -RBIG, -RBIG],
