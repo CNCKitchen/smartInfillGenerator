@@ -32,7 +32,9 @@
 use filasim_core::cutcell::{CutGeometry, CutStiffness};
 use filasim_core::solve::{active_nodes, grid_eps, solve_cached, SolverCache};
 use filasim_core::spr::{project_traction, recover_nodal_spr};
-use filasim_core::stress::{cell_field, material_factor, recover_nodal, FieldKind};
+use filasim_core::stress::{
+    cell_field_cut, cut_normals, material_factor, recover_nodal, recover_surface, FieldKind,
+};
 use filasim_core::{
     pad_for_levels, solve_nodes, NodeProblem, SolveSettings, VoxelGrid,
 };
@@ -115,6 +117,15 @@ enum Recovery {
     Spr,
     /// SPR plus the closed-form traction projection at the sample point.
     SprProjected,
+    /// F1 only: directional occupancy decoupling on cut cells
+    /// (`stress::cut_normals` + `decouple_traction`), then the production mean
+    /// recovery. Isolates the cut-cell fix from the surface fit.
+    Cut,
+    /// F1 + F3: decoupling, then `stress::recover_surface` (degree-1 patch fit
+    /// from clean interior cells, evaluated at the boundary cell centre), then
+    /// mean recovery. THIS is the shipping wasm read-back path — `cell_field_cut`
+    /// → `recover_surface` → `recover_nodal`, as wired in `Model::cell_values_opt`.
+    CutSurface,
 }
 
 impl Recovery {
@@ -123,11 +134,24 @@ impl Recovery {
             Recovery::Mean => "mean (today)",
             Recovery::Spr => "SPR",
             Recovery::SprProjected => "SPR+proj",
+            Recovery::Cut => "cut-decoupled",
+            Recovery::CutSurface => "cut+surf-rec",
         }
     }
 }
 
-const RECOVERIES: [Recovery; 3] = [Recovery::Mean, Recovery::Spr, Recovery::SprProjected];
+/// The h-refinement case (B′) is the expensive one — ~107 min, ~13 GB — so it
+/// carries only the modes that can change its verdict: production, and the two
+/// read-back fixes. SPR was already measured as no better than the mean there.
+const REFINE_MODES: [Recovery; 3] = [Recovery::Mean, Recovery::Cut, Recovery::CutSurface];
+
+const RECOVERIES: [Recovery; 5] = [
+    Recovery::Mean,
+    Recovery::Spr,
+    Recovery::SprProjected,
+    Recovery::Cut,
+    Recovery::CutSurface,
+];
 
 struct SurfaceStress {
     grid: VoxelGrid,
@@ -147,9 +171,20 @@ impl SurfaceStress {
             FieldKind::Syz,
             FieldKind::Szx,
         ];
-        let cellf: Vec<Vec<f32>> =
-            kinds.iter().map(|&k| cell_field(grid, u, E0, NU, &eps, k)).collect();
-        let nodal = if mode == Recovery::Mean {
+        // F1: the decoupling only means anything against the occupancy-corrected
+        // `eps` above, which is exactly what this probe uses.
+        let cut = matches!(mode, Recovery::Cut | Recovery::CutSurface)
+            .then(|| cut_normals(grid));
+        let mut cellf: Vec<Vec<f32>> = kinds
+            .iter()
+            .map(|&k| cell_field_cut(grid, u, E0, NU, &eps, None, [0.0; 3], k, cut.as_deref()))
+            .collect();
+        // F3: fit the boundary cells from the clean interior, per component,
+        // BEFORE nodal recovery — the order the shipping path uses.
+        if mode == Recovery::CutSurface {
+            cellf = cellf.iter().map(|c| recover_surface(grid, c)).collect();
+        }
+        let nodal = if mode != Recovery::Spr && mode != Recovery::SprProjected {
             // Interleave the six independently mean-recovered components so both
             // paths share one sampler.
             let per: Vec<Vec<f32>> = cellf.iter().map(|c| recover_nodal(grid, c)).collect();
@@ -567,7 +602,7 @@ fn surf_kirsch_plate_with_hole_offaxis() {
     for &h in &[1.0, 0.5] {
         println!("\n  h={h}  (cells per hole radius ~ {:.0})", a / h);
         println!(
-            "    {:<8} {:<14} {:>10} {:>10} {:>12} {:>12}",
+            "    {:<8} {:<24} {:>10} {:>10} {:>12} {:>12}",
             "rotation", "boundary", "Kt(s1)", "Kt err%", "resid RMS%", "resid MAX%"
         );
         for &deg in &[0.0f64, 15.0, 30.0, 45.0] {
@@ -575,7 +610,7 @@ fn surf_kirsch_plate_with_hole_offaxis() {
           for &exact_cut in &[false, true] {
             let (pg, u, _tl) =
                 rotated_plate(&inside_local, [-hw, -hw, 0.0], [hw, hw, t], phi, h, f_total, exact_cut);
-            for mode in [Recovery::Mean] {
+            for mode in RECOVERIES {
                 let probe = SurfaceStress::new(&pg, &u, mode);
                 // Peak von Mises on the hole rim at mid-thickness (VM is rotation
                 // invariant, and at the rim σ_rr = σ_zz = 0 so VM = |σ_θθ| = Kt·σ∞).
@@ -597,9 +632,13 @@ fn surf_kirsch_plate_with_hole_offaxis() {
                     resid.add(axis_angle_deg(n), norm3(traction(&sg, n)) / (3.0 * sigma_inf));
                 }
                 println!(
-                    "    {:<8} {:<14} {kt:>10.3} {:>+9.1}% {:>11.1}% {:>11.1}%",
+                    "    {:<8} {:<24} {kt:>10.3} {:>+9.1}% {:>11.1}% {:>11.1}%",
                     format!("{deg:.0}°"),
-                    if exact_cut { "EXACT cut KE" } else { "ersatz (today)" },
+                    format!(
+                        "{} / {}",
+                        if exact_cut { "EXACT" } else { "ersatz" },
+                        mode.label()
+                    ),
                     (kt - 3.0) / 3.0 * 100.0,
                     resid.rms() * 100.0,
                     resid.max() * 100.0
@@ -720,8 +759,9 @@ fn surf_kirsch_h_refinement() {
     println!("  whole field drifts up' (p50 rises) from 'only the extremes do'");
     println!("  (p50 flat, max rises).");
     println!(
-        "\n  {:<7} {:>7} {:>11} {:>8} {:>9} | {:>8} {:>8} {:>8} | {:>9} {:>9} {:>8}",
+        "\n  {:<7} {:<14} {:>7} {:>11} {:>8} {:>9} | {:>8} {:>8} {:>8} | {:>9} {:>9} {:>8}",
         "h",
+        "readback",
         "cells/a",
         "cells",
         "Kt(s1)",
@@ -734,8 +774,12 @@ fn surf_kirsch_h_refinement() {
         "solve s"
     );
 
-    let mut kts: Vec<(f64, f64)> = Vec::new(); // (h, Kt max)
-    let mut p50s: Vec<(f64, f64)> = Vec::new(); // (h, median ratio)
+    // The solve dominates this case, so every read-back rides the SAME solve —
+    // adding modes costs sampling time, not the 107 minutes. SPR is left out
+    // deliberately: it was already measured as no better than the mean here, and
+    // the question now is whether the read-back FIXES (F1, F1+F3) converge.
+    let mut kts: Vec<Vec<(f64, f64)>> = vec![Vec::new(); REFINE_MODES.len()]; // (h, Kt max)
+    let mut p50s: Vec<Vec<(f64, f64)>> = vec![Vec::new(); REFINE_MODES.len()]; // (h, median)
     for &h in &[1.0f64, 0.5, 0.25, 0.125] {
         let t0 = Instant::now();
         let (pg, u, _tl) =
@@ -743,43 +787,49 @@ fn surf_kirsch_h_refinement() {
         let secs = t0.elapsed().as_secs_f64();
         let cells = pg.cell_count();
 
-        let probe = SurfaceStress::new(&pg, &u, Recovery::Mean);
-        let mut kt = 0.0f64;
-        let mut resid = ErrBins::new();
-        let mut ratios: Vec<f64> = Vec::new();
-        // Angular sampling refines WITH the mesh so the number of samples per
-        // boundary cell is constant (~23). Otherwise the fine grids would be
-        // undersampled and the peak would look artificially low.
-        let n_theta = (720.0 / h.min(1.0)) as usize;
-        let rr = a + 0.30 * h;
-        for it in 0..n_theta {
-            let th = 2.0 * PI * it as f64 / n_theta as f64;
-            let p = [rr * th.cos(), rr * th.sin(), t / 2.0];
-            let n = [-th.cos(), -th.sin(), 0.0];
-            let Some(sg) = probe.sigma_on_free_surface(p, n) else { continue };
-            let s1 = principal_max(&sg) / sigma_inf;
-            kt = kt.max(s1);
-            resid.add(axis_angle_deg(n), norm3(traction(&sg, n)) / (3.0 * sigma_inf));
-            // Ratio statistics only where the analytic hoop stress is safely
-            // tensile (θ ∈ [45°,135°] ∪ [225°,315°]); near θ=0 it goes
-            // compressive, σ₁ saturates at ~0 and the ratio is meaningless.
-            let exact = kirsch_stt(a, rr, th, sigma_inf);
-            if exact >= 1.0 * sigma_inf {
-                ratios.push(s1 / exact);
+        for (mi, &mode) in REFINE_MODES.iter().enumerate() {
+            let probe = SurfaceStress::new(&pg, &u, mode);
+            let mut kt = 0.0f64;
+            let mut resid = ErrBins::new();
+            let mut ratios: Vec<f64> = Vec::new();
+            // Angular sampling refines WITH the mesh so the number of samples per
+            // boundary cell is constant (~23). Otherwise the fine grids would be
+            // undersampled and the peak would look artificially low.
+            let n_theta = (720.0 / h.min(1.0)) as usize;
+            let rr = a + 0.30 * h;
+            for it in 0..n_theta {
+                let th = 2.0 * PI * it as f64 / n_theta as f64;
+                let p = [rr * th.cos(), rr * th.sin(), t / 2.0];
+                let n = [-th.cos(), -th.sin(), 0.0];
+                let Some(sg) = probe.sigma_on_free_surface(p, n) else { continue };
+                let s1 = principal_max(&sg) / sigma_inf;
+                kt = kt.max(s1);
+                resid.add(axis_angle_deg(n), norm3(traction(&sg, n)) / (3.0 * sigma_inf));
+                // Ratio statistics only where the analytic hoop stress is safely
+                // tensile (θ ∈ [45°,135°] ∪ [225°,315°]); near θ=0 it goes
+                // compressive, σ₁ saturates at ~0 and the ratio is meaningless.
+                let exact = kirsch_stt(a, rr, th, sigma_inf);
+                if exact >= 1.0 * sigma_inf {
+                    ratios.push(s1 / exact);
+                }
             }
+            ratios.sort_by(|x, y| x.partial_cmp(y).unwrap());
+            let q = |f: f64| ratios[((ratios.len() - 1) as f64 * f) as usize];
+            let (p50, p90, rmax) = (q(0.50), q(0.90), q(1.0));
+            println!(
+                "  {:<7} {:<14} {:>7.0} {cells:>11} {kt:>8.3} {:>+8.1}% | {p50:>8.3} {p90:>8.3} {rmax:>8.3} | {:>8.1}% {:>8.1}% {:>8}",
+                format!("{h}"),
+                mode.label(),
+                a / h,
+                (kt - 3.0) / 3.0 * 100.0,
+                resid.rms() * 100.0,
+                resid.max() * 100.0,
+                // The solve is shared across modes; only the first row pays it.
+                if mi == 0 { format!("{secs:.0}") } else { "—".to_string() }
+            );
+            kts[mi].push((h, kt));
+            p50s[mi].push((h, p50));
         }
-        ratios.sort_by(|x, y| x.partial_cmp(y).unwrap());
-        let q = |f: f64| ratios[((ratios.len() - 1) as f64 * f) as usize];
-        let (p50, p90, rmax) = (q(0.50), q(0.90), q(1.0));
-        println!(
-            "  {h:<7} {:>7.0} {cells:>11} {kt:>8.3} {:>+8.1}% | {p50:>8.3} {p90:>8.3} {rmax:>8.3} | {:>8.1}% {:>8.1}% {secs:>8.0}",
-            a / h,
-            (kt - 3.0) / 3.0 * 100.0,
-            resid.rms() * 100.0,
-            resid.max() * 100.0
-        );
-        kts.push((h, kt));
-        p50s.push((h, p50));
     }
 
     // Reference-free convergence: observed order from successive differences,
@@ -789,15 +839,18 @@ fn surf_kirsch_h_refinement() {
         "    {:<12} {:<20} {:>10} {:>9} {:>12}",
         "quantity", "h triple", "Δ", "order p", "extrapolated"
     );
-    for (name, seq) in [("Kt (max)", &kts), ("ratio_p50", &p50s)] {
-        for w in seq.windows(3) {
-            let (d1, d2) = (w[1].1 - w[0].1, w[2].1 - w[1].1);
-            let p = (d1 / d2).abs().log2();
-            let lim = w[2].1 + d2 / ((2f64).powf(p) - 1.0);
-            println!(
-                "    {name:<12} {:<20} {d2:>10.4} {p:>9.2} {lim:>12.3}",
-                format!("{}/{}/{}", w[0].0, w[1].0, w[2].0)
-            );
+    for (mi, &mode) in REFINE_MODES.iter().enumerate() {
+        for (name, seq) in [("Kt (max)", &kts[mi]), ("ratio_p50", &p50s[mi])] {
+            for w in seq.windows(3) {
+                let (d1, d2) = (w[1].1 - w[0].1, w[2].1 - w[1].1);
+                let p = (d1 / d2).abs().log2();
+                let lim = w[2].1 + d2 / ((2f64).powf(p) - 1.0);
+                println!(
+                    "    {:<12} {:<20} {d2:>10.4} {p:>9.2} {lim:>12.3}",
+                    format!("{name} [{}]", mode.label()),
+                    format!("{}/{}/{}", w[0].0, w[1].0, w[2].0)
+                );
+            }
         }
     }
 
@@ -971,7 +1024,7 @@ fn surf_stepped_shaft_fillet_offaxis() {
         for &h in &[0.5, 0.25] {
             println!("    h={h}  (cells across the fillet ~ {:.0})", r / h);
             println!(
-                "    {:<8} {:<14} {:>10} {:>10} {:>12} {:>12}",
+                "    {:<8} {:<24} {:>10} {:>10} {:>12} {:>12}",
                 "rotation", "boundary", "Kt(s1)", "Kt err%", "resid RMS%", "resid MAX%"
             );
             for &deg in &[0.0f64, 45.0] {
@@ -980,7 +1033,7 @@ fn surf_stepped_shaft_fillet_offaxis() {
                 let (pg, u, _tl) =
                     rotated_plate(&inside_local, [0.0, -hd, 0.0], [lbar, hd, t], phi, h, f_total, exact_cut);
                 let (c, s) = (phi.cos(), phi.sin());
-                for mode in [Recovery::Mean] {
+                for mode in RECOVERIES {
                     let probe = SurfaceStress::new(&pg, &u, mode);
                     // Walk the fillet arc (local frame), top flank, mid-thickness.
                     let mut kt = 0.0f64;
@@ -1003,9 +1056,13 @@ fn surf_stepped_shaft_fillet_offaxis() {
                             .add(axis_angle_deg(n), norm3(traction(&sg, n)) / (kt_ref * sigma_nom));
                     }
                     println!(
-                        "    {:<8} {:<14} {kt:>10.3} {:>+9.1}% {:>11.1}% {:>11.1}%",
+                        "    {:<8} {:<24} {kt:>10.3} {:>+9.1}% {:>11.1}% {:>11.1}%",
                         format!("{deg:.0}°"),
-                        if exact_cut { "EXACT cut KE" } else { "ersatz (today)" },
+                        format!(
+                            "{} / {}",
+                            if exact_cut { "EXACT" } else { "ersatz" },
+                            mode.label()
+                        ),
                         (kt - kt_ref) / kt_ref * 100.0,
                         resid.rms() * 100.0,
                         resid.max() * 100.0
@@ -1224,7 +1281,7 @@ fn surf_thin_wall_tube() {
             pg.solid_count()
         );
         println!(
-            "    {:<16} {:>12} {:>12} {:>12} {:>12}",
+            "    {:<24} {:>12} {:>12} {:>12} {:>12}",
             "boundary", "tip/EB", "σxx RMS%", "resid RMS%", "resid MAX%"
         );
 
@@ -1244,38 +1301,49 @@ fn surf_thin_wall_tube() {
             }
             let tip_ratio = if cnt > 0 { (sum / cnt as f64) / delta_eb } else { f64::NAN };
 
-            let probe = SurfaceStress::new(&pg, &u, Recovery::Mean);
-            let (x0, x1) = (0.30 * l, 0.70 * l);
-            let sigma_ref = (-f_tip) * (l - x0) * ro / inertia;
-            let mut resid = ErrBins::new();
-            let mut sxx = ErrBins::new();
-            // Sample BOTH free surfaces — the bore is as traction-free as the OD,
-            // and on a thin wall the two are only a couple of cells apart.
-            for (rad, sgn) in [(ro, 1.0f64), (ri, -1.0f64)] {
-                for ix in 0..15 {
-                    let x = x0 + (x1 - x0) * ix as f64 / 14.0;
-                    for it in 0..240 {
-                        let th = 2.0 * PI * it as f64 / 240.0;
-                        // Nudge INTO the material: outward for the bore, inward
-                        // for the OD.
-                        let rr = rad - sgn * 0.25 * h;
-                        let p = [x, rr * th.cos(), rr * th.sin()];
-                        let n = [0.0, sgn * th.cos(), sgn * th.sin()];
-                        let Some(s) = probe.sigma_on_free_surface(p, n) else { continue };
-                        let ang = axis_angle_deg(n);
-                        resid.add(ang, norm3(traction(&s, n)) / sigma_ref);
-                        let exact = (-f_tip) * (l - x) * (rr * th.sin()) / inertia;
-                        sxx.add(ang, (s[0] - exact) / sigma_ref);
+            // A thin wall is the adversarial case for `recover_surface`: the fit
+            // needs clean interior cells (occupancy 1 on all six faces) within
+            // two cells, and a 1.5 mm wall may have none, so F3 degrades to
+            // nearest-clean or to the raw value. If it helps HERE it helps
+            // anywhere; if it hurts here, that is the limit worth knowing.
+            for mode in RECOVERIES {
+                let probe = SurfaceStress::new(&pg, &u, mode);
+                let (x0, x1) = (0.30 * l, 0.70 * l);
+                let sigma_ref = (-f_tip) * (l - x0) * ro / inertia;
+                let mut resid = ErrBins::new();
+                let mut sxx = ErrBins::new();
+                // Sample BOTH free surfaces — the bore is as traction-free as the
+                // OD, and on a thin wall the two are only a couple of cells apart.
+                for (rad, sgn) in [(ro, 1.0f64), (ri, -1.0f64)] {
+                    for ix in 0..15 {
+                        let x = x0 + (x1 - x0) * ix as f64 / 14.0;
+                        for it in 0..240 {
+                            let th = 2.0 * PI * it as f64 / 240.0;
+                            // Nudge INTO the material: outward for the bore,
+                            // inward for the OD.
+                            let rr = rad - sgn * 0.25 * h;
+                            let p = [x, rr * th.cos(), rr * th.sin()];
+                            let n = [0.0, sgn * th.cos(), sgn * th.sin()];
+                            let Some(s) = probe.sigma_on_free_surface(p, n) else { continue };
+                            let ang = axis_angle_deg(n);
+                            resid.add(ang, norm3(traction(&s, n)) / sigma_ref);
+                            let exact = (-f_tip) * (l - x) * (rr * th.sin()) / inertia;
+                            sxx.add(ang, (s[0] - exact) / sigma_ref);
+                        }
                     }
                 }
+                println!(
+                    "    {:<24} {tip_ratio:>12.4} {:>11.1}% {:>11.1}% {:>11.1}%",
+                    format!(
+                        "{} / {}",
+                        if exact_cut { "EXACT" } else { "ersatz" },
+                        mode.label()
+                    ),
+                    sxx.rms() * 100.0,
+                    resid.rms() * 100.0,
+                    resid.max() * 100.0
+                );
             }
-            println!(
-                "    {:<16} {tip_ratio:>12.4} {:>11.1}% {:>11.1}% {:>11.1}%",
-                if exact_cut { "EXACT cut KE" } else { "ersatz (today)" },
-                sxx.rms() * 100.0,
-                resid.rms() * 100.0,
-                resid.max() * 100.0
-            );
         }
     }
     println!("\n  tip/EB nearer 1.0 = better global stiffness. If the ersatz→exact");
