@@ -243,6 +243,27 @@ can be pointed at a real part.
 | 7.9 | **`surf_kirsch_submodel`** — ±3a box, Dirichlet-driven from a coarse global | the same global solved fine everywhere | does voxel submodeling recover the fine answer, and at what cost? **~11 min** (dominated by the fine global it is checked against) |
 | 7.10 | **`surf_kirsch_submodel_box_sweep`** — 5 box sizes × 3 driver meshes | global h=0.25 | how small can the box be, and how coarse the driver, before submodeling breaks? ~4 min |
 | 7.11 | **`far_field_cut_perpendicular_to_stress`** — bar, frictionless ends, 11 meshes | `σxx = σ∞` exactly, everywhere | the FAR-FIELD read-back on a cell cut perpendicular to the stress — the case F1 was built for. ~10 s |
+| 7.12 | **`stepped_round_bar_vs_ansys`** — `roundbarwithstep.step`, 3 load cases | **Ansys Mechanical**, ν=0.3 (see below) | the first genuine 3-D cross-code reference, on a fillet 1/60th the size of the part. ~4 min |
+| 7.13 | **`stepped_round_bar_submodel_vs_ansys`** | same | submodeling a realistically small feature, incl. torsion across the cut. ~5 min |
+
+**The Ansys reference (7.12/7.13).** `D`=12 over x∈[0,30], concave fillet
+`r_f`=1 over x∈[30,31], `d`=6 over x∈[31,60]; fixed support on the x=0 face,
+load on the x=60 face.
+
+| LC | load | max SEQV | max S1 | implied Kt(σ₁) | Peterson, D/d=2 r/d=0.167 |
+|---|---|---|---|---|---|
+| 1 | axial 1000 N | 59.50 | 65.83 | 1.86 | ~1.85 |
+| 2 | bending 50 N | 98.16 | 108.23 | 1.58 | ~1.55–1.60 |
+| 3 | torsion 1000 N·mm | 51.82 | 29.92 | 1.27 | ~1.25–1.30 |
+
+The reference is self-consistent before anything is compared to it: all three
+implied Kt match the handbook, and LC3 gives `S1/SEQV = 0.5774 = 1/√3` exactly,
+i.e. pure shear, which is what a torsion fillet root must be. Stress is
+independent of `E` for a homogeneous isotropic body under any mix of traction and
+displacement BCs, so the harness runs at `E0` rather than steel's 200 GPa; ν must
+match and does. **Caveat: this compares filaSim to Ansys, not to truth** — the
+mesh convergence of the reference run at a 1 mm fillet is not independently
+established here.
 
 Run: `cargo test -p filasim-core --test surfstress -- --ignored --nocapture`
 (7.6 is excluded from any routine sweep — run it by name, deliberately: it took
@@ -280,9 +301,10 @@ shipping; both modules carry their measured verdicts in their own docs so the
 results are not re-derived.
 
 **Surface recovery (F3) is the exception, and it is resolution-dependent.** It
-biases the reading *downward* by removing the boundary cells from it, so its
-sign of benefit follows the sign of the baseline error, and that flips at
-roughly **10–15 cells per feature radius**:
+biases the reading *downward* by removing the boundary cells from it, so **its
+sign of benefit follows the sign of the baseline error** — it helps exactly when
+the baseline over-reads and hurts when it under-reads. On the Kirsch hole that
+sign change lands near 10–20 cells per hole radius:
 
 - *Below* the threshold the baseline under-reads and F3 doubles the error
   (hole at 5 cells/radius: −16.6% → −31.3%).
@@ -295,6 +317,16 @@ geometry (quarter plate, symmetry BCs, its own samplers). Normalised to cells
 per hole radius the two harnesses agree to within a few points — 5 cells:
 raw −12.9% / recovered −29.1% there vs −16.6% / −31.3% here; 10 cells: −0.7% /
 −10.2% vs −7.6% / −13.6%. Two independently written samplers, same curve.
+
+**Do NOT read "10–20 cells per radius" as a universal threshold.** It is where
+*this* geometry's baseline changes sign, nothing more. Case F (stepped round bar
+vs Ansys) is still under-reading by −6.6% at **16** cells per fillet radius, so
+F3 has no over-read to remove there and loses to the production read-back at
+every mesh tested. The portable statement is the sign rule above; the cell count
+is a property of the feature, and a concave 3-D blend behaves differently from a
+through-hole. Where the sign change sits for an unfamiliar feature is not known
+in advance — which is what the `surface_band` / `MeshQuality` pair exists to
+report per solve instead of guessing.
 
 F1 alone is a **no-op on the peak** (identical to three decimals at every mesh
 in 7.6) but consistently improves the free-surface traction residual MAX
@@ -601,22 +633,30 @@ cases — useful for setting user expectations.
 >   CalculiX cross-check gives it a 3-D reference.** It can measure *changes*,
 >   not *correctness*.
 >
->   **The staircase reading is now confirmed rather than inferred.** Under
->   surface recovery the same fillet converges: −8.5% at `h`=0.5 and +6.2% at
->   `h`=0.25, against +4.9% → +14.6% raw, and the same reversal holds across
+>   **The staircase reading is supported, but case 2.6's absolute error is still
+>   not usable as a gate.** Under surface recovery the same fillet converges:
+>   −8.5% at `h`=0.5 and +6.2% at `h`=0.25, against +4.9% → +14.6% raw, across
 >   both radii, both rotations and both stiffness operators. A read-back change
->   cannot remove a genuine 3-D-constraint effect, so the fact that it removes
->   this divergence rules the 3-D explanation out and leaves the staircase.
+>   cannot remove a genuine 3-D-constraint effect, which argues against the 3-D
+>   explanation for the *divergence*. But the sign of 2.6's error is measured
+>   against the 2-D chart this very caution distrusts, and case 7.12 — the same
+>   topology, round, against a real 3-D Ansys solution — **under**-reads at every
+>   mesh it can afford. So "the raw read-back over-reads a fillet" is not
+>   established; what is established is that the raw sequence moves upward under
+>   refinement while the recovered one does not.
 >
 > - **Refining now helps — but only with surface recovery on.** This caution
 >   previously read "do not refine a mesh to make a displayed peak more
 >   accurate," and that is still correct for the raw read-back: more cells per
 >   feature radius improve the field everywhere except the max statistic, which
 >   boundary roughness drives upward. With `recover_surface` the max converges
->   too (observed order ≈1), so refining is productive above roughly **15 cells
->   per feature radius**. Below that threshold recovery under-reads and the raw
->   value is closer — which is the regime `MeshQuality` reports as `unresolved`.
->   Read the band, not one number.
+>   too (observed order ≈1), so refining is productive — on the Kirsch hole,
+>   above roughly 15 cells per hole radius. That number is **not** portable: on
+>   the stepped round bar of case F the baseline is still under-reading at 16
+>   cells per fillet radius, so recovery is still the worse of the two there.
+>   Recovery only ever biases downward; it helps where the baseline over-reads
+>   and hurts where it under-reads. Read the band and the `MeshQuality` bucket,
+>   which measure that per solve, rather than a remembered cell count.
 
 ---
 

@@ -1900,3 +1900,456 @@ fn far_field_cut_perpendicular_to_stress() {
     println!("  face (not a free one) to appear and the probe must be rebuilt.");
 }
 
+
+// ------------------------------- case F: stepped round bar vs an ANSYS solution
+
+/// **The 3-D reference this tier has been missing.** Â§10 says case 2.6 (the
+/// shoulder fillet) cannot be used as an accuracy gate until a cross-code check
+/// gives it a genuine 3-D reference, because the 2-D Peterson chart is not the
+/// right answer for a thick section. This is that reference: a stepped ROUND bar
+/// solved in Ansys Mechanical (structural steel, Î½=0.3), three load cases.
+///
+/// ```text
+/// D = 12 (x 0..30), fillet r_f = 1 (x 30..31), d = 6 (x 31..60)
+/// fixed support on the x=0 face, load on the x=60 face
+///
+/// LC              load          max SEQV   max S1
+/// 1  axial        1000 N          59.50     65.83
+/// 2  bending        50 N          98.16    108.23
+/// 3  torsion      1000 NÂ·mm       51.82     29.92
+/// ```
+///
+/// The reference is internally consistent before we compare anything to it:
+/// implied Kt = 1.86 / 1.58 / 1.27 against Peterson's ~1.85 / ~1.55-1.60 /
+/// ~1.25-1.30 for D/d = 2, r/d = 0.167, and LC3 gives S1/SEQV = 0.5774 = 1/âˆš3
+/// exactly, which is pure shear â€” what a torsion fillet root must be.
+///
+/// STRESS IS INDEPENDENT OF E for a homogeneous isotropic body under any mix of
+/// traction and displacement BCs, so running at the harness `E0` rather than
+/// steel's 200 GPa costs nothing. Î½ must match, and does (0.3).
+///
+/// **The hard part is the fillet is TINY** â€” r_f = 1 mm on a 60 mm bar. Cells
+/// across the fillet radius are 1/h: just 8 even at h=0.125 and 4.4M cells.
+/// Reaching the ~15 cells/radius crossover where the recovered read-back is
+/// trustworthy (Â§6b) would need h=0.07, i.e. ~69M cells globally. This case is
+/// therefore the realistic illustration of why 7.9's submodel matters: the
+/// global mesh cannot resolve the feature that sets the answer.
+#[test]
+#[ignore]
+fn stepped_round_bar_vs_ansys() {
+    use std::f64::consts::PI;
+    println!("\n=== CASE F: STEPPED ROUND BAR vs ANSYS ===");
+    println!("  D=12 (x 0..30), fillet r_f=1 (x 30..31), d=6 (x 31..60).");
+    println!("  Fixed at x=0, loaded at x=60. nu=0.3 both codes.");
+    println!("  Peak read on the FILLET surface â€” max over the blend, which is");
+    println!("  where Ansys puts its Max marker in all three load cases.");
+
+    const XA: f64 = 30.0; // shoulder plane / fillet start
+    const XB: f64 = 31.0; // fillet end / small shaft start
+    const RF: f64 = 1.0; // fillet radius
+    const RBIG: f64 = 6.0;
+    const RSML: f64 = 3.0;
+    const LEN: f64 = 60.0;
+
+    let inside = |p: [f64; 3]| -> bool {
+        let (x, r) = (p[0], (p[1] * p[1] + p[2] * p[2]).sqrt());
+        if !(0.0..=LEN).contains(&x) {
+            return false;
+        }
+        if x <= XA {
+            r <= RBIG
+        } else if x <= XB {
+            // Concave blend: material is everything at least RF from the arc
+            // centre (XB, RSML+RF), plus the shaft core itself.
+            r <= RSML
+                || (r <= RSML + RF
+                    && (x - XB).powi(2) + (r - (RSML + RF)).powi(2) >= RF * RF)
+        } else {
+            r <= RSML
+        }
+    };
+
+    // Nominal stresses on the small section, for the Kt columns.
+    let area = PI * RSML * RSML;
+    let z_bend = PI * (2.0 * RSML).powi(3) / 32.0;
+    let z_pol = PI * (2.0 * RSML).powi(3) / 16.0;
+    let nom = [
+        1000.0 / area,                  // LC1 axial
+        50.0 * (LEN - XB) / z_bend,     // LC2 bending, moment at the fillet root
+        1000.0 / z_pol,                 // LC3 torsion (shear)
+    ];
+    // (name, ansys SEQV, ansys S1)
+    let cases = [
+        ("LC1 axial 1000N", 59.50f64, 65.83f64),
+        ("LC2 bending 50N", 98.16, 108.23),
+        ("LC3 torsion 1000Nmm", 51.82, 29.92),
+    ];
+
+    println!(
+        "\n  {:<22} {:>5} {:>7} {:<14} {:>9} {:>9} {:>9} {:>9} {:>7}",
+        "case", "h", "cells/rf", "readback", "SEQV", "vs ansys", "S1", "vs ansys", "Kt(S1)"
+    );
+
+    for &h in &[1.0f64, 0.5, 0.25, 0.125] {
+        let grid = voxelize_production(
+            &inside,
+            [0.0, -RBIG, -RBIG],
+            [LEN, RBIG, RBIG],
+            h,
+            6,
+            1,
+        );
+        let settings =
+            SolveSettings { e0: E0, nu: NU, tol: 1e-8, max_iter: 3000, ..Default::default() };
+        let (pg, levels) = pad_for_levels(&grid, settings.max_levels);
+        let (mx, my, mz) = (pg.nx + 1, pg.ny + 1, pg.nz + 1);
+        let act = active_nodes(&pg);
+        let npos = |n: usize| -> [f64; 3] {
+            let (x, y, z) = (n % mx, (n / mx) % my, n / (mx * my));
+            [
+                pg.origin[0] + x as f64 * pg.h,
+                pg.origin[1] + y as f64 * pg.h,
+                pg.origin[2] + z as f64 * pg.h,
+            ]
+        };
+        let mut fixed = Vec::new();
+        let mut tip: Vec<(usize, [f64; 3])> = Vec::new();
+        for n in 0..mx * my * mz {
+            if !act[n] {
+                continue;
+            }
+            let p = npos(n);
+            if p[0] <= 0.5 * pg.h {
+                fixed.push(n as u32);
+            } else if p[0] >= LEN - 0.5 * pg.h {
+                tip.push((n, p));
+            }
+        }
+        assert!(!fixed.is_empty() && !tip.is_empty(), "bar BCs at h={h}");
+        let inv = 1.0 / tip.len() as f64;
+        // Torsion: tangential forces f = cÂ·(0,âˆ’z,y) give Mx = cÂ·Î£rÂ², so scaling
+        // by c = T/Î£rÂ² lands the resultant torque exactly.
+        let sum_r2: f64 = tip.iter().map(|(_, p)| p[1] * p[1] + p[2] * p[2]).sum();
+
+        for (ci, &(name, a_seqv, a_s1)) in cases.iter().enumerate() {
+            let mut np = NodeProblem::default();
+            np.fixed = fixed.clone();
+            for &(n, p) in &tip {
+                let f = match ci {
+                    0 => [1000.0 * inv, 0.0, 0.0],
+                    1 => [0.0, 50.0 * inv, 0.0],
+                    _ => {
+                        let c = 1000.0 / sum_r2;
+                        [0.0, -c * p[2], c * p[1]]
+                    }
+                };
+                np.forces.push((n as u32, f));
+            }
+            let u = solve_nodes(&pg, levels, &np, &settings).expect("bar solve").u;
+
+            for mode in [Recovery::Mean, Recovery::CutSurface] {
+                let probe = SurfaceStress::new(&pg, &u, mode);
+                let (mut seqv, mut s1) = (0f64, f64::MIN);
+                // Walk the fillet blend: meridian angle alpha over the quarter
+                // arc, full circumference.
+                let n_a = (60.0 / h.min(1.0)).max(24.0) as usize;
+                let n_t = (360.0 / h.min(1.0)) as usize;
+                for ia in 0..=n_a {
+                    let alpha = PI + 0.5 * PI * ia as f64 / n_a as f64;
+                    let (xs, rs) = (XB + alpha.cos() * RF, RSML + RF + alpha.sin() * RF);
+                    // Outward normal points at the arc centre (concave blend).
+                    let (nx, nr) = (-alpha.cos(), -alpha.sin());
+                    for it in 0..n_t {
+                        let th = 2.0 * PI * it as f64 / n_t as f64;
+                        let (ct, st) = (th.cos(), th.sin());
+                        let nn = [nx, nr * ct, nr * st];
+                        let p = [
+                            xs - 0.30 * h * nn[0],
+                            rs * ct - 0.30 * h * nn[1],
+                            rs * st - 0.30 * h * nn[2],
+                        ];
+                        let Some(sg) = probe.sigma_on_free_surface(p, nn) else { continue };
+                        seqv = seqv.max(von_mises(&sg));
+                        s1 = s1.max(principal_max(&sg));
+                    }
+                }
+                println!(
+                    "  {:<22} {h:>5} {:>7.0} {:<14} {seqv:>9.2} {:>+8.1}% {s1:>9.2} {:>+8.1}% {:>7.2}",
+                    if mode == Recovery::Mean { name } else { "" },
+                    RF / h,
+                    mode.label(),
+                    (seqv - a_seqv) / a_seqv * 100.0,
+                    (s1 - a_s1) / a_s1 * 100.0,
+                    s1 / nom[ci]
+                );
+            }
+        }
+    }
+
+    println!("\n  Ansys implied Kt(S1): 1.86 axial / 1.58 bending / 1.27 torsion");
+    println!("  (Peterson D/d=2 r/d=0.167: ~1.85 / ~1.55-1.60 / ~1.25-1.30).");
+    println!("  cells/rf is cells per FILLET radius â€” the resolution that matters.");
+    println!("  Per 6b the recovered read-back only becomes trustworthy above ~15,");
+    println!("  which no global mesh here reaches: h=0.125 is 8, at 4.4M cells.");
+}
+
+
+// --------------------- case Fâ€²: the Ansys bar, reached by submodeling the fillet
+
+/// Case F converges toward the Ansys answer but cannot arrive: the fillet is
+/// `r_f = 1` on a 60 mm bar, so cells per fillet radius are `1/h` and even
+/// h=0.125 â€” 4.4M cells â€” buys only 8. Crossing the ~15 of Â§6b globally needs
+/// hâ‰ˆ0.06, about 35M cells. This is the realistic version of the problem 7.9
+/// solved on a toy: the feature that sets the answer is 1/60th of the part.
+///
+/// Two rows, doing two different jobs:
+///
+/// * **validation** â€” `sub h=0.125 from h=0.5` against case F's *global* h=0.125
+///   (axial âˆ’10.5%, bending âˆ’14.8%, torsion âˆ’2.5%). Same mesh, different route;
+///   they should agree. This is 7.9's check repeated on a geometry with a real
+///   3-D reference and three load cases including torsion.
+/// * **extension** â€” `sub h=0.0625 from h=0.25` reaches 16 cells per fillet
+///   radius, past the crossover, which no global mesh here can afford.
+///
+/// The box spans `x âˆˆ [27, 35]` â€” about 1.3 small-diameters either side of the
+/// blend â€” and is cut only in `x`; the cylindrical surface inside it is the
+/// bar's own free surface and stays free. Torsion is the load case that most
+/// stresses the Dirichlet interpolation, since the boundary data carries the
+/// whole twist across the cut.
+#[test]
+#[ignore]
+fn stepped_round_bar_submodel_vs_ansys() {
+    use std::f64::consts::PI;
+    println!("\n=== CASE F': the ANSYS bar via a fillet submodel ===");
+    println!("  Box x in [27,35], cut in x only. Driver -> submodel, three LCs.");
+
+    const XA: f64 = 30.0;
+    const XB: f64 = 31.0;
+    const RF: f64 = 1.0;
+    const RBIG: f64 = 6.0;
+    const RSML: f64 = 3.0;
+    const LEN: f64 = 60.0;
+    const BX0: f64 = 27.0;
+    const BX1: f64 = 35.0;
+
+    let inside = |p: [f64; 3]| -> bool {
+        let (x, r) = (p[0], (p[1] * p[1] + p[2] * p[2]).sqrt());
+        if !(0.0..=LEN).contains(&x) {
+            return false;
+        }
+        if x <= XA {
+            r <= RBIG
+        } else if x <= XB {
+            r <= RSML
+                || (r <= RSML + RF
+                    && (x - XB).powi(2) + (r - (RSML + RF)).powi(2) >= RF * RF)
+        } else {
+            r <= RSML
+        }
+    };
+    let cases = [
+        ("LC1 axial 1000N", 59.50f64, 65.83f64),
+        ("LC2 bending 50N", 98.16, 108.23),
+        ("LC3 torsion 1000Nmm", 51.82, 29.92),
+    ];
+
+    // Peak SEQV / S1 over the fillet blend, as case F reads it.
+    let read_fillet = |pg: &VoxelGrid, u: &[f32], mode: Recovery, h: f64| -> (f64, f64) {
+        let probe = SurfaceStress::new(pg, u, mode);
+        let (mut seqv, mut s1) = (0f64, f64::MIN);
+        let n_a = (60.0 / h.min(1.0)).max(24.0) as usize;
+        let n_t = (360.0 / h.min(1.0)) as usize;
+        for ia in 0..=n_a {
+            let alpha = PI + 0.5 * PI * ia as f64 / n_a as f64;
+            let (xs, rs) = (XB + alpha.cos() * RF, RSML + RF + alpha.sin() * RF);
+            let (nx, nr) = (-alpha.cos(), -alpha.sin());
+            for it in 0..n_t {
+                let th = 2.0 * PI * it as f64 / n_t as f64;
+                let (ct, st) = (th.cos(), th.sin());
+                let nn = [nx, nr * ct, nr * st];
+                let p = [
+                    xs - 0.30 * h * nn[0],
+                    rs * ct - 0.30 * h * nn[1],
+                    rs * st - 0.30 * h * nn[2],
+                ];
+                let Some(sg) = probe.sigma_on_free_surface(p, nn) else { continue };
+                seqv = seqv.max(von_mises(&sg));
+                s1 = s1.max(principal_max(&sg));
+            }
+        }
+        (seqv, s1)
+    };
+    let sample_u = |pg: &VoxelGrid, u: &[f32], act: &[bool], p: [f64; 3]| -> Option<[f64; 3]> {
+        let (mx, my) = (pg.nx + 1, pg.ny + 1);
+        let mz = pg.nz + 1;
+        let f = [
+            (p[0] - pg.origin[0]) / pg.h,
+            (p[1] - pg.origin[1]) / pg.h,
+            (p[2] - pg.origin[2]) / pg.h,
+        ];
+        let base = [
+            (f[0].floor() as i64).clamp(0, mx as i64 - 2) as usize,
+            (f[1].floor() as i64).clamp(0, my as i64 - 2) as usize,
+            (f[2].floor() as i64).clamp(0, mz as i64 - 2) as usize,
+        ];
+        let tt = [
+            (f[0] - base[0] as f64).clamp(0.0, 1.0),
+            (f[1] - base[1] as f64).clamp(0.0, 1.0),
+            (f[2] - base[2] as f64).clamp(0.0, 1.0),
+        ];
+        let (mut acc, mut wsum) = ([0f64; 3], 0f64);
+        for oz in 0..2 {
+            for oy in 0..2 {
+                for ox in 0..2 {
+                    let n = ((base[2] + oz) * my + (base[1] + oy)) * mx + (base[0] + ox);
+                    let w = (if ox == 1 { tt[0] } else { 1.0 - tt[0] })
+                        * (if oy == 1 { tt[1] } else { 1.0 - tt[1] })
+                        * (if oz == 1 { tt[2] } else { 1.0 - tt[2] });
+                    if w <= 0.0 || !act[n] {
+                        continue;
+                    }
+                    for c in 0..3 {
+                        acc[c] += w * u[3 * n + c] as f64;
+                    }
+                    wsum += w;
+                }
+            }
+        }
+        if wsum <= 1e-12 {
+            return None;
+        }
+        Some([acc[0] / wsum, acc[1] / wsum, acc[2] / wsum])
+    };
+
+    println!(
+        "\n  {:<22} {:<22} {:>8} {:>10} {:>9} {:>9} {:>9} {:>9}",
+        "case", "route", "cells/rf", "cells", "SEQV", "vs ansys", "S1", "vs ansys"
+    );
+
+    for &(h_g, h_s) in &[(0.5f64, 0.125f64), (0.25, 0.0625)] {
+        // Driver: the whole bar, one solve per load case.
+        let grid =
+            voxelize_production(&inside, [0.0, -RBIG, -RBIG], [LEN, RBIG, RBIG], h_g, 6, 1);
+        let settings =
+            SolveSettings { e0: E0, nu: NU, tol: 1e-8, max_iter: 3000, ..Default::default() };
+        let (pg_g, lv_g) = pad_for_levels(&grid, settings.max_levels);
+        let (gx, gy, gz) = (pg_g.nx + 1, pg_g.ny + 1, pg_g.nz + 1);
+        let act_g = active_nodes(&pg_g);
+        let gpos = |n: usize| -> [f64; 3] {
+            let (x, y, z) = (n % gx, (n / gx) % gy, n / (gx * gy));
+            [
+                pg_g.origin[0] + x as f64 * pg_g.h,
+                pg_g.origin[1] + y as f64 * pg_g.h,
+                pg_g.origin[2] + z as f64 * pg_g.h,
+            ]
+        };
+        let (mut fixed, mut tip) = (Vec::new(), Vec::new());
+        for n in 0..gx * gy * gz {
+            if !act_g[n] {
+                continue;
+            }
+            let p = gpos(n);
+            if p[0] <= 0.5 * pg_g.h {
+                fixed.push(n as u32);
+            } else if p[0] >= LEN - 0.5 * pg_g.h {
+                tip.push((n, p));
+            }
+        }
+        let inv = 1.0 / tip.len() as f64;
+        let sum_r2: f64 = tip.iter().map(|(_, p)| p[1] * p[1] + p[2] * p[2]).sum();
+
+        // Submodel grid, shared across load cases (only the RHS changes).
+        let inside_sub = |p: [f64; 3]| -> bool { inside(p) && p[0] >= BX0 && p[0] <= BX1 };
+        let sgrid = voxelize_production(
+            &inside_sub,
+            [BX0, -RBIG, -RBIG],
+            [BX1, RBIG, RBIG],
+            h_s,
+            6,
+            1,
+        );
+        let (pg_s, lv_s) = pad_for_levels(&sgrid, settings.max_levels);
+        let (sx, sy, sz) = (pg_s.nx + 1, pg_s.ny + 1, pg_s.nz + 1);
+        let act_s = active_nodes(&pg_s);
+        let spos = |n: usize| -> [f64; 3] {
+            let (x, y, z) = (n % sx, (n / sx) % sy, n / (sx * sy));
+            [
+                pg_s.origin[0] + x as f64 * pg_s.h,
+                pg_s.origin[1] + y as f64 * pg_s.h,
+                pg_s.origin[2] + z as f64 * pg_s.h,
+            ]
+        };
+        // The two artificial cut planes; the cylindrical surface stays free.
+        let cut_nodes: Vec<usize> = (0..sx * sy * sz)
+            .filter(|&n| {
+                act_s[n] && {
+                    let x = spos(n)[0];
+                    (x - BX0).abs() <= 0.5 * pg_s.h || (x - BX1).abs() <= 0.5 * pg_s.h
+                }
+            })
+            .collect();
+        assert!(!cut_nodes.is_empty(), "no submodel cut nodes at h={h_s}");
+        let k = 300.0 * E0 * pg_s.h;
+
+        for (ci, &(name, a_seqv, a_s1)) in cases.iter().enumerate() {
+            let mut np = NodeProblem::default();
+            np.fixed = fixed.clone();
+            for &(n, p) in &tip {
+                let f = match ci {
+                    0 => [1000.0 * inv, 0.0, 0.0],
+                    1 => [0.0, 50.0 * inv, 0.0],
+                    _ => {
+                        let c = 1000.0 / sum_r2;
+                        [0.0, -c * p[2], c * p[1]]
+                    }
+                };
+                np.forces.push((n as u32, f));
+            }
+            let u_g = solve_nodes(&pg_g, lv_g, &np, &settings).expect("driver solve").u;
+            let (gq, g1) = read_fillet(&pg_g, &u_g, Recovery::Mean, h_g);
+            println!(
+                "  {name:<22} {:<22} {:>8.0} {:>10} {gq:>9.2} {:>+8.1}% {g1:>9.2} {:>+8.1}%",
+                format!("global h={h_g}"),
+                RF / h_g,
+                pg_g.cell_count(),
+                (gq - a_seqv) / a_seqv * 100.0,
+                (g1 - a_s1) / a_s1 * 100.0
+            );
+
+            let mut nps = NodeProblem::default();
+            for &n in &cut_nodes {
+                let Some(ud) = sample_u(&pg_g, &u_g, &act_g, spos(n)) else { continue };
+                for d in 0..3 {
+                    let mut dir = [0f64; 3];
+                    dir[d] = 1.0;
+                    nps.springs.push((n as u32, dir, k));
+                    if ud[d] != 0.0 {
+                        let mut f = [0f64; 3];
+                        f[d] = k * ud[d];
+                        nps.forces.push((n as u32, f));
+                    }
+                }
+            }
+            let u_s = solve_nodes(&pg_s, lv_s, &nps, &settings).expect("submodel solve").u;
+            for mode in [Recovery::Mean, Recovery::CutSurface] {
+                let (sq, s1) = read_fillet(&pg_s, &u_s, mode, h_s);
+                println!(
+                    "  {:<22} {:<22} {:>8.0} {:>10} {sq:>9.2} {:>+8.1}% {s1:>9.2} {:>+8.1}%",
+                    "",
+                    format!("sub h={h_s} [{}]", mode.label()),
+                    RF / h_s,
+                    pg_s.cell_count(),
+                    (sq - a_seqv) / a_seqv * 100.0,
+                    (s1 - a_s1) / a_s1 * 100.0
+                );
+            }
+        }
+    }
+
+    println!("\n  Row 1 of each pair validates: sub h=0.125 should reproduce case F's");
+    println!("  GLOBAL h=0.125 (axial -10.5%, bending -14.8%, torsion -2.5%).");
+    println!("  Row 2 extends past what a global mesh can afford: 16 cells per");
+    println!("  fillet radius, over the crossover, where cut+surf-rec should start");
+    println!("  BEATING the production read-back rather than trailing it.");
+}
+
