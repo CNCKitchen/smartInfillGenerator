@@ -151,6 +151,7 @@ fn problem_for(grid: &VoxelGrid) -> NodeProblem {
         springs: Vec::new(),
         forces: load.into_iter().map(|n| (n, [0.0, 0.0, f])).collect(),
         rigid: Vec::new(),
+        prescribed: Vec::new(),
     }
 }
 

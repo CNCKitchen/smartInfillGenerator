@@ -1649,6 +1649,25 @@ impl MgSolver {
     /// optimization loop re-solves after small density updates and converges
     /// in a few iterations from the previous displacement field.
     pub fn solve_warm(&mut self, b: &[f64], u: &mut [f64], tol: f64, max_iter: usize) -> SolveStats {
+        self.solve_warm_ref(b, u, tol, max_iter, None)
+    }
+
+    /// Like `solve_warm`, but measures the relative residual against
+    /// `ref_norm` instead of ‖b‖. Pass `Some` when ‖b‖ is not the physical load
+    /// scale — penalty-enforced PRESCRIBED DISPLACEMENTS put a `k·value` term in
+    /// `b` that is orders of magnitude larger than any force in the model and
+    /// cancels against the spring in `K·u`, so `tol` measured against ‖b‖ stops
+    /// meaning anything (see `solve::solve_slot`, which passes the lifted-problem
+    /// norm ‖b − K·u_lift‖). `None` keeps the plain ‖b‖ criterion, so every
+    /// caller without a prescribed motion is unchanged.
+    pub fn solve_warm_ref(
+        &mut self,
+        b: &[f64],
+        u: &mut [f64],
+        tol: f64,
+        max_iter: usize,
+        ref_norm: Option<f64>,
+    ) -> SolveStats {
         let n = self.levels[0].ndof();
         assert_eq!(b.len(), n);
         assert_eq!(u.len(), n);
@@ -1672,6 +1691,11 @@ impl MgSolver {
             u.fill(0.0);
             return SolveStats { iterations: 0, rel_residual: 0.0, converged: true };
         }
+        // The scale every reported/compared residual below is divided by.
+        let norm_b = match ref_norm {
+            Some(v) if v.is_finite() && v > 0.0 => v,
+            _ => norm_b,
+        };
         // r = b - A u0
         let mut r = vec![0f64; n];
         self.levels[0].apply64_eps(&self.eps_exact, self.ti_eps_exact.as_deref(), u, &mut r);

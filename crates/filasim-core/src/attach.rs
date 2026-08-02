@@ -153,7 +153,7 @@ pub struct Assembled {
     /// Nodes attached to each BC, in input order (for visualization/debug).
     pub bc_nodes: Vec<Vec<u32>>,
     /// Range into `problem.springs` contributed by each BC, in input order —
-    /// lets reaction recovery attribute a penalty spring back to its support.
+    /// attributes a penalty spring back to the support that placed it.
     pub bc_springs: Vec<std::ops::Range<usize>>,
     /// Range into `problem.forces` contributed by each BC, in input order.
     /// Body-load (self-weight) forces are appended after all BCs and belong to
@@ -253,6 +253,17 @@ pub fn assemble(
                 // This rides the force RHS path, so the value never invalidates
                 // the cached matrix (only the constrained-axis SET does).
                 let k = SPRING_FACTOR * settings.e0 * h;
+                // The same motion as a DISPLACEMENT, on the enforced axes only.
+                // `k·value` is a few hundred times the force the support really
+                // transmits, so it must not be what the solver measures its
+                // convergence against — `NodeProblem::prescribed` hands the
+                // solve the lift it needs to rescale that test.
+                let mut lift = [0f64; 3];
+                for d in 0..3 {
+                    if axes[d] {
+                        lift[d] = values[d];
+                    }
+                }
                 for &n in &nodes {
                     let p = node_pos(n);
                     for d in 0..3 {
@@ -267,6 +278,9 @@ pub fn assemble(
                                 problem.forces.push((n, f));
                             }
                         }
+                    }
+                    if lift != [0.0; 3] {
+                        problem.prescribed.push((n, lift));
                     }
                 }
             }

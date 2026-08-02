@@ -146,6 +146,41 @@ compatibility or simulation results; patch releases are fixes only.
     micro-timings and a nested-start probe. `mg.rs` records the negative results.
 
 ### Fixed
+- **A pressure load drew no glyph in the setup view** — it was the only load
+  with nothing but a face tint to show for itself: no marker, no value label,
+  so a pressure was invisible next to the arrows of a force. It now gets a
+  field of equal-length arrows normal to the loaded patch (uniform pressure ⇒
+  equal arrows) plus the usual value callout. The arrows follow the sign
+  convention: a positive pressure pushes, so they point INTO the surface with
+  their tips on it; a negative one pulls and points out, tails on the surface.
+- **Reaction forces on a model with a prescribed displacement were wrong** — not
+  slightly wrong: on a C-clamp spread by ±2.5 mm at its two prongs, the supports
+  reported 4 N and 35 N with the fixed anchor carrying 140 N, so the three
+  reactions did not even sum to zero (they must — nothing else loads the part).
+  The prescribed value is enforced by penalty springs, so it enters the
+  right-hand side as `k·value` with `k = 300·E₀·h`: a few hundred times any real
+  force in the model, and a term that cancels against the spring inside `K·u`.
+  It dominated ‖b‖, and since the solver's tolerance is *relative to* ‖b‖, the
+  default `1e-5` was accepting ~30 N of out-of-balance force on a problem whose
+  answer is ~13 N. The convergence test is now measured against the LIFTED
+  problem — `‖b − K·u_lift‖`, from which the penalty cancels exactly — so `tol`
+  means the same thing it means for a force-loaded solve. Same clamp now reads
+  −13.3 N / +13.3 N with the fixed anchor at ~0.3 N. The displacement field was
+  ~1 % off for the same reason and is fixed with it; stresses and safety factors
+  on prescribed-displacement models move accordingly. Solves that prescribe no
+  motion are bit-identical (no lift ⇒ the ‖b‖ criterion is untouched). Such a
+  solve now needs several times more iterations — that is the real cost of the
+  accuracy, previously hidden by stopping early.
+- Support reactions are now recovered by ONE rule for every support kind —
+  nodal equilibrium of the element operator, `Rₙ = (K·u)ₙ − fₙ^ext` — instead of
+  summing spring forces for the penalty supports (Displacement / Frictionless /
+  Cylindrical / Elastic). The two are algebraically identical, but the spring
+  form multiplies the solve's displacement error by the penalty stiffness and
+  the equilibrium form only by `E₀·h`, ~300× less: on the clamp above it is the
+  difference between reactions good to 0.2 % and reactions good to 5 % that move
+  by half a newton between runs. `Σ R` now closes to solver accuracy as well,
+  because the element operator's zero row sums make the nodal balances
+  telescope.
 - Reorienting the part (rotate, place-on-face, rescale) left the cached cylinder
   fit of a cylindrical support or a bearing load behind, so its axis glyph and
   bore-fan drew at the old pose while the part had moved. The cached fit now
