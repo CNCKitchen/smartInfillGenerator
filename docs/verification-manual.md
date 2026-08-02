@@ -662,4 +662,6 @@ cases — useful for setting user expectations.
 
 *For the engineering theory behind these cases, see the
 [Theory Manual](theory-manual.md). For product rationale, see
-[`DESIGN.md`](../DESIGN.md).*
+[`DESIGN.md`](../DESIGN.md). For what Tier 7 implies for the product and how to
+act on it, see
+[Feature resolution & submodeling](feature-resolution-and-submodeling.md).*
