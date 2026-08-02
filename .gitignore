@@ -58,3 +58,8 @@ Thumbs.db
 *.swp
 *~
 buildsim_out/
+
+# Tessellated STEP geometry for the native benchmark harnesses. Regenerated in
+# seconds by web/scripts/tessellate-step.mjs from the .step files above — never
+# commit them (kirschbench and the Tier-7 cases build their own).
+*.bin
