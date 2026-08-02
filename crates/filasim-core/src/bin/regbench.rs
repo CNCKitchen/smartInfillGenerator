@@ -440,7 +440,7 @@ fn bench_beam(
     // --- tension: total +Fx spread over the tip face ---
     let forces: Vec<(u32, [f64; 3])> =
         tip.iter().map(|&n| (n, [TENSION_N / tip.len() as f64, 0.0, 0.0])).collect();
-    let prob = NodeProblem { fixed: fixed.clone(), springs: Vec::new(), forces, rigid: Vec::new() };
+    let prob = NodeProblem { fixed: fixed.clone(), springs: Vec::new(), forces, rigid: Vec::new(), prescribed: Vec::new() };
     let t0 = Instant::now();
     let r = solve_cached(&mut None, &grid, levels, &prob, &s, eps.clone(), s.tol, s.max_iter)
         .expect("tension solve");
@@ -459,7 +459,7 @@ fn bench_beam(
     // --- bending: total -Fz spread over the tip face ---
     let forces: Vec<(u32, [f64; 3])> =
         tip.iter().map(|&n| (n, [0.0, 0.0, BENDING_N / tip.len() as f64])).collect();
-    let prob = NodeProblem { fixed: fixed.clone(), springs: Vec::new(), forces, rigid: Vec::new() };
+    let prob = NodeProblem { fixed: fixed.clone(), springs: Vec::new(), forces, rigid: Vec::new(), prescribed: Vec::new() };
     let t0 = Instant::now();
     let r = solve_cached(&mut None, &grid, levels, &prob, &s, eps.clone(), s.tol, s.max_iter)
         .expect("bending solve");
@@ -480,7 +480,7 @@ fn bench_beam(
     }
 
     // --- modal: root-clamped free vibration, lowest 6 modes ---
-    let mprob = NodeProblem { fixed: fixed.clone(), springs: Vec::new(), forces: Vec::new(), rigid: Vec::new() };
+    let mprob = NodeProblem { fixed: fixed.clone(), springs: Vec::new(), forces: Vec::new(), rigid: Vec::new(), prescribed: Vec::new() };
     let mut cache = SolverCache::build(&grid, levels, &mprob, &s, eps.clone());
     let cfg = ModalConfig::new(6);
     let t0 = Instant::now();
@@ -769,7 +769,7 @@ fn bench_strength(m: &mut Metrics) {
     let f_tip = -8.0f64;
     let forces: Vec<(u32, [f64; 3])> =
         tip.iter().map(|&n| (n, [0.0, 0.0, f_tip / tip.len() as f64])).collect();
-    let prob = NodeProblem { fixed, springs: Vec::new(), forces, rigid: Vec::new() };
+    let prob = NodeProblem { fixed, springs: Vec::new(), forces, rigid: Vec::new(), prescribed: Vec::new() };
     let spec = StrengthSpec {
         measure: SfMeasure::Both,
         strength: 50.0,

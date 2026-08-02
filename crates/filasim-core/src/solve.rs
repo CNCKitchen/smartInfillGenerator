@@ -213,6 +213,16 @@ pub struct NodeProblem {
     /// term realized on the finest solver level. Empty ⇒ the byte-identical
     /// no-rigid path (every rigid loop below is skipped).
     pub rigid: Vec<RigidGroup>,
+    /// Prescribed nodal MOTION of the penalty supports that enforce one
+    /// (a `BcKind::Displacement` with a non-zero value), as a displacement
+    /// rather than the `k·value` force it rides in on. Only the enforced axes
+    /// are non-zero. Empty ⇒ every solve behaves exactly as before.
+    ///
+    /// The solver never applies this as a constraint — the springs already do
+    /// that — it uses it as the LIFT the convergence test is measured against
+    /// (see `solve_slot`), because `k·value` is hundreds of times the force the
+    /// support actually transmits and would otherwise set the residual scale.
+    pub prescribed: Vec<(u32, [f64; 3])>,
 }
 
 #[derive(Clone)]
@@ -665,6 +675,52 @@ pub fn solve_cached_rhs(
     solve_slot(slot, grid, levels, problem, s, eps, extra_rhs, tol, max_iter)
 }
 
+/// The convergence scale for a problem whose supports PRESCRIBE a non-zero
+/// motion (`BcKind::Displacement` with a value) — `None` when none do, which
+/// leaves the plain ‖b‖ criterion and every other solve untouched.
+///
+/// Such a support is enforced by penalty springs, so the prescribed value rides
+/// the RHS as `k·value` with `k = SPRING_FACTOR·E0·h`. That is a few hundred
+/// times the force the support actually transmits, and it cancels almost
+/// exactly against the spring term inside `K·u` — so it dominates ‖b‖ while
+/// carrying no information. Measured against it, `tol` stops meaning anything:
+/// a 2.5 mm prescribed motion on a PETG clamp puts ‖b‖ at ~3·10⁶ N while the
+/// support reactions are ~13 N, and the default `tol = 1e-5` then accepts ~30 N
+/// of absolute residual — a displacement field ~1 % off and reported reactions
+/// that are pure noise (a "fixed" support that carries nothing reads 140 N, and
+/// `Σ R` does not close).
+///
+/// So measure the LIFTED problem instead: with `u = u_lift + w` (`u_lift` the
+/// prescribed motion), `K w = b − K·u_lift`, and the penalty cancels exactly in
+/// that difference. `‖b − K·u_lift‖` is therefore the physical load scale, and
+/// `tol` against it means what it means for every force-loaded solve. Costs one
+/// matvec, only on problems that prescribe motion.
+pub fn prescribed_ref_norm(solver: &MgSolver, problem: &NodeProblem, b: &[f64]) -> Option<f64> {
+    if problem.prescribed.is_empty() {
+        return None;
+    }
+    let constrained = &solver.levels[0].constrained;
+    let mut lift = vec![0f64; b.len()];
+    for &(n, v) in &problem.prescribed {
+        for d in 0..3 {
+            lift[3 * n as usize + d] = v[d];
+        }
+    }
+    for (i, c) in constrained.iter().enumerate() {
+        if *c {
+            lift[i] = 0.0;
+        }
+    }
+    let mut ku = vec![0f64; b.len()];
+    solver.apply_k(&lift, &mut ku);
+    let n2: f64 = (0..b.len())
+        .map(|i| if constrained[i] { 0.0 } else { (b[i] - ku[i]).powi(2) })
+        .sum();
+    // A degenerate lift (every prescribed node also hard-fixed) leaves nothing
+    // to measure — fall back to ‖b‖ rather than dividing by zero.
+    (n2 > 0.0).then(|| n2.sqrt())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn solve_slot(
     slot: &mut Option<SolverCache>,
@@ -702,9 +758,10 @@ fn solve_slot(
             b[i] = 0.0;
         }
     }
+    let ref_norm = prescribed_ref_norm(&cache.solver, problem, &b);
     let mut u = std::mem::take(&mut cache.last_u);
     debug_assert_eq!(u.len(), ndof);
-    let stats = cache.solver.solve_warm(&b, &mut u, tol, max_iter);
+    let stats = cache.solver.solve_warm_ref(&b, &mut u, tol, max_iter, ref_norm);
     if crate::cancel::requested() {
         // Keep the partial iterate as a future warm start, but don't present
         // it as a result.

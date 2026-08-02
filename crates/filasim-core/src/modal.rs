@@ -831,7 +831,7 @@ mod tests {
                 }
             }
         }
-        let problem = NodeProblem { fixed, springs: Vec::new(), forces: Vec::new(), rigid: Vec::new() };
+        let problem = NodeProblem { fixed, springs: Vec::new(), forces: Vec::new(), rigid: Vec::new(), prescribed: Vec::new() };
         let eps = grid_eps(&grid);
         let mut cache = SolverCache::build(&grid, levels, &problem, &s, eps);
         let cfg = ModalConfig::new(num_modes);
@@ -908,7 +908,7 @@ mod tests {
                 }
             }
         }
-        let problem = NodeProblem { fixed, springs: Vec::new(), forces: Vec::new(), rigid: Vec::new() };
+        let problem = NodeProblem { fixed, springs: Vec::new(), forces: Vec::new(), rigid: Vec::new(), prescribed: Vec::new() };
         let mut cache = SolverCache::build(&grid, levels, &problem, &s, grid_eps(&grid));
         let cfg = ModalConfig::new(1);
 
@@ -975,7 +975,7 @@ mod tests {
             }
         }
         eprintln!("fixed {} lower-face nodes", fixed.len());
-        let problem = NodeProblem { fixed, springs: Vec::new(), forces: Vec::new(), rigid: Vec::new() };
+        let problem = NodeProblem { fixed, springs: Vec::new(), forces: Vec::new(), rigid: Vec::new(), prescribed: Vec::new() };
         let t = Instant::now();
         let mut cache = SolverCache::build(&grid, levels, &problem, &s, grid_eps(&grid));
         eprintln!("cache build: {:.2}s", t.elapsed().as_secs_f64());
@@ -1033,7 +1033,7 @@ mod tests {
         // Weak anchors lift the 6 rigid-body modes without hard constraints.
         let k = 1e-4 * s.e0 * grid.h;
         let springs = rigid_body_anchor_springs(mx, my, mz, &active, k);
-        let problem = NodeProblem { fixed: Vec::new(), springs, forces: Vec::new(), rigid: Vec::new() };
+        let problem = NodeProblem { fixed: Vec::new(), springs, forces: Vec::new(), rigid: Vec::new(), prescribed: Vec::new() };
         let mut cache = SolverCache::build(&grid, levels, &problem, &s, grid_eps(&grid));
         let cfg = ModalConfig::new(1 + 6); // 6 rigid-body + 1 flexible
         let res = analyze(&mut cache.solver, &grid.scale, density, &[], &cfg, |_, _, _| {}).unwrap();
@@ -1090,7 +1090,7 @@ mod tests {
             }
         }
         let problem =
-            NodeProblem { fixed, springs: Vec::new(), forces: Vec::new(), rigid: Vec::new() };
+            NodeProblem { fixed, springs: Vec::new(), forces: Vec::new(), rigid: Vec::new(), prescribed: Vec::new() };
 
         let params = OptimizeParams::default();
         let split = design_split(&grid, &params, &problem, &LoadSet::default());

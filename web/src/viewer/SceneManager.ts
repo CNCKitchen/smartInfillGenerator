@@ -1212,6 +1212,10 @@ export class SceneManager {
         this.buildMomentGlyph(bc, inactive);
         continue;
       }
+      if (bc.kind === "pressure") {
+        this.buildPressureGlyphs(bc, inactive);
+        continue;
+      }
       if (bc.kind === "force" && bc.force) {
         const f = new THREE.Vector3(...bc.force);
         if (f.lengthSq() === 0) continue;
@@ -1370,13 +1374,23 @@ export class SceneManager {
     );
   }
 
-  private buildSupportGlyphs(bc: Bc, inactive = false) {
-    const p = this.basePositions!;
+  /** Glyph sites spread over a triangle selection: greedy farthest-point
+   *  sampling of the triangle centroids, seeded at the largest triangle, so the
+   *  markers cover the whole patch instead of clumping where its tessellation is
+   *  dense. At most `max` sites, none closer than `spacingFrac` × the bbox
+   *  diagonal. Each site carries its triangle's outward unit normal. */
+  private sampleSelectionSites(
+    tris: Uint32Array,
+    max: number,
+    spacingFrac: number
+  ): { c: THREE.Vector3; n: THREE.Vector3 }[] {
+    const p = this.basePositions;
+    if (!p) return [];
     // Triangle centroids + outward normals + areas of the selection.
     const items: { c: THREE.Vector3; n: THREE.Vector3; a: number }[] = [];
     const e1 = new THREE.Vector3();
     const e2 = new THREE.Vector3();
-    for (const t of bc.tris) {
+    for (const t of tris) {
       const o = 9 * t;
       const a = new THREE.Vector3(p[o], p[o + 1], p[o + 2]);
       const b = new THREE.Vector3(p[o + 3], p[o + 4], p[o + 5]);
@@ -1389,13 +1403,12 @@ export class SceneManager {
       n.divideScalar(len);
       items.push({ c: a.add(b).add(c).divideScalar(3), n, a: len });
     }
-    if (!items.length) return;
-    // Greedy farthest-point sampling, seeded at the largest triangle.
+    if (!items.length) return [];
     items.sort((u, v) => v.a - u.a);
     const chosen = [items[0]];
     const minD2 = items.map((it) => it.c.distanceToSquared(items[0].c));
-    const spacing2 = (0.06 * this.bboxDiag) ** 2;
-    while (chosen.length < 12) {
+    const spacing2 = (spacingFrac * this.bboxDiag) ** 2;
+    while (chosen.length < max) {
       let best = -1;
       let bd = spacing2;
       for (let i = 0; i < items.length; i++) {
@@ -1410,6 +1423,60 @@ export class SceneManager {
         minD2[i] = Math.min(minD2[i], items[i].c.distanceToSquared(items[best].c));
       }
     }
+    return chosen;
+  }
+
+  /** Pressure: a field of equal-length arrows normal to the loaded patch — one
+   *  per glyph site, all the same length because the pressure is uniform.
+   *  A POSITIVE pressure pushes onto the surface (the engine applies
+   *  f = −p·A·n, see `pressure_forces`), so its arrows point INTO the part; a
+   *  negative one pulls and points out. Signed value callout on the patch. */
+  private buildPressureGlyphs(bc: Bc, inactive: boolean) {
+    const mpa = bc.pressure ?? 0;
+    if (mpa === 0) return;
+    const sites = this.sampleSelectionSites(bc.tris, 14, 0.055);
+    if (!sites.length) return;
+    const len = this.bboxDiag * 0.09; // shorter than a force arrow — there are many
+    const mat = new THREE.MeshStandardMaterial({
+      color: BC_COLORS.pressure.clone(),
+      roughness: 0.45,
+      metalness: 0.05,
+      transparent: inactive,
+      opacity: inactive ? 0.25 : 1,
+    });
+    // Same absolute shaft/head thickness as the force arrow (which is twice as
+    // long), so a pressure field reads as a bundle of the same kind of arrow.
+    const shaftLen = len * 0.72;
+    const shaftGeo = new THREE.CylinderGeometry(len * 0.05, len * 0.05, shaftLen, 8);
+    const headGeo = new THREE.ConeGeometry(len * 0.14, len * 0.28, 12);
+    this.markerDisposables.push(mat, shaftGeo, headGeo);
+    const up = new THREE.Vector3(0, 1, 0);
+    const pushing = mpa > 0;
+    for (const s of sites) {
+      const dir = pushing ? s.n.clone().negate() : s.n.clone();
+      const g = new THREE.Group();
+      const shaft = new THREE.Mesh(shaftGeo, mat);
+      shaft.position.y = shaftLen / 2;
+      const head = new THREE.Mesh(headGeo, mat);
+      head.position.y = shaftLen + len * 0.14;
+      g.add(shaft, head);
+      g.quaternion.setFromUnitVectors(up, dir);
+      // Keep the whole arrow outside the part (the force-arrow rule): pushing →
+      // head tip on the surface with the shaft trailing outward, pulling → tail
+      // on the surface so the head sits at the far, outer end.
+      g.position.copy(pushing ? s.c.clone().addScaledVector(s.n, len) : s.c);
+      this.bcMarkers.add(g);
+    }
+    // Signed value — the sign IS the load direction here, unlike a force whose
+    // callout reports the magnitude of an already-drawn vector.
+    const a = Math.abs(mpa);
+    const dec = a >= 9.95 ? 0 : a >= 0.995 ? 1 : a >= 0.0995 ? 2 : 3;
+    this.pushBcCallout(bc, this.selectionCentroid(bc.tris), `${mpa.toFixed(dec)} MPa`, inactive);
+  }
+
+  private buildSupportGlyphs(bc: Bc, inactive = false) {
+    const chosen = this.sampleSelectionSites(bc.tris, 12, 0.06);
+    if (!chosen.length) return;
     // A cylindrical support usually sits INSIDE a bore, where the cones point at
     // the wall from within — cap them to the fitted radius so they stay in the
     // hole instead of shooting out the far side of a small one.

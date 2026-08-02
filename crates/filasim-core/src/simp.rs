@@ -1055,6 +1055,8 @@ pub fn optimize_cached(
     // cases (their `extra_bb` is built once and never touched — byte-identical).
     let mut extra_base: Vec<Vec<f64>> = Vec::new();
     let mut extra_cons_idx: Vec<Vec<u32>> = Vec::new();
+    // Per-case convergence scale — `Some` only for a case that prescribes motion.
+    let mut extra_ref: Vec<Option<f64>> = Vec::new();
     for (j, (p, wj)) in loads.extra.iter().enumerate() {
         let group = if cache.same_constraints(p) {
             None
@@ -1083,6 +1085,18 @@ pub fn optimize_cached(
                 }
             }
         }
+        // Same rescaling the primary case gets inside `solve_slot`: a case whose
+        // supports prescribe a motion must not be measured against its penalty
+        // RHS. Constant across iterations (the RHS's self-weight part moves, the
+        // penalty part does not), so it is computed once here.
+        extra_ref.push(crate::solve::prescribed_ref_norm(
+            match group {
+                None => &cache.solver,
+                Some(i) => &extra_caches[i].solver,
+            },
+            p,
+            &bbj,
+        ));
         extra_base.push(if has_body { bbj.clone() } else { Vec::new() });
         extra_cons_idx.push(cons_idx);
         extra_group.push(group);
@@ -1235,13 +1249,22 @@ pub fn optimize_cached(
             }
             match extra_group[j] {
                 None => {
-                    slot.as_mut()
-                        .unwrap()
-                        .solver
-                        .solve_warm(&extra_bb[j], &mut extra_u[j], tol_i, cap_i);
+                    slot.as_mut().unwrap().solver.solve_warm_ref(
+                        &extra_bb[j],
+                        &mut extra_u[j],
+                        tol_i,
+                        cap_i,
+                        extra_ref[j],
+                    );
                 }
                 Some(i) => {
-                    extra_caches[i].solver.solve_warm(&extra_bb[j], &mut extra_u[j], tol_i, cap_i);
+                    extra_caches[i].solver.solve_warm_ref(
+                        &extra_bb[j],
+                        &mut extra_u[j],
+                        tol_i,
+                        cap_i,
+                        extra_ref[j],
+                    );
                 }
             }
         }
